@@ -5,7 +5,7 @@
   "status": "active",
   "local_plan": "docs/computer_use_local_diagnostic_plan_20261002.json",
   "combined_goal": "docs/computer_use_local_advisor_goal_20261002.md",
-  "current_stage": "latex_new_formal_complete_repair_development_running",
+  "current_stage": "latex_repair_development_passed_client30_qualification_running",
   "source_baseline": "56896791b41b6aa5c022c99dac4996f719bd4ba0",
   "stages": {
     "P0": {
@@ -207,15 +207,18 @@
     "apps/computer_use/.runtime/latex-new-formal-20261003/audit.json",
     "apps/computer_use/.runtime/latex-new-complete-replay-20261003/browser-check.json",
     "apps/computer_use/.runtime/original-readiness-recheck-20261003/result.json",
-    "apps/computer_use/.runtime/latex-repair-fixture-01/result.json"
+    "apps/computer_use/.runtime/latex-repair-fixture-01/result.json",
+    "apps/computer_use/.runtime/product-latex-repair-01/result.json",
+    "apps/computer_use/.runtime/product-latex-repair-01/audit.json",
+    "apps/computer_use/.runtime/windows-client-30-qualification-01/result.json"
   ],
   "latest_checks": {
-    "gpu_idle": false,
+    "gpu_idle": true,
     "root_available_approx_gib": 227,
-    "previous_queue_status": "latex_new_formal_terminal_repair_01_live",
-    "gpu_compute_processes": 1
+    "previous_queue_status": "latex_repair_01_terminal_engine_stopped_client30_qualification_live",
+    "gpu_compute_processes": 0
   },
-  "next_action": "Wait on existing product-latex-repair-01 process and owned latex-repair-engine-01; inspect actual missing-file diagnosis, targeted package restoration, source/unrelated-project preservation, PDF, launchers and application reopening. After successful development qualification freeze three formal repair repetitions; otherwise classify the first error without replacing the failed trial.",
+  "next_action": "Finish existing client30 native qualification; freeze formal LaTeX repair inputs and three trials. Each reset must first prove healthy projects and then reproduce the same missing-class bytes/metadata state; keep VM and cache warm, restart owned app/engine, require full independent PDF/launcher/reopen checks.",
   "advisor_provider": {
     "provider": "deepseek",
     "model": "deepseek-flash",
@@ -239,18 +242,18 @@
     "status": "three_product_scenarios_formal_complete_latex_repair_pending",
     "completed": 9,
     "planned": 12,
-    "development_attempts_completed": 9,
-    "development_passed": 6,
+    "development_attempts_completed": 10,
+    "development_passed": 7,
     "development_failed": 3,
     "formal_template_frozen": true,
     "report": "docs/computer_use_python_workflow_20261003.md",
-    "latest_native_bundle": "apps/computer_use/.runtime/windows-native-client-29",
+    "latest_native_bundle": "apps/computer_use/.runtime/windows-native-client-30",
     "native_contract_tests_passed": 128,
     "scenario_status": {
       "product-python-new": "formal_3_of_3_passed_with_launcher_and_reopen",
       "product-python-repair": "formal_3_of_3_passed_with_launcher_and_reopen",
       "product-latex-new": "formal_3_of_3_passed_with_pdf_launcher_and_reopen",
-      "product-latex-repair": "verified_missing_class_fixture_real_model_development_running"
+      "product-latex-repair": "development_passed_formal_next"
     },
     "formal_passed": 9,
     "formal_report": "docs/computer_use_python_formal_20261003.md",
@@ -352,8 +355,8 @@
     "report": "docs/computer_use_latex_product_20261003.md",
     "integrated": true,
     "native_contracts_passed": 128,
-    "bundle": "apps/computer_use/.runtime/windows-native-client-29",
-    "bundle_sha256": "b841567c7f489f7f46ecd1ebb98c590d0e70b0ce021ebf58c1bc01ad6748814c",
+    "bundle": "apps/computer_use/.runtime/windows-native-client-30",
+    "bundle_sha256": "d801bc07496c50c05108bb036978fabf7cf581b763601f38c614255c5ef75e89",
     "new_development_completed": 2,
     "new_development_passed": 1,
     "new_development_failed": 1,
@@ -412,6 +415,8 @@
       "action": "Controlled follow-up after product baseline; compare context settings/KVMem without equating network-dependent task duration to model speedup."
     },
     "repair_fixture_qualified": true,
-    "repair_development": "apps/computer_use/.runtime/product-latex-repair-01/result.json"
+    "repair_development": "apps/computer_use/.runtime/product-latex-repair-01/result.json",
+    "repair_development_passed": true,
+    "repair_development_audit": "apps/computer_use/.runtime/product-latex-repair-01/audit.json"
   }
 }
