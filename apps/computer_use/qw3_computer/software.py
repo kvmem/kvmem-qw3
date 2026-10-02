@@ -56,6 +56,15 @@ def process_environment():
     return env
 
 
+def job_receipt(job):
+    """Expose the identifier accepted by job_status, not its private owner ID."""
+    receipt = {k: v for k, v in job.items() if k != "task_id"}
+    receipt["job_id"] = job["id"]
+    if job["status"] in ACTIVE:
+        receipt["next_poll"] = {"operation": "job_status", "job_id": job["id"], "wait_seconds": 10}
+    return receipt
+
+
 class Software:
     def __init__(self, root):
         self.root = Path(root).resolve()
@@ -105,7 +114,7 @@ class Software:
     def snapshot(self, task_id=None):
         return {"root": str(self.root), "profiles": {k: {"description": v["description"], "requirements": v["requirements"]}
                 for k, v in self.catalog["profiles"].items()}, "python_version": self.catalog["python"]["version"],
-                "jobs": [j.copy() for j in self.jobs.values() if task_id is None or j["task_id"] == task_id]}
+                "jobs": [job_receipt(j) for j in self.jobs.values() if task_id is None or j["task_id"] == task_id]}
 
     def inspect(self, task_id):
         projects = []
@@ -137,13 +146,14 @@ class Software:
             raise DesktopError("Software tool needs an object")
         operation = arguments.get("operation")
         fields = {"inspect": {"operation"}, "setup_python": {"operation", "action_id", "project", "profile"},
+                  "repair_python": {"operation", "action_id", "project", "profile"},
                   "job_status": {"operation", "job_id", "wait_seconds"}, "cancel_job": {"operation", "job_id"},
                   "resume_job": {"operation", "job_id"}}
         if operation not in fields or set(arguments) - fields[operation]:
             raise DesktopError("Unsupported software operation or argument")
         if operation == "inspect":
             return self.inspect(task_id)
-        if operation == "setup_python":
+        if operation in {"setup_python", "repair_python"}:
             return self.start(task_id, arguments)
         job_id = arguments.get("job_id")
         if not isinstance(job_id, str) or job_id not in self.jobs or self.jobs[job_id]["task_id"] != task_id:
@@ -167,7 +177,7 @@ class Software:
             job.pop("error", None)
             self.save(job)
             self.tasks[job_id] = asyncio.create_task(self.perform(job))
-        return job.copy()
+        return job_receipt(job)
 
     def start(self, task_id, arguments):
         project, profile, identity = (arguments.get(k) for k in ("project", "profile", "action_id"))
@@ -175,12 +185,15 @@ class Software:
                 or not isinstance(profile, str) or profile not in self.catalog["profiles"]
                 or not isinstance(identity, str) or not ACTION_ID.fullmatch(identity)):
             raise DesktopError("Invalid project, reviewed profile, or action identity")
-        request = {"task_id": task_id, "project": project, "profile": profile}
+        request = {"task_id": task_id, "project": project, "profile": profile,
+                   "operation": arguments.get("operation", "setup_python")}
+        if request["operation"] not in {"setup_python", "repair_python"}:
+            raise DesktopError("Unsupported software operation")
         if identity in self.jobs:
             job = self.jobs[identity]
-            if any(job[k] != v for k, v in request.items()):
+            if any(job.get(k, "setup_python" if k == "operation" else None) != v for k, v in request.items()):
                 raise DesktopError("Software action identity was reused with different arguments")
-            return job.copy() | {"duplicate": True}
+            return job_receipt(job) | {"duplicate": True}
         if sys.platform != "win32":
             raise DesktopError("Software installation currently requires the native Windows client")
         if any(j["status"] in ACTIVE or j["status"] == "uncertain" for j in self.jobs.values()):
@@ -193,7 +206,7 @@ class Software:
         self.jobs[identity] = job
         self.save(job)  # Reserve identity durably before any installation work.
         self.tasks[identity] = asyncio.create_task(self.perform(job))
-        return job.copy()
+        return job_receipt(job)
 
     async def cancel(self, identity):
         task = self.tasks.get(identity)
@@ -318,6 +331,11 @@ class Software:
             return result
 
         try:
+            if job.get("operation") == "repair_python":
+                from .software_repair import repair_python
+                job["verification"] = await repair_python(self, job, stage)
+                job.update(status="completed", finished_at=time.time())
+                return
             profile = self.catalog["profiles"][job["profile"]]
             project = self.path("projects", job["project"]); project.mkdir(exist_ok=True)
             marker = self.path("projects", job["project"], ".qw3-project.json")

@@ -146,14 +146,66 @@ async def grade(project, baseline, output):
     return result
 
 
+async def grade_repair(project, baseline, output):
+    result = {"kind": "independent_python_repair_acceptance", "passed": False, "checks": {}}
+    try:
+        fixture = baseline["fixture"]
+        reference = Path(fixture["reference_project"])
+        checks = result["checks"]
+        checks["input_files_unchanged"] = all(digest(Path(fixture[key]) / name) == value
+            for key, label in (("target_project", "repair-target"), ("reference_project", "unrelated-project"))
+            for name, value in fixture["source_hashes"][label].items())
+        checks["unrelated_project_unchanged"] = fixture["unrelated_project_files"] == {
+            str(p.relative_to(reference)): digest(p) for p in reference.rglob("*") if p.is_file()}
+        checks["registry_paths_unchanged"] = registry_paths() == baseline["registry_paths"]
+        commands = []
+        for label, folder, args in (
+            ("target_program", project, ["main.py"]),
+            ("target_tests", project, ["-m", "pytest", "-q", "-p", "no:cacheprovider", "test_main.py"]),
+            ("target_dependencies", project, ["-m", "pip", "--isolated", "check"]),
+            ("reference_program", reference, ["main.py"]),
+        ):
+            process = None
+            try:
+                process = await asyncio.create_subprocess_exec(str(folder / ".venv/Scripts/python.exe"), "-I", "-B", *args,
+                    cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                stdout, stderr = await asyncio.wait_for(process.communicate(), 60)
+                commands.append(dict(label=label, exit_code=process.returncode, stdout=stdout.decode("utf-8", errors="replace"),
+                                     stderr=stderr.decode("utf-8", errors="replace")))
+            finally:
+                await stop_process_tree(process)
+        result["commands"] = commands
+        checks["programs_and_dependencies_passed"] = all(c["exit_code"] == 0 for c in commands)
+        checks["target_result"] = commands[0]["stdout"].strip() == "42"
+        checks["target_test_executed"] = "1 passed" in commands[1]["stdout"]
+        checks["reference_result"] = commands[3]["stdout"].strip() == "42"
+        checks["unrelated_project_unchanged_after_probes"] = fixture["unrelated_project_files"] == {
+            str(p.relative_to(reference)): digest(p) for p in reference.rglob("*") if p.is_file()}
+        result["passed"] = all(checks.values())
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    save(output / "independent-grade.json", result)
+    return result
+
+
 async def run(configuration):
     config = json.loads(configuration.read_text(encoding="utf-8-sig"))
     identity = config["run"]
     output = Path("C:/Qw3Computer/product-runs") / identity
     output.mkdir(parents=True, exist_ok=False)
     share = Path("//host.lan/Data")
-    workspace = Path("C:/Qw3Computer/outputs") / (identity + "-software")
-    project = workspace / "projects/python-demo"
+    repair = config.get("task") == "product-python-repair"
+    fixture = None
+    if repair:
+        fixture_path = share / (identity + "-fixture.json")
+        if digest(fixture_path) != config["repair_fixture_sha256"]:
+            raise ValueError("Repair fixture evidence changed")
+        fixture = json.loads(fixture_path.read_text())
+        if fixture["status"] != "ready_fault_injected" or fixture["model_used"] is not False:
+            raise ValueError("Repair fixture is not independently prepared")
+    workspace = Path(fixture["workspace"]) if repair else Path("C:/Qw3Computer/outputs") / (identity + "-software")
+    project = workspace / "projects" / ("repair-target" if repair else "python-demo")
+    grader = grade_repair if repair else grade
     bundle = Path("C:/Qw3Computer/clients") / config["bundle_sha256"][:12]
     manifest = json.loads((bundle / "manifest.json").read_text())
     if "opt_in_software_workflows" not in manifest["runtime_capabilities"]:
@@ -167,7 +219,8 @@ async def run(configuration):
         raise ValueError("Guest executor differs from the recorded candidate")
     report = {"kind": "native_local_python_product_trial", "run": identity, "status": "preparing", "passed": False,
               "model_used": True, "advisor_used": False, "execution_mode": "local_model_with_controlled_software_tools",
-              "bundle_sha256": config["bundle_sha256"], "cold_workspace": True, "started_at": time.time()}
+              "bundle_sha256": config["bundle_sha256"], "cold_workspace": not repair, "started_at": time.time(),
+              "scenario": "product-python-repair" if repair else "product-python-new", "thinking": config.get("thinking", False)}
     app = None
     owned_ready = False
     token_path = Path("C:/Qw3Computer") / (identity + "-model-token.txt")
@@ -184,13 +237,22 @@ async def run(configuration):
                 response.raise_for_status()
                 return await response.json()
         try:
-            if workspace.exists():
-                raise ValueError("Product workspace already exists; clean-install trial is invalid")
-            project.mkdir(parents=True)
-            (project / "main.py").write_text(MAIN, encoding="utf-8")
-            (project / "test_main.py").write_text(TEST, encoding="utf-8")
-            baseline = {"registry_paths": registry_paths(), "venv_absent": not (project / ".venv").exists(),
-                        "input_sha256": {name: digest(project / name) for name in ("main.py", "test_main.py")}}
+            if repair:
+                baseline = {"registry_paths": registry_paths(), "fixture": fixture}
+                pre = output / "before"; pre.mkdir()
+                initial_grade = await grade_repair(project, baseline, pre)
+                initial_launcher = await grade_launcher(project, pre)
+                if (initial_grade["passed"] or initial_launcher["passed"]
+                        or not initial_grade["checks"].get("unrelated_project_unchanged")):
+                    raise ValueError("Repair faults or reference preservation are not present at task start")
+            else:
+                if workspace.exists():
+                    raise ValueError("Product workspace already exists; clean-install trial is invalid")
+                project.mkdir(parents=True)
+                (project / "main.py").write_text(MAIN, encoding="utf-8")
+                (project / "test_main.py").write_text(TEST, encoding="utf-8")
+                baseline = {"registry_paths": registry_paths(), "venv_absent": not (project / ".venv").exists(),
+                            "input_sha256": {name: digest(project / name) for name in ("main.py", "test_main.py")}}
             save(output / "initial-state.json", baseline)
             try:
                 await api("/api/state")
@@ -203,6 +265,8 @@ async def run(configuration):
                     "--desktop-token", "C:/Qw3Computer/executor-token.txt", "--backend", config["backend"],
                     "--backend-token", str(token_path), "--runtime", str(output / "app"), "--software-root", str(workspace),
                     "--tool-call-limit", "100", "--output-policy", "task", "--trace-backend"]
+            if config.get("thinking"):
+                args.append("--thinking")
             with (output / "app.stdout.log").open("wb") as stdout, (output / "app.stderr.log").open("wb") as stderr:
                 app = await asyncio.create_subprocess_exec(*args, env=env, cwd=bundle / "app", stdout=stdout, stderr=stderr,
                                                           creationflags=subprocess.CREATE_NO_WINDOW)
@@ -229,12 +293,17 @@ async def run(configuration):
                       "不修改系统 PATH 或其他 Python。使用已提供的 python-web 软件配置档。"
                       "等待安装结束并核对工具的实际验证结果，再说明项目路径和下次如何打开项目终端。"
                       "如果失败，先报告具体错误；不要仅凭开始安装就说完成。")
+            if repair:
+                prompt = ("请修复选定软件工作目录中的 repair-target Python 项目。现在程序不能正常运行，"
+                          "打开项目终端选择的环境也不对。它原本使用 python-web 配置档。"
+                          "先诊断实际问题，只修复这个项目，保留源文件、系统 PATH 和 unrelated-project 项目。"
+                          "等待实际验证通过后，说明发现的问题、做了什么修复、下次如何打开正确的项目终端。")
             (output / "prompt.txt").write_text(prompt, encoding="utf-8")
             progress("model_running")
             report["task"] = await run_task("http://127.0.0.1:18083", prompt, output / "task", config["timeout_seconds"])
             report["terminal_state"] = await api("/api/state")
             progress("independent_verification")
-            report["grade"] = await grade(project, baseline, output)
+            report["grade"] = await grader(project, baseline, output)
             report["passed"] = report["task"]["outcome"] == "agent_completed" and report["grade"]["passed"]
             report["launcher_grade"] = await grade_launcher(project, output)
             report["passed"] = report["passed"] and report["launcher_grade"]["passed"]
@@ -263,7 +332,7 @@ async def run(configuration):
                             pass
                         await asyncio.sleep(.3)
                 restart_output = output / "reopened"; restart_output.mkdir()
-                restarted_grade = await grade(project, baseline, restart_output)
+                restarted_grade = await grader(project, baseline, restart_output)
                 restarted_launcher = await grade_launcher(project, restart_output)
                 restart_checks = {"different_process": app.pid != prior_pid, "task_identity_preserved": reopened["id"] == before["id"],
                     "completion_preserved": reopened["status"] == "completed" and reopened.get("software_verified") is True,

@@ -48,7 +48,7 @@ async def run(args):
     lock = open("/tmp/qw3-osworld-vm.lock", "a")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     report = {"kind": "local_model_software_product_trial", "status": "preparing", "passed": False,
-              "task": "product-python-new", "model_used": True, "advisor_used": False,
+              "task": "product-python-repair" if args.repair_fixture else "product-python-new", "model_used": True, "advisor_used": False,
               "execution_mode": "local_model_with_controlled_software_tools", "started_at": time.time()}
     recorder = None; relay = None; sampler = None
     sampled = asyncio.Event()
@@ -63,6 +63,8 @@ async def run(args):
             frozen = json.loads(args.acceptance_manifest.read_text())
             if frozen["task"] != report["task"] or identity not in frozen["trial_ids"] or args.timeout != frozen["timeout_seconds"]:
                 raise ValueError("Run identity, task or budget differs from frozen acceptance")
+            if args.thinking != frozen.get("thinking", False):
+                raise ValueError("Thinking mode differs from frozen acceptance")
             for relative, expected in frozen["source_sha256"].items():
                 if sha256(ROOT / relative) != expected:
                     raise ValueError("Frozen acceptance source changed: " + relative)
@@ -74,7 +76,8 @@ async def run(args):
             raise ValueError("VM ownership mismatch")
         storage = Path(next(m["Source"] for m in info["Mounts"] if m["Destination"] == "/storage"))
         report["space"] = require_evidence_space(output, SHARE, storage)
-        report["snapshot_qualification"] = snapshot_qualification(APP, args.snapshot)
+        if not args.repair_fixture:
+            report["snapshot_qualification"] = snapshot_qualification(APP, args.snapshot)
         baseline = args.baseline_sources.resolve()
         if (baseline / "snapshot.py").read_bytes() != (APP / "vm/snapshot.py").read_bytes():
             raise ValueError("Baseline restore helper differs from reviewed code")
@@ -109,22 +112,26 @@ async def run(args):
             previous = await desktop("/observe")
             (output / "before-restore.png").write_bytes(base64.b64decode(previous.pop("image")))
             save(output / "before-restore.json", previous)
-            event("restoring_clean_baseline")
-            await command("docker", "stop", "-t", "120", "qw3-computer-windows")
-            (output / "prior-share-archive.json").write_text(await command(sys.executable, APP / "vm/archive_share.py", "shared-archive-" + identity))
-            await command(sys.executable, baseline / "snapshot.py", "restore", "--name", args.snapshot)
-            shutil.copyfile(output / "executed-executor.ps1", SHARE / "executor.ps1")
-            await command("docker", "start", "qw3-computer-windows")
-            async with asyncio.timeout(180):
-                while True:
-                    try:
-                        health = await desktop("/health")
-                        break
-                    except (aiohttp.ClientError, TimeoutError):
-                        await asyncio.sleep(1)
-            if not health["paused"] or (await desktop("/files"))["files"]:
-                raise ValueError("Restored executor is not clean and paused")
-            report["restored_health"] = health
+            if args.repair_fixture:
+                report["fixture_preserved_without_restore"] = True
+                report["initial_health"] = health
+            else:
+                event("restoring_clean_baseline")
+                await command("docker", "stop", "-t", "120", "qw3-computer-windows")
+                (output / "prior-share-archive.json").write_text(await command(sys.executable, APP / "vm/archive_share.py", "shared-archive-" + identity))
+                await command(sys.executable, baseline / "snapshot.py", "restore", "--name", args.snapshot)
+                shutil.copyfile(output / "executed-executor.ps1", SHARE / "executor.ps1")
+                await command("docker", "start", "qw3-computer-windows")
+                async with asyncio.timeout(180):
+                    while True:
+                        try:
+                            health = await desktop("/health")
+                            break
+                        except (aiohttp.ClientError, TimeoutError):
+                            await asyncio.sleep(1)
+                if not health["paused"] or (await desktop("/files"))["files"]:
+                    raise ValueError("Restored executor is not clean and paused")
+                report["restored_health"] = health
         event("installing_qualified_native_client")
         install = prepare_bundle(args.bundle, identity, SHARE, output / "bundle-install")
         report["native_bundle"] = install
@@ -155,7 +162,21 @@ async def run(args):
         shutil.copyfile(output / "executed-guest.py", guest_path)
         configuration = {"run": identity, "bundle_sha256": install["archive"]["sha256"],
                          "backend": f"http://{network['Gateway']}:18084/v1", "timeout_seconds": args.timeout,
+                         "task": report["task"], "thinking": args.thinking,
                          "guest_script_sha256": sha256(guest_path), "executor_sha256": sha256(output / "executed-executor.ps1")}
+        if args.repair_fixture:
+            fixture = json.loads(args.repair_fixture.read_text())
+            if fixture.get("status") != "ready_fault_injected":
+                raise ValueError("Repair fixture is not ready")
+            if args.acceptance_manifest:
+                definition = frozen["repair_fixture"]
+                if (fixture.get("reset_from_sha256") != definition["sha256"]
+                        or fixture.get("fixture_source_sha256") != definition["reset_source_sha256"]
+                        or fixture.get("workspace") != definition["workspace"]):
+                    raise ValueError("Repair reset differs from frozen acceptance inputs")
+            shutil.copyfile(args.repair_fixture, SHARE / (identity + "-fixture.json"))
+            shutil.copyfile(args.repair_fixture, output / "fixture.json")
+            configuration["repair_fixture_sha256"] = sha256(args.repair_fixture)
         save(SHARE / (identity + "-configuration.json"), configuration)
         save(output / "configuration.json", configuration)
         script = f'''$ErrorActionPreference='Stop'
@@ -208,6 +229,8 @@ if __name__ == "__main__":
     parser.add_argument("--baseline-sources", type=Path, default=APP / ".runtime/local-diagnostic-baseline-vm-daaaf6c")
     parser.add_argument("--ffmpeg", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--repair-fixture", type=Path, help="Use an independently prepared broken project, preserving the current VM")
+    parser.add_argument("--thinking", action="store_true")
     parser.add_argument("--acceptance-manifest", type=Path, help="Require a predeclared frozen formal-acceptance trial")
     result = asyncio.run(run(parser.parse_args()))
     raise SystemExit(0 if result["status"] == "complete" else 1)

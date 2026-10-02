@@ -44,6 +44,7 @@ def write_config(runtime, bridge_url, mcp_command=None, mcp_args=(), *, thinking
             "Software jobs are asynchronous: starting a job is not completing the task. Use job_status with bounded waits "
             "until its terminal result; require verification.passed=true before reporting successful setup. "
             "Do not run installers or shell commands through GUI typing. Preserve existing installations and project files. "
+            "For a broken managed project use repair_python; read its diagnosis and verification, and report what changed. "
             "On an uncertain software operation, stop and request reconciliation.\n")
     catalog = {"models": [{
         "slug": "qw3-computer", "display_name": "QW3 Computer",

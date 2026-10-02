@@ -40,7 +40,7 @@ async function post(path,body){const response=await fetch(path,{method:'POST',he
 function render(s){state=s;el('status').textContent=s.ready?(labels[s.status]||s.status):'尚未就绪';
  el('softwareCard').hidden=!s.software;
  if(s.software){el('softwareRoot').textContent='工作目录：'+s.software.root;
-  const stages={download_python:'下载并校验 Python',install_python:'安装并核对解释器',create_venv:'创建项目环境',install_dependencies:'安装固定依赖',verify_project:'在新进程中验证'};
+  const stages={download_python:'下载并校验 Python',install_python:'安装并核对解释器',create_venv:'创建项目环境',install_dependencies:'安装固定依赖',verify_project:'在新进程中验证',diagnose_project:'诊断项目与终端环境',repair_dependencies:'修复项目依赖',repair_terminal_launcher:'修复终端启动器并保留备份',verify_repair:'验证修复后的环境'};
   const statuses={starting:'准备中',running:'执行中',completed:'验证通过',failed:'失败',cancelled:'已中断',uncertain:'结果待核对'};
   el('softwareJobs').replaceChildren(...s.software.jobs.map(j=>{const d=document.createElement('div');d.className='message';d.textContent=j.project+' · '+(statuses[j.status]||j.status)+'\n'+(stages[j.stage]||'准备工作')+(j.error?'\n'+j.error:'')+(j.verification?.passed?'\n可用项目：'+j.verification.project+'\n双击项目中的 open-terminal.cmd 打开项目终端。':'');return d}));
  }

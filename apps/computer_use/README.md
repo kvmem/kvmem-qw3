@@ -102,7 +102,17 @@ The model selects the profile and checks the job; the application produces the
 installation commands. It does not accept model-supplied shell commands, URLs
 or packages. System PATH and unrelated Python installations are preserved. A
 conflicting Python 3.13 registration or unmanaged existing `.venv` stops setup
-for inspection. This first profile is not yet a general Python repair tool.
+for inspection. `repair_python` first diagnoses a matching managed project,
+checks its actual imports as well as package metadata, reinstalls the exact
+reviewed wheels when necessary, and repairs the delivered terminal launcher
+with a saved backup. It verifies the selected interpreter and imports in two
+new processes. It preserves source files and does not reinstall system Python.
+Unmanaged environments, unknown interpreter identities and changed dependency
+locks still require inspection; this is not a general Python repair tool.
+
+For an existing managed project, request: “修复 repair-target 项目，先诊断运行和
+终端环境的问题，保留源文件及其他项目，验证后说明修复内容。” Add `-Thinking`
+to the Windows launcher to use the locally qualified reasoning mode.
 
 Jobs retain stage results, errors, logs and action identity. Pause cancels known
 owned work; downloads and known-stopped jobs can resume under the same identity.
@@ -131,9 +141,12 @@ PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/software_product
 ```
 
 The engine must be running and owned by its manifest; the harness requires the
-task-owned VM to be paused before restoring its snapshot. The current harness
-only covers the Python new-environment pilot. Repair and LaTeX acceptance are
-not implied by a successful new-environment run.
+task-owned VM to be paused before restoring its snapshot. For repair development,
+`--repair-fixture <result.json> --thinking` preserves an independently prepared
+broken-project VM instead of restoring it. The guest verifies the faults before
+starting the model, and checks source hashes, unrelated project contents, PATH,
+fresh processes, the actual launcher and application reopening afterward.
+Repair and LaTeX acceptance are not implied by a successful new-environment run.
 
 The model catalog advertises image input and a 1M logical context. Automatic
 compaction starts at 950K tokens, above the 128K KVMem retrieval threshold.

@@ -43,6 +43,9 @@ def main():
         raise ValueError("Campaign already has a receipt; inspect its recorded handles before taking further action")
     frozen_bytes = args.acceptance.read_bytes()
     frozen = json.loads(frozen_bytes)
+    for relative, expected in frozen["source_sha256"].items():
+        if hashlib.sha256((ROOT / relative).read_bytes()).hexdigest() != expected:
+            raise ValueError("Frozen campaign source changed: " + relative)
     report = {"kind": "serial_formal_product_campaign", "status": "running", "started_at": time.time(),
               "acceptance_sha256": hashlib.sha256(frozen_bytes).hexdigest(), "planned": len(frozen["trial_ids"]),
               "campaign_pid": os.getpid(), "trials": [], "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
@@ -58,6 +61,26 @@ def main():
             trial_dir = APP / ".runtime" / identity
             if engine_dir.exists() or trial_dir.exists():
                 raise ValueError("Trial identity already exists; no automatic retry is permitted")
+            repair_args = []
+            if frozen["task"] == "product-python-repair":
+                definition = frozen["repair_fixture"]
+                original = ROOT / definition["path"]
+                if hashlib.sha256(original.read_bytes()).hexdigest() != definition["sha256"]:
+                    raise ValueError("Frozen repair inputs changed")
+                fixture_dir = APP / ".runtime" / (identity + "-fixture")
+                report.update(stage="resetting_repair_faults", current_trial=identity)
+                save(path, report)
+                with (output / (identity + "-fixture.log")).open("xb") as log:
+                    worker = subprocess.Popen([sys.executable, str(APP / "prepare_python_repair.py"),
+                        "--bundle", str(args.bundle.resolve()), "--output", str(fixture_dir), "--reset-from", str(original)],
+                        cwd=ROOT, env=dict(os.environ, PYTHONPATH=str(APP)), stdout=log, stderr=log)
+                    report["fixture_worker_pid"] = worker.pid; save(path, report)
+                    worker.wait()
+                if worker.returncode != 0:
+                    raise ValueError("Repair input preparation failed; inspect the recorded worker before retry")
+                repair_args = ["--repair-fixture", str(fixture_dir / "result.json")]
+            if frozen.get("thinking"):
+                repair_args.append("--thinking")
             engine = subprocess.Popen([sys.executable, str(APP / "run_engine.py"), "--method", "dflash2", "--kvmem", "off",
                                        "--run-dir", str(engine_dir), "--lock-timeout", "15"], cwd=ROOT)
             report.update(stage="starting_engine", current_trial=identity, engine_pid=engine.pid)
@@ -84,7 +107,7 @@ def main():
             with log_path.open("xb") as log:
                 worker = subprocess.Popen([sys.executable, str(APP / "software_product_run.py"), "--output", str(trial_dir),
                     "--bundle", str(args.bundle.resolve()), "--engine", str(engine_dir), "--ffmpeg", str(args.ffmpeg.resolve()),
-                    "--timeout", str(frozen["timeout_seconds"]), "--acceptance-manifest", str(args.acceptance.resolve())],
+                    "--timeout", str(frozen["timeout_seconds"]), "--acceptance-manifest", str(args.acceptance.resolve()), *repair_args],
                     cwd=ROOT, env=dict(os.environ, PYTHONPATH=str(APP)), stdout=log, stderr=log)
                 report["worker_pid"] = worker.pid
                 save(path, report)

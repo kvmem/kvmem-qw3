@@ -34,6 +34,7 @@ def summarize(root):
     checks = guest.get("grade", {}).get("checks", {})
     return {
         "attempt": root.name, "status": result["status"], "passed": result["passed"],
+        "scenario": result.get("task", "product-python-new"),
         "result_sha256": hashlib.sha256(result_path.read_bytes()).hexdigest(),
         "execution_mode": result["execution_mode"], "model_used": result["model_used"],
         "advisor_used": result["advisor_used"], "bundle_sha256": result.get("native_bundle", {}).get("archive", {}).get("sha256"),

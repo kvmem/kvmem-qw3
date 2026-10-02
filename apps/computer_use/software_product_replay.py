@@ -10,7 +10,7 @@ from software_product_report import summarize
 
 HTML = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>本地 Python 配置 · 实测回放</title>
+<title>本地 Python 配置与修复 · 实测回放</title>
 <style>
 body{font:16px system-ui,sans-serif;background:#f5f6fa;color:#152134;margin:24px auto;padding:0 20px;max-width:1600px}
 h1{font-size:26px}p{line-height:1.6}.note{color:#59677b}button,select{font:inherit;padding:9px 13px;border:1px solid #cad2df;border-radius:7px;background:white;margin:5px 8px 5px 0}
@@ -18,7 +18,7 @@ h1{font-size:26px}p{line-height:1.6}.note{color:#59677b}button,select{font:inher
 video{width:100%;aspect-ratio:1.6;background:#152134;border-radius:7px}.facts{white-space:pre-wrap;line-height:1.8}.error{color:#982a26}small{word-break:break-all;color:#617189}
 @media(max-width:850px){.grid{grid-template-columns:1fr}}
 </style>
-<h1>本地 Python 环境配置：测试回放</h1>
+<h1>本地 Python 环境配置与修复：测试回放</h1>
 <p>真实 QW3 + Codex · Windows 虚拟机 · 受控软件工具 · KVMem 关闭 · 顾问关闭</p>
 <p class="note">这里是连续 VNC 录像，包含准备等待。可按任务开始时间对齐播放；两侧走过的步骤不同，不能将画面进度或总时长直接视为模型加速比。右侧结果由新终端独立验收。</p>
 <button id="play">从任务开始同时播放</button><button id="pause">暂停两侧</button>
@@ -33,7 +33,7 @@ const el=id=>document.getElementById(id);let trials=[];let generation=0;
 const seconds=x=>x==null?'未取得':x.toFixed(2)+' 秒';
 function chosen(side){return trials[Number(el(side).value)]}
 function render(side){const t=chosen(side),v=el(side+'Video');v.pause();v.src=t.video;
- el(side+'Facts').textContent=(t.passed?'已通过独立验收':'未通过')+' · '+t.attempt+'\\n'+(t.acceptance_manifest_sha256?'正式重复验收':'开发试次')+' · 应用重开：'+(t.application_reopen_passed===true?'通过':t.application_reopen_passed===false?'未通过':'未检查')+'\\n任务耗时：'+seconds(t.task_seconds)+' · 模型请求 '+t.inference.count+' 次 · 工具调用 '+t.tool_calls+' 次\\n工具错误 '+t.tool_errors+' 次，其中等待参数类型错误 '+t.wait_argument_type_errors+' 次';
+ el(side+'Facts').textContent=(t.passed?'已通过独立验收':'未通过')+' · '+t.attempt+'\\n'+(t.scenario==='product-python-repair'?'项目故障修复':'新项目环境配置')+' · '+(t.acceptance_manifest_sha256?'正式重复验收':'开发试次')+' · 应用重开：'+(t.application_reopen_passed===true?'通过':t.application_reopen_passed===false?'未通过':'未检查')+'\\n任务耗时：'+seconds(t.task_seconds)+' · 模型请求 '+t.inference.count+' 次 · 工具调用 '+t.tool_calls+' 次\\n工具错误 '+t.tool_errors+' 次，其中等待参数类型错误 '+t.wait_argument_type_errors+' 次';
  el(side+'Stages').textContent=t.stages.map(s=>s.name+'：'+s.status+'（'+seconds(s.seconds)+'）').join(' → ');
  el(side+'Identity').textContent='客户端 SHA-256：'+t.bundle_sha256+' · 原始结果 SHA-256：'+t.result_sha256;
 }
