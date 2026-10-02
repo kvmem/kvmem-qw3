@@ -59,6 +59,16 @@ async def run(args):
         print(stage, flush=True)
 
     try:
+        if args.acceptance_manifest:
+            frozen = json.loads(args.acceptance_manifest.read_text())
+            if frozen["task"] != report["task"] or identity not in frozen["trial_ids"] or args.timeout != frozen["timeout_seconds"]:
+                raise ValueError("Run identity, task or budget differs from frozen acceptance")
+            for relative, expected in frozen["source_sha256"].items():
+                if sha256(ROOT / relative) != expected:
+                    raise ValueError("Frozen acceptance source changed: " + relative)
+            if json.loads((args.bundle / "archive.json").read_text())["sha256"] != frozen["bundle_sha256"]:
+                raise ValueError("Native bundle differs from frozen acceptance")
+            report["acceptance"] = {"manifest_sha256": sha256(args.acceptance_manifest), "definition": frozen}
         info = json.loads(await command("docker", "inspect", "qw3-computer-windows"))[0]
         if info["Config"].get("Labels", {}).get("com.qw3.computer-use.owner") != "codex-goal-20260930":
             raise ValueError("VM ownership mismatch")
@@ -77,6 +87,9 @@ async def run(args):
         if not actual or actual[0].decode() != engine["command"][0] or engine["kvmem"] != "off":
             raise ValueError("Selected local baseline engine is not live or is not KVMem-off")
         report["engine"] = engine
+        if args.acceptance_manifest:
+            if engine["binary_sha256"] != frozen["engine_binary_sha256"] or engine["command"] != frozen["engine_command"]:
+                raise ValueError("Engine differs from frozen acceptance profile")
         sources = [Path(__file__), APP / "software_product_guest.py", APP / "vm/executor.ps1",
                    *sorted((APP / "qw3_computer").glob("*.py")), APP / "qw3_computer/software_catalog.json"]
         report["source_commit"] = (await command("git", "rev-parse", "HEAD")).strip()
@@ -195,5 +208,6 @@ if __name__ == "__main__":
     parser.add_argument("--baseline-sources", type=Path, default=APP / ".runtime/local-diagnostic-baseline-vm-daaaf6c")
     parser.add_argument("--ffmpeg", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--acceptance-manifest", type=Path, help="Require a predeclared frozen formal-acceptance trial")
     result = asyncio.run(run(parser.parse_args()))
     raise SystemExit(0 if result["status"] == "complete" else 1)

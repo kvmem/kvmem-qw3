@@ -18,7 +18,7 @@ h1{font-size:26px}p{line-height:1.6}.note{color:#59677b}button,select{font:inher
 video{width:100%;aspect-ratio:1.6;background:#152134;border-radius:7px}.facts{white-space:pre-wrap;line-height:1.8}.error{color:#982a26}small{word-break:break-all;color:#617189}
 @media(max-width:850px){.grid{grid-template-columns:1fr}}
 </style>
-<h1>本地 Python 环境配置：失败、修复与复测</h1>
+<h1>本地 Python 环境配置：测试回放</h1>
 <p>真实 QW3 + Codex · Windows 虚拟机 · 受控软件工具 · KVMem 关闭 · 顾问关闭</p>
 <p class="note">这里是连续 VNC 录像，包含准备等待。可按任务开始时间对齐播放；两侧走过的步骤不同，不能将画面进度或总时长直接视为模型加速比。右侧结果由新终端独立验收。</p>
 <button id="play">从任务开始同时播放</button><button id="pause">暂停两侧</button>
@@ -27,13 +27,13 @@ video{width:100%;aspect-ratio:1.6;background:#152134;border-radius:7px}.facts{wh
  <section class="panel"><select id="left" aria-label="左侧试次"></select><div class="facts" id="leftFacts"></div><video id="leftVideo" controls preload="metadata" muted></video><p id="leftStages"></p><small id="leftIdentity"></small></section>
  <section class="panel"><select id="right" aria-label="右侧试次"></select><div class="facts" id="rightFacts"></div><video id="rightVideo" controls preload="metadata" muted></video><p id="rightStages"></p><small id="rightIdentity"></small></section>
 </div>
-<p class="note">这些是开发试次，全部失败保留。一次通过不代表稳定成功率，也不证明通用视觉或复杂规划能力。显存按宿主 GPU 设备采样，内存只统计引擎进程；尚未包含完整应用和虚拟机内存。</p>
+<p class="note">每个试次分别标明开发或正式验收，全部失败保留。少量通过不能代表稳定成功率，也不证明通用视觉或复杂规划能力。显存按宿主 GPU 设备采样，内存只统计引擎进程；尚未包含完整应用和虚拟机内存。</p>
 <script>
 const el=id=>document.getElementById(id);let trials=[];let generation=0;
 const seconds=x=>x==null?'未取得':x.toFixed(2)+' 秒';
 function chosen(side){return trials[Number(el(side).value)]}
 function render(side){const t=chosen(side),v=el(side+'Video');v.pause();v.src=t.video;
- el(side+'Facts').textContent=(t.passed?'已通过独立验收':'未通过')+' · '+t.attempt+'\\n任务耗时：'+seconds(t.task_seconds)+' · 模型请求 '+t.inference.count+' 次 · 工具调用 '+t.tool_calls+' 次\\n工具错误 '+t.tool_errors+' 次，其中等待参数类型错误 '+t.wait_argument_type_errors+' 次';
+ el(side+'Facts').textContent=(t.passed?'已通过独立验收':'未通过')+' · '+t.attempt+'\\n'+(t.acceptance_manifest_sha256?'正式重复验收':'开发试次')+' · 应用重开：'+(t.application_reopen_passed===true?'通过':t.application_reopen_passed===false?'未通过':'未检查')+'\\n任务耗时：'+seconds(t.task_seconds)+' · 模型请求 '+t.inference.count+' 次 · 工具调用 '+t.tool_calls+' 次\\n工具错误 '+t.tool_errors+' 次，其中等待参数类型错误 '+t.wait_argument_type_errors+' 次';
  el(side+'Stages').textContent=t.stages.map(s=>s.name+'：'+s.status+'（'+seconds(s.seconds)+'）').join(' → ');
  el(side+'Identity').textContent='客户端 SHA-256：'+t.bundle_sha256+' · 原始结果 SHA-256：'+t.result_sha256;
 }
@@ -57,7 +57,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("runs", type=Path, nargs="+")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--port", type=int, default=18109)
     args = parser.parse_args()
+    if not 1024 <= args.port <= 65535:
+        parser.error("Use an unprivileged local port between 1024 and 65535")
     args.output.mkdir(parents=True, exist_ok=False)
     trials = []
     for index, root in enumerate(args.runs):
@@ -82,7 +85,7 @@ root=Path(__file__).resolve().parent
 app=web.Application()
 app.router.add_static('/',root,show_index=False)
 web.run_app(app,host='127.0.0.1',port=18109,print=None)
-''', encoding="utf-8")
+'''.replace("port=18109", f"port={args.port}"), encoding="utf-8")
     print(args.output / "index.html")
 
 

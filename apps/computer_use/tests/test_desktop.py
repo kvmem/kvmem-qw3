@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import json
 import tempfile
 import unittest
 
@@ -34,6 +35,7 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
             if request.path.startswith("/actions/"):
                 return web.json_response(self.receipts.get(request.path.rsplit("/", 1)[1], {"status": "unknown"}))
             body = await request.json()
+            self.last_dispatched = body
             if self.mode == "reject":
                 return web.json_response({"delivery": "rejected", "error": "Foreground changed"}, status=409)
             self.effects += 1
@@ -82,6 +84,51 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.effects, 1)
         with self.assertRaisesRegex(DesktopError, "different arguments"):
             await self.desktop.act(request | {"action": {"kind": "key", "key": "ENTER"}})
+
+    async def test_normalized_click_converts_once_and_keeps_pixel_actions_unchanged(self):
+        request = self.action(coordinate_space="normalized_1000",
+            action={"kind": "click", "x": 500, "y": 1000, "button": "left", "clicks": 1})
+        first = await self.desktop.act(request)
+        self.assertEqual(self.last_dispatched["action"]["x"], 4)
+        self.assertEqual(self.last_dispatched["action"]["y"], 7)
+        self.assertNotIn("coordinate_space", self.last_dispatched)
+        self.assertEqual(first["coordinate_mapping"]["input_action"]["x"], 500)
+        self.assertTrue((await self.desktop.act(request))["duplicate"])
+        self.assertEqual(self.effects, 1)
+        with self.assertRaisesRegex(DesktopError, "different arguments"):
+            await self.desktop.act(request | {"coordinate_space": "pixels"})
+        await self.desktop.act(self.action("pixel_action_02", coordinate_space="pixels",
+            action={"kind": "click", "x": 3, "y": 5, "button": "left", "clicks": 1}))
+        self.assertEqual(self.last_dispatched["action"]["x"], 3)
+        self.assertEqual(self.last_dispatched["action"]["y"], 5)
+
+    async def test_invalid_normalized_actions_never_dispatch(self):
+        for value in (True, "500", 500.5, -1, 1001):
+            with self.subTest(value=value), self.assertRaises(DesktopError):
+                await self.desktop.act(self.action(coordinate_space="normalized_1000",
+                    action={"kind": "click", "x": value, "y": 100, "button": "left", "clicks": 1}))
+        for space in ("normalized_1000", "automatic"):
+            with self.assertRaises(DesktopError):
+                await self.desktop.act(self.action(coordinate_space=space))
+        self.assertEqual(self.effects, 0)
+        self.assertEqual(self.desktop.unresolved(), [])
+
+    async def test_normalized_lost_response_reconciles_after_restart_without_reconversion(self):
+        self.mode = "lost_response"
+        request = self.action(coordinate_space="normalized_1000", action={"kind": "drag",
+            "from_x": 0, "from_y": 500, "to_x": 1000, "to_y": 250, "duration_ms": 300, "modifier": "none"})
+        with self.assertRaises(DesktopError):
+            await self.desktop.act(request)
+        self.assertEqual(self.last_dispatched["action"] | {"kind": "drag"},
+                         {"kind": "drag", "from_x": 0, "from_y": 4, "to_x": 7, "to_y": 2, "duration_ms": 300, "modifier": "none"})
+        await self.desktop.close()
+        self.desktop = Desktop(self.url, "fixture-token", self.temp.name)
+        await self.desktop.start(); await self.desktop.control("resume")
+        result = await self.desktop.act(request)
+        self.assertTrue(result["duplicate"])
+        self.assertEqual(result["coordinate_mapping"]["width"], 8)
+        self.assertEqual(result["coordinate_mapping"]["dispatched_action"], self.last_dispatched["action"])
+        self.assertEqual(self.effects, 1)
 
     async def test_invalid_identity_stale_and_paused_never_dispatch(self):
         for change in ({"desktop_id": "wrong"}, {"observation_id": "old"}, {"action_id": "../../bad"}):

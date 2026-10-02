@@ -9,6 +9,7 @@ import sqlite3
 import time
 
 import aiohttp
+from .coordinates import dispatch_arguments
 
 
 class DesktopError(RuntimeError):
@@ -31,6 +32,7 @@ class Desktop:
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("CREATE TABLE IF NOT EXISTS actions (id TEXT PRIMARY KEY, task TEXT, request TEXT, status TEXT, result TEXT, created REAL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS observations (id TEXT PRIMARY KEY, task TEXT, metadata TEXT, created REAL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS coordinate_dispatches (id TEXT PRIMARY KEY, mapping TEXT)")
         self.db.commit()
         self.session = None
         self.latest = None
@@ -94,6 +96,9 @@ class Desktop:
                 receipt = await self.request("GET", "/actions/" + action["action_id"])
                 if receipt.get("status") == "completed":
                     result = receipt["result"]
+                    mapping = self.db.execute("SELECT mapping FROM coordinate_dispatches WHERE id=?", (action["action_id"],)).fetchone()
+                    if mapping:
+                        result = result | {"coordinate_mapping": json.loads(mapping[0])}
                     metadata = self.remember(result["observation"])
                     result = result | {"observation": metadata}
                     self.db.execute("UPDATE actions SET status='completed', result=? WHERE id=?",
@@ -129,11 +134,19 @@ class Desktop:
                 raise DesktopError("Unknown desktop; observe first")
             if arguments.get("observation_id") != self.latest["observation_id"]:
                 raise DesktopError("Stale observation; observe again")
+            try:
+                dispatched, mapping = dispatch_arguments(arguments, self.latest)
+            except (ValueError, TypeError, KeyError) as exc:
+                raise DesktopError(str(exc)) from exc
             self.db.execute("INSERT INTO actions VALUES (?, ?, ?, 'dispatching', NULL, ?)",
                             (action_id, self.task_id, serialized, time.time()))
+            if mapping:
+                self.db.execute("INSERT INTO coordinate_dispatches VALUES (?, ?)", (action_id, json.dumps(mapping)))
             self.db.commit()
             try:
-                result = await self.request("POST", "/act", arguments)
+                result = await self.request("POST", "/act", dispatched)
+                if mapping:
+                    result = result | {"coordinate_mapping": mapping}
                 metadata = self.remember(result["observation"])
                 self.db.execute("UPDATE actions SET status='completed', result=? WHERE id=?",
                                 (json.dumps(result | {"observation": metadata}), action_id))

@@ -36,14 +36,59 @@ def save(path, data):
     temporary.replace(path)
 
 
-def user_path():
+def registry_paths():
     import winreg
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
-        try:
-            value, kind = winreg.QueryValueEx(key, "Path")
-            return {"value": value, "kind": kind}
-        except FileNotFoundError:
-            return {"missing": True}
+    result = {}
+    for scope, hive, path in (("user", winreg.HKEY_CURRENT_USER, "Environment"),
+                             ("machine", winreg.HKEY_LOCAL_MACHINE,
+                              r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")):
+        with winreg.OpenKey(hive, path) as key:
+            try:
+                value, kind = winreg.QueryValueEx(key, "Path")
+                result[scope] = {"value": value, "kind": kind}
+            except FileNotFoundError:
+                result[scope] = {"missing": True}
+    return result
+
+
+async def stop_process_tree(process):
+    if process and process.returncode is None:
+        killer = await asyncio.create_subprocess_exec(
+            str(Path(os.environ["SYSTEMROOT"]) / "System32/taskkill.exe"),
+            "/PID", str(process.pid), "/T", "/F", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        await asyncio.wait_for(killer.wait(), 15)
+        await asyncio.wait_for(process.wait(), 15)
+
+
+async def grade_launcher(project, output):
+    """Exercise the actual delivered launcher, not a replacement activation script."""
+    result = {"kind": "delivered_terminal_launcher_acceptance", "passed": False}
+    process = None
+    try:
+        if not (project / "open-terminal.cmd").is_file():
+            raise ValueError("The delivered launcher does not exist")
+        # Deliberately start without an inherited activated virtual environment.
+        env = {k: v for k, v in os.environ.items() if k.upper() not in {"VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH"}}
+        process = await asyncio.create_subprocess_exec(
+            str(Path(os.environ["SYSTEMROOT"]) / "System32/cmd.exe"), "/d", "/q", "/c", "open-terminal.cmd",
+            cwd=project, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        code = "import json,sys,requests,pytest;print('QW3_LAUNCHER_FACTS '+json.dumps(dict(executable=sys.executable,prefix=sys.prefix,version=sys.version.split()[0],requests=requests.__version__,pytest=pytest.__version__)))"
+        stdin = ('python -c "' + code + '"\r\nexit\r\n').encode("ascii")
+        stdout, stderr = await asyncio.wait_for(process.communicate(stdin), 45)
+        text = stdout.decode("utf-8", errors="replace")
+        facts = [json.loads(line.removeprefix("QW3_LAUNCHER_FACTS ")) for line in text.splitlines()
+                 if line.startswith("QW3_LAUNCHER_FACTS ")]
+        result.update(exit_code=process.returncode, stdout=text, stderr=stderr.decode("utf-8", errors="replace"), facts=facts)
+        result["passed"] = (process.returncode == 0 and len(facts) == 1
+            and Path(facts[0]["executable"]).resolve() == (project / ".venv/Scripts/python.exe").resolve()
+            and Path(facts[0]["prefix"]).resolve() == (project / ".venv").resolve()
+            and (facts[0]["version"], facts[0]["requests"], facts[0]["pytest"]) == ("3.13.16", "2.34.2", "9.1.1"))
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        await stop_process_tree(process)
+        save(output / "launcher-grade.json", result)
+    return result
 
 
 async def grade(project, baseline, output):
@@ -51,7 +96,8 @@ async def grade(project, baseline, output):
     try:
         result["checks"].update(
             input_files_unchanged=all(digest(project / name) == value for name, value in baseline["input_sha256"].items()),
-            user_path_unchanged=user_path() == baseline["user_path"],
+            user_path_unchanged=registry_paths()["user"] == baseline["registry_paths"]["user"],
+            machine_path_unchanged=registry_paths()["machine"] == baseline["registry_paths"]["machine"],
             terminal_launcher_present=(project / "open-terminal.cmd").is_file(),
             dependency_lock_present=(project / "requirements.lock").is_file())
         results = []
@@ -73,12 +119,7 @@ async def grade(project, baseline, output):
                     cwd=project, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 stdout, stderr = await asyncio.wait_for(process.communicate(), 60)
             finally:
-                if process and process.returncode is None:
-                    killer = await asyncio.create_subprocess_exec(
-                        str(Path(os.environ["SYSTEMROOT"]) / "System32/taskkill.exe"),
-                        "/PID", str(process.pid), "/T", "/F", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    await asyncio.wait_for(killer.wait(), 10)
-                    await asyncio.wait_for(process.wait(), 10)
+                await stop_process_tree(process)
                 script.unlink()
             results.append({"command": command, "exit_code": process.returncode,
                             "stdout": stdout.decode("utf-8", errors="replace"),
@@ -96,7 +137,8 @@ async def grade(project, baseline, output):
                   "request_preparation": facts["url"] == "https://example.com/",
                   "tests_executed": "1 passed" in results[1]["stdout"],
                   "input_files_unchanged": all(digest(project / name) == value for name, value in baseline["input_sha256"].items()),
-                  "user_path_unchanged": user_path() == baseline["user_path"]}
+                  "user_path_unchanged": registry_paths()["user"] == baseline["registry_paths"]["user"],
+                  "machine_path_unchanged": registry_paths()["machine"] == baseline["registry_paths"]["machine"]}
         result.update(checks=checks, passed=all(checks.values()))
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
@@ -147,7 +189,7 @@ async def run(configuration):
             project.mkdir(parents=True)
             (project / "main.py").write_text(MAIN, encoding="utf-8")
             (project / "test_main.py").write_text(TEST, encoding="utf-8")
-            baseline = {"user_path": user_path(), "venv_absent": not (project / ".venv").exists(),
+            baseline = {"registry_paths": registry_paths(), "venv_absent": not (project / ".venv").exists(),
                         "input_sha256": {name: digest(project / name) for name in ("main.py", "test_main.py")}}
             save(output / "initial-state.json", baseline)
             try:
@@ -194,6 +236,43 @@ async def run(configuration):
             progress("independent_verification")
             report["grade"] = await grade(project, baseline, output)
             report["passed"] = report["task"]["outcome"] == "agent_completed" and report["grade"]["passed"]
+            report["launcher_grade"] = await grade_launcher(project, output)
+            report["passed"] = report["passed"] and report["launcher_grade"]["passed"]
+            if report["task"]["outcome"] == "agent_completed":
+                progress("reopening_application")
+                before = report["terminal_state"]
+                if not before["desktop_paused"] or any(j["status"] != "completed" for j in before["software"]["jobs"]):
+                    raise ValueError("Cannot close/reopen application with unresolved actions or software jobs")
+                saved_jobs = {str(p.relative_to(workspace)): digest(p) for p in (workspace / "jobs").rglob("job.json")}
+                prior_pid = app.pid
+                await stop_process_tree(app)
+                owned_ready = False
+                with (output / "reopened.stdout.log").open("wb") as stdout, (output / "reopened.stderr.log").open("wb") as stderr:
+                    app = await asyncio.create_subprocess_exec(*args, env=env, cwd=bundle / "app", stdout=stdout, stderr=stderr,
+                                                              creationflags=subprocess.CREATE_NO_WINDOW)
+                async with asyncio.timeout(60):
+                    while True:
+                        if app.returncode is not None:
+                            raise RuntimeError("Reopened application exited at startup")
+                        try:
+                            reopened = await api("/api/state")
+                            if reopened["ready"]:
+                                owned_ready = True
+                                break
+                        except aiohttp.ClientError:
+                            pass
+                        await asyncio.sleep(.3)
+                restart_output = output / "reopened"; restart_output.mkdir()
+                restarted_grade = await grade(project, baseline, restart_output)
+                restarted_launcher = await grade_launcher(project, restart_output)
+                restart_checks = {"different_process": app.pid != prior_pid, "task_identity_preserved": reopened["id"] == before["id"],
+                    "completion_preserved": reopened["status"] == "completed" and reopened.get("software_verified") is True,
+                    "desktop_paused": reopened["desktop_paused"], "job_records_unchanged": bool(saved_jobs) and
+                    saved_jobs == {str(p.relative_to(workspace)): digest(p) for p in (workspace / "jobs").rglob("job.json")},
+                    "fresh_project_checks_passed": restarted_grade["passed"], "delivered_launcher_passed": restarted_launcher["passed"]}
+                report["reopen"] = {"checks": restart_checks, "passed": all(restart_checks.values()),
+                                    "prior_pid": prior_pid, "new_pid": app.pid, "state": reopened}
+                report["passed"] = report["passed"] and report["reopen"]["passed"]
             report["status"] = "complete"
         except Exception as exc:
             report.update(status="halted", error=f"{type(exc).__name__}: {exc}")
@@ -206,10 +285,7 @@ async def run(configuration):
                     report["stop_error"] = str(exc)
             if app and app.returncode is None:
                 try:
-                    killer = await asyncio.create_subprocess_exec("taskkill.exe", "/PID", str(app.pid), "/T", "/F",
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    await asyncio.wait_for(killer.wait(), 15)
-                    await asyncio.wait_for(app.wait(), 15)
+                    await stop_process_tree(app)
                 except Exception as exc:
                     report.update(passed=False, cleanup_error=str(exc), needs_reconciliation=True)
             if (workspace / "jobs").exists():

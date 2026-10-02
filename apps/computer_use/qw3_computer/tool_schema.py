@@ -46,9 +46,17 @@ TOOLS = [{"name": "observe", "description": "Observe the selected desktop. Retur
          {"name": "act", "description": "Perform ONE action on the selected desktop and return its resulting screenshot. Coordinates are exact screenshot pixels (not normalized). Use a fresh unique action_id. type inserts literal Unicode text; key sends one supported chord. drag holds the left button from (from_x,from_y) to (to_x,to_y) for 100–2000 ms, with an optional SHIFT/CTRL/ALT modifier; both are released before returning. scroll moves the pointer to (x,y) inside the intended content pane and scrolls in the named up/down direction by 1 to 8 wheel notches. open_app starts a named installed application: Notepad, Explorer in the current task folder, Edge on the current task's websites, LibreOffice Writer/Calc/Impress, Thunderbird, GIMP, or WPS Spreadsheets. A rejected action may return a fresh screenshot; use that observation to decide the next action. On uncertain delivery or pause wait for user recovery. Do not blindly repeat actions.",
           "inputSchema": {"type": "object", "properties": {
               "desktop_id": {"type": "string"}, "observation_id": {"type": "string"},
+              "coordinate_space": {"type": "string", "enum": ["pixels", "normalized_1000"],
+                  "description": "For screenshot-estimated click/scroll/drag positions, use normalized_1000: both axes 0..1000; the program converts to pixels. For accessibility center_x/center_y, use pixels. Omitted means pixels. Never mix spaces within an action."},
               "action_id": {"type": "string", "minLength": 8, "maxLength": 80, "pattern": "^[a-zA-Z0-9_-]+$"}, "action": ACTION},
               "required": ["desktop_id", "observation_id", "action_id", "action"], "additionalProperties": False},
           "annotations": {"readOnlyHint": False, "idempotentHint": False}}]
+
+TOOLS[1]["description"] = TOOLS[1]["description"].replace(
+    "Coordinates are exact screenshot pixels (not normalized).",
+    "Declare coordinate_space: normalized_1000 for positions estimated from the screenshot (both axes 0..1000), "
+    "or pixels for accessibility control centers. The host converts normalized coordinates using the exact latest screenshot dimensions. "
+    "Coordinates must be integers, not quoted strings. Omitted coordinate_space retains pixel behavior.")
 
 SOFTWARE_TOOLS = [{"name": "software", "description":
     "Manage software in the explicitly selected local Windows workspace. inspect lists reviewed profiles, projects and jobs. "
