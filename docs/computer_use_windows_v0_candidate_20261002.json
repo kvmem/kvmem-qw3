@@ -15,7 +15,7 @@
   "client_manifest_sha256": "dff5d1d1e96358ffd6e0f256d842fa3aa6f810bf79abf01c4e4cd9fe7af3fe2d",
   "client_qualification_path": "apps/computer_use/.runtime/windows-client-15-qualification-01/result.json",
   "client_qualification_sha256": "bdf0a5d33cecafc5b051d51e04b2f9cf39be19f3e9e88851c8bd8696a1c26459",
-  "snapshot": null,
+  "snapshot": "qw3-osworld-client15-20261002",
   "qualified_parent_snapshot": "qw3-osworld-office-text-20261002",
   "visual_history": "pin-all",
   "backend_timeout_seconds": 1800,
@@ -65,7 +65,7 @@
     "apps/computer_use/osworld_windows/materials006.py": "f441529217550bb63334ff21eb7850f52eee02a801981c2fce0c28e5166f6e0c",
     "apps/computer_use/osworld_windows/materials022.py": "bcbeb01d97bf376368eb3bf97a2151756779547577fdde619bec682d3c552677",
     "apps/computer_use/osworld_windows/mirror006.py": "9256de6ae7eb1a24424456093e4cdef966eb6f6fe58e5da405c94e3c2796f4aa",
-    "apps/computer_use/osworld_windows/native_run.py": "ecebfcc32405e00a2424bfc489962424e0d14d8b0039818b7f44092f882e3e96",
+    "apps/computer_use/osworld_windows/native_run.py": "e47d5e9a71a788a464ffc9bda06abeca1cbf9b76158d77a576eda773fd16cf61",
     "apps/computer_use/osworld_windows/offline_sites.py": "8dd500ae7ac2f801d314d0502134c26b67caa26884f5332c0d14f89f23ec9d9b",
     "apps/computer_use/osworld_windows/preflight013.py": "4ea514fd05881077837eb72d7eb92f83153f6cd00a861d9ac1d03ac15a3229f2",
     "apps/computer_use/osworld_windows/prepare006.py": "58b261e1f037b68d905e60fe99b04ee6462e13697b2f26af0367366a77adeadb",
@@ -275,7 +275,7 @@
     "actual_on_near_1m_compaction": true,
     "actual_off_near_1m_compaction_and_exit": true,
     "full_extended_wait_application_launcher": false,
-    "new_client_clean_snapshot_restore": false,
+    "new_client_clean_snapshot_restore": true,
     "006_required_original_cv_available": false,
     "006_full_adapter_and_application_focus": false,
     "051_from_scratch_native_process_positive": false,
@@ -287,5 +287,7 @@
     "off_native_compaction_summary_count": "16 actual observations reported as 17; original failure and 11/13 audit retained",
     "off_native_diagnostic_evidence": "apps/computer_use/.runtime/native-long-context-wait-off-01/long-context-off-01/failure-analysis.json",
     "infrastructure_gate_scope": "The off near-1M gate covers measured compaction, restored tools, request receipts and owned engine exit. Model answer accuracy is separately failed and must be reported in subsequent trials; it is not a prerequisite to force positive answers."
-  }
+  },
+  "snapshot_qualification_path": "apps/computer_use/.runtime/client15-baseline-qualification-01/roundtrip-result.json",
+  "snapshot_qualification_sha256": "925cd1759b5324d25b0ec43c2b51c24673f06076fb069e1914bb33175beaae33"
 }

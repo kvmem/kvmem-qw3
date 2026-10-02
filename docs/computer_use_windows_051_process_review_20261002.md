@@ -34,7 +34,7 @@ GIMP 的最终 XCF 可以通过原图层评分，却无法证明过程中没有�
 - [实际预跑的审核包](/home/chaidi/qw3/apps/computer_use/.runtime/osworld-051-process-review-02/manifest.json)
 - [未填写的审核模板](/home/chaidi/qw3/apps/computer_use/.runtime/osworld-051-process-review-02/review-template.json)
 - [六项审核合同检查](/home/chaidi/qw3/apps/computer_use/.runtime/osworld-051-process-review-qualification-01/result.json)
-- [队列、存储及过程审核的 23 项控制](/home/chaidi/qw3/apps/computer_use/.runtime/host-preparation-contracts-02/result.json)
+- [队列、存储及过程审核的 23 项控制](/home/chaidi/qw3/apps/computer_use/.runtime/host-preparation-contracts-03/result.json)
 
 ## 使用方式
 

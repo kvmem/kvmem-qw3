@@ -33,6 +33,7 @@ SNAPSHOT_QUALIFICATIONS = {
     'qw3-osworld-images-20261002': 'image-handler-qualification-01/roundtrip-result.json',
     'qw3-osworld-office-20261002-v2': 'office-handler-qualification-02/roundtrip-result.json',
     DEFAULT_SNAPSHOT: 'text-handler-qualification-01/roundtrip-result.json',
+    'qw3-osworld-client15-20261002': 'client15-baseline-qualification-01/roundtrip-result.json',
 }
 
 def require_evidence_space(*paths):

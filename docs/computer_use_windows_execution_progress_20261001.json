@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T10:04:28.120390+00:00",
+  "updated_at": "2026-10-02T10:16:41.091674+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -248,7 +248,7 @@
     "Complete remaining common platform and task preparation; JPG/PNG/JPEG snapshot restoration and same-budget 051 actual-model retest have passed platform checks, while task remains incomplete",
     "Complete 006 missing original availability and application focus qualification; original mirror/initializer and neutral folder export are now native-verified, with full scenario still unready",
     "Keep scripted four-review 035 platform qualification separate from actual QW3 failure; dynamic event rules and 022 nonrequired broken links are frozen in the adaptation contract",
-    "Actual-model KVMem on near-1M compaction and two-marker retention passed; off native readonly qualification is running with explicitly longer component waits; finish shared application/relay connection-profile qualification and common freeze",
+    "Actual-model KVMem on near-1M compaction and two-marker retention passed; off native readonly compaction and tools completed but summary counting failed (16 reported as 17); finish shared application/relay connection-profile qualification and common freeze",
     "043 source-conflict handling is disclosed; complete 051 full process audit when an artifact could pass; retain failures as failures",
     "Freeze common model/engine/history/budgets and qualified clean snapshot before formal comparisons",
     "20 V0 on/off baseline runs; diagnose; at most two generic candidates; V1 comparison and conditional repetition"
@@ -2423,16 +2423,51 @@
     "windows_contract_tests": 79,
     "windows_evidence": "apps/computer_use/.runtime/windows-client-15-qualification-01/result.json",
     "native_windows_runtime_qualified": true,
-    "new_clean_snapshot_created": false,
+    "new_clean_snapshot_created": true,
     "actual_model_extended_wait_launcher_qualified": false,
     "host_contract_tests": 23,
-    "host_contract_evidence": "apps/computer_use/.runtime/host-preparation-contracts-02/result.json",
+    "host_contract_evidence": "apps/computer_use/.runtime/host-preparation-contracts-03/result.json",
     "storage_guard_checks_output_share_and_vm_disk": true,
-    "engine_and_backend_trace_links_enabled_in_candidate": true
+    "engine_and_backend_trace_links_enabled_in_candidate": true,
+    "launcher_first_attempt": {
+      "run": "native-client-15-launch-on-01",
+      "valid_model_task": false,
+      "status": "infra_invalid",
+      "failure": "Parent clean snapshot restores only client 13, so requested client 15 is unavailable before model task startup",
+      "result": "apps/computer_use/.runtime/native-client-15-launch-on-01/result.json",
+      "complete_video": true,
+      "video_seconds": 14.5,
+      "original_failure_retained": true
+    },
+    "new_clean_snapshot_preparation": {
+      "directory": "apps/computer_use/.runtime/client15-baseline-qualification-01",
+      "snapshot": "qw3-osworld-client15-20261002",
+      "status": "passed_clean_snapshot_restore",
+      "model_used": false,
+      "bundle_files_expected": 429,
+      "parent_snapshot": "qw3-osworld-office-text-20261002",
+      "qualification": "apps/computer_use/.runtime/client15-baseline-qualification-01/roundtrip-result.json",
+      "qualification_sha256": "925cd1759b5324d25b0ec43c2b51c24673f06076fb069e1914bb33175beaae33",
+      "windows_contract_tests": 79,
+      "all_archive_files_verified": 429,
+      "neutral_marker_removed": true,
+      "all_eight_default_associations_preserved": true
+    },
+    "actual_model_launcher_retests": {
+      "status": "planned",
+      "attempts": [
+        "native-client-15-launch-on-02",
+        "native-client-15-launch-off-02"
+      ],
+      "snapshot": "qw3-osworld-client15-20261002",
+      "backend_timeout_seconds": 1800,
+      "backend_read_timeout_seconds": 1500,
+      "formal_run": false
+    }
   },
   "v0_candidate_preparation": {
     "profile": "docs/computer_use_windows_v0_candidate_20261002.json",
-    "profile_sha256": "9f43c9cce3f1a68e249ffffbcdaac4cdb878b7e76aff31cf132544ddc9a8156f",
+    "profile_sha256": "baec260fa6fdae93f7f6f1f3a740aba55f826e4bee3d9698bf8c746c2dbe6ff5",
     "task_ids": [
       "013",
       "004",
