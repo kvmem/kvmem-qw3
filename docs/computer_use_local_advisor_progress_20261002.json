@@ -5,7 +5,7 @@
   "status": "active",
   "local_plan": "docs/computer_use_local_diagnostic_plan_20261002.json",
   "combined_goal": "docs/computer_use_local_advisor_goal_20261002.md",
-  "current_stage": "latex_new_formal_complete_repair_fixture_running",
+  "current_stage": "latex_new_formal_complete_repair_development_running",
   "source_baseline": "56896791b41b6aa5c022c99dac4996f719bd4ba0",
   "stages": {
     "P0": {
@@ -206,15 +206,16 @@
     "apps/computer_use/.runtime/latex-new-formal-03/result.json",
     "apps/computer_use/.runtime/latex-new-formal-20261003/audit.json",
     "apps/computer_use/.runtime/latex-new-complete-replay-20261003/browser-check.json",
-    "apps/computer_use/.runtime/original-readiness-recheck-20261003/result.json"
+    "apps/computer_use/.runtime/original-readiness-recheck-20261003/result.json",
+    "apps/computer_use/.runtime/latex-repair-fixture-01/result.json"
   ],
   "latest_checks": {
-    "gpu_idle": true,
+    "gpu_idle": false,
     "root_available_approx_gib": 227,
-    "previous_queue_status": "latex_new_formal_terminal_engines_stopped_repair_fixture_live",
-    "gpu_compute_processes": 0
+    "previous_queue_status": "latex_new_formal_terminal_repair_01_live",
+    "gpu_compute_processes": 1
   },
-  "next_action": "Inspect the existing latex-repair-fixture-01 host/guest worker and result without restarting it. Once healthy prerequisites and exact missing-class fault are verified, run real local-model repair; analyze any failure, then freeze three formal repairs. P3-P6/KVMem and advisor scope remains required.",
+  "next_action": "Wait on existing product-latex-repair-01 process and owned latex-repair-engine-01; inspect actual missing-file diagnosis, targeted package restoration, source/unrelated-project preservation, PDF, launchers and application reopening. After successful development qualification freeze three formal repair repetitions; otherwise classify the first error without replacing the failed trial.",
   "advisor_provider": {
     "provider": "deepseek",
     "model": "deepseek-flash",
@@ -249,7 +250,7 @@
       "product-python-new": "formal_3_of_3_passed_with_launcher_and_reopen",
       "product-python-repair": "formal_3_of_3_passed_with_launcher_and_reopen",
       "product-latex-new": "formal_3_of_3_passed_with_pdf_launcher_and_reopen",
-      "product-latex-repair": "scripted_fixture_running"
+      "product-latex-repair": "verified_missing_class_fixture_real_model_development_running"
     },
     "formal_passed": 9,
     "formal_report": "docs/computer_use_python_formal_20261003.md",
@@ -403,12 +404,14 @@
       "limits": "One descriptive comparison; cold cache on both but download duration changed, so wall-time difference is not isolated agent speedup."
     },
     "formal_audit": "apps/computer_use/.runtime/latex-new-formal-20261003/audit.json",
-    "repair_fixture": "apps/computer_use/.runtime/latex-repair-fixture-01/worker.json",
+    "repair_fixture": "apps/computer_use/.runtime/latex-repair-fixture-01/result.json",
     "resource_followup": {
       "gpu_peak_gib_approx": 67.3,
       "max_context_tokens": 1048576,
       "short_context_profile_qualified": false,
       "action": "Controlled follow-up after product baseline; compare context settings/KVMem without equating network-dependent task duration to model speedup."
-    }
+    },
+    "repair_fixture_qualified": true,
+    "repair_development": "apps/computer_use/.runtime/product-latex-repair-01/result.json"
   }
 }

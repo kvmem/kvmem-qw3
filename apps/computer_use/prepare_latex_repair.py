@@ -3,6 +3,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path, PureWindowsPath
 import re
 import shutil
@@ -51,6 +52,10 @@ def main():
             shutil.copyfile(args.reset_from, share / (identity+'-original.json'))
             reset_arg = " --reset-from '\\\\host.lan\\Data\\"+identity+"-original.json'"
         source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        launch = {'status': 'starting', 'host_pid': os.getpid(), 'identity': identity,
+                  'workspace': workspace, 'fixture_source_sha256': source_hash,
+                  'bundle_sha256': archive['sha256'], 'started_at': time.time()}
+        (output / 'worker.json').write_text(json.dumps(launch, indent=2) + '\n')
         script = f'''$ErrorActionPreference='Stop'
 $source='\\\\host.lan\\Data\\{identity}.py'
 if ((Get-FileHash $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne '{source_hash}') {{throw 'Fixture source changed'}}
@@ -61,6 +66,17 @@ if ((Get-FileHash $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne '{sour
         subprocess.run([sys.executable, str(app / 'vm/provision.py'), str(output / 'prepare.ps1')], check=True)
         deadline = time.monotonic()+1200
         while not (share / (identity+'-exit.json')).exists():
+            progress = share / (identity+'-result/result.json')
+            if progress.is_file() and 'guest_pid' not in launch:
+                try:
+                    state = json.loads(progress.read_text(encoding='utf-8'))
+                except (OSError, ValueError):
+                    state = {}
+                if state.get('guest_pid'):
+                    if state['fixture_source_sha256'] != source_hash:
+                        raise ValueError('Running fixture identity differs from the staged source')
+                    launch.update(status='running', guest_pid=state['guest_pid'])
+                    (output / 'worker.json').write_text(json.dumps(launch, indent=2) + '\n')
             if time.monotonic()>deadline:
                 raise TimeoutError('Fixture worker unresolved; inspect before another attempt')
             time.sleep(1)
@@ -68,6 +84,8 @@ if ((Get-FileHash $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne '{sour
         result = json.loads((share / (identity+'-result/result.json')).read_text())
         result.update(process_exit=receipt, fixture_source_sha256=source_hash, bundle_sha256=archive['sha256'])
         (output / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2)+'\n')
+        launch.update(status='terminal', process_exit_code=receipt['exit_code'], finished_at=time.time())
+        (output / 'worker.json').write_text(json.dumps(launch, indent=2) + '\n')
         print(json.dumps({'status': result['status'], 'exit': receipt['exit_code']}))
         if result['status'] != 'ready_fault_injected' or receipt['exit_code'] != 0:
             raise SystemExit(1)

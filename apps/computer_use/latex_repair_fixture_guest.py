@@ -6,6 +6,7 @@ setup/reset and refuse another mutation when prior work is unresolved.
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -37,6 +38,16 @@ def probe(software, name, output):
             'missing_class': "File `ctexart.cls' not found" in text, 'output': str(output)}
 
 
+def ctex_installed(software, output):
+    executable = software.path('latex', 'latex-repair', 'texmfs', 'install', 'miktex', 'bin', 'x64', 'miktex.exe')
+    result = subprocess.run([str(executable), 'packages', 'list', '--template', '{id}|{isInstalled}\n'],
+        cwd=software.path('projects', 'latex-repair'), env=process_environment(), stdin=subprocess.DEVNULL,
+        capture_output=True, timeout=60)
+    output.write_bytes(result.stdout + result.stderr)
+    states = result.stdout.decode('utf-8', errors='replace').splitlines()
+    return result.returncode == 0 and 'ctex|true' in states
+
+
 async def run(args):
     args.output.mkdir(parents=True, exist_ok=False)
     original = json.loads(args.reset_from.read_text(encoding='utf-8-sig')) if args.reset_from else None
@@ -47,7 +58,9 @@ async def run(args):
         raise ValueError('LaTeX repair fixture workspace already exists')
     software = Software(args.workspace)
     report = {'kind': 'scripted_latex_repair_fixture', 'model_used': False, 'agent_success_claimed': False,
-              'status': 'preparing', 'started_at': time.time(), 'jobs': [], 'workspace': str(args.workspace)}
+              'status': 'preparing', 'started_at': time.time(), 'jobs': [], 'workspace': str(args.workspace),
+              'guest_pid': os.getpid(), 'fixture_source_sha256': sha256(Path(__file__))}
+    save(args.output / 'result.json', report)
     try:
         if any(j['status'] not in {'completed', 'failed', 'cancelled'} for j in software.jobs.values()):
             raise ValueError('Previous software action is unresolved')
@@ -81,6 +94,8 @@ async def run(args):
             raise ValueError('Expected exactly one installed CTeX article class')
         broken = software.path(*candidates[0].relative_to(software.root).parts)
         original_sha = sha256(broken)
+        if not ctex_installed(software, args.output / 'package-state-before.log'):
+            raise ValueError('CTeX package metadata is absent before fault injection')
         if original and original_sha != original['fault']['original_sha256']:
             raise ValueError('Restored class differs from the original fault input')
         backup = software.path('fixture-backups', args.output.name)
@@ -88,6 +103,9 @@ async def run(args):
         broken.rename(backup / 'ctexart.cls')
         report['fault'] = {'kind': 'missing_class_with_package_metadata_present', 'file': str(broken),
                            'original_sha256': original_sha, 'backup': str(backup / 'ctexart.cls')}
+        report['fault']['package_metadata_preserved'] = ctex_installed(software, args.output / 'package-state-after.log')
+        if not report['fault']['package_metadata_preserved']:
+            raise ValueError('CTeX package metadata changed during fault injection')
         report['target_broken_probe'] = probe(software, 'latex-repair', args.output / 'target-broken')
         report['reference_after_injection_probe'] = probe(software, 'unrelated-latex', args.output / 'reference-after')
         failed = report['target_broken_probe']; healthy = report['reference_after_injection_probe']
