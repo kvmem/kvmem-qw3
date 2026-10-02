@@ -22,6 +22,7 @@ from .entries import prepare as prepare_entries
 from .launch import prepare as prepare_launch
 from .scenarios import IMPLEMENTED, SITES, collection, prepare as prepare_task, validate_task
 from .sites import Site
+from .site_platform import PLATFORM as SITE_PLATFORM, qualify_runtime as qualify_sites
 from .source import ROOT, sha256
 
 DEFAULT_SNAPSHOT = 'qw3-osworld-images-20261002'
@@ -166,10 +167,12 @@ async def run(args):
             else:
                 raise ValueError('A model is already running')
             report['source_commit'] = (await command('git', 'rev-parse', 'HEAD')).strip()
+            report['private_site_platform'] = await qualify_sites(command)
             sources = list((app / 'osworld_windows').glob('*.py')) + [
                 app / ('vm/' + name) for name in ('run_native_task.ps1', 'record_console.py',
                 'model_relay.py', 'snapshot.py', 'archive_share.py', 'client_resources.ps1')]
             sources.append(app / 'run_engine.py')
+            sources.append(SITE_PLATFORM)
             report['source_sha256'] = {str(p.relative_to(ROOT)): sha256(p) for p in sources}
             report['snapshot'] = json.loads((share.parent / 'snapshots' / args.snapshot / 'manifest.json').read_text())
             owns_desktop = True

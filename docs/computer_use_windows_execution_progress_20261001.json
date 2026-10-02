@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-01T23:22:27.051033+00:00",
+  "updated_at": "2026-10-02T00:15:50.563153+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -248,7 +248,7 @@
     "Complete remaining common platform and task preparation; JPG/PNG/JPEG snapshot restoration and same-budget 051 actual-model retest have passed platform checks, while task remains incomplete",
     "Complete 006 missing original availability and application focus qualification; original mirror/initializer and neutral folder export are now native-verified, with full scenario still unready",
     "Keep scripted four-review 035 platform qualification separate from actual QW3 failure; freeze dynamic event rules and disclose 022 nonrequired broken links",
-    "Mirror private-site fonts and dynamic decorative assets; 65 avatar images are frozen and decoded, candidate not deployed",
+    "Qualify remaining common long-context and native interruption behavior, then freeze model/engine/history/budgets; offline private-site images, fonts and routing are now Windows-qualified",
     "Complete 043 source-conflict disclosures and 051 full process audit when an artifact could pass; retain failures as failures",
     "Freeze common model/engine/history/budgets and qualified clean snapshot before formal comparisons",
     "20 V0 on/off baseline runs; diagnose; at most two generic candidates; V1 comparison and conditional repetition"
@@ -379,7 +379,13 @@
     "native_client": "apps/computer_use/.runtime/windows/shared-archive-20261002/osworld-client-tests-13.json",
     "recording": "apps/computer_use/.runtime/windows-osworld-recording-probe-02",
     "installers": "apps/computer_use/.runtime/windows/shared-archive-20261002/osworld-installers-01",
-    "inventory": "apps/computer_use/.runtime/windows/shared-archive-20261002/osworld-app-inventory-02.json"
+    "inventory": "apps/computer_use/.runtime/windows/shared-archive-20261002/osworld-app-inventory-02.json",
+    "offline_private_sites": {
+      "http_evidence": "apps/computer_use/.runtime/osworld-offline-sites-03/http-result.json",
+      "deployment_evidence": "apps/computer_use/.runtime/osworld-offline-site-deploy-04/deployment-result.json",
+      "native_render_evidence": "apps/computer_use/.runtime/osworld-offline-render-qualification-03/result.json",
+      "runtime_gate": "apps/computer_use/osworld_windows/offline_site_platform.json"
+    }
   },
   "office_artifact_qualification": {
     "gimp": {
@@ -1923,15 +1929,60 @@
     "cached_originals": 49,
     "new_direct_downloads": 16,
     "all_proxy_variables_unset": true,
-    "deployed": false,
-    "fonts_and_dynamic_fallbacks_pending": true,
+    "deployed": true,
+    "fonts_and_dynamic_fallbacks_pending": false,
     "decode_checks_passed": 65,
     "decode_evidence": "apps/computer_use/.runtime/osworld-offline-assets-inventory-01/candidate/decode-qualification.json",
     "fonts_candidate": "apps/computer_use/.runtime/osworld-offline-assets-inventory-01/font-candidate/manifest.json",
-    "font_files_frozen": 19,
-    "note": "65 avatars and 19 original font files are frozen, not deployed; calendar dynamic decorative fallbacks remain pending",
-    "font_decode_checks_passed": 19,
-    "font_decode_evidence": "apps/computer_use/.runtime/osworld-offline-assets-inventory-01/font-candidate/decode-qualification.json"
+    "font_files_frozen": 22,
+    "note": "Five offline frontends deployed and seven original-task Windows views qualified, including Calendar modal and guest picker; this does not qualify every possible route or constitute model task success",
+    "font_decode_checks_passed": 22,
+    "font_decode_evidence": "apps/computer_use/.runtime/osworld-offline-assets-inventory-01/font-candidate/decode-qualification.json",
+    "qualified_in_windows": true,
+    "total_fixed_image_urls": 73,
+    "distinct_image_files": 66,
+    "public_assets_per_frontend": 90,
+    "http_asset_checks_passed": 450,
+    "source_builder": "apps/computer_use/osworld_windows/offline_sites.py",
+    "build_evidence": "apps/computer_use/.runtime/osworld-offline-sites-03/build-result.json",
+    "http_evidence": "apps/computer_use/.runtime/osworld-offline-sites-03/http-result.json",
+    "deployment_evidence": "apps/computer_use/.runtime/osworld-offline-site-deploy-04/deployment-result.json",
+    "native_render_evidence": "apps/computer_use/.runtime/osworld-offline-render-qualification-03/result.json",
+    "runtime_gate": "apps/computer_use/osworld_windows/offline_site_platform.json",
+    "runtime_gate_cases_passed": 6,
+    "qualified_views": [
+      "013-formcraft",
+      "035-teamchat",
+      "038-cloudcrm",
+      "038-teamchat",
+      "038-mailhub",
+      "043-calendar",
+      "043-teamchat"
+    ],
+    "native_page_requests": 112,
+    "external_page_requests": 0,
+    "seven_task_data_unchanged": true,
+    "all_five_admin_state_routes_blocked": true,
+    "final_clean_restore": true,
+    "backend_containers_unchanged": 5,
+    "historical_states_unchanged_at_deployment": 37,
+    "dynamic_avatar_policy": "Local SVG initials; no test email addresses sent to external avatar service. Decorative adaptation is fixed for both comparison arms.",
+    "routing_policy": "Docker DNS re-resolution with five-second TTL prevents frontend address reuse from crossing app routes",
+    "additional_font_candidate": "apps/computer_use/.runtime/osworld-offline-assets-inventory-01/google-sans-candidate/manifest.json",
+    "preserved_failed_qualifications": [
+      "apps/computer_use/.runtime/osworld-offline-render-qualification-01/result.json",
+      "apps/computer_use/.runtime/osworld-offline-render-qualification-02/result.json"
+    ],
+    "preserved_failures": [
+      "First frontend build failed TypeScript string/Blob validation; corrected in a new build",
+      "First Windows render exposed two missing static avatars, one remote font stylesheet, and a wrong diagnostic channel path",
+      "Second Windows render exposed stale gateway DNS after container recreation; fixed without backend restarts"
+    ],
+    "approval_review_rejection": {
+      "action": "Download dynamic avatars using fixture email names",
+      "reason": "Would transmit test email addresses to ui-avatars.com",
+      "resolution": "Generate initials in the frontend locally; no external request"
+    }
   },
   "image_default_clean_base": {
     "snapshot": "qw3-osworld-images-20261002",

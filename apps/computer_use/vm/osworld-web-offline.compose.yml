@@ -1,0 +1,35 @@
+# Overlay for verified local image/font builds. Use with osworld-web.compose.yml.
+# The existing Calendar container keeps its in-memory state and API. A separate
+# renderer serves Calendar HTML/static files, with all /api/ requests routed to
+# the original backend by the gateway.
+x-owner: &owner
+  com.qw3.computer-use.owner: codex-goal-20260930
+services:
+  formcraft-frontend:
+    image: qw3-osworld-windows-formcraft-frontend-offline:20261002
+    build: {context: "${QW3_OFFLINE_SITE_ROOT:?Set verified offline contexts}/formcraft", dockerfile: Dockerfile}
+    labels: *owner
+  teamchat-frontend:
+    image: qw3-osworld-windows-teamchat-frontend-offline:20261002
+    build: {context: "${QW3_OFFLINE_SITE_ROOT:?Set verified offline contexts}/teamchat", dockerfile: Dockerfile}
+    labels: *owner
+  cloudcrm-frontend:
+    image: qw3-osworld-windows-cloudcrm-frontend-offline:20261002
+    build: {context: "${QW3_OFFLINE_SITE_ROOT:?Set verified offline contexts}/cloudcrm", dockerfile: Dockerfile}
+    labels: *owner
+  mailhub-frontend:
+    image: qw3-osworld-windows-mailhub-frontend-offline:20261002
+    build: {context: "${QW3_OFFLINE_SITE_ROOT:?Set verified offline contexts}/mailhub", dockerfile: Dockerfile}
+    labels: *owner
+  calendar-frontend:
+    image: qw3-osworld-windows-calendar-frontend-offline:20261002
+    build:
+      context: "${QW3_OFFLINE_SITE_ROOT:?Set verified offline contexts}/calendar"
+      dockerfile: Dockerfile
+      args: {HTTP_PROXY: "", HTTPS_PROXY: "", ALL_PROXY: "", http_proxy: "", https_proxy: "", all_proxy: ""}
+    environment: {NODE_ENV: production, COOKIE_NAME: user_id, COOKIE_MAX_AGE: "2592000"}
+    labels: *owner
+  gateway:
+    volumes:
+      - "./osworld-web-offline.nginx.conf:/etc/nginx/conf.d/default.conf:ro"
+    depends_on: [calendar-frontend]

@@ -1,0 +1,117 @@
+{
+  "kind": "qualified_windows_private_site_platform",
+  "qualified": true,
+  "formal_run": false,
+  "model_used": false,
+  "windows_qualification": "apps/computer_use/.runtime/osworld-offline-render-qualification-03/result.json",
+  "containers": {
+    "qw3-osworld-windows-formcraft-backend-1": {
+      "service": "formcraft-backend",
+      "image": "sha256:3627382b20b8c09b0e7b8b8e2abd64ecb1aab054be7d1f5f2ca6dc1001a2d51a",
+      "bind_mounts": [
+        {
+          "source": "/home/chaidi/qw3/third_party/OSWorld-web/formcraft_web/STATE.md",
+          "destination": "/app/STATE.md",
+          "rw": false
+        }
+      ]
+    },
+    "qw3-osworld-windows-teamchat-backend-1": {
+      "service": "teamchat-backend",
+      "image": "sha256:36c10bd0451402171964e290eab20f992063d25fa96b02db92d9569701cb9423",
+      "bind_mounts": [
+        {
+          "source": "/home/chaidi/qw3/third_party/OSWorld-web/teamchat_web/STATE.md",
+          "destination": "/app/STATE.md",
+          "rw": false
+        }
+      ]
+    },
+    "qw3-osworld-windows-cloudcrm-backend-1": {
+      "service": "cloudcrm-backend",
+      "image": "sha256:cd4d46c18034475aa964ba15979fcf8d5d4210ad1a0800fc939c7518ee566896",
+      "bind_mounts": [
+        {
+          "source": "/home/chaidi/qw3/third_party/OSWorld-web/cloudcrm_web/STATE.md",
+          "destination": "/app/STATE.md",
+          "rw": false
+        }
+      ]
+    },
+    "qw3-osworld-windows-mailhub-backend-1": {
+      "service": "mailhub-backend",
+      "image": "sha256:4722ec0cb6e92161a41f37438999dce118b7fe7d5de86515cbecf199ebfba768",
+      "bind_mounts": [
+        {
+          "source": "/home/chaidi/qw3/third_party/OSWorld-web/mailhub_web/STATE.md",
+          "destination": "/app/STATE.md",
+          "rw": false
+        }
+      ]
+    },
+    "qw3-osworld-windows-calendar-1": {
+      "service": "calendar",
+      "image": "sha256:95f5193b06477b278d02be0c0ea2173a0cb1c5452a5e5ec3ece582f43acec33e",
+      "bind_mounts": []
+    },
+    "qw3-osworld-windows-formcraft-frontend-1": {
+      "service": "formcraft-frontend",
+      "image": "sha256:814d38abc0ae3dd8dba5ff9abeeb6721e4a9ce603247e8c9910465f92a5d03bc",
+      "bind_mounts": []
+    },
+    "qw3-osworld-windows-teamchat-frontend-1": {
+      "service": "teamchat-frontend",
+      "image": "sha256:1579b33ed78050f0b7eb810e52c9f1ace701c74e426fe5a79a6cb84cd35686bc",
+      "bind_mounts": []
+    },
+    "qw3-osworld-windows-cloudcrm-frontend-1": {
+      "service": "cloudcrm-frontend",
+      "image": "sha256:124ceee040cff5dd02b93103d74a8c464dfb2189e7717b39fab630dc19495790",
+      "bind_mounts": []
+    },
+    "qw3-osworld-windows-mailhub-frontend-1": {
+      "service": "mailhub-frontend",
+      "image": "sha256:72d3228fa595df5350a4518a620ef56e3057d1c66243def59328a51b65486254",
+      "bind_mounts": []
+    },
+    "qw3-osworld-windows-calendar-frontend-1": {
+      "service": "calendar-frontend",
+      "image": "sha256:077e96165744bd40e3d3c97dca97bf77e4b4d6ee9fb7ee80b3e2346e0daaa157",
+      "bind_mounts": []
+    },
+    "qw3-osworld-windows-gateway-1": {
+      "service": "gateway",
+      "image": "sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10",
+      "bind_mounts": [
+        {
+          "source": "/home/chaidi/qw3/apps/computer_use/vm/osworld-web-admin-blocks.conf",
+          "destination": "/etc/nginx/benchmark-admin-blocks.conf",
+          "rw": false
+        },
+        {
+          "source": "/home/chaidi/qw3/apps/computer_use/vm/osworld-web-offline.nginx.conf",
+          "destination": "/etc/nginx/conf.d/default.conf",
+          "rw": false
+        }
+      ]
+    }
+  },
+  "files": {
+    "apps/computer_use/.runtime/osworld-offline-render-qualification-03/result.json": "dcc3bc1d7c2f6ce3e2d7c54d159a01d89cd439ca97261c419e7ce2aefcf0fe0b",
+    "apps/computer_use/.runtime/osworld-offline-site-deploy-04/deployment-result.json": "4ca261def5171fee32313c6ea908b6eb3fe905ff700a20046707fe6e338ddee0",
+    "apps/computer_use/.runtime/osworld-offline-sites-03/build-result.json": "e29d9888900657e8693a6024a420fd953b11897def656bb2e90a709b5ba5ce2f",
+    "apps/computer_use/.runtime/osworld-offline-sites-03/http-result.json": "a2508ae9cd20c10d001842bdca64613fff3a4504a5cfa6c380dfc94dca23a938",
+    "apps/computer_use/.runtime/osworld-offline-sites-03/manifest.json": "5bdef39d7d46ab2d4cc9ad713743fb67631034fc743910f0149bf2c6835f1b68",
+    "apps/computer_use/osworld_windows/offline_sites.py": "8dd500ae7ac2f801d314d0502134c26b67caa26884f5332c0d14f89f23ec9d9b",
+    "apps/computer_use/osworld_windows/qualify_offline_sites_guest.py": "92ffea4ebac8e2a2e39f62ded92cd0335a8f94ce38246a18192f8b32024efddc",
+    "apps/computer_use/vm/osworld-web-admin-blocks.conf": "34704c8cc37e0ace04271f66fd7ef404b60cb5d5e66a847ea443458e4ef24b94",
+    "apps/computer_use/vm/osworld-web-offline.compose.yml": "68ef78be6ece64d6e12609ad3d6aa2a2773cefdf7db3c27b9aa761c61d1badf7",
+    "apps/computer_use/vm/osworld-web-offline.nginx.conf": "ec38a58976d5cd0c812f80b9e4a94690492017102efc564c46fb096857cb6056",
+    "third_party/OSWorld-web/cloudcrm_web/STATE.md": "ed60510fcc73bc066dc316170c9c8d3956efd3bc395eda0644e4d875970c5169",
+    "third_party/OSWorld-web/formcraft_web/STATE.md": "b4d49ba20949cdfb4f64b50dac20bf00c580a37b20011857fcca629670096d16",
+    "third_party/OSWorld-web/mailhub_web/STATE.md": "1742691424487e3b199b5f07f9f758954104bb8062c0def8a621e781750f5075",
+    "third_party/OSWorld-web/teamchat_web/STATE.md": "5a91d72feb11cc6a13e95c08ad10a21b35a3f7dd43539aed638e4177ae93a164"
+  },
+  "render_scope": "Seven original task views plus Calendar event modal and guest picker; not every possible application route",
+  "decorative_policy": "73 fixed image URLs served locally; 22 original font files; dynamic avatar initials generated locally without sending emails"
+}
