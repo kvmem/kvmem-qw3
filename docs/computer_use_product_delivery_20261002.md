@@ -64,5 +64,5 @@
 任务状态、独立验收和回放页面。能力仍不足的任务要有明确边界与接管出口，不伪报成功。
 
 本路线与[持续目标](computer_use_local_advisor_goal_20261002.md)共同生效；当前执行进度
-记录在[清单](computer_use_local_advisor_progress_20261002.json)。本文件中的新能力均为
-待实现/待验收要求，未将规划表述为完成。
+记录在[清单](computer_use_local_advisor_progress_20261002.json)。本文件保持整体交付与验收要求，
+实际实现及测试结果以进度清单和各阶段证据为准。

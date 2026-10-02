@@ -66,9 +66,10 @@ not an implementation of OpenAI effort budgets. Raw local reasoning travels in
 separate `reasoning` items and is replayed across tool/user turns. The same output
 token cap includes reasoning. Resume/follow-up requires the task's saved mode.
 Default launches retain the original non-thinking behavior. This candidate passed
-real local-model image/tool smoke checks and native Windows/Codex contracts;
-actual QW3 thinking on the native Windows client and business-task improvement
-remain unqualified. See the [P0 report](../../docs/computer_use_local_diagnostic_p0_20261002.md).
+real local-model image/tool checks and native Windows/Codex product tasks, with
+actual reasoning-stream and DFlash evidence. See the
+[native thinking report](../../docs/computer_use_native_thinking_20261003.md) and
+[LaTeX product report](../../docs/computer_use_latex_product_20261003.md) for the tested scope and limits.
 
 The current [product delivery goal](../../docs/computer_use_product_delivery_20261002.md)
 prioritizes complete Python/LaTeX software workflows, using diagnostic results to
@@ -754,3 +755,11 @@ Run the product harness with `--scenario latex --thinking` and a qualified
 client bundle. It restores the declared Windows baseline and records continuous
 video; host Poppler tools independently inspect and render the actual PDFs.
 Script qualification and native contracts are separate from model task passes.
+
+The fixed Python setup/repair and LaTeX setup/missing-class repair scenarios each
+passed three formal Windows VM trials, including independent artifacts, actual
+launchers and application restart. These are controlled-software workflows;
+arbitrary package sets, physical machines and ordinary-memory deployment remain
+unqualified. The current 1M-context GPU profile used about 67 GiB in the LaTeX
+trials. Full local recovery/capability/KVMem diagnostics and optional advisor
+integration remain active work; the advisor is still disabled and unimplemented.
