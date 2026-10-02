@@ -63,3 +63,13 @@ new-02 的状态查询反复返回完整下载和阶段结果，最大单次工�
 不是 agent 成功。当前尚未实际执行该准备脚本和模型修复。
 
 client29 SHA-256：`b841567c7f489f7f46ecd1ebb98c590d0e70b0ce021ebf58c1bc01ad6748814c`。
+
+## 正式验收（进行中）
+
+已预先冻结 client29、源文件哈希、固定文档、安装/宏包清单、900 秒任务预算和评分项。
+清单为 `apps/computer_use/.runtime/latex-new-formal-20261003/acceptance.json`；三次均恢复
+同一干净 Windows 快照，项目/工具链/下载缓存为空，每次启动独立本地引擎，thinking 开、
+DFlash2 开、KVMem/顾问关。串行队列首个失败即停止分析，不自动重跑或跳过失败。
+
+实时记录见同目录 `campaign.json`。在终态和证据审计前不计为正式通过；当前其他产品
+正式通过仍为 Python 两场景共 6/12。后续还需 LaTeX 修复、P3–P6/KVMem 与顾问对照。

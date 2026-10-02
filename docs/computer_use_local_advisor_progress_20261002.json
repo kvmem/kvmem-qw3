@@ -5,7 +5,7 @@
   "status": "active",
   "local_plan": "docs/computer_use_local_diagnostic_plan_20261002.json",
   "combined_goal": "docs/computer_use_local_advisor_goal_20261002.md",
-  "current_stage": "latex_cold_install_development_passed_compact_receipts_native_qualified_formal_next",
+  "current_stage": "latex_new_formal_campaign_running_client29",
   "source_baseline": "56896791b41b6aa5c022c99dac4996f719bd4ba0",
   "stages": {
     "P0": {
@@ -201,12 +201,12 @@
     "apps/computer_use/.runtime/latex-product-replay-20261003/browser-check.json"
   ],
   "latest_checks": {
-    "gpu_idle": true,
+    "gpu_idle": false,
     "root_available_approx_gib": 227,
-    "previous_queue_status": "latex_new_02_passed_owned_engine_stopped_client29_qualified",
-    "gpu_compute_processes": 0
+    "previous_queue_status": "latex_new_formal_campaign_live",
+    "gpu_compute_processes": 1
   },
-  "next_action": "Freeze client29 plus source hashes and run three serial formal cold LaTeX installations; halt on the first failure for analysis. Then actual missing-package fixture/repair development and three formal repairs. Formal product count remains 6/12; P3-P6/KVMem/advisor remain required.",
+  "next_action": "Continue the existing latex-new-formal-20261003 campaign without starting another copy. Read its campaign.json handles and terminal results. Audit all three after completion, then prepare latex-repair fixture and real-model repair development; retain failures and remaining P3-P6/advisor requirements.",
   "advisor_provider": {
     "provider": "deepseek",
     "model": "deepseek-flash",
@@ -240,7 +240,7 @@
     "scenario_status": {
       "product-python-new": "formal_3_of_3_passed_with_launcher_and_reopen",
       "product-python-repair": "formal_3_of_3_passed_with_launcher_and_reopen",
-      "product-latex-new": "development_1_of_2_passed_formal_next",
+      "product-latex-new": "development_passed_formal_campaign_running",
       "product-latex-repair": "planned"
     },
     "formal_passed": 6,
@@ -354,6 +354,16 @@
     "source_switch": "reviewed HTTPS mirrors only, bounded GET attempts, stop on integrity mismatch",
     "audit": "apps/computer_use/.runtime/latex-product-development-audit-20261003.json",
     "replay": "apps/computer_use/.runtime/latex-product-replay-20261003/index.html",
-    "poll_receipt_compaction": "implemented_native_qualified_real_model_retest_pending"
+    "poll_receipt_compaction": "implemented_native_qualified_real_model_retest_pending",
+    "formal_campaign": {
+      "status": "running",
+      "acceptance": "apps/computer_use/.runtime/latex-new-formal-20261003/acceptance.json",
+      "progress": "apps/computer_use/.runtime/latex-new-formal-20261003/campaign.json",
+      "planned": 3,
+      "same_version_three_repetitions": true,
+      "cold_download_cache": true,
+      "fresh_vm_and_engine_each_trial": true,
+      "halt_on_first_failure": true
+    }
   }
 }
