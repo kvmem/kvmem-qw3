@@ -173,6 +173,23 @@ class CampaignTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CollectionBindingTests(unittest.TestCase):
+    def test_native_thinking_requires_capability_and_preserves_boolean_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); bundle = root / 'bundle'; bundle.mkdir()
+            (bundle / 'archive.json').write_text(json.dumps({'sha256': 'a' * 64}))
+            manifest = bundle / 'manifest.json'; manifest.write_text('{}')
+            staged = root / 'thinking-check-001-inputs'; staged.mkdir()
+            def launch(value):
+                return prepare_launch('004', 'thinking-check-001', 'Public prompt', {'files': []},
+                    bundle, staged, root / 'launch', timeout=600, tool_limit=100,
+                    backend='http://172.17.0.1:18084/v1', thinking=value)
+            with self.assertRaisesRegex(ValueError, 'boolean'): launch('true')
+            with self.assertRaisesRegex(ValueError, 'thinking capability'): launch(True)
+            manifest.write_text(json.dumps({'runtime_capabilities': ['opt_in_local_thinking']}))
+            result = launch(True)
+            self.assertIs(result['thinking'], True)
+            self.assertIs(json.loads((staged / 'native-task.json').read_text())['thinking'], True)
+
     def test_legacy_bundle_is_compatible_only_with_default_waits(self):
         with tempfile.TemporaryDirectory() as temporary:
             bundle = Path(temporary)

@@ -166,6 +166,7 @@ async def run(args):
     report = dict(kind='osworld_native_end_to_end_preflight', formal_run=False,
                   v0_frozen=False, qw3_backend_selected=True, task=args.task, run=run_id,
                   kvmem=args.kvmem, timeout_seconds=args.timeout, tool_call_limit=args.tool_limit, visual_history=args.visual_history,
+                  thinking=getattr(args, 'thinking', False),
                   pipeline_passed=False, task_success_claimed=False, events=[])
     report.update(waits)
     report['evidence_filesystem_space_before_trial'] = spaces
@@ -238,6 +239,20 @@ async def run(args):
                 sources.append(app / 'capability_regrade.py')
             report['source_sha256'] = {str(p.relative_to(ROOT)): sha256(p) for p in sources}
             report['snapshot'] = json.loads((share.parent / 'snapshots' / args.snapshot / 'manifest.json').read_text())
+            restore_helper = app / 'vm/snapshot.py'
+            snapshot_sources = getattr(args, 'snapshot_sources', None)
+            executor_candidate = getattr(args, 'executor_candidate', None)
+            if snapshot_sources:
+                frozen = output / 'snapshot-sources'; frozen.mkdir()
+                for name in ('snapshot.py', 'executor.ps1', 'fixture.html', 'bootstrap.ps1'):
+                    shutil.copyfile(snapshot_sources / name, frozen / name)
+                if {name: sha256(frozen / name) for name in report['snapshot']['source_hashes']} != report['snapshot']['source_hashes']:
+                    raise ValueError('Frozen restore sources do not match the selected snapshot')
+                restore_helper = frozen / 'snapshot.py'
+                report['restore_source_sha256'] = {p.name: sha256(p) for p in frozen.iterdir()}
+            if executor_candidate:
+                shutil.copyfile(executor_candidate, output / 'executor-candidate.ps1')
+                report['executor_candidate_sha256'] = sha256(output / 'executor-candidate.ps1')
             owns_desktop = True
             event('restoring_clean_base')
             await command('docker', 'stop', '-t', '120', 'qw3-computer-windows')
@@ -245,7 +260,9 @@ async def run(args):
             archived = await command(sys.executable, app / 'vm/archive_share.py', 'shared-archive-' + run_id)
             (output / 'prior-share-archive.json').write_text(archived)
             event('prior_share_archived')
-            await command(sys.executable, app / 'vm/snapshot.py', 'restore', '--name', args.snapshot)
+            await command(sys.executable, restore_helper, 'restore', '--name', args.snapshot)
+            if executor_candidate:
+                shutil.copyfile(output / 'executor-candidate.ps1', share / 'executor.ps1')
             event('disk_snapshot_restored')
             await command('docker', 'start', 'qw3-computer-windows')
             event('vm_started_waiting_for_executor')
@@ -253,6 +270,9 @@ async def run(args):
             if not report['initial_health']['paused'] or (await get('http://127.0.0.1:18082/files', True))['files']:
                 raise ValueError('Restored desktop is not empty and paused')
             event('clean_desktop_ready')
+            # Restored Explorer needs time before the first administrative Run
+            # dialog; the same settling delay was qualified by the product suite.
+            await asyncio.sleep(8)
             report['bundle_install_identity'] = await asyncio.to_thread(
                 prepare_bundle, args.bundle, run_id, share, output / 'bundle-install')
             await command(sys.executable, app / 'vm/provision.py', output / 'bundle-install/install.ps1')
@@ -293,6 +313,7 @@ async def run(args):
             prepare_launch(args.task, run_id, manifest['instruction'], collection(args.task), args.bundle, staged,
                 output / 'launch', timeout=args.timeout, tool_limit=args.tool_limit,
                 backend=f"http://{relay_info['bind']}:18084/v1",
+                thinking=getattr(args, 'thinking', False),
                 backend_timeout=waits['backend_timeout_seconds'],
                 backend_read_timeout=waits['backend_read_timeout_seconds'])
             recorder = await launch('recorder', [sys.executable, app / 'vm/record_console.py',
@@ -407,6 +428,9 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--bundle', type=Path, default=ROOT / 'apps/computer_use/.runtime/windows-native-client-13')
     parser.add_argument('--snapshot', default=DEFAULT_SNAPSHOT)
+    parser.add_argument('--snapshot-sources', type=Path, help='Frozen helper and original executor/fixture/bootstrap matching the snapshot')
+    parser.add_argument('--executor-candidate', type=Path, help='Explicit executor revision staged after restoring the original baseline')
+    parser.add_argument('--thinking', action='store_true', help='Enable qualified actual local reasoning in the native application')
     parser.add_argument('--ffmpeg', type=Path, required=True)
     parser.add_argument('--kvmem', choices=('on', 'off'), default='on')
     parser.add_argument('--timeout', type=int, default=900)

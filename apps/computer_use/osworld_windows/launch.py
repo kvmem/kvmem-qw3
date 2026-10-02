@@ -22,9 +22,13 @@ def verify_wait_capability(bundle, waits):
 
 
 def prepare(task, run, prompt, collection, bundle, staged, output, *, timeout, tool_limit, backend,
-            backend_timeout=600, backend_read_timeout=180):
+            backend_timeout=600, backend_read_timeout=180, thinking=False):
     waits = connection_waits(backend_timeout, backend_read_timeout)
     verify_wait_capability(bundle, waits)
+    if type(thinking) is not bool:
+        raise ValueError('Thinking must be a boolean')
+    if thinking and 'opt_in_local_thinking' not in json.loads((Path(bundle) / 'manifest.json').read_text()).get('runtime_capabilities', []):
+        raise ValueError('Native bundle has no qualified thinking capability')
     if (task not in {'013','004','006','010','038','022','035','043','080','051', *CAPABILITY_TASKS}
             or not re.fullmatch(r'[a-zA-Z0-9_-]{8,60}',run) or not isinstance(prompt,str) or not prompt.strip()
             or type(timeout) is not int or not 1 <= timeout <= 14400
@@ -45,6 +49,7 @@ def prepare(task, run, prompt, collection, bundle, staged, output, *, timeout, t
         if destination.exists():raise ValueError('Launcher helper already staged')
         shutil.copyfile(ROOT/'apps/computer_use/vm'/name,destination)
     configuration = dict(run=run,task=task,bundle_sha256=archive['sha256'],backend=backend,
+        thinking=thinking,
         timeout_seconds=timeout,tool_call_limit=tool_limit,review_batches=3 if task=='035' else 0,
         public_sha256={name:sha256(staged/name) for name in ('prompt.txt','collection.json','client_resources.ps1')})
     configuration.update(waits)
