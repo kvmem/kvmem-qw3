@@ -36,16 +36,16 @@ DEFINITIONS = {
         'Open C:\\Users\\Qw3Test\\Desktop\\order.xlsx in the spreadsheet application. '
         'In D2:D4 calculate each row total using a formula multiplying Quantity by Unit price. '
         'In D5 use a SUM formula to add D2:D4. Keep all existing labels and inputs unchanged. '
-        'Save as C:\\Qw3Computer\\outputs\\cap05.xlsx and verify the totals.'),
+        'Save as C:\\Users\\Qw3Test\\Desktop\\cap05.xlsx and verify the totals.'),
     'cap06': ('Document title and constrained text replacement', 600, 'cap06.docx',
         'Open C:\\Users\\Qw3Test\\Desktop\\weekly.docx in the document application. '
         'Change the title Weekly Update to Weekly Report, and replace both occurrences of Draft with Approved. '
         'Keep all other text, including Owner: Mei and the two project names, unchanged. '
-        'Save as C:\\Qw3Computer\\outputs\\cap06.docx.'),
+        'Save as C:\\Users\\Qw3Test\\Desktop\\cap06.docx.'),
     'cap07': ('Edit and remove specified presentation slides', 600, 'cap07.pptx',
         'Open C:\\Users\\Qw3Test\\Desktop\\briefing.pptx in the presentation application. '
         'Change only the title of slide 2 from Findings to Results. Delete the last slide titled Obsolete. '
-        'Keep slide 1 and the body text on slide 2 unchanged. Save as C:\\Qw3Computer\\outputs\\cap07.pptx.'),
+        'Keep slide 1 and the body text on slide 2 unchanged. Save as C:\\Users\\Qw3Test\\Desktop\\cap07.pptx.'),
     'cap08': ('Resolve two rule versions across applications', 900, 'cap08.txt',
         'Read C:\\Users\\Qw3Test\\Desktop\\policy-old.txt and policy-new.txt. Use the latest effective policy '
         'for the 2026-10-02 request with cost 125.00. Also obtain the Copy task reference code from the Edge '
@@ -61,7 +61,7 @@ DEFINITIONS = {
         'Open C:\\Users\\Qw3Test\\Desktop\\sales.xlsx in the spreadsheet application. '
         'Sort the four complete data rows A2:C5 by Revenue from highest to lowest, keeping IDs and owners '
         'with their revenue. Keep the headers unchanged. In C6 enter a SUM formula adding C2:C5. '
-        'Save as C:\\Qw3Computer\\outputs\\cap10.xlsx and verify the order and total.'),
+        'Save as C:\\Users\\Qw3Test\\Desktop\\cap10.xlsx and verify the order and total.'),
 }
 
 
@@ -71,7 +71,10 @@ def files(task):
         return [(name, folder + relative) for name, relative in [
             ('summary.txt', 'summary.txt'), ('archived-todo.txt', 'Archive\\todo.txt'),
             ('keep.txt', 'keep.txt'), ('old-draft.txt', 'draft.txt'), ('old-todo.txt', 'todo.txt')]]
-    result = [(DEFINITIONS[task][2], OUTPUTS + DEFINITIONS[task][2])]
+    # The executor's legacy /files route is for text/JSON. Office binaries use
+    # explicit Desktop export, as do the original qualified office scenarios.
+    folder = DESKTOP if task in {'cap05', 'cap06', 'cap07', 'cap10'} else OUTPUTS
+    result = [(DEFINITIONS[task][2], folder + DEFINITIONS[task][2])]
     if task == 'cap02':
         result.append(('original-draft.txt', DESKTOP + 'draft.txt'))
     return result

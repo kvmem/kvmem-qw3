@@ -37,3 +37,8 @@ cap02 关闭版本最终截图独立查看确认标题、Owner、Approved 和 Ho
 这些是每配置单次摸底，不能形成显著性结论。开启版本启用当前产品的 KVMem 前缀复用；关闭版本没有该能力，差异不能全部归因检索机制。第一批最长输入约 79K token，尚不足以检验很长历史的记忆保留。任务计时不含快照恢复和模型加载，录像包含启动与收尾。
 
 实际结果：apps/computer_use/.runtime/windows-capability-calibration-01/result.json；汇总和轨迹审查：apps/computer_use/.runtime/windows-capability-analysis-01；连续双栏回放：http://127.0.0.1:18089/capability/index.html。准备或脚本化控制测试不计为模型通过。
+
+
+第二批首条 cap05-on-01 的保存文件通过全部公式与计算值检查，但原生客户端收尾的 legacy /files 对被 LibreOffice 占用的 outputs/cap05.xlsx 使用 ReadAllBytes，导致 infrastructure_error。独立二进制收集成功，连续录像完整；这条是无效测试，不计入完整通过或模型失败。队列正确停止并保留其余 11 条未运行。
+
+Office 校准场景改用与原 OSWorld 办公场景一致的 Desktop 交付和显式二进制收集。新的开关配对两边使用相同新路径，原失败不覆盖、不重判。产品的通用二进制结果列表仍需修复，未宣称平台缺陷已经解决。新版计划为 computer_use_windows_capability_plan_03_20261002.json。

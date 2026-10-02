@@ -2041,7 +2041,7 @@
     "formal_run": false,
     "definition": "apps/computer_use/osworld_windows/capabilities.py",
     "first_batch_plan": "docs/computer_use_windows_capability_plan_20261002.json",
-    "status": "first_batch_complete",
+    "status": "office_queue_halted_by_export_listing",
     "original_ten_task_results_preserved": true,
     "formal_original_runs_completed": 0,
     "completed_attempts": 8,
@@ -2049,14 +2049,18 @@
     "first_batch_evidence": "apps/computer_use/.runtime/windows-capability-calibration-01/result.json",
     "analysis": "apps/computer_use/.runtime/windows-capability-analysis-01/summary.json",
     "preview_url": "http://127.0.0.1:18089/capability/index.html",
-    "next_batch_plan": "docs/computer_use_windows_capability_plan_02_20261002.json",
+    "next_batch_plan": "docs/computer_use_windows_capability_plan_03_20261002.json",
     "observed_feasible": [
       "Create and save text",
       "Edit while preserving input",
       "Browser to Notepad extraction",
       "Browser form submission"
     ],
-    "observed_limit": "cap02 off correctly edited onscreen but failed to save by 300 seconds; not proof of inability to edit"
+    "observed_limit": "cap02 off correctly edited onscreen but failed to save by 300 seconds; not proof of inability to edit",
+    "invalid_office_attempts": 1,
+    "office_artifact_correct_despite_invalid_trial": true,
+    "halted_queue": "apps/computer_use/.runtime/windows-capability-calibration-02/result.json",
+    "export_listing_limitation": "Legacy text/JSON outputs enumeration fails on locked Office binary; new office tasks use established Desktop binary collection, original failure preserved"
   },
   "native_interruption_recovery": {
     "qualified": true,
