@@ -331,6 +331,14 @@ class Controller:
                 self.state["status"] = "paused"
                 self.state["notice"] = "连续操作没有改变桌面，任务已暂停。"
                 await self.client.interrupt(self.state["thread_id"], self.state["turn_id"])
+            if result.get("app_focus", {}).get("verified") is False:
+                # Launch was delivered exactly once, but its postcondition
+                # failed. Return the current screen as a recoverable tool error;
+                # do not label delivery uncertain or silently relaunch the app.
+                return mcp_observation(result["observation"], result | {
+                    "error": "Application launch was dispatched, but target focus was not confirmed. "
+                             "Use the resulting screen to recover; do not type until the intended window is foreground."
+                }) | {"isError": True}
             return mcp_observation(result["observation"], result)
         except DesktopRejected as exc:
             # The guest explicitly confirms that no input was dispatched.

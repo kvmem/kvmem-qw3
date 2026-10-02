@@ -2,7 +2,7 @@
 
 Restore the owned VM once, then administratively reset neutral application
 fixtures before each trial. Only /act performs the operations under test.
-The original executor is unchanged; UIA locates known controls for this
+The executor identity is recorded; UIA locates known controls for this
 infrastructure check and is not credited as model visual grounding.
 """
 import argparse
@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import time
 
@@ -106,7 +107,7 @@ async def trial(desktop, output, trial_id, category, repetition):
         response = await desktop.act(dict(desktop_id=before["desktop_id"],
             observation_id=before["observation_id"], action_id=f"{trial_id}-{counter}", action=action))
         record.update(ended_monotonic_ns=time.monotonic_ns(), after=desktop.latest,
-                      no_progress=response.get("no_progress", False))
+                      no_progress=response.get("no_progress", False), app_focus=response.get("app_focus"))
         save(output / "result.json", result)
         return response
 
@@ -198,6 +199,10 @@ async def trial(desktop, output, trial_id, category, repetition):
                     settled=desktop.latest["foreground"], at_return_matches=matches(at_return),
                     settled_matches=matches(desktop.latest)))
             result["passed"] = all(x["at_return_matches"] and x["settled_matches"] for x in result["focus_checks"])
+            # Preserve the original app-foreground metric for comparison.
+            # New executor receipts add a separate, stricter confirmation.
+            receipts = [a.get("app_focus") for a in result["actions"] if a["action"]["kind"] == "open_app"]
+            result["focus_postconditions_passed"] = all(r and r.get("verified") is True for r in receipts)
         elif category == "known_control_click":
             await click_control("Name", "Edit")
             target = await control("Name", "Edit")
@@ -246,6 +251,19 @@ async def run(args):
     recorder = None
     desktop = None
     try:
+        restore_sources = args.baseline_sources.resolve() if args.baseline_sources else APP / "vm"
+        # A candidate may be installed after restoring an immutable baseline.
+        # The original snapshot helper still verifies all three baseline
+        # hashes; this option never waives that verification.
+        if (restore_sources / "snapshot.py").read_bytes() != (APP / "vm/snapshot.py").read_bytes():
+            raise ValueError("Baseline restore helper differs from the reviewed snapshot helper")
+        for name in ("fixture.html", "bootstrap.ps1"):
+            if (restore_sources / name).read_bytes() != (APP / "vm" / name).read_bytes():
+                raise ValueError("This diagnostic candidate may change only the executor")
+        report["restore_source_sha256"] = {name: sha256(restore_sources / name)
+            for name in ("executor.ps1", "fixture.html", "bootstrap.ps1", "snapshot.py")}
+        shutil.copyfile(__file__, output / "executed-probe.py")
+        shutil.copyfile(APP / "vm/executor.ps1", output / "executed-executor.ps1")
         info = json.loads(await command("docker", "inspect", "qw3-computer-windows"))[0]
         if info["Config"].get("Labels", {}).get("com.qw3.computer-use.owner") != "codex-goal-20260930":
             raise ValueError("VM ownership mismatch")
@@ -271,13 +289,15 @@ async def run(args):
             sources = [*sorted((APP / "qw3_computer").glob("*.py")), APP / "vm/executor.ps1", Path(__file__)]
             report["source_commit"] = (await command("git", "rev-parse", "HEAD")).strip()
             report["source_sha256"] = {str(p.relative_to(ROOT)): sha256(p) for p in sources}
-            report["restored_executor_only"] = True
+            report["restored_executor_only"] = args.baseline_sources is None
             save(output / "result.json", report)
             print("restoring clean executor baseline", flush=True)
             await command("docker", "stop", "-t", "120", "qw3-computer-windows")
             archive = await command(sys.executable, APP / "vm/archive_share.py", "shared-archive-" + output.name)
             (output / "prior-share-archive.json").write_text(archive)
-            await command(sys.executable, APP / "vm/snapshot.py", "restore", "--name", args.snapshot)
+            await command(sys.executable, restore_sources / "snapshot.py", "restore", "--name", args.snapshot)
+            if args.baseline_sources:
+                shutil.copyfile(APP / "vm/executor.ps1", SHARE / "executor.ps1")
             await command("docker", "start", "qw3-computer-windows")
             async with asyncio.timeout(180):
                 while True:
@@ -347,6 +367,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--snapshot", default="qw3-osworld-client15-20261002")
+    parser.add_argument("--baseline-sources", type=Path,
+                        help="Frozen original VM source directory; install the current executor after strict snapshot restore")
     parser.add_argument("--ffmpeg", type=Path, required=True)
     parser.add_argument("--categories", choices=CATEGORIES, nargs="+", default=list(CATEGORIES))
     parser.add_argument("--repetitions", type=int, choices=range(1, 4), default=3)

@@ -70,3 +70,7 @@ MCP。实际 QW3/DFlash2、KVMem-off 的 thinking 开/关各完成一个图像/�
 这些是接口与历史传递证据，不能说明 thinking 提升了复杂任务成功率，也不能用两次
 短探针的耗时计算性能收益。现有 Windows 原生归档尚未替换成此候选，后续打包和实操
 测试仍需记录新身份。阶段运行已停止，Windows 保持暂停，GPU 专用探针引擎已退出。
+
+后续已完成[焦点修复与同条件复测](computer_use_focus_improvement_20261003.md)：最终候选 3/3，
+九次启动焦点回执确认；新 Windows 客户端 17 的 89 项运行时合约通过。以上原始首轮
+基线和失败记录保持不变。产品工作流、P1/P2 和真实 Windows QW3 thinking 仍待继续。

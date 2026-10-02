@@ -1,5 +1,12 @@
 # Local Codex computer use
 
+The current product goal is tracked in the
+[delivery plan](../../docs/computer_use_product_delivery_20261002.md).
+The latest [Windows focus repair](../../docs/computer_use_focus_improvement_20261003.md)
+passed three fixed switching trials (baseline: zero of three), and native client
+17 passed 89 runtime contracts. These are execution/runtime checks; Python/LaTeX
+product acceptance and optional advisor integration remain open.
+
 Work in progress: the local UI, Codex provider bridge, Computer MCP and Windows
 VM executor work end to end. A frozen native Windows client passed 18 core-task
 trials from a clean snapshot. The repaired Linux client completed a 36-page

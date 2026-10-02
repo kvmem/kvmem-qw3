@@ -43,6 +43,13 @@ try {
     $python=Join-Path $client 'python\python.exe'
     if (!(Test-Path $python)) {throw 'Qualified native client is unavailable'}
     $manifest=Get-Content "$client\manifest.json" -Raw | ConvertFrom-Json
+    $thinking=$false
+    if ('thinking' -in $configuration.PSObject.Properties.Name) {
+        if ($configuration.thinking -isnot [bool]) {throw 'Thinking must be a boolean'}
+        $thinking=$configuration.thinking
+    }
+    if ($thinking -and 'opt_in_local_thinking' -notin $manifest.runtime_capabilities) {throw 'Native bundle does not support thinking'}
+    $result.thinking=$thinking
     # Verify actual installed application bytes before every trial. The archive
     # hash and native contract qualification are additionally checked by host.
     foreach ($entry in $manifest.source_files.PSObject.Properties) {
@@ -67,6 +74,7 @@ try {
     if ($modelWait -ne 600 -or $modelReadWait -ne 180) {
         $appArguments+=' --backend-timeout '+$modelWait+' --backend-read-timeout '+$modelReadWait
     }
+    if ($thinking) { $appArguments+=' --thinking' }
     $app=Start-Process $python -ArgumentList $appArguments -WindowStyle Hidden -PassThru -RedirectStandardOutput "$runtime\app.stdout.log" -RedirectStandardError "$runtime\app.stderr.log"
     $appHandle=$app.Handle
     $deadline=[DateTime]::UtcNow.AddSeconds(60)

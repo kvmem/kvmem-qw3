@@ -150,6 +150,27 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.desktop.act.assert_awaited_once()
         self.assertFalse(self.desktop.paused)
 
+    async def test_unfocused_launch_is_recoverable_error_not_reissued_or_uncertain(self):
+        self.controller.state["status"] = "running"
+        self.desktop.paused = False
+        self.desktop.act = AsyncMock(return_value={
+            "action_id": "launch-001", "status": "completed", "no_progress": False,
+            "app_focus": {"verified": False, "reason": "ambiguous_windows"},
+            "observation": self.desktop.latest | {"image": "fresh-screen"}})
+        result = await self.controller.tool("act", {
+            "action_id": "launch-001", "action": {"kind": "open_app", "app": "edge"}})
+        self.assertTrue(result["isError"])
+        metadata = json.loads(result["content"][0]["text"])
+        self.assertEqual(metadata["status"], "completed")
+        self.assertEqual(metadata["app_focus"]["reason"], "ambiguous_windows")
+        self.assertIn("do not type", metadata["error"])
+        self.assertEqual(result["content"][1]["data"], "fresh-screen")
+        self.desktop.act.assert_awaited_once()
+        self.desktop.observe.assert_not_awaited()
+        self.controller.client.interrupt.assert_not_awaited()
+        self.assertFalse(self.desktop.paused)
+        self.assertEqual(self.controller.state["status"], "running")
+
     async def test_clean_shutdown_retains_resumable_task(self):
         self.controller.state.update(status="running", id="task", thread_id="test-thread", turn_id="test-turn")
         await self.controller.close()

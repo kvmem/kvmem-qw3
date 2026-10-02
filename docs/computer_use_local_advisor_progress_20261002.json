@@ -21,7 +21,22 @@
       "report": "docs/computer_use_local_diagnostic_p0_20261002.md",
       "thinking_qualification_scope": "Real local-model image/tool round trip and Linux pinned Codex/application contracts; new native Windows bundle pending",
       "native_windows_thinking_candidate_qualified": false,
-      "identity_manifest": "apps/computer_use/.runtime/local-diagnostic-p0-thinking-audit-01/identity.json"
+      "identity_manifest": "apps/computer_use/.runtime/local-diagnostic-p0-thinking-audit-01/identity.json",
+      "focus_improvement": {
+        "status": "fixed_scripted_retest_passed",
+        "baseline_trials": 3,
+        "baseline_passed": 0,
+        "candidate_trials": 3,
+        "candidate_passed": 3,
+        "candidate_focus_receipts_confirmed": 9,
+        "intermediate_trials_retained": 6,
+        "report": "docs/computer_use_focus_improvement_20261003.md",
+        "audit": "apps/computer_use/.runtime/local-diagnostic-p0-focus-audit-01/result.json",
+        "replay": "apps/computer_use/.runtime/focus-comparison-replay-20261003/index.html"
+      },
+      "native_windows_thinking_contracts_qualified": true,
+      "native_windows_qualification_scope": "Client 17 passed 89 Windows/Codex runtime contracts with scripted inference; actual QW3 thinking in Windows and business acceptance remain pending",
+      "native_windows_bundle": "apps/computer_use/.runtime/windows-native-client-17"
     },
     "P1": {
       "status": "planned",
@@ -68,7 +83,9 @@
     "apps/computer_use/.runtime/local-diagnostic-p0-executor-01/result.json",
     "apps/computer_use/.runtime/local-diagnostic-p0-executor-02/result.json",
     "apps/computer_use/.runtime/local-diagnostic-p0-executor-03/result.json",
-    "apps/computer_use/.runtime/local-diagnostic-p0-thinking-audit-01/result.json"
+    "apps/computer_use/.runtime/local-diagnostic-p0-thinking-audit-01/result.json",
+    "apps/computer_use/.runtime/local-diagnostic-p0-focus-audit-01/result.json",
+    "apps/computer_use/.runtime/windows-client-17-qualification-01/result.json"
   ],
   "latest_checks": {
     "gpu_idle": true,
@@ -76,7 +93,7 @@
     "root_available_approx_gib": 70,
     "previous_queue_status": "halted"
   },
-  "next_action": "Fix verified Edge focus issue with a bounded, verified application activation path and matched retest; prepare P1 neutral visual samples and native thinking candidate. Continue Python/LaTeX product workflow implementation.",
+  "next_action": "Continue Python/LaTeX controlled workflow implementation and P1 neutral visual samples; qualify actual QW3 thinking on native client 17. Use frozen baseline sources for old snapshot restoration; original OSWorld V0 remains unfrozen.",
   "advisor_provider": {
     "provider": "deepseek",
     "model": "deepseek-flash",

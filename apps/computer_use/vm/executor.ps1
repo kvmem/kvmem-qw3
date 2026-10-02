@@ -23,6 +23,56 @@ public static class DesktopNative {
     [DllImport("user32.dll")] public static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    private delegate bool WindowVisitor(IntPtr window, IntPtr extra);
+    [DllImport("user32.dll")] private static extern bool EnumWindows(WindowVisitor visitor, IntPtr extra);
+    [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr window, uint command);
+    [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr window, int command);
+    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr window);
+    public static long[] VisibleWindows() {
+        var windows = new List<long>();
+        EnumWindows((window, extra) => {
+            int style = GetWindowStyle(window, -20);
+            // Owned notification/tool windows (e.g. Edge's Restore pages
+            // bubble) are not another application document. A blocked owner
+            // remains excluded: do not bypass its modal dialog.
+            bool appWindow = (style & 0x80) == 0 &&
+                (GetWindow(window, 4) == IntPtr.Zero || (style & 0x40000) != 0);
+            if (appWindow && IsWindowVisible(window) && IsWindowEnabled(window)) windows.Add(window.ToInt64());
+            return true;
+        }, IntPtr.Zero);
+        return windows.ToArray();
+    }
+    public static string ActivateWindow(long handle, uint expectedProcess) {
+        IntPtr window = new IntPtr(handle);
+        uint process; GetWindowThreadProcessId(window, out process);
+        if (process != expectedProcess || !IsWindowVisible(window) || !IsWindowEnabled(window)) return "target_changed";
+        if (IsIconic(window)) ShowWindowAsync(window, 9);
+        SetForegroundWindow(window);
+        if (GetForegroundWindow() == window) return "native_activation";
+        // Windows' foreground lock permits activation following ALT input.
+        // Use one guarded down/up pair, never attach thread input queues or
+        // change the system-wide foreground-lock policy. No menu commands or
+        // document input are sent. Verify the postcondition separately.
+        foreach (int key in new [] { 1, 2, 4, 16, 17, 18, 91, 92 })
+            if ((GetAsyncKeyState(key) & 0x8000) != 0) return "held_input";
+        IntPtr before = GetForegroundWindow();
+        var info = new GuiThreadInfo(); info.size = (uint)Marshal.SizeOf(typeof(GuiThreadInfo));
+        if (!GetGUIThreadInfo(GetWindowThreadProcessId(before, out process), ref info) ||
+            (info.flags & 0x1c) != 0) return "active_menu_or_unknown_focus";
+        Input down = new Input(), up = new Input(); down.type = up.type = 1;
+        down.value.keyboard.vk = up.value.keyboard.vk = 18; up.value.keyboard.flags = 2;
+        if (SendInput(2, new [] { down, up }, Marshal.SizeOf(typeof(Input))) != 2) {
+            keybd_event(18, 0, 2, UIntPtr.Zero);
+            throw new InvalidOperationException("Focus key delivery incomplete; ALT released");
+        }
+        System.Threading.Thread.Sleep(50);
+        if (GetForegroundWindow() != before) return "foreground_changed_during_activation";
+        GetWindowThreadProcessId(window, out process);
+        if (process != expectedProcess || !IsWindowVisible(window) || !IsWindowEnabled(window)) return "target_changed";
+        SetForegroundWindow(window);
+        return "alt_activation_attempted";
+    }
     [StructLayout(LayoutKind.Sequential)] public struct WindowRect { public int left, top, right, bottom; }
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr window, out WindowRect rect);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
@@ -281,6 +331,64 @@ function Foreground {
     if ($processId) { $name = (Get-Process -Id $processId -ErrorAction SilentlyContinue).ProcessName }
     return @{ handle=$handle.ToInt64(); process=$name; title=$title.ToString() }
 }
+function App-Windows([string]$App) {
+    $names = @{
+        notepad=@('notepad'); edge=@('msedge'); explorer=@('explorer')
+        writer=@('soffice.bin'); calc=@('soffice.bin'); impress=@('soffice.bin')
+        thunderbird=@('thunderbird'); gimp=@('gimp-3'); wps_spreadsheets=@('et','wps')
+    }[$App]
+    foreach ($handle in [DesktopNative]::VisibleWindows()) {
+        [uint32]$processId = 0
+        [DesktopNative]::GetWindowThreadProcessId([IntPtr]$handle, [ref]$processId) | Out-Null
+        $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+        if ($process.ProcessName -notin $names) { continue }
+        $title = [Text.StringBuilder]::new(1024)
+        [DesktopNative]::GetWindowText([IntPtr]$handle, $title, $title.Capacity) | Out-Null
+        if (!$title.Length) { continue }
+        # Shell desktop/taskbar windows are not an Explorer folder.
+        if ($App -eq 'explorer' -and $title.ToString() -eq 'Program Manager') { continue }
+        @{handle=$handle; process_id=$processId; process=$process.ProcessName; title=$title.ToString()}
+    }
+}
+function Confirm-AppFocus([string]$App, $BeforeWindows, [int]$LaunchProcessId) {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $attempted = @{}
+    $reason = 'window_not_found'
+    $stableIdentity = ''; $stableSince = 0
+    # A launch may initially expose its old window or a transient splash.
+    Start-Sleep -Milliseconds 1000
+    do {
+        $windows = @(App-Windows $App)
+        $front = [DesktopNative]::GetForegroundWindow().ToInt64()
+        $new = @($windows | Where-Object { $_.handle -notin $BeforeWindows.handle })
+        $launched = @($windows | Where-Object { $_.process_id -eq $LaunchProcessId })
+        $target = $null
+        if ($new.Count -eq 1) { $target = $new[0] }
+        elseif ($launched.Count -eq 1) { $target = $launched[0] }
+        elseif ($windows.Count -eq 1) { $target = $windows[0] }
+        if ($target) {
+            if ($front -eq $target.handle) {
+                $identity = "$($target.handle):$($target.process_id):$($target.title)"
+                if ($stableIdentity -ne $identity) { $stableIdentity=$identity; $stableSince=$watch.ElapsedMilliseconds }
+                if (($watch.ElapsedMilliseconds-$stableSince) -ge 600) {
+                    return @{verified=$true; reason='foreground_confirmed'; window=$target; activation=$attempted; elapsed_ms=$watch.ElapsedMilliseconds}
+                }
+            } else {
+                $stableIdentity = ''
+                $reason = 'activation_denied'
+                $identity = "$($target.handle):$($target.process_id)"
+                if (!$attempted.ContainsKey($identity)) {
+                    $attempted[$identity] = [DesktopNative]::ActivateWindow($target.handle, $target.process_id)
+                }
+            }
+        } else {
+            $stableIdentity = ''
+            if ($windows.Count -gt 1) { $reason = 'ambiguous_windows' }
+        }
+        Start-Sleep -Milliseconds 200
+    } while ($watch.ElapsedMilliseconds -lt 6000)
+    return @{verified=$false; reason=$reason; candidates=$windows; activation=$attempted; elapsed_ms=$watch.ElapsedMilliseconds}
+}
 function Observe([int]$Attempt = 0) {
     $bounds = [Windows.Forms.Screen]::PrimaryScreen.Bounds
     $bitmap = [Drawing.Bitmap]::new($bounds.Width, $bounds.Height)
@@ -430,6 +538,7 @@ function Act($Request) {
     # dispatch the same action_id again, including after executor restart.
     try {
         $a = $Request.action
+        $focusResult = $null
         switch ($a.kind) {
             'click' {
                 [DesktopNative]::SetCursorPos($a.x,$a.y) | Out-Null
@@ -477,21 +586,23 @@ function Act($Request) {
                 Start-Sleep -Milliseconds 600
             }
             'open_app' {
+                $beforeWindows = @(App-Windows $a.app)
+                $launched = $null
                 if ($officeApps.ContainsKey([string]$a.app)) {
                     $launch = $officeApps[$a.app]
-                    if ($launch.arguments.Count) { Start-Process -FilePath $launch.path -ArgumentList $launch.arguments }
-                    else { Start-Process -FilePath $launch.path }
+                    if ($launch.arguments.Count) { $launched = Start-Process -FilePath $launch.path -ArgumentList $launch.arguments -PassThru }
+                    else { $launched = Start-Process -FilePath $launch.path -PassThru }
                 }
                 switch ($a.app) {
-                    'notepad' { Start-Process notepad.exe }
-                    'explorer' { Start-Process explorer.exe -ArgumentList ('"'+$applicationEntries.explorer_path+'"') }
+                    'notepad' { $launched = Start-Process notepad.exe -PassThru }
+                    'explorer' { $launched = Start-Process explorer.exe -ArgumentList ('"'+$applicationEntries.explorer_path+'"') -PassThru }
                     'edge' {
                         $edge = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
                         $arguments = @('--no-first-run','--no-default-browser-check','--disable-background-networking','--disable-component-update','--disable-sync','--force-renderer-accessibility',('--user-data-dir="'+$applicationEntries.browser_profile+'"')) + $applicationEntries.browser_urls
-                        Start-Process $edge -ArgumentList $arguments
+                        $launched = Start-Process $edge -ArgumentList $arguments -PassThru
                     }
                 }
-                Start-Sleep -Milliseconds 800
+                $focusResult = Confirm-AppFocus $a.app $beforeWindows $launched.Id
             }
         }
         Start-Sleep -Milliseconds 250
@@ -506,6 +617,14 @@ function Act($Request) {
         $script:lastSignature = $actionSignature
         if ($script:noProgress -ge 2) { $script:paused = $true; $after.paused = $true }
         $result = @{ action_id=$Request.action_id; status='completed'; observation=$after; no_progress=$script:paused }
+        if ($focusResult) {
+            # Completion records delivery. The separate postcondition must
+            # still match the screenshot before a caller treats launch as success.
+            if ($focusResult.verified -and $after.foreground.handle -ne $focusResult.window.handle) {
+                $focusResult.verified=$false; $focusResult.reason='foreground_changed_after_activation'
+            }
+            $result.app_focus = $focusResult
+        }
         $record.status='completed'; $record.result=$result
         Save-Json $path $record
         return $result
