@@ -56,9 +56,26 @@ def process_environment():
     return env
 
 
-def job_receipt(job):
+def job_receipt(job, *, compact=False):
     """Expose the identifier accepted by job_status, not its private owner ID."""
-    receipt = {k: v for k, v in job.items() if k not in {"task_id", "action_id"}}
+    if compact:
+        # Durable records and the application's state API retain full evidence.
+        # Re-sending every asset/hash on each model poll grows the conversation
+        # even when the job has made no new decision-relevant progress.
+        keys = {"id", "status", "project", "profile", "operation", "attempt", "stage",
+                "created_at", "started_at", "finished_at", "error", "needs_reconciliation",
+                "process", "last_process", "verification", "diagnosis"}
+        receipt = {k: v for k, v in job.items() if k in keys}
+        steps = job.get("steps", [])
+        downloads = job.get("downloads", [])
+        receipt["progress"] = {"stages_completed": sum(s["status"] == "completed" for s in steps),
+            "download_requests": len(downloads),
+            "assets_downloaded": len({r["file"] for r in downloads if r["status"] == "verified"})}
+        if downloads:
+            receipt["progress"]["latest_download"] = {k: downloads[-1].get(k)
+                for k in ("file", "host", "status", "http_status", "bytes", "error")}
+    else:
+        receipt = {k: v for k, v in job.items() if k not in {"task_id", "action_id"}}
     receipt["job_id"] = job["id"]
     if job["status"] in ACTIVE:
         receipt["next_poll"] = {"operation": "job_status", "job_id": job["id"], "wait_seconds": 10}
@@ -70,7 +87,9 @@ class Software:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.catalog = json.loads(Path(__file__).with_name("software_catalog.json").read_text())
-        for name in ("projects", "downloads", "jobs", "python"):
+        self.latex_catalog = json.loads(Path(__file__).with_name("latex_catalog.json").read_text(encoding="utf-8"))
+        self.profiles = self.catalog["profiles"] | {self.latex_catalog["profile"]: self.latex_catalog}
+        for name in ("projects", "downloads", "jobs", "python", "latex"):
             self.path(name).mkdir(exist_ok=True)
         # The profile is a local authorization boundary, not a model argument.
         self.lock = self.path("workspace.lock").open("a+b")
@@ -113,10 +132,10 @@ class Software:
 
     def snapshot(self, task_id=None):
         return {"root": str(self.root), "profiles": {k: {"description": v["description"], "requirements": v["requirements"]}
-                for k, v in self.catalog["profiles"].items()}, "python_version": self.catalog["python"]["version"],
+                for k, v in self.profiles.items()}, "python_version": self.catalog["python"]["version"],
                 "jobs": [job_receipt(j) for j in self.jobs.values() if task_id is None or j["task_id"] == task_id]}
 
-    def inspect(self, task_id):
+    def inspect(self, task_id, *, compact=False):
         projects = []
         for path in self.path("projects").iterdir():
             if not PROJECT.fullmatch(path.name) or path.name in RESERVED:
@@ -125,8 +144,13 @@ class Software:
             if path.is_dir():
                 projects.append({"name": path.name, "path": str(path),
                                  "managed": (path / ".qw3-project.json").is_file(),
-                                 "venv_present": (path / ".venv").exists()})
-        return self.snapshot(task_id) | {"projects": projects, "registered_python": self.registered_python()}
+                                 "venv_present": (path / ".venv").exists(),
+                                 "latex_managed": (path / ".qw3-latex-project.json").is_file(),
+                                 "latex_source_present": (path / "main.tex").is_file()})
+        result = self.snapshot(task_id) | {"projects": projects, "registered_python": self.registered_python()}
+        if compact:
+            result["jobs"] = [job_receipt(j, compact=True) for j in self.jobs.values() if j["task_id"] == task_id]
+        return result
 
     def registered_python(self):
         if sys.platform != "win32":
@@ -147,13 +171,15 @@ class Software:
         operation = arguments.get("operation")
         fields = {"inspect": {"operation"}, "setup_python": {"operation", "action_id", "project", "profile"},
                   "repair_python": {"operation", "action_id", "project", "profile"},
+                  "setup_latex": {"operation", "action_id", "project", "profile"},
+                  "repair_latex": {"operation", "action_id", "project", "profile"},
                   "job_status": {"operation", "job_id", "wait_seconds"}, "cancel_job": {"operation", "job_id"},
                   "resume_job": {"operation", "job_id"}}
         if operation not in fields or set(arguments) - fields[operation]:
             raise DesktopError("Unsupported software operation or argument")
         if operation == "inspect":
-            return self.inspect(task_id)
-        if operation in {"setup_python", "repair_python"}:
+            return self.inspect(task_id, compact=True)
+        if operation in {"setup_python", "repair_python", "setup_latex", "repair_latex"}:
             return self.start(task_id, arguments)
         job_id = arguments.get("job_id")
         if not isinstance(job_id, str) or job_id not in self.jobs or self.jobs[job_id]["task_id"] != task_id:
@@ -177,12 +203,12 @@ class Software:
             job.pop("error", None)
             self.save(job)
             self.tasks[job_id] = asyncio.create_task(self.perform(job))
-        return job_receipt(job)
+        return job_receipt(job, compact=True)
 
     def start(self, task_id, arguments):
         project, profile, action_id = (arguments.get(k) for k in ("project", "profile", "action_id"))
         if (not isinstance(project, str) or not PROJECT.fullmatch(project) or project in RESERVED
-                or not isinstance(profile, str) or profile not in self.catalog["profiles"]
+                or not isinstance(profile, str) or profile not in self.profiles
                 or not isinstance(action_id, str) or not ACTION_ID.fullmatch(action_id)):
             raise DesktopError("Invalid project, reviewed profile, or action identity")
         if not isinstance(task_id, str) or not task_id:
@@ -197,27 +223,30 @@ class Software:
             identity = "job-" + hashlib.sha256(encoded).hexdigest()[:24]
         request = {"task_id": task_id, "project": project, "profile": profile,
                    "operation": arguments.get("operation", "setup_python"), "action_id": action_id}
-        if request["operation"] not in {"setup_python", "repair_python"}:
+        if request["operation"] not in {"setup_python", "repair_python", "setup_latex", "repair_latex"}:
             raise DesktopError("Unsupported software operation")
+        if request["operation"].endswith("latex") != (profile == self.latex_catalog["profile"]):
+            raise DesktopError("Software operation does not match its reviewed profile")
         if identity in self.jobs:
             job = self.jobs[identity]
             previous = job | {"operation": job.get("operation", "setup_python"), "action_id": job.get("action_id", job["id"])}
             if any(previous[k] != v for k, v in request.items()):
                 raise DesktopError("Software action identity was reused with different arguments")
-            return job_receipt(job) | {"duplicate": True}
+            return job_receipt(job, compact=True) | {"duplicate": True}
         if sys.platform != "win32":
             raise DesktopError("Software installation currently requires the native Windows client")
         if any(j["status"] in ACTIVE or j["status"] == "uncertain" for j in self.jobs.values()):
             raise DesktopError("Another software job is active or unresolved")
-        if shutil.disk_usage(self.root).free < 1024**3:
-            raise DesktopError("Software workspace requires at least 1 GiB free before installation")
+        minimum_gib = 4 if request["operation"].endswith("latex") else 1
+        if shutil.disk_usage(self.root).free < minimum_gib * 1024**3:
+            raise DesktopError(f"Software workspace requires at least {minimum_gib} GiB free before installation")
         self.path("jobs", identity).mkdir(exist_ok=False)
         job = request | {"id": identity, "status": "starting", "attempt": 1, "steps": [],
                          "created_at": time.time(), "needs_reconciliation": False}
         self.jobs[identity] = job
         self.save(job)  # Reserve identity durably before any installation work.
         self.tasks[identity] = asyncio.create_task(self.perform(job))
-        return job_receipt(job)
+        return job_receipt(job, compact=True)
 
     async def cancel(self, identity):
         task = self.tasks.get(identity)
@@ -248,40 +277,71 @@ class Software:
             if sha256(target) != asset["sha256"]:
                 raise DesktopError("Cached download hash mismatch; retained for inspection")
             return {"file": target.name, "cache_hit": True, "bytes": target.stat().st_size, "sha256": asset["sha256"]}
-        url = urlparse(asset["url"])
-        if url.scheme != "https" or url.hostname not in {"www.python.org", "files.pythonhosted.org"}:
-            raise DesktopError("Unreviewed software download source")
+        sources = [asset["url"], *asset.get("mirrors", [])]
+        if len(sources) > 3 or len(set(sources)) != len(sources):
+            raise DesktopError("Software download requires at most three distinct reviewed sources")
+        for address in sources:
+            url = urlparse(address)
+            if (url.scheme != "https" or url.username or url.password or url.port not in (None, 443)
+                    or url.hostname not in {"www.python.org", "files.pythonhosted.org",
+                        "mirrors.jlu.edu.cn", "mirrors.ustc.edu.cn", "mirrors.hit.edu.cn"}):
+                raise DesktopError("Unreviewed software download source")
         temporary = target.with_suffix(target.suffix + ".partial-" + job["id"])
-        # A cancelled GET can restart safely; an installer is never retried here.
         maximum = asset.get("max_bytes", asset.get("bytes", 0))
-        digest = hashlib.sha256(); count = 0; started = time.monotonic()
-        try:
-            # The bundled Python cannot rely on a freshly installed Windows
-            # root store. Ship a versioned public CA bundle; retain TLS hostname
-            # and certificate checks, then separately verify the asset hash.
-            tls = ssl.create_default_context(cafile=certifi.where())
-            connector = aiohttp.TCPConnector(ssl=tls)
-            async with aiohttp.ClientSession(connector=connector, trust_env=False,
-                    timeout=aiohttp.ClientTimeout(total=300, sock_read=30)) as client:
-                async with client.get(asset["url"], allow_redirects=False) as response:
-                    if response.status != 200:
-                        raise DesktopError(f"Software download HTTP {response.status}")
-                    with temporary.open("wb") as handle:
-                        async for data in response.content.iter_chunked(262144):
-                            count += len(data)
-                            if count > maximum:
-                                raise DesktopError("Software download exceeded its reviewed size")
-                            handle.write(data); digest.update(data)
-            if digest.hexdigest() != asset["sha256"]:
-                raise DesktopError("Downloaded software hash differs from the reviewed catalog")
-            temporary.replace(target)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
-        return {"file": target.name, "cache_hit": False, "bytes": count, "sha256": digest.hexdigest(),
-                "download_seconds": time.monotonic() - started}
+        started = time.monotonic()
+        attempts = []
+        # Bounded GET fallback is safe; neither installer retries nor integrity
+        # failures are handled by this loop. Every source uses the same hash.
+        tls = ssl.create_default_context(cafile=certifi.where())
+        connector = aiohttp.TCPConnector(ssl=tls)
+        async with aiohttp.ClientSession(connector=connector, trust_env=False,
+                timeout=aiohttp.ClientTimeout(total=300, sock_read=30)) as client:
+            for address in sources:
+                host = urlparse(address).hostname
+                record = {"file": target.name, "host": host, "url": address, "status": "downloading",
+                          "started_at": time.time(), "bytes": 0, "proxy": False}
+                job.setdefault("downloads", []).append(record)
+                attempts.append(record)
+                self.save(job)
+                digest = hashlib.sha256(); last_saved = time.monotonic()
+                try:
+                    async with client.get(address, allow_redirects=False) as response:
+                        record["http_status"] = response.status
+                        if response.status != 200:
+                            record.update(status="unavailable", error=f"HTTP {response.status}")
+                            continue
+                        with temporary.open("wb") as handle:
+                            async for data in response.content.iter_chunked(262144):
+                                record["bytes"] += len(data)
+                                if record["bytes"] > maximum:
+                                    raise DesktopError(f"{target.name} from {host} exceeded its reviewed size")
+                                handle.write(data); digest.update(data)
+                                if time.monotonic() - last_saved >= 1:
+                                    self.save(job); last_saved = time.monotonic()
+                    record["sha256"] = digest.hexdigest()
+                    if digest.hexdigest() != asset["sha256"]:
+                        raise DesktopError(f"Downloaded {target.name} from {host} has a hash mismatch; no fallback permitted")
+                    temporary.replace(target)
+                    record["status"] = "verified"
+                    return {"file": target.name, "cache_hit": False, "bytes": record["bytes"],
+                            "sha256": digest.hexdigest(), "source_host": host,
+                            "download_seconds": time.monotonic() - started}
+                except (aiohttp.ClientError, TimeoutError) as exc:
+                    record.update(status="unavailable", error=f"{type(exc).__name__}: {exc}")
+                except BaseException as exc:
+                    record.update(status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                                  error=f"{type(exc).__name__}: {exc}")
+                    raise
+                finally:
+                    record["finished_at"] = time.time()
+                    if temporary.exists():
+                        temporary.unlink()
+                    self.save(job)
+        failures = "; ".join(f"{r['host']}: {r['error']}" for r in attempts)
+        raise DesktopError(f"Could not download {target.name} from reviewed sources ({failures}). "
+                           "No installer started by this download; this does not establish a system-wide network restriction.")
 
-    async def command(self, job, tag, argv, *, cwd, timeout=300):
+    async def command(self, job, tag, argv, *, cwd, timeout=300, allowed_exit_codes=(0,)):
         for path in (Path(argv[0]), Path(cwd)):
             self.path(*path.relative_to(self.root).parts)
         log = self.path("jobs", job["id"], f"{job['attempt']}-{tag}.log")
@@ -298,7 +358,7 @@ class Software:
                             raise DesktopError("Software process output exceeded its limit")
                         await asyncio.sleep(.2)
                     code = await process.wait()
-                if code:
+                if code not in allowed_exit_codes:
                     raise DesktopError(f"{tag} exited with {code}; inspect {log.name}")
             except BaseException:
                 stopped = process.returncode is not None
@@ -314,7 +374,7 @@ class Software:
                         pass
                 # An installer may delegate to Windows Installer. Killing its
                 # launcher does not establish rollback or completed delivery.
-                if tag == "install-python" or not stopped:
+                if tag in {"install-python", "install-latex"} or not stopped:
                     job["needs_reconciliation"] = True
                 raise
             finally:
@@ -342,6 +402,11 @@ class Software:
             return result
 
         try:
+            if job.get("operation") in {"setup_latex", "repair_latex"}:
+                from .software_latex import latex_workflow
+                job["verification"] = await latex_workflow(self, job, stage)
+                job.update(status="completed", finished_at=time.time())
+                return
             if job.get("operation") == "repair_python":
                 from .software_repair import repair_python
                 job["verification"] = await repair_python(self, job, stage)

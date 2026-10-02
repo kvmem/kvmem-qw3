@@ -43,6 +43,9 @@ def main():
         raise ValueError("Campaign already has a receipt; inspect its recorded handles before taking further action")
     frozen_bytes = args.acceptance.read_bytes()
     frozen = json.loads(frozen_bytes)
+    if frozen['task'] not in {'product-python-new', 'product-python-repair', 'product-latex-new', 'product-latex-repair'}:
+        raise ValueError('This campaign requires a supported product task and reset procedure')
+    scenario = frozen['task'].split('-')[1]
     for relative, expected in frozen["source_sha256"].items():
         if hashlib.sha256((ROOT / relative).read_bytes()).hexdigest() != expected:
             raise ValueError("Frozen campaign source changed: " + relative)
@@ -62,7 +65,7 @@ def main():
             if engine_dir.exists() or trial_dir.exists():
                 raise ValueError("Trial identity already exists; no automatic retry is permitted")
             repair_args = []
-            if frozen["task"] == "product-python-repair":
+            if frozen["task"].endswith('-repair'):
                 definition = frozen["repair_fixture"]
                 original = ROOT / definition["path"]
                 if hashlib.sha256(original.read_bytes()).hexdigest() != definition["sha256"]:
@@ -71,7 +74,7 @@ def main():
                 report.update(stage="resetting_repair_faults", current_trial=identity)
                 save(path, report)
                 with (output / (identity + "-fixture.log")).open("xb") as log:
-                    worker = subprocess.Popen([sys.executable, str(APP / "prepare_python_repair.py"),
+                    worker = subprocess.Popen([sys.executable, str(APP / f"prepare_{scenario}_repair.py"),
                         "--bundle", str(args.bundle.resolve()), "--output", str(fixture_dir), "--reset-from", str(original)],
                         cwd=ROOT, env=dict(os.environ, PYTHONPATH=str(APP)), stdout=log, stderr=log)
                     report["fixture_worker_pid"] = worker.pid; save(path, report)
@@ -105,7 +108,7 @@ def main():
             save(path, report)
             log_path = output / (identity + ".log")
             with log_path.open("xb") as log:
-                worker = subprocess.Popen([sys.executable, str(APP / "software_product_run.py"), "--output", str(trial_dir),
+                worker = subprocess.Popen([sys.executable, str(APP / "software_product_run.py"), "--scenario", scenario, "--output", str(trial_dir),
                     "--bundle", str(args.bundle.resolve()), "--engine", str(engine_dir), "--ffmpeg", str(args.ffmpeg.resolve()),
                     "--timeout", str(frozen["timeout_seconds"]), "--acceptance-manifest", str(args.acceptance.resolve()), *repair_args],
                     cwd=ROOT, env=dict(os.environ, PYTHONPATH=str(APP)), stdout=log, stderr=log)

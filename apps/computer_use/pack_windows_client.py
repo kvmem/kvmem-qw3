@@ -16,7 +16,7 @@ from qw3_computer.limits import MAX_MODEL_REQUEST_BYTES
 NATIVE_TEST_FILES = (
     "test_protocol.py", "test_bridge.py", "test_controller.py", "test_desktop.py",
     "test_collect_artifacts.py", "test_long_evidence.py", "test_task_driver.py",
-    "test_vm_relay.py", "test_codex_integration.py", "test_thinking.py", "test_software.py", "fixture_mcp.py", "fixture_long_mcp.py",
+    "test_vm_relay.py", "test_codex_integration.py", "test_thinking.py", "test_software.py", "test_software_latex.py", "fixture_mcp.py", "fixture_long_mcp.py",
 )
 
 
@@ -77,6 +77,8 @@ def main():
     shutil.copyfile(root / "probe_compaction.py", app / "probe_compaction.py")
     shutil.copyfile(root / "task_driver.py", app / "task_driver.py")
     shutil.copyfile(root / "collect_artifacts.py", app / "collect_artifacts.py")
+    for name in ("software_product_guest.py", "latex_product.py"):
+        shutil.copyfile(root / name, app / name)
     (output / "start.ps1").write_text('''param(
     [string]$Backend = 'http://127.0.0.1:18080/v1',
     [string]$BackendToken = '',

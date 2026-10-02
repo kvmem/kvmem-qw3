@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from qw3_computer.desktop import DesktopError
-from qw3_computer.software import Software, atomic_json, process_environment
+from qw3_computer.software import Software, atomic_json, process_environment, job_receipt
 
 
 class SoftwareTests(unittest.IsolatedAsyncioTestCase):
@@ -246,6 +246,106 @@ class SoftwareTests(unittest.IsolatedAsyncioTestCase):
         facts = json.loads(result.stdout)
         self.assertEqual(facts["hresult"], 0)
         self.assertEqual(Path(facts["path"]), Path(os.environ["PROGRAMDATA"]))
+
+
+class DownloadTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        import hashlib
+        self.temp = tempfile.TemporaryDirectory()
+        self.software = Software(Path(self.temp.name) / "workspace")
+        self.job = {"id": "download-fixture"}
+        self.software.path("jobs", self.job["id"]).mkdir()
+        self.payload = b"reviewed fixture bytes"
+        self.asset = {"filename": "fixture.bin", "url": "https://mirrors.jlu.edu.cn/fixture.bin",
+                      "mirrors": ["https://mirrors.hit.edu.cn/fixture.bin"], "max_bytes": 100,
+                      "sha256": hashlib.sha256(self.payload).hexdigest()}
+
+    async def asyncTearDown(self):
+        await self.software.close()
+        self.temp.cleanup()
+
+    async def download_with(self, responses):
+        from unittest.mock import MagicMock
+        class Response:
+            def __init__(inner, status, payload):
+                inner.status = status; inner.payload = payload; inner.content = inner
+            async def __aenter__(inner): return inner
+            async def __aexit__(inner, *args): pass
+            async def iter_chunked(inner, size):
+                yield inner.payload
+        client = MagicMock()
+        client.get.side_effect = [Response(*r) for r in responses]
+        session = MagicMock()
+        session.__aenter__.return_value = client
+        self.client = client
+        with patch('qw3_computer.software.aiohttp.TCPConnector'), patch(
+                'qw3_computer.software.aiohttp.ClientSession', return_value=session) as factory:
+            try:
+                return await self.software.download(self.job, self.asset)
+            finally:
+                if factory.called: self.assertFalse(factory.call_args.kwargs['trust_env'])
+
+    async def test_denied_source_falls_back_once_and_audits_verified_bytes(self):
+        result = await self.download_with([(403, b''), (200, self.payload)])
+        self.assertEqual(result['source_host'], 'mirrors.hit.edu.cn')
+        self.assertEqual(self.client.get.call_count, 2)
+        saved = json.loads(self.software.path('jobs', self.job['id'], 'job.json').read_text())
+        self.assertEqual([r['status'] for r in saved['downloads']], ['unavailable', 'verified'])
+        self.assertEqual(saved['downloads'][0]['http_status'], 403)
+        self.assertEqual(self.software.path('downloads', 'fixture.bin').read_bytes(), self.payload)
+        self.assertFalse(list(self.software.path('downloads').glob('*.partial-*')))
+
+    async def test_integrity_failure_does_not_fall_back_or_publish_asset(self):
+        with self.assertRaisesRegex(DesktopError, 'hash mismatch'):
+            await self.download_with([(200, b'changed bytes'), (200, self.payload)])
+        self.assertEqual(self.client.get.call_count, 1)
+        self.assertEqual(self.job['downloads'][0]['status'], 'failed')
+        self.assertFalse(list(self.software.path('downloads').iterdir()))
+
+    async def test_all_sources_unavailable_names_asset_hosts_and_statuses(self):
+        with self.assertRaises(DesktopError) as context:
+            await self.download_with([(403, b''), (503, b'')])
+        message = str(context.exception)
+        for part in ('fixture.bin', 'mirrors.jlu.edu.cn: HTTP 403', 'mirrors.hit.edu.cn: HTTP 503'):
+            self.assertIn(part, message)
+        self.assertEqual(self.client.get.call_count, 2)
+        self.assertFalse(list(self.software.path('downloads').iterdir()))
+
+    async def test_unreviewed_fallback_is_rejected_before_any_network_request(self):
+        self.asset['mirrors'] = ['https://unreviewed.invalid/fixture.bin']
+        with self.assertRaisesRegex(DesktopError, 'Unreviewed'):
+            await self.download_with([])
+        self.client.get.assert_not_called()
+
+
+class ReceiptTests(unittest.TestCase):
+    def test_model_poll_is_bounded_while_complete_evidence_remains_available(self):
+        downloads = [{'file': f'asset-{i}.bin', 'host': 'mirrors.hit.edu.cn', 'status': 'verified',
+                      'http_status': 200, 'bytes': 1024, 'sha256': 'a' * 64, 'url': 'https://mirrors.hit.edu.cn/' + 'x' * 200}
+                     for i in range(200)]
+        job = {'id': 'job-test', 'task_id': 'private-task', 'action_id': 'private-action', 'status': 'running',
+               'stage': 'install_latex', 'needs_reconciliation': False, 'downloads': downloads,
+               'steps': [{'status': 'completed', 'result': {'assets': downloads}}]}
+        original = json.dumps(job)
+        compact = job_receipt(job, compact=True)
+        self.assertLess(len(json.dumps(compact)), 1500)
+        self.assertEqual(compact['progress']['assets_downloaded'], 200)
+        self.assertEqual(compact['next_poll']['job_id'], job['id'])
+        self.assertNotIn('task_id', compact)
+        self.assertEqual(job_receipt(job)['downloads'], downloads)
+        self.assertEqual(json.dumps(job), original)
+
+    def test_terminal_receipt_retains_error_diagnosis_and_actual_delivery(self):
+        job = {'id': 'job-test', 'status': 'failed', 'error': 'ctexart.cls absent',
+               'needs_reconciliation': True, 'diagnosis': {'missing_file': 'ctexart.cls'}}
+        receipt = job_receipt(job, compact=True)
+        self.assertEqual(receipt['error'], job['error'])
+        self.assertEqual(receipt['diagnosis'], job['diagnosis'])
+        self.assertTrue(receipt['needs_reconciliation'])
+        self.assertNotIn('next_poll', receipt)
+        job.update(status='completed', needs_reconciliation=False,
+                   verification={'passed': True, 'pdf': 'C:/project/build/actual.pdf'})
+        self.assertEqual(job_receipt(job, compact=True)['verification'], job['verification'])
 
 
 if __name__ == "__main__":

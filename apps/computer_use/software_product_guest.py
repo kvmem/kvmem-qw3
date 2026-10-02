@@ -194,7 +194,8 @@ async def run(configuration):
     output = Path("C:/Qw3Computer/product-runs") / identity
     output.mkdir(parents=True, exist_ok=False)
     share = Path("//host.lan/Data")
-    repair = config.get("task") == "product-python-repair"
+    repair = config.get("task", "").endswith("-repair")
+    latex = config.get("task", "").startswith("product-latex-")
     fixture = None
     if repair:
         fixture_path = share / (identity + "-fixture.json")
@@ -204,8 +205,11 @@ async def run(configuration):
         if fixture["status"] != "ready_fault_injected" or fixture["model_used"] is not False:
             raise ValueError("Repair fixture is not independently prepared")
     workspace = Path(fixture["workspace"]) if repair else Path("C:/Qw3Computer/outputs") / (identity + "-software")
-    project = workspace / "projects" / ("repair-target" if repair else "python-demo")
+    project = Path(fixture["target_project"]) if repair else workspace / "projects" / ("latex-paper" if latex else "python-demo")
     grader = grade_repair if repair else grade
+    launcher_grader = grade_launcher
+    if latex:
+        from latex_product import grade as grader, grade_launcher as launcher_grader
     bundle = Path("C:/Qw3Computer/clients") / config["bundle_sha256"][:12]
     manifest = json.loads((bundle / "manifest.json").read_text())
     if "opt_in_software_workflows" not in manifest["runtime_capabilities"]:
@@ -217,10 +221,10 @@ async def run(configuration):
         raise ValueError("Guest launcher changed")
     if digest(Path("C:/Qw3Computer/executor.ps1")) != config["executor_sha256"]:
         raise ValueError("Guest executor differs from the recorded candidate")
-    report = {"kind": "native_local_python_product_trial", "run": identity, "status": "preparing", "passed": False,
+    report = {"kind": "native_local_software_product_trial", "run": identity, "status": "preparing", "passed": False,
               "model_used": True, "advisor_used": False, "execution_mode": "local_model_with_controlled_software_tools",
               "bundle_sha256": config["bundle_sha256"], "cold_workspace": not repair, "started_at": time.time(),
-              "scenario": "product-python-repair" if repair else "product-python-new", "thinking": config.get("thinking", False)}
+              "scenario": config["task"], "thinking": config.get("thinking", False)}
     app = None
     owned_ready = False
     token_path = Path("C:/Qw3Computer") / (identity + "-model-token.txt")
@@ -240,8 +244,8 @@ async def run(configuration):
             if repair:
                 baseline = {"registry_paths": registry_paths(), "fixture": fixture}
                 pre = output / "before"; pre.mkdir()
-                initial_grade = await grade_repair(project, baseline, pre)
-                initial_launcher = await grade_launcher(project, pre)
+                initial_grade = await grader(project, baseline, pre)
+                initial_launcher = await launcher_grader(project, pre)
                 if (initial_grade["passed"] or initial_launcher["passed"]
                         or not initial_grade["checks"].get("unrelated_project_unchanged")):
                     raise ValueError("Repair faults or reference preservation are not present at task start")
@@ -249,10 +253,14 @@ async def run(configuration):
                 if workspace.exists():
                     raise ValueError("Product workspace already exists; clean-install trial is invalid")
                 project.mkdir(parents=True)
-                (project / "main.py").write_text(MAIN, encoding="utf-8")
-                (project / "test_main.py").write_text(TEST, encoding="utf-8")
+                if latex:
+                    shutil.copyfile(bundle / "app/qw3_computer/latex_example.tex", project / "main.tex")
+                else:
+                    (project / "main.py").write_text(MAIN, encoding="utf-8")
+                    (project / "test_main.py").write_text(TEST, encoding="utf-8")
                 baseline = {"registry_paths": registry_paths(), "venv_absent": not (project / ".venv").exists(),
-                            "input_sha256": {name: digest(project / name) for name in ("main.py", "test_main.py")}}
+                            "input_sha256": {name: digest(project / name) for name in (("main.tex",) if latex else ("main.py", "test_main.py"))},
+                            "latex_install_absent": not (workspace / "latex/latex-paper").exists()}
             save(output / "initial-state.json", baseline)
             try:
                 await api("/api/state")
@@ -298,6 +306,14 @@ async def run(configuration):
                           "打开项目终端选择的环境也不对。它原本使用 python-web 配置档。"
                           "先诊断实际问题，只修复这个项目，保留源文件、系统 PATH 和 unrelated-project 项目。"
                           "等待实际验证通过后，说明发现的问题、做了什么修复、下次如何打开正确的项目终端。")
+            if latex:
+                prompt = ("请为选定工作目录中的 latex-paper 项目安装可用的 LaTeX 环境。保留已有 main.tex，"
+                          "用提供的 latex-chinese-math 配置档生成中文和公式正常的 PDF，不修改系统 PATH。"
+                          "等待实际安装、编译和验证完成，再告诉我 PDF 在哪里，以及下次怎样打开项目终端和重新编译。")
+                if repair:
+                    prompt = ("请修复选定工作目录中的 latex-repair 项目。它原来可以用 latex-chinese-math 配置档编译，"
+                              "现在编译失败。先诊断真实错误，保留原始 main.tex 和其他项目，不修改系统 PATH。"
+                              "修复后重新编译，等待实际验证通过，说明错误原因和可用 PDF 的位置。")
             (output / "prompt.txt").write_text(prompt, encoding="utf-8")
             progress("model_running")
             report["task"] = await run_task("http://127.0.0.1:18083", prompt, output / "task", config["timeout_seconds"])
@@ -305,7 +321,7 @@ async def run(configuration):
             progress("independent_verification")
             report["grade"] = await grader(project, baseline, output)
             report["passed"] = report["task"]["outcome"] == "agent_completed" and report["grade"]["passed"]
-            report["launcher_grade"] = await grade_launcher(project, output)
+            report["launcher_grade"] = await launcher_grader(project, output)
             report["passed"] = report["passed"] and report["launcher_grade"]["passed"]
             if report["task"]["outcome"] == "agent_completed":
                 progress("reopening_application")
@@ -333,7 +349,7 @@ async def run(configuration):
                         await asyncio.sleep(.3)
                 restart_output = output / "reopened"; restart_output.mkdir()
                 restarted_grade = await grader(project, baseline, restart_output)
-                restarted_launcher = await grade_launcher(project, restart_output)
+                restarted_launcher = await launcher_grader(project, restart_output)
                 restart_checks = {"different_process": app.pid != prior_pid, "task_identity_preserved": reopened["id"] == before["id"],
                     "completion_preserved": reopened["status"] == "completed" and reopened.get("software_verified") is True,
                     "desktop_paused": reopened["desktop_paused"], "job_records_unchanged": bool(saved_jobs) and
@@ -360,7 +376,7 @@ async def run(configuration):
             if (workspace / "jobs").exists():
                 shutil.copytree(workspace / "jobs", output / "software-jobs")
             artifacts = output / "project"; artifacts.mkdir(exist_ok=True)
-            for name in ("main.py", "test_main.py", "requirements.lock", "ENVIRONMENT.txt", "open-terminal.cmd", "environment-verification.json"):
+            for name in ("main.py", "test_main.py", "requirements.lock", "ENVIRONMENT.txt", "open-terminal.cmd", "environment-verification.json", "main.tex", "open-latex-terminal.cmd", "compile-latex.cmd"):
                 if (project / name).is_file():
                     shutil.copyfile(project / name, artifacts / name)
             report["finished_at"] = time.time()

@@ -80,7 +80,7 @@ basic-miktex-25.12-x64.exe --unattended --private --portable=<独立目录> --no
 `5105e31100f2ef70ed0ebff76df631a2670b2d8889994bb7ebd639952c5b3ff6`。
 实测 PDF SHA-256：`e25d314ec3db03ad60f8e2a2fd50c3175ec94f3a588c88f2be7a49faac652d8e`。
 安装文件、20 个宏包、4 个仓库元数据及字体身份已整理为
-`apps/computer_use/latex_catalog.json`，标明仅完成脚本资格验证，尚未向 agent 提供。
+`apps/computer_use/qw3_computer/latex_catalog.json`，标明仅完成脚本资格验证，尚未向 agent 提供。
 旧探针的 host 层 `source_sha256` 是执行脚本哈希；文档哈希取自 guest 结果并由独立
 校验器重新计算，不混用两个字段。
 

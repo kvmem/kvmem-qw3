@@ -725,3 +725,32 @@ scripted token usage. At the 950K threshold, the observed compaction request
 includes the prior image and the following request contains the text summary
 without that image. Both policies must use this same history behavior and
 record compaction events. This probe is not a 950K-token GPU inference test.
+
+## LaTeX software workflow
+
+The current Windows candidate adds `setup_latex` and `repair_latex` with the
+`latex-chinese-math` profile. Native contract checks passed; real model product
+acceptance is tracked in `docs/computer_use_latex_product_20261003.md`.
+
+Place a UTF-8 `main.tex` in `SoftwareRoot/projects/<project>` (or let a new setup
+create the included Chinese/math example), then ask the local agent to configure
+that project. The workflow installs a private portable MiKTeX 25.12 under
+`SoftwareRoot/latex/<project>`, verifies the fixed assets in
+`qw3_computer/latex_catalog.json`, and compiles in two new processes. It leaves
+system PATH untouched and provides `open-latex-terminal.cmd` and
+`compile-latex.cmd`. The result receipt and app show the produced PDF path.
+Downloads ignore proxy environment variables and verify TLS and SHA-256.
+
+Repair accepts only a matching managed project. It compiles the original source,
+maps a missing file to the verified package archives, repairs at most two known
+packages, and compiles again. Unknown failures retain their logs for takeover.
+It cannot silently upgrade an arbitrary existing TeX distribution. Interrupted
+installers remain uncertain and cannot be automatically restarted. Compilation
+disables automatic package installation, shell escapes, and first-line option
+parsing. This is a controlled installation workflow, not an OS sandbox for
+untrusted TeX source; use a VM when opening documents you do not trust.
+
+Run the product harness with `--scenario latex --thinking` and a qualified
+client bundle. It restores the declared Windows baseline and records continuous
+video; host Poppler tools independently inspect and render the actual PDFs.
+Script qualification and native contracts are separate from model task passes.

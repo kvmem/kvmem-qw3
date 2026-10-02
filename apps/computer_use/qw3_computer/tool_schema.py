@@ -64,17 +64,20 @@ SOFTWARE_TOOLS = [{"name": "software", "description":
     "install the selected profile's exact dependencies and verify them in fresh processes. project is a short lowercase name, "
     "repair_python diagnoses an existing managed project, repairs missing/broken dependencies and its terminal launcher, "
     "preserves a replaced launcher backup, and verifies again. It does not reinstall Python or repair unknown environments. "
-    "not a path. Check job_status with wait_seconds=10 while it runs. A completed job must include verification.passed=true. "
+    "not a path. setup_latex installs a project-local MiKTeX toolchain, preserves or creates main.tex, installs fixed Chinese/math "
+    "packages, compiles twice, and delivers a PDF plus open-latex-terminal.cmd and compile-latex.cmd. repair_latex diagnoses "
+    "an existing managed LaTeX project and repairs at most two reviewed missing packages, then compiles twice. "
+    "Use profile latex-chinese-math for LaTeX operations and python-web for Python operations. Check job_status with wait_seconds=10 while it runs. A completed job must include verification.passed=true. "
     "Copy job_id from the job receipt or use its next_poll arguments exactly; the desktop task ID is a different identifier. "
     "Do not claim completion from a job start receipt. cancel_job stops further workflow steps; interrupted installers may "
     "require human reconciliation. resume_job continues only a known stopped failed/cancelled job. Never resubmit an uncertain "
     "installation with another action_id. No arbitrary commands, URLs, package scripts or system PATH edits are accepted.",
     "inputSchema": {"type": "object", "oneOf": [
         {"type": "object", "properties": {"operation": {"const": "inspect"}}, "required": ["operation"], "additionalProperties": False},
-        {"type": "object", "properties": {"operation": {"enum": ["setup_python", "repair_python"]},
+        {"type": "object", "properties": {"operation": {"enum": ["setup_python", "repair_python", "setup_latex", "repair_latex"]},
             "action_id": {"type": "string", "pattern": "^[a-zA-Z0-9_-]{8,80}$"},
             "project": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,47}$"},
-            "profile": {"enum": ["python-web"]}},
+            "profile": {"enum": ["python-web", "latex-chinese-math"]}},
          "required": ["operation", "action_id", "project", "profile"], "additionalProperties": False},
         {"type": "object", "properties": {"operation": {"const": "job_status"}, "job_id": {"type": "string"},
             "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 10}},
@@ -87,7 +90,7 @@ SOFTWARE_TOOLS = [{"name": "software", "description":
 # Keep operation-specific oneOf validation, and expose the same property types
 # at the root so wait_seconds is decoded as an integer rather than raw text.
 SOFTWARE_TOOLS[0]["inputSchema"]["properties"] = {
-    "operation": {"type": "string", "enum": ["inspect", "setup_python", "repair_python", "job_status", "cancel_job", "resume_job"]},
+    "operation": {"type": "string", "enum": ["inspect", "setup_python", "repair_python", "setup_latex", "repair_latex", "job_status", "cancel_job", "resume_job"]},
     "action_id": {"type": "string"}, "project": {"type": "string"}, "profile": {"type": "string"},
     "job_id": {"type": "string"}, "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 10}
 }

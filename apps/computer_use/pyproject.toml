@@ -17,4 +17,4 @@ qw3-computer = "qw3_computer.app:main"
 include = ["qw3_computer*"]
 
 [tool.setuptools.package-data]
-qw3_computer = ["ui.html", "software_catalog.json"]
+qw3_computer = ["ui.html", "software_catalog.json", "latex_catalog.json", "latex_example.tex"]

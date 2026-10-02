@@ -45,6 +45,9 @@ def summarize(root):
         "delivered_launcher_passed": guest.get("launcher_grade", {}).get("passed"),
         "application_reopen_passed": guest.get("reopen", {}).get("passed"),
         "application_reopen_checks": guest.get("reopen", {}).get("checks", {}),
+        "pdf_acceptance_passed": result.get("pdf_grade", {}).get("passed"),
+        "download_attempts": [{k: r.get(k) for k in ("file", "host", "status", "http_status", "bytes", "error")}
+                              for job in jobs for r in job.get("downloads", [])],
         "task_seconds": task.get("finished_at", 0) - task.get("started_at", 0) if task.get("finished_at") else None,
         "host_total_seconds": result.get("finished_at", 0) - result["started_at"] if result.get("finished_at") else None,
         "inference": latency([(r["host_finished_monotonic_ns"] - r["host_received_monotonic_ns"]) / 1e9 for r in requests]),

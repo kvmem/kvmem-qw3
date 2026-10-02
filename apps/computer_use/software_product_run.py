@@ -48,7 +48,7 @@ async def run(args):
     lock = open("/tmp/qw3-osworld-vm.lock", "a")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     report = {"kind": "local_model_software_product_trial", "status": "preparing", "passed": False,
-              "task": "product-python-repair" if args.repair_fixture else "product-python-new", "model_used": True, "advisor_used": False,
+              "task": f"product-{args.scenario}-" + ("repair" if args.repair_fixture else "new"), "model_used": True, "advisor_used": False,
               "execution_mode": "local_model_with_controlled_software_tools", "started_at": time.time()}
     recorder = None; relay = None; sampler = None
     sampled = asyncio.Event()
@@ -93,8 +93,9 @@ async def run(args):
         if args.acceptance_manifest:
             if engine["binary_sha256"] != frozen["engine_binary_sha256"] or engine["command"] != frozen["engine_command"]:
                 raise ValueError("Engine differs from frozen acceptance profile")
-        sources = [Path(__file__), APP / "software_product_guest.py", APP / "vm/executor.ps1",
-                   *sorted((APP / "qw3_computer").glob("*.py")), APP / "qw3_computer/software_catalog.json"]
+        sources = [Path(__file__), APP / "software_product_guest.py", APP / "latex_product.py", APP / "vm/executor.ps1",
+                   *sorted((APP / "qw3_computer").glob("*.py")),
+                   *sorted((APP / "qw3_computer").glob("*.json")), APP / "qw3_computer/latex_example.tex"]
         report["source_commit"] = (await command("git", "rev-parse", "HEAD")).strip()
         report["source_sha256"] = {str(p.relative_to(ROOT)): sha256(p) for p in sources}
         shutil.copyfile(__file__, output / "executed-host.py")
@@ -199,6 +200,10 @@ $worker=Start-Process $python -ArgumentList $arguments -WindowStyle Hidden -Pass
             source = SHARE / (identity + "-guest." + suffix)
             if source.exists(): shutil.copyfile(source, output / ("guest." + suffix))
         report.update(status="complete", passed=guest.get("passed") is True and guest.get("desktop_stopped") is True)
+        if args.scenario == "latex":
+            from latex_product import host_pdf_grade
+            report["pdf_grade"] = host_pdf_grade(output)
+            report["passed"] = report["passed"] and report["pdf_grade"]["passed"]
         credential.unlink()
     except Exception as exc:
         report.update(status="halted", error=f"{type(exc).__name__}: {exc}")
@@ -222,6 +227,7 @@ $worker=Start-Process $python -ArgumentList $arguments -WindowStyle Hidden -Pass
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scenario", choices=["python", "latex"], default="python")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--engine", type=Path, required=True)
