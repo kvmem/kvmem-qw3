@@ -198,7 +198,10 @@
     "apps/computer_use/.runtime/product-latex-new-02/result.json",
     "apps/computer_use/.runtime/latex-product-development-audit-20261003.json",
     "apps/computer_use/.runtime/windows-client-29-qualification-01/result.json",
-    "apps/computer_use/.runtime/latex-product-replay-20261003/browser-check.json"
+    "apps/computer_use/.runtime/latex-product-replay-20261003/browser-check.json",
+    "apps/computer_use/.runtime/latex-new-formal-20261003/acceptance.json",
+    "apps/computer_use/.runtime/latex-new-formal-01/result.json",
+    "apps/computer_use/.runtime/latex-new-formal-01/audited-summary.json"
   ],
   "latest_checks": {
     "gpu_idle": false,
@@ -228,7 +231,7 @@
   ],
   "product_trials": {
     "status": "python_formal_complete_latex_development_running",
-    "completed": 6,
+    "completed": 7,
     "planned": 12,
     "development_attempts_completed": 9,
     "development_passed": 6,
@@ -240,10 +243,10 @@
     "scenario_status": {
       "product-python-new": "formal_3_of_3_passed_with_launcher_and_reopen",
       "product-python-repair": "formal_3_of_3_passed_with_launcher_and_reopen",
-      "product-latex-new": "development_passed_formal_campaign_running",
+      "product-latex-new": "formal_1_of_3_passed_queue_running",
       "product-latex-repair": "planned"
     },
-    "formal_passed": 6,
+    "formal_passed": 7,
     "formal_report": "docs/computer_use_python_formal_20261003.md",
     "formal_acceptance": "apps/computer_use/.runtime/python-new-formal-20261003/acceptance.json",
     "repair_fixture": {
@@ -349,12 +352,12 @@
     "new_development_passed": 1,
     "new_development_failed": 1,
     "current_trial": null,
-    "formal_completed": 0,
+    "formal_completed": 1,
     "network_failure_diagnosis": "JLU installer HTTP403; direct HIT same file verified against official SHA256; USTC package files reachable",
     "source_switch": "reviewed HTTPS mirrors only, bounded GET attempts, stop on integrity mismatch",
     "audit": "apps/computer_use/.runtime/latex-product-development-audit-20261003.json",
     "replay": "apps/computer_use/.runtime/latex-product-replay-20261003/index.html",
-    "poll_receipt_compaction": "implemented_native_qualified_real_model_retest_pending",
+    "poll_receipt_compaction": "actual_local_model_qualified_first_formal_trial",
     "formal_campaign": {
       "status": "running",
       "acceptance": "apps/computer_use/.runtime/latex-new-formal-20261003/acceptance.json",
@@ -363,7 +366,36 @@
       "same_version_three_repetitions": true,
       "cold_download_cache": true,
       "fresh_vm_and_engine_each_trial": true,
-      "halt_on_first_failure": true
+      "halt_on_first_failure": true,
+      "completed": 1,
+      "passed": 1
+    },
+    "formal_passed": 1,
+    "first_formal_audit": "apps/computer_use/.runtime/latex-new-formal-01/audited-summary.json",
+    "receipt_comparison": {
+      "baseline": "product-latex-new-02",
+      "candidate": "latex-new-formal-01",
+      "max_prompt_tokens": [
+        87916,
+        14130
+      ],
+      "max_tool_response_chars": [
+        22877,
+        3082
+      ],
+      "task_seconds": [
+        339.7788300514221,
+        221.70896887779236
+      ],
+      "download_seconds": [
+        120.29164934158325,
+        30.306095361709595
+      ],
+      "inference_seconds": [
+        168.872743048,
+        56.841063362999996
+      ],
+      "limits": "One descriptive comparison; cold cache on both but download duration changed, so wall-time difference is not isolated agent speedup."
     }
   }
 }
