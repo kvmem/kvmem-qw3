@@ -70,6 +70,10 @@ def summarize(directory):
             timing_rows.append(dict(re.findall(r'(\w+)=([0-9.]+)', line)))
     first_tokens = [float(r['server_ttft_ms']) for r in timing_rows if r.get('model_token_seen') == '1']
     visible_output = [float(r['response_ttft_ms']) for r in timing_rows if r.get('visible_output_seen') == '1']
+    measured_first_tokens = [r for r in timing_rows
+        if r.get('model_token_seen') == '1' and float(r.get('request_total_ms', 0)) > 0]
+    first_token_wait = sum(float(r['server_ttft_ms']) for r in measured_first_tokens)
+    server_request_time = sum(float(r['request_total_ms']) for r in measured_first_tokens)
     review = directory / 'trajectory-review.json'
     return dict(task=result['task'], name=DEFINITIONS[result['task']][0], kvmem=result['kvmem'],
         run=result['run'], formal_run=False, pipeline_passed=result['pipeline_passed'],
@@ -84,6 +88,10 @@ def summarize(directory):
         max_request_seconds=max(request_seconds) if request_seconds else None,
         median_server_first_token_ms=statistics.median(first_tokens) if first_tokens else None,
         median_visible_response_ms=statistics.median(visible_output) if visible_output else None,
+        server_timed_requests=len(measured_first_tokens),
+        server_first_token_wait_seconds_sum=first_token_wait / 1000,
+        server_timed_request_seconds_sum=server_request_time / 1000,
+        first_token_wait_fraction=first_token_wait / server_request_time if server_request_time else None,
         largest_input_tokens=max(tokens) if tokens else None,
         sampled_gpu_device_peak_bytes=max((r.get('gpu_memory_bytes', 0) for r in resources), default=0),
         sampled_engine_tree_peak_rss_bytes=max((r.get('peak_rss_bytes', 0) for r in resources), default=0),
@@ -135,6 +143,12 @@ def write_markdown(result, output):
         f"{result['passed']} 条按时完整通过，{result['valid_artifact_correct']} 条有效试次产物正确。", '',
         '## 同配置开关结果', '',
         '| 场景 | 预算 | KVMem 开 | KVMem 关 |', '|---|---:|---|---|']
+    matrix = result['first_ten_scenario_matrix']
+    lines[6:6] = [
+        f"首次配对已完成 {matrix['completed_paired_scenarios']} 个场景："
+        f"{matrix['valid_attempts']} 条有效试次，{matrix['complete_passes']} 条按时通过，"
+        f"{matrix['artifact_correct']} 条产物正确；开 {matrix['on_complete_passes']} 次通过，"
+        f"关 {matrix['off_complete_passes']} 次通过。额外配对复测单独保留。", '']
     groups = {}
     for row in rows:
         if row['valid_trial']:
@@ -192,6 +206,17 @@ def build(queues, output, preview):
                      'Short contexts do not measure long-history KVMem retention benefits.',
                      'On/off use the current product configurations, including prefix cache differences.',
                      'Videos start at capture start and include startup/cleanup; actions are not aligned.'])
+    first_pairs = {}
+    for pair in result['matched_pairs']:
+        first_pairs.setdefault(pair['task'], pair)
+    result['first_ten_scenario_matrix'] = dict(
+        completed_paired_scenarios=len(first_pairs),
+        valid_attempts=2 * len(first_pairs),
+        complete_passes=sum(p['on_passed'] + p['off_passed'] for p in first_pairs.values()),
+        artifact_correct=sum(p['on_artifact_correct'] + p['off_artifact_correct'] for p in first_pairs.values()),
+        on_complete_passes=sum(p['on_passed'] for p in first_pairs.values()),
+        off_complete_passes=sum(p['off_passed'] for p in first_pairs.values()),
+        additional_paired_retests=len(result['matched_pairs']) - len(first_pairs))
     (output / 'summary.json').write_text(json.dumps(result, indent=2, ensure_ascii=False) + '\n')
     write_markdown(result, output)
     fields = ['task', 'name', 'kvmem', 'run', 'status', 'passed', 'partial_check_fraction', 'task_seconds',

@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T03:03:18.383857+00:00",
+  "updated_at": "2026-10-02T03:57:23.070095+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -2041,11 +2041,11 @@
     "formal_run": false,
     "definition": "apps/computer_use/osworld_windows/capabilities.py",
     "first_batch_plan": "docs/computer_use_windows_capability_plan_20261002.json",
-    "status": "text_platform_qualified_remaining_three_prepared",
+    "status": "ten_custom_pairs_and_budget_retest_complete",
     "original_ten_task_results_preserved": true,
     "formal_original_runs_completed": 0,
-    "completed_attempts": 17,
-    "passed": 12,
+    "completed_attempts": 25,
+    "passed": 20,
     "first_batch_evidence": "apps/computer_use/.runtime/windows-capability-calibration-01/result.json",
     "analysis": "apps/computer_use/.runtime/windows-capability-analysis-01/summary.json",
     "preview_url": "http://127.0.0.1:18089/capability/index.html",
@@ -2056,7 +2056,11 @@
       "Browser to Notepad extraction",
       "Browser form submission",
       "Spreadsheet formulas and saved workbook",
-      "Constrained document edits"
+      "Constrained document edits",
+      "Presentation constrained edits",
+      "Two rule versions and browser reference",
+      "File rename and move with exact byte preservation",
+      "Sort complete spreadsheet records and preserve formulas"
     ],
     "observed_limit": "cap02 off correctly edited onscreen but failed to save by 300 seconds; not proof of inability to edit",
     "invalid_office_attempts": 1,
@@ -2075,11 +2079,11 @@
     "office_snapshot": "qw3-osworld-office-20261002-v2",
     "office_restore_qualification": "apps/computer_use/.runtime/office-handler-qualification-02/roundtrip-result.json",
     "office_restore_qualified": true,
-    "valid_calibration_attempts": 14,
-    "complete_passes": 12,
+    "valid_calibration_attempts": 22,
+    "complete_passes": 20,
     "separate_blocked_or_invalid_attempts": 3,
-    "valid_artifact_correct": 13,
-    "current_queue": "apps/computer_use/.runtime/windows-capability-calibration-04/result.json",
+    "valid_artifact_correct": 21,
+    "current_queue": "apps/computer_use/.runtime/windows-capability-calibration-06/result.json",
     "current_case": null,
     "observed_limits": [
       "cap02 off edited correctly but did not save within 300 seconds",
@@ -2088,7 +2092,28 @@
     "presentation_grader_correction": "apps/computer_use/capability_regrade.py",
     "presentation_correction_source": "presentation-text-v2",
     "first_presentation_grades_preserved": true,
-    "original_grader_and_model_results_preserved": true
+    "original_grader_and_model_results_preserved": true,
+    "first_ten_matrix": {
+      "completed_paired_scenarios": 10,
+      "valid_attempts": 20,
+      "complete_passes": 18,
+      "artifact_correct": 19,
+      "on_complete_passes": 10,
+      "off_complete_passes": 8,
+      "additional_paired_retests": 1
+    },
+    "all_continuous_recordings_complete": true,
+    "agent_strategy_optimized": false,
+    "budget_retest": {
+      "task": "cap02",
+      "timeout_seconds": 600,
+      "on_passed": true,
+      "off_passed": true,
+      "on_seconds": 163.1286447,
+      "off_seconds": 223.512188,
+      "not_isolated_timeout_causal_experiment": true
+    },
+    "observed_tool_id_format_errors": 31
   },
   "native_interruption_recovery": {
     "qualified": true,
