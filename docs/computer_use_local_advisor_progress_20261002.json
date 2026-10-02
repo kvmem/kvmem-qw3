@@ -5,7 +5,7 @@
   "status": "active",
   "local_plan": "docs/computer_use_local_diagnostic_plan_20261002.json",
   "combined_goal": "docs/computer_use_local_advisor_goal_20261002.md",
-  "current_stage": "latex_new_formal_campaign_running_client29",
+  "current_stage": "latex_new_formal_complete_repair_fixture_running",
   "source_baseline": "56896791b41b6aa5c022c99dac4996f719bd4ba0",
   "stages": {
     "P0": {
@@ -201,15 +201,20 @@
     "apps/computer_use/.runtime/latex-product-replay-20261003/browser-check.json",
     "apps/computer_use/.runtime/latex-new-formal-20261003/acceptance.json",
     "apps/computer_use/.runtime/latex-new-formal-01/result.json",
-    "apps/computer_use/.runtime/latex-new-formal-01/audited-summary.json"
+    "apps/computer_use/.runtime/latex-new-formal-01/audited-summary.json",
+    "apps/computer_use/.runtime/latex-new-formal-02/result.json",
+    "apps/computer_use/.runtime/latex-new-formal-03/result.json",
+    "apps/computer_use/.runtime/latex-new-formal-20261003/audit.json",
+    "apps/computer_use/.runtime/latex-new-complete-replay-20261003/browser-check.json",
+    "apps/computer_use/.runtime/original-readiness-recheck-20261003/result.json"
   ],
   "latest_checks": {
-    "gpu_idle": false,
+    "gpu_idle": true,
     "root_available_approx_gib": 227,
-    "previous_queue_status": "latex_new_formal_campaign_live",
-    "gpu_compute_processes": 1
+    "previous_queue_status": "latex_new_formal_terminal_engines_stopped_repair_fixture_live",
+    "gpu_compute_processes": 0
   },
-  "next_action": "Continue the existing latex-new-formal-20261003 campaign without starting another copy. Read its campaign.json handles and terminal results. Audit all three after completion, then prepare latex-repair fixture and real-model repair development; retain failures and remaining P3-P6/advisor requirements.",
+  "next_action": "Inspect the existing latex-repair-fixture-01 host/guest worker and result without restarting it. Once healthy prerequisites and exact missing-class fault are verified, run real local-model repair; analyze any failure, then freeze three formal repairs. P3-P6/KVMem and advisor scope remains required.",
   "advisor_provider": {
     "provider": "deepseek",
     "model": "deepseek-flash",
@@ -230,8 +235,8 @@
     "product-latex-repair"
   ],
   "product_trials": {
-    "status": "python_formal_complete_latex_development_running",
-    "completed": 7,
+    "status": "three_product_scenarios_formal_complete_latex_repair_pending",
+    "completed": 9,
     "planned": 12,
     "development_attempts_completed": 9,
     "development_passed": 6,
@@ -243,10 +248,10 @@
     "scenario_status": {
       "product-python-new": "formal_3_of_3_passed_with_launcher_and_reopen",
       "product-python-repair": "formal_3_of_3_passed_with_launcher_and_reopen",
-      "product-latex-new": "formal_1_of_3_passed_queue_running",
-      "product-latex-repair": "planned"
+      "product-latex-new": "formal_3_of_3_passed_with_pdf_launcher_and_reopen",
+      "product-latex-repair": "scripted_fixture_running"
     },
-    "formal_passed": 7,
+    "formal_passed": 9,
     "formal_report": "docs/computer_use_python_formal_20261003.md",
     "formal_acceptance": "apps/computer_use/.runtime/python-new-formal-20261003/acceptance.json",
     "repair_fixture": {
@@ -352,14 +357,14 @@
     "new_development_passed": 1,
     "new_development_failed": 1,
     "current_trial": null,
-    "formal_completed": 1,
+    "formal_completed": 3,
     "network_failure_diagnosis": "JLU installer HTTP403; direct HIT same file verified against official SHA256; USTC package files reachable",
     "source_switch": "reviewed HTTPS mirrors only, bounded GET attempts, stop on integrity mismatch",
     "audit": "apps/computer_use/.runtime/latex-product-development-audit-20261003.json",
-    "replay": "apps/computer_use/.runtime/latex-product-replay-20261003/index.html",
+    "replay": "apps/computer_use/.runtime/latex-new-complete-replay-20261003/index.html",
     "poll_receipt_compaction": "actual_local_model_qualified_first_formal_trial",
     "formal_campaign": {
-      "status": "running",
+      "status": "complete_audited",
       "acceptance": "apps/computer_use/.runtime/latex-new-formal-20261003/acceptance.json",
       "progress": "apps/computer_use/.runtime/latex-new-formal-20261003/campaign.json",
       "planned": 3,
@@ -367,10 +372,10 @@
       "cold_download_cache": true,
       "fresh_vm_and_engine_each_trial": true,
       "halt_on_first_failure": true,
-      "completed": 1,
-      "passed": 1
+      "completed": 3,
+      "passed": 3
     },
-    "formal_passed": 1,
+    "formal_passed": 3,
     "first_formal_audit": "apps/computer_use/.runtime/latex-new-formal-01/audited-summary.json",
     "receipt_comparison": {
       "baseline": "product-latex-new-02",
@@ -396,6 +401,14 @@
         56.841063362999996
       ],
       "limits": "One descriptive comparison; cold cache on both but download duration changed, so wall-time difference is not isolated agent speedup."
+    },
+    "formal_audit": "apps/computer_use/.runtime/latex-new-formal-20261003/audit.json",
+    "repair_fixture": "apps/computer_use/.runtime/latex-repair-fixture-01/worker.json",
+    "resource_followup": {
+      "gpu_peak_gib_approx": 67.3,
+      "max_context_tokens": 1048576,
+      "short_context_profile_qualified": false,
+      "action": "Controlled follow-up after product baseline; compare context settings/KVMem without equating network-dependent task duration to model speedup."
     }
   }
 }

@@ -1151,7 +1151,7 @@
         "host_queue_and_review_contract_evidence": "apps/computer_use/.runtime/host-preparation-contracts-02/result.json"
       },
       "full_budget_client15_process_preflight": {
-        "status": "real_model_task_running",
+        "status": "task_failed",
         "run": "osworld-native051-client15-on-03",
         "formal_run": false,
         "timeout_seconds": 3600,
@@ -1169,10 +1169,15 @@
         "workspace_evidence_path_preserved": true,
         "recording_required": true,
         "independent_full_process_review_pending": true,
-        "last_verified_stage": "native_task_launched",
+        "last_verified_stage": "terminal_result_reconciled",
         "continuous_recorder_started": true,
         "original_public_materials_initialized": true,
-        "actual_prompt_and_model_engine_sources_unchanged": true
+        "actual_prompt_and_model_engine_sources_unchanged": true,
+        "outcome": "agent_failed",
+        "strict_success": false,
+        "artifact_error": "missing_final_xcf",
+        "reconciled_from": "apps/computer_use/.runtime/original-readiness-recheck-20261003/result.json",
+        "session_historical_only": true
       }
     },
     "022": {
