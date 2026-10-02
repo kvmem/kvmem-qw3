@@ -39,3 +39,11 @@ class RecoveryDiagnosticTests(unittest.TestCase):
         self.assertIn('20000', page('delayed_update', '/request').decode())
         self.assertNotIn('Aster', content)
         self.assertNotIn('R-204', content)
+
+    def test_correct_request_does_not_hide_changes_to_the_protected_note(self):
+        state = dict(condition='normal', started=True, events=[{'event':'saved_visible'}],
+                     saved_count=1, saved={'name':'Aster','reference':'R-204'})
+        task = dict(outcome='agent_completed', desktop_stopped=True, terminal_observation={})
+        self.assertTrue(grade(state, task, b'Protected unrelated note.')['unassisted_success'])
+        self.assertFalse(grade(state, task, b'Changed note.')['unassisted_success'])
+        self.assertFalse(grade(state, task)['unassisted_success'])
