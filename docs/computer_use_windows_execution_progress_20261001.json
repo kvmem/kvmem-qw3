@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T03:57:23.070095+00:00",
+  "updated_at": "2026-10-02T04:46:47.611795+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -248,7 +248,7 @@
     "Complete remaining common platform and task preparation; JPG/PNG/JPEG snapshot restoration and same-budget 051 actual-model retest have passed platform checks, while task remains incomplete",
     "Complete 006 missing original availability and application focus qualification; original mirror/initializer and neutral folder export are now native-verified, with full scenario still unready",
     "Keep scripted four-review 035 platform qualification separate from actual QW3 failure; freeze dynamic event rules and disclose 022 nonrequired broken links",
-    "Qualify remaining common long-context and native interruption behavior, then freeze model/engine/history/budgets; offline private-site images, fonts and routing are now Windows-qualified",
+    "Qualify actual-model near-1M context/compaction and choose a disclosed common history policy; native Windows interruption control-plane passed with scripted inference; then freeze model/engine/history/budgets",
     "Complete 043 source-conflict disclosures and 051 full process audit when an artifact could pass; retain failures as failures",
     "Freeze common model/engine/history/budgets and qualified clean snapshot before formal comparisons",
     "20 V0 on/off baseline runs; diagnose; at most two generic candidates; V1 comparison and conditional repetition"
@@ -2158,5 +2158,52 @@
     "client_and_executor_unchanged": true,
     "final_clean_restore": true,
     "failed_native_txt_trial_preserved": "apps/computer_use/.runtime/windows-capability-calibration-04/capability-cap08-on-03/result.json"
+  },
+  "actual_long_context_qualification": {
+    "status": "two_actual_model_diagnostics_failed_before_compaction",
+    "formal_run": false,
+    "v1_candidate_implemented": false,
+    "native_client_unchanged": true,
+    "default_history_policy_changed": false,
+    "first_attempt": {
+      "directory": "apps/computer_use/.runtime/native-long-context-boundary-on-01/long-context-on-01",
+      "visual_history": "pin-all",
+      "observations_received": 5,
+      "requests_completed": 5,
+      "maximum_completed_prompt_tokens": 253792,
+      "failed_request_index": 6,
+      "error": "KVMem mandatory semantic selection plus sink blocks exceeds the configured selection budget",
+      "completed_compactions": 0,
+      "continuous_recording_complete": true,
+      "scope": "Synthetic 60K-token tool-result padding with a live screenshot per observation; not representative desktop latency or task success",
+      "attempted_prompt_tokens": 316743
+    },
+    "next_attempt": {
+      "directory": "apps/computer_use/.runtime/native-long-context-retrievable-on-01/long-context-on-02",
+      "visual_history": "retrievable",
+      "status": "failed_before_compaction",
+      "observations_received": 5,
+      "maximum_completed_prompt_tokens": 253806,
+      "attempted_prompt_tokens": 316760,
+      "completed_compactions": 0,
+      "continuous_recording_complete": true,
+      "error": "KVMem mandatory semantic selection plus sink blocks exceeds the configured selection budget"
+    },
+    "independent_audit": "apps/computer_use/osworld_windows/grade_long_context.py",
+    "limits": [
+      "Do not claim 1M qualification from scripted usage",
+      "Near-1M summary request itself must have measured usage and engine trace",
+      "History strategy is an isolated diagnostic variable; not V1 success evidence"
+    ],
+    "near_1m_qualified": false,
+    "diagnosis": "Both visual policies planned 509 mandatory blocks, but final runtime retained 1509/1493 against budget 1024; reused checkpoint 127744 made effective suffix about 189K tokens. Visual-policy toggle did not resolve failure; exact corrective change still requires a controlled engine regression.",
+    "earlier_visual_only_hypothesis_not_supported": true,
+    "gpu_oom_observed": false,
+    "off_long_context_diagnostic_completed": false,
+    "host_services_stopped": true,
+    "desktop_paused": true,
+    "audit_unit_controls_passed": 4,
+    "report": "docs/computer_use_windows_long_context_boundary_20261002.md",
+    "preview_url": "http://127.0.0.1:18089/long-context/index.html"
   }
 }
