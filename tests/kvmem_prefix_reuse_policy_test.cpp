@@ -410,3 +410,21 @@ static_assert(qw3::detail::kvmem_query_safe_prompt_checkpoint_split(582, 0, 32, 
 static_assert(qw3::detail::kvmem_complete_query_replay_boundary(2441, 2415, 2439, 128) == 2304);
 static_assert(qw3::detail::kvmem_complete_query_replay_boundary(2574, 2415, 2439, 128) == 2560);
 static_assert(qw3::detail::kvmem_complete_query_replay_boundary(1019, 1025, 1080, 32) == 992);
+
+// The Windows long-history failure restored P=127744 but the current tool
+// result begins around 253K. Replaying everything after P incorrectly pins
+// about 189K tokens against a 128K window. Advance only the replay checkpoint,
+// without truncating any ingested source or relaxing the complete-Q rule.
+static_assert(qw3::detail::kvmem_cached_query_replay_boundary(
+    253799, 1882, 1972, 128, 127744) == 253696);
+static_assert(316760 - qw3::detail::kvmem_cached_query_replay_boundary(
+    253799, 1882, 1972, 128, 127744) < 65536);
+static_assert(qw3::detail::kvmem_cached_query_replay_boundary(
+    2441, 2415, 2439, 128, 2048) == 2304);
+static_assert(qw3::detail::kvmem_cached_query_replay_boundary(
+    1882, 1882, 1972, 128, 127744) == 127744);
+static_assert(qw3::detail::kvmem_cached_query_replay_boundary(
+    1019, 1025, 1080, 32, 1024) == 1024);
+static_assert(qw3::detail::kvmem_cached_query_replay_boundary(
+    (1ull << 40) + 500, 1882, 1972, 128, (1ull << 40)) ==
+    (1ull << 40) + 384);

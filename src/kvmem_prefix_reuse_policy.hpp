@@ -66,6 +66,21 @@ constexpr uint64_t kvmem_complete_query_replay_boundary(
         ? before_query : boundary;
 }
 
+// A cached scoring Q does not make all tokens after its old P/M checkpoint a
+// live transaction. Ingest completed tool history before capturing the current
+// live suffix boundary, keeping the restored checkpoint as the earliest
+// reachable origin. Otherwise an old P can turn several bounded tool results
+// into one mandatory suffix larger than the selection budget. The complete
+// source remains indexed; only the post-selection replay origin advances.
+constexpr uint64_t kvmem_cached_query_replay_boundary(
+        uint64_t requested_begin, uint64_t query_begin,
+        uint64_t query_end, uint32_t block_tokens,
+        uint64_t resume_position) {
+    const uint64_t live_boundary = kvmem_complete_query_replay_boundary(
+        requested_begin, query_begin, query_end, block_tokens);
+    return live_boundary > resume_position ? live_boundary : resume_position;
+}
+
 // Stage P before one complete branch-sensitive tail block.  Agent harnesses
 // rewrite a small suffix of the prior live assistant turn when it becomes
 // history (for example, the generated empty-think marker may disappear).  The

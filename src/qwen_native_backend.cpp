@@ -12848,7 +12848,9 @@ private:
             const uint32_t bt = std::max<uint32_t>(
                 1, executor_->block_store()->config().block_tokens);
             query_replay_begin = ru.query_snapshot_reuse
-                ? reuse_m
+                ? detail::kvmem_cached_query_replay_boundary(
+                    requested_replay_begin, options.kvmem_query_begin,
+                    options.kvmem_query_end, bt, reuse_m)
                 : detail::kvmem_complete_query_replay_boundary(
                     requested_replay_begin, options.kvmem_query_begin, options.kvmem_query_end, bt);
             if (query_replay_begin == 0) {
@@ -15120,7 +15122,10 @@ private:
             const uint32_t bt = std::max<uint32_t>(
                 1, executor_->block_store()->config().block_tokens);
             kvmem_query_replay_begin = kvmem_ru.query_snapshot_reuse
-                ? kvmem_reuse_m
+                ? detail::kvmem_cached_query_replay_boundary(
+                    kvmem_effective_replay_begin(options),
+                    options.kvmem_query_begin, options.kvmem_query_end,
+                    bt, kvmem_reuse_m)
                 : detail::kvmem_complete_query_replay_boundary(
                     kvmem_effective_replay_begin(options), options.kvmem_query_begin, options.kvmem_query_end, bt);
             if (kvmem_query_replay_begin == 0) {
