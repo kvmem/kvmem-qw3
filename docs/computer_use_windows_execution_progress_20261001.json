@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T10:28:11.930819+00:00",
+  "updated_at": "2026-10-02T10:31:01.166917+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -1151,7 +1151,7 @@
         "host_queue_and_review_contract_evidence": "apps/computer_use/.runtime/host-preparation-contracts-02/result.json"
       },
       "full_budget_client15_process_preflight": {
-        "status": "planned",
+        "status": "real_model_task_running",
         "run": "osworld-native051-client15-on-03",
         "formal_run": false,
         "timeout_seconds": 3600,
@@ -1161,7 +1161,18 @@
         "snapshot": "qw3-osworld-client15-20261002",
         "bundle": "windows-native-client-15",
         "v1_agent_strategy_change": false,
-        "purpose": "Complete from-original-material process and final artifact evidence; any missing artifact or process violation stays failure; unknown process audit is disclosed separately"
+        "purpose": "Complete from-original-material process and final artifact evidence; any missing artifact or process violation stays failure; unknown process audit is disclosed separately",
+        "session": 25181,
+        "output": "apps/computer_use/.runtime/windows-client15-051-process-01/osworld-native051-client15-on-03",
+        "private_data_output": "/data/qw3-computer-use-history-20261002/windows-client15-051-process-01/osworld-native051-client15-on-03",
+        "source_commit": "8a83f99",
+        "workspace_evidence_path_preserved": true,
+        "recording_required": true,
+        "independent_full_process_review_pending": true,
+        "last_verified_stage": "native_task_launched",
+        "continuous_recorder_started": true,
+        "original_public_materials_initialized": true,
+        "actual_prompt_and_model_engine_sources_unchanged": true
       }
     },
     "022": {
