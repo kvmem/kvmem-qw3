@@ -446,8 +446,9 @@ function Application-Entries {
     $entry = [Text.Encoding]::UTF8.GetString($raw).TrimStart([char]0xfeff) | ConvertFrom-Json
     Properties $entry @('version','run','task','browser_profile','browser_urls','explorer_path')
     Require ($entry.version -eq 1 -and $entry.run -cmatch '^[a-zA-Z0-9_-]{8,60}$') 'Invalid task application entry identity'
-    Require ($entry.task -in @('013','004','006','010','038','022','035','043','080','051')) 'Unknown application entry task'
+    Require ($entry.task -in @('013','004','006','010','038','022','035','043','080','051','p3')) 'Unknown application entry task'
     $profile = "$root\OsworldBrowserProfile"
+    if ($entry.task -eq 'p3') { $profile = "$root\P3Tasks\$($entry.run)\BrowserProfile" }
     if ($entry.task -eq '022') { $profile = "$root\LoanTasks\$($entry.run)\BrowserProfile" }
     if ($entry.task -eq '035') { $profile = "$root\PurchaseTasks\$($entry.run)\BrowserProfile" }
     if ($entry.task -eq '043') { $profile = "$root\CalendarTasks\$($entry.run)\BrowserProfile" }

@@ -29,7 +29,7 @@ def prepare(task, run, prompt, collection, bundle, staged, output, *, timeout, t
         raise ValueError('Thinking must be a boolean')
     if thinking and 'opt_in_local_thinking' not in json.loads((Path(bundle) / 'manifest.json').read_text()).get('runtime_capabilities', []):
         raise ValueError('Native bundle has no qualified thinking capability')
-    if (task not in {'013','004','006','010','038','022','035','043','080','051', *CAPABILITY_TASKS}
+    if (task not in {'013','004','006','010','038','022','035','043','080','051','p3', *CAPABILITY_TASKS}
             or not re.fullmatch(r'[a-zA-Z0-9_-]{8,60}',run) or not isinstance(prompt,str) or not prompt.strip()
             or type(timeout) is not int or not 1 <= timeout <= 14400
             or type(tool_limit) is not int or not 1 <= tool_limit <= 10000

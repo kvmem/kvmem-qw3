@@ -5,7 +5,7 @@
   "status": "active",
   "local_plan": "docs/computer_use_local_diagnostic_plan_20261002.json",
   "combined_goal": "docs/computer_use_local_advisor_goal_20261002.md",
-  "current_stage": "four_product_scenarios_formal_complete_p3_and_resource_followup_next",
+  "current_stage": "p3_fixture_qualified_native_model_preflight_running",
   "source_baseline": "56896791b41b6aa5c022c99dac4996f719bd4ba0",
   "stages": {
     "P0": {
@@ -99,9 +99,39 @@
       "native_report": "docs/computer_use_native_thinking_20261003.md"
     },
     "P3": {
-      "status": "planned",
+      "status": "fixture_qualified_native_model_preflight_running",
       "trials_completed": 0,
-      "planned_trials": 32
+      "planned_trials": 32,
+      "report": "docs/computer_use_recovery_diagnostic_p3_20261003.md",
+      "baseline_bundle": "windows-native-client-30",
+      "condition_count": 8,
+      "model_trials_completed": 0,
+      "scripted_conditions_qualified": [
+        "normal",
+        "wrong_focus",
+        "save_confirmation",
+        "outside_scope",
+        "delayed_update",
+        "wrong_page",
+        "uncertain_delivery",
+        "normal_slow_loading"
+      ],
+      "qualification_failures_retained": [
+        "Notepad process-name case-sensitive assertion",
+        "partial SMB preparation receipt read",
+        "custom outside-scope window unavailable"
+      ],
+      "infrastructure_fixes": [
+        "case-insensitive process comparison",
+        "atomic preparation receipts and bounded JSON read retries",
+        "use built-in Character Map as unrelated outside-scope foreground"
+      ],
+      "qualification_queue": null,
+      "scripted_qualification_attempts": 10,
+      "scripted_qualification_passed": 8,
+      "scripted_qualification_failed": 2,
+      "qualification_manifest": "apps/computer_use/.runtime/p3-baseline-20261003/qualification.json",
+      "current_model_preflight": "apps/computer_use/.runtime/p3-native-preflight-01"
     },
     "P4": {
       "status": "planned",
@@ -226,7 +256,7 @@
     "gpu_compute_processes": 0,
     "checked_at": 1790982486.6385703
   },
-  "next_action": "Advance P3: freeze eight fault/healthy recovery scenarios with selected thinking-on local profile, qualify fixed fault injection and grading, run original/candidate two repetitions (32) with independent artifacts and videos. Also predeclare a short-context resource follow-up for actual product workloads before claiming ordinary-hardware suitability. Preserve P4/P5, original ten V0/V1, and P7/P8 advisor requirements; overall goal remains active.",
+  "next_action": "Complete remaining P3 fixture qualifications, freeze baseline 16 real-model attempts, record independent request artifacts and continuous video; analyze actual failures before at most two general recovery changes and 16 candidate attempts. Keep all pending P4/P5, original ten V0/V1, advisor and resource qualification requirements active.",
   "advisor_provider": {
     "provider": "deepseek",
     "model": "deepseek-flash",

@@ -26,7 +26,7 @@ function Sample-Client {
 }
 try {
     $configuration=Get-Content "$public\native-task.json" -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($configuration.run -cne $RunId -or $configuration.task -notin @('013','004','006','010','038','022','035','043','080','051','cap01','cap02','cap03','cap04','cap05','cap06','cap07','cap08','cap09','cap10','cap11','cap12')) {throw 'Task configuration identity mismatch'}
+    if ($configuration.run -cne $RunId -or $configuration.task -notin @('013','004','006','010','038','022','035','043','080','051','p3','cap01','cap02','cap03','cap04','cap05','cap06','cap07','cap08','cap09','cap10','cap11','cap12')) {throw 'Task configuration identity mismatch'}
     if ($configuration.bundle_sha256 -cnotmatch '^[a-f0-9]{64}$' -or $configuration.backend -cnotmatch '^http://[0-9.]+:18084/v1$') {throw 'Invalid frozen client/backend identity'}
     if ($configuration.timeout_seconds -lt 1 -or $configuration.timeout_seconds -gt 14400 -or $configuration.tool_call_limit -lt 1 -or $configuration.tool_call_limit -gt 10000) {throw 'Invalid frozen task budget'}
     $modelWait=600; $modelReadWait=180
@@ -69,6 +69,9 @@ try {
     $appArguments='-X utf8 -m qw3_computer.app --desktop http://127.0.0.1:5000 --desktop-token C:\Qw3Computer\executor-token.txt'+
         ' --backend '+$configuration.backend+' --backend-token "'+$runtime+'\model-token.txt" --runtime "'+$runtime+'\app"'+
         ' --tool-call-limit '+$configuration.tool_call_limit+' --output-policy task --trace-backend'
+    # P3's authenticated loopback proxy forwards every real executor request;
+    # its only transport fault withholds a successfully delivered save receipt.
+    if ($configuration.task -eq 'p3') { $appArguments=$appArguments.Replace('--desktop http://127.0.0.1:5000 ', '--desktop http://127.0.0.1:5001 ') }
     # Historical bundles keep their original default CLI. Extended waits
     # require a newly qualified bundle that supports these explicit options.
     if ($modelWait -ne 600 -or $modelReadWait -ne 180) {
@@ -84,6 +87,11 @@ try {
         Start-Sleep -Milliseconds 250
     }
     if (!$ownedReady) {throw 'Native application did not become ready'}
+    if ($configuration.task -eq 'p3') {
+        $fixtureToken=(Get-Content 'C:\Qw3Computer\executor-token.txt' -Raw).Trim()
+        $fixture=Invoke-RestMethod 'http://127.0.0.1:5001/fixture/start' -Method Post -Headers @{Authorization="Bearer $fixtureToken"} -ContentType 'application/json' -Body '{}' -TimeoutSec 10
+        if (!$fixture.started) {throw 'Recovery fixture did not confirm its initial condition'}
+    }
     $taskArguments='-X utf8 "'+$client+'\app\task_driver.py" --prompt "'+$runtime+'\prompt.txt" --output "'+$runtime+'\task" --timeout '+$configuration.timeout_seconds
     if ($configuration.review_batches) {$taskArguments+=' --review-mailbox "'+$share+'\'+$RunId+'-reviews" --review-batches '+$configuration.review_batches}
     Write-Progress 'task_starting'
