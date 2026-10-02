@@ -1,0 +1,33 @@
+{
+  "kind": "public_capability_inputs",
+  "host_expected_outputs_included": false,
+  "tasks": {
+    "cap01": {},
+    "cap02": {
+      "draft.txt": "d93ad79295f6c43455365ae292f8a858015f784cd11c1eaa4573eb9bd7f5fbde"
+    },
+    "cap03": {},
+    "cap04": {},
+    "cap05": {
+      "order.xlsx": "7878b977eece6cff0308f2ce19aeaf8b04337a4f92a4f4aacd0b28ee4e404216"
+    },
+    "cap06": {
+      "weekly.docx": "06e348e0e67467190bd714e5ea348707149bc455b766d59de4b07f273c7cc3ec"
+    },
+    "cap07": {
+      "briefing.pptx": "bfcf4991ad0c3e262165dc2e48f0ca8b4e67137f2b20a8c8b0ca54db550bdaac"
+    },
+    "cap08": {
+      "policy-new.txt": "6372a2664d096ef2977219777acef74d63f0615037d4221f1da79a68724e6bdb",
+      "policy-old.txt": "562ef84b7fa7e61c0ad8a7c29c1e199e8a8274452e6902bdd817dcb58700ac8b"
+    },
+    "cap09": {
+      "CapFiles/keep.txt": "81ebb2f65b34537a68b2fa83b3b2fdfadbcd83f6ddd2fcb4b9cab1cc680f76c8",
+      "CapFiles/draft.txt": "299e77774eb636547598ff7bddb65e7861ad375245d4b2265a4a20aafe2dddaa",
+      "CapFiles/todo.txt": "dc4e4771f9295bc3658c7bf8e07f94be230efafbbb7303d21b79c7144d524530"
+    },
+    "cap10": {
+      "sales.xlsx": "9cfb9f5f538284eef7bf470d3a023d31276d3ee02ad79391fd0f783fe7bb4360"
+    }
+  }
+}

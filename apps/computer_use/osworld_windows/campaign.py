@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from .native_run import DEFAULT_SNAPSHOT, run as run_attempt
 from .scenarios import validate_task
 from .source import ROOT, sha256
+from .capabilities import TASKS as CAPABILITY_TASKS, INPUT_ROOT, input_sources
 
 
 def validate(plan):
@@ -48,7 +49,13 @@ async def execute(plan, args, *, runner=run_attempt):
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     report = dict(kind='windows_native_integration_queue', formal_run=False,
                   plan=plan, status='running', completed_attempts=0, trials=[])
-    sources = {p: sha256(p) for p in (ROOT / 'apps/computer_use/osworld_windows').glob('*.py')}
+    source_paths = list((ROOT / 'apps/computer_use/osworld_windows').glob('*.py'))
+    if any(a['task'] in CAPABILITY_TASKS for a in plan['attempts']):
+        source_paths += input_sources()
+        if (plan.get('public_inputs_manifest_sha256') is not None
+                and plan['public_inputs_manifest_sha256'] != sha256(INPUT_ROOT / 'manifest.json')):
+            raise ValueError('Queue plan belongs to another public fixture corpus')
+    sources = {p: sha256(p) for p in source_paths}
     report['source_sha256'] = {str(p.relative_to(ROOT)): value for p, value in sources.items()}
 
     def save():

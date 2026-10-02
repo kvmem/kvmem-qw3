@@ -2041,9 +2041,22 @@
     "formal_run": false,
     "definition": "apps/computer_use/osworld_windows/capabilities.py",
     "first_batch_plan": "docs/computer_use_windows_capability_plan_20261002.json",
-    "status": "prepared",
+    "status": "first_batch_complete",
     "original_ten_task_results_preserved": true,
-    "formal_original_runs_completed": 0
+    "formal_original_runs_completed": 0,
+    "completed_attempts": 8,
+    "passed": 7,
+    "first_batch_evidence": "apps/computer_use/.runtime/windows-capability-calibration-01/result.json",
+    "analysis": "apps/computer_use/.runtime/windows-capability-analysis-01/summary.json",
+    "preview_url": "http://127.0.0.1:18089/capability/index.html",
+    "next_batch_plan": "docs/computer_use_windows_capability_plan_02_20261002.json",
+    "observed_feasible": [
+      "Create and save text",
+      "Edit while preserving input",
+      "Browser to Notepad extraction",
+      "Browser form submission"
+    ],
+    "observed_limit": "cap02 off correctly edited onscreen but failed to save by 300 seconds; not proof of inability to edit"
   },
   "native_interruption_recovery": {
     "qualified": true,

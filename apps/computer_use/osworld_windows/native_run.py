@@ -24,6 +24,7 @@ from .scenarios import IMPLEMENTED, SITES, collection, prepare as prepare_task, 
 from .sites import Site
 from .site_platform import PLATFORM as SITE_PLATFORM, qualify_runtime as qualify_sites
 from .source import ROOT, sha256
+from .capabilities import TASKS as CAPABILITY_TASKS, input_sources
 
 DEFAULT_SNAPSHOT = 'qw3-osworld-images-20261002'
 SNAPSHOT_QUALIFICATIONS = {
@@ -173,6 +174,8 @@ async def run(args):
                 'model_relay.py', 'snapshot.py', 'archive_share.py', 'client_resources.ps1')]
             sources.append(app / 'run_engine.py')
             sources.append(SITE_PLATFORM)
+            if args.task in CAPABILITY_TASKS:
+                sources += input_sources()
             report['source_sha256'] = {str(p.relative_to(ROOT)): sha256(p) for p in sources}
             report['snapshot'] = json.loads((share.parent / 'snapshots' / args.snapshot / 'manifest.json').read_text())
             owns_desktop = True

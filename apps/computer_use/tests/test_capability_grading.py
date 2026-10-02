@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
+import zipfile
 
 from osworld_windows.capabilities import grade, public_inputs
 
@@ -64,6 +66,54 @@ class CapabilityGradingTests(unittest.TestCase):
                                        ('cap07', 'briefing.pptx', 'cap07.pptx'), ('cap10', 'sales.xlsx', 'cap10.xlsx')]:
                 folder = root / task; public_inputs(task, folder)
                 (folder / result).write_bytes((folder / name).read_bytes())
+                self.assertFalse(grade(task, folder)['strict_success'])
+
+    def test_correct_saved_office_outputs_can_pass_and_wrong_records_fail(self):
+        # Private evaluator controls, never copied into the VM input corpus.
+        from docx import Document
+        from pptx import Presentation
+        from openpyxl import load_workbook
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for task in ['cap05', 'cap06', 'cap07', 'cap10']:
+                public_inputs(task, root / task)
+            word = root / 'cap06'; doc = Document(word / 'weekly.docx')
+            doc.paragraphs[0].text = 'Weekly Report'
+            doc.paragraphs[2].text = 'Atlas: Approved'; doc.paragraphs[3].text = 'Birch: Approved'
+            doc.save(word / 'cap06.docx')
+            self.assertTrue(grade('cap06', word)['strict_success'])
+            doc.paragraphs[1].text = 'Owner: someone else'; doc.save(word / 'cap06.docx')
+            self.assertFalse(grade('cap06', word)['strict_success'])
+            slides = root / 'cap07'; deck = Presentation(slides / 'briefing.pptx')
+            deck.slides[1].shapes.title.text = 'Results'
+            member = deck.slides._sldIdLst[-1]; deck.part.drop_rel(member.rId); deck.slides._sldIdLst.remove(member)
+            deck.save(slides / 'cap07.pptx')
+            self.assertTrue(grade('cap07', slides)['strict_success'])
+            for task, source, formulas, cached in [
+                ('cap05', 'order.xlsx', {'D2': '=B2*C2', 'D3': '=B3*C3', 'D4': '=B4*C4', 'D5': '=SUM(D2:D4)'},
+                 {'D2': 24, 'D3': 24, 'D4': 15, 'D5': 63}),
+                ('cap10', 'sales.xlsx', {'C6': '=SUM(C2:C5)'}, {'C6': 900})]:
+                folder = root / task; book = load_workbook(folder / source); sheet = book.active
+                if task == 'cap10':
+                    records = sorted(list(sheet.values)[1:5], key=lambda row: row[2], reverse=True)
+                    for r, row in enumerate(records, 2):
+                        for c, value in enumerate(row, 1): sheet.cell(r, c).value = value
+                for cell, expression in formulas.items(): sheet[cell] = expression
+                target = folder / (task + '.xlsx'); book.save(target)
+                # openpyxl cannot calculate; model ordinary Office cache bytes in
+                # the independent control, retaining formulas in the file.
+                with zipfile.ZipFile(target) as archive: members = {n: archive.read(n) for n in archive.namelist()}
+                tree = ET.fromstring(members['xl/worksheets/sheet1.xml']); ns = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+                for cell in tree.iter(ns + 'c'):
+                    if cell.get('r') in cached:
+                        value = cell.find(ns + 'v')
+                        if value is None: value = ET.SubElement(cell, ns + 'v')
+                        value.text = str(cached[cell.get('r')])
+                members['xl/worksheets/sheet1.xml'] = ET.tostring(tree)
+                with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED) as archive:
+                    for name, content in members.items(): archive.writestr(name, content)
+                self.assertTrue(grade(task, folder)['strict_success'])
+                broken = load_workbook(target); broken.active['A2'] = 'wrong ID'; broken.save(target)
                 self.assertFalse(grade(task, folder)['strict_success'])
 
 

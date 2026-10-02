@@ -7,11 +7,12 @@ this suite does not change its allowlist, client bundle, or disk snapshot.
 import json
 from pathlib import Path
 import re
-import subprocess
+import shutil
 
 from .source import ROOT, sha256
 
 TASKS = tuple(f'cap{i:02d}' for i in range(1, 11))
+INPUT_ROOT = ROOT / 'apps/computer_use/fixtures/windows_capability'
 DESKTOP = 'C:\\Users\\Qw3Test\\Desktop\\'
 OUTPUTS = 'C:\\Qw3Computer\\outputs\\'
 DEFINITIONS = {
@@ -117,15 +118,41 @@ def public_inputs(task, directory):
         book.save(directory / 'sales.xlsx')
 
 
+def input_sources():
+    """Validate the fixed public fixture corpus and expose its freeze inputs."""
+    manifest = INPUT_ROOT / 'manifest.json'
+    index = json.loads(manifest.read_text())
+    if (index.get('host_expected_outputs_included') is not False
+            or set(index.get('tasks', {})) != set(TASKS)):
+        raise ValueError('Invalid public fixture corpus')
+    sources = [manifest]
+    for members in index['tasks'].values():
+        for relative, digest in members.items():
+            path = Path(relative)
+            if path.is_absolute() or '..' in path.parts or '\\' in relative:
+                raise ValueError('Unsafe fixture member')
+            # Resolve the task explicitly below; all members must match bytes.
+    for task, members in index['tasks'].items():
+        for relative, digest in members.items():
+            path = INPUT_ROOT / task / relative
+            if sha256(path) != digest:
+                raise ValueError('Public fixture changed: ' + task + '/' + relative)
+            sources.append(path)
+    return sources
+
+
 def prepare(task, run, output, bundle=None):
     if task not in TASKS or not re.fullmatch(r'[a-zA-Z0-9_-]{8,60}', run):
         raise ValueError('Invalid capability attempt')
     output = Path(output); output.mkdir(parents=True, exist_ok=False)
     staged = ROOT / 'apps/computer_use/.runtime/windows/shared' / (run + '-inputs'); staged.mkdir(exist_ok=False)
-    # Office authoring dependencies are in the qualified host evaluator environment.
-    subprocess.run([str(ROOT / 'third_party/OSWorld-V2/.venv/bin/python'), '-m',
-                    'osworld_windows.capabilities', '--public-inputs', task,
-                    '--directory', str(staged / 'materials')], check=True, timeout=60)
+    input_sources()
+    members = json.loads((INPUT_ROOT / 'manifest.json').read_text())['tasks'][task]
+    (staged / 'materials').mkdir()
+    for relative in members:
+        destination = staged / 'materials' / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(INPUT_ROOT / task / relative, destination)
     hashes = {str(p.relative_to(staged / 'materials')).replace('\\', '/'): sha256(p)
               for p in (staged / 'materials').rglob('*') if p.is_file()}
     (staged / 'material-hashes.json').write_text(json.dumps(hashes, indent=2))
@@ -155,7 +182,8 @@ $result | ConvertTo-Json -Depth 5 | Set-Content '\\host.lan\Data\RUN_ID-setup-re
     prompt = DEFINITIONS[task][3] + ' Use only the computer tools. Verify the saved result before finishing.'
     manifest = dict(task=task, run=run, instruction=prompt, formal_run=False,
                     suite='custom_capability_calibration', osworld_official_task=False,
-                    inputs=hashes, fixture_sha256=fixture_sha, legacy_application_entries=True)
+                    inputs=hashes, fixture_sha256=fixture_sha, legacy_application_entries=True,
+                    public_inputs_manifest_sha256=sha256(INPUT_ROOT / 'manifest.json'))
     (output / 'prompt.txt').write_text(prompt)
     (output / 'manifest.json').write_text(json.dumps(manifest, indent=2))
     return manifest
