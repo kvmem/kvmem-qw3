@@ -1,0 +1,908 @@
+{
+  "kind": "original_ten_readiness_evidence_inventory",
+  "formal_run": false,
+  "readiness_declared_complete": false,
+  "tasks": [
+    {
+      "task": "013",
+      "grader_certificate_available": true,
+      "grader_certificate": {
+        "path": "apps/computer_use/.runtime/osworld-013-grader-01/result.json",
+        "sha256": "08899b60f2ce14936750d3c91c639da469ea107cfdd3243fc1b4009c2bcccb94"
+      },
+      "case_count": 50,
+      "all_case_controls_passed": true,
+      "positive_control_candidates": [
+        {
+          "case": "valid-00",
+          "pointer": "/cases/0/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-01",
+          "pointer": "/cases/1/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-02",
+          "pointer": "/cases/2/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-03",
+          "pointer": "/cases/3/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-04",
+          "pointer": "/cases/4/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-05",
+          "pointer": "/cases/5/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-06",
+          "pointer": "/cases/6/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-07",
+          "pointer": "/cases/7/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-08",
+          "pointer": "/cases/8/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-09",
+          "pointer": "/cases/9/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-10",
+          "pointer": "/cases/10/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-11",
+          "pointer": "/cases/11/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-12",
+          "pointer": "/cases/12/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-13",
+          "pointer": "/cases/13/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-14",
+          "pointer": "/cases/14/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-15",
+          "pointer": "/cases/15/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-16",
+          "pointer": "/cases/16/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-17",
+          "pointer": "/cases/17/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-18",
+          "pointer": "/cases/18/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-19",
+          "pointer": "/cases/19/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-20",
+          "pointer": "/cases/20/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-21",
+          "pointer": "/cases/21/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-22",
+          "pointer": "/cases/22/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-23",
+          "pointer": "/cases/23/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-24",
+          "pointer": "/cases/24/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-25",
+          "pointer": "/cases/25/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-26",
+          "pointer": "/cases/26/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-27",
+          "pointer": "/cases/27/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-28",
+          "pointer": "/cases/28/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-29",
+          "pointer": "/cases/29/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-30",
+          "pointer": "/cases/30/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-31",
+          "pointer": "/cases/31/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-32",
+          "pointer": "/cases/32/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-33",
+          "pointer": "/cases/33/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-34",
+          "pointer": "/cases/34/result",
+          "strict_success": true
+        },
+        {
+          "case": "valid-35",
+          "pointer": "/cases/35/result",
+          "strict_success": true
+        }
+      ],
+      "negative_control_candidates": [
+        {
+          "case": "initial",
+          "pointer": "/cases/36/result",
+          "strict_success": false
+        },
+        {
+          "case": "missing-first_prize",
+          "pointer": "/cases/37/result",
+          "strict_success": false
+        },
+        {
+          "case": "missing-first_prize_amount",
+          "pointer": "/cases/38/result",
+          "strict_success": false
+        },
+        {
+          "case": "missing-second_prize",
+          "pointer": "/cases/39/result",
+          "strict_success": false
+        },
+        {
+          "case": "missing-second_prize_amount",
+          "pointer": "/cases/40/result",
+          "strict_success": false
+        },
+        {
+          "case": "missing-third_prize",
+          "pointer": "/cases/41/result",
+          "strict_success": false
+        },
+        {
+          "case": "missing-third_prize_amount",
+          "pointer": "/cases/42/result",
+          "strict_success": false
+        },
+        {
+          "case": "missing-participation_prize",
+          "pointer": "/cases/43/result",
+          "strict_success": false
+        },
+        {
+          "case": "missing-participation_prize_amount",
+          "pointer": "/cases/44/result",
+          "strict_success": false
+        },
+        {
+          "case": "wrong-amount",
+          "pointer": "/cases/45/result",
+          "strict_success": false
+        },
+        {
+          "case": "duplicate-choice",
+          "pointer": "/cases/46/result",
+          "strict_success": false
+        },
+        {
+          "case": "no-submit",
+          "pointer": "/cases/47/result",
+          "strict_success": false
+        },
+        {
+          "case": "tampered-form",
+          "pointer": "/cases/48/result",
+          "strict_success": false
+        },
+        {
+          "case": "incompatible-valid-fields",
+          "pointer": "/cases/49/result",
+          "strict_success": false
+        }
+      ],
+      "current_common_setup_reset_certificate_complete": false
+    },
+    {
+      "task": "004",
+      "grader_certificate_available": true,
+      "grader_certificate": {
+        "path": "apps/computer_use/.runtime/osworld-004-grader-02/result.json",
+        "sha256": "d33ce8107f12bd00c9134025dbb430310eef9eb2172aed9967efac61de89af71"
+      },
+      "case_count": 18,
+      "all_case_controls_passed": true,
+      "positive_control_candidates": [
+        {
+          "case": "complete_positive",
+          "pointer": "/cases/2/grade",
+          "strict_success": true,
+          "native_process_proof": true
+        },
+        {
+          "case": "native_save_1_positive",
+          "pointer": "/cases/16/grade",
+          "strict_success": true,
+          "native_process_proof": true
+        },
+        {
+          "case": "native_save_2_positive",
+          "pointer": "/cases/17/grade",
+          "strict_success": true,
+          "native_process_proof": true
+        }
+      ],
+      "negative_control_candidates": [
+        {
+          "case": "original_has_unfinished_new_slides",
+          "pointer": "/cases/0/grade"
+        },
+        {
+          "case": "published_positive_missing_links",
+          "pointer": "/cases/1/grade"
+        },
+        {
+          "case": "missing_submission",
+          "pointer": "/cases/3/grade"
+        },
+        {
+          "case": "invalid_submission",
+          "pointer": "/cases/4/grade"
+        },
+        {
+          "case": "locked_title_changed",
+          "pointer": "/cases/5/grade"
+        },
+        {
+          "case": "new_slide_still_wrong",
+          "pointer": "/cases/15/grade"
+        }
+      ],
+      "current_common_setup_reset_certificate_complete": false
+    },
+    {
+      "task": "010",
+      "grader_certificate_available": true,
+      "grader_certificate": {
+        "path": "apps/computer_use/.runtime/osworld-010-grader-02/result.json",
+        "sha256": "bb2c9ed0d2329e3ced9ff5d366225170bcf8439c3efdc3286de05ca8bf515fbd"
+      },
+      "case_count": 11,
+      "all_case_controls_passed": true,
+      "positive_control_candidates": [
+        {
+          "case": "positive",
+          "pointer": "/cases/0/grade",
+          "strict_success": true,
+          "native_process_proof": true
+        },
+        {
+          "case": "numeric-display-format",
+          "pointer": "/cases/7/grade",
+          "strict_success": true,
+          "native_process_proof": true
+        }
+      ],
+      "negative_control_candidates": [
+        {
+          "case": "wrong-student",
+          "pointer": "/cases/1/grade"
+        },
+        {
+          "case": "wrong-segment-days",
+          "pointer": "/cases/2/grade"
+        },
+        {
+          "case": "wrong-budget-code",
+          "pointer": "/cases/3/grade"
+        },
+        {
+          "case": "wrong-subtotal",
+          "pointer": "/cases/4/grade"
+        },
+        {
+          "case": "missing-table",
+          "pointer": "/cases/5/grade"
+        },
+        {
+          "case": "wrong-total",
+          "pointer": "/cases/6/grade"
+        },
+        {
+          "case": "missing-reference",
+          "pointer": "/cases/8/grade"
+        },
+        {
+          "case": "changed-reference",
+          "pointer": "/cases/9/grade"
+        },
+        {
+          "case": "missing-output",
+          "pointer": "/cases/10/grade"
+        }
+      ],
+      "current_common_setup_reset_certificate_complete": false
+    },
+    {
+      "task": "038",
+      "grader_certificate_available": true,
+      "grader_certificate": {
+        "path": "apps/computer_use/.runtime/osworld-038-grader-01/result.json",
+        "sha256": "a5aa2cc0e62e7e77d39bd246526d16e9b1471070e67f77749f9923ee79db6325"
+      },
+      "case_count": 11,
+      "all_case_controls_passed": true,
+      "positive_control_candidates": [
+        {
+          "case": "positive",
+          "pointer": "/cases/0/grade",
+          "strict_success": true,
+          "native_process_proof": true
+        }
+      ],
+      "negative_control_candidates": [
+        {
+          "case": "initial",
+          "pointer": "/cases/1/grade"
+        },
+        {
+          "case": "missing-unchanged-lead",
+          "pointer": "/cases/2/grade"
+        },
+        {
+          "case": "duplicate-lead",
+          "pointer": "/cases/3/grade"
+        },
+        {
+          "case": "wrong-status",
+          "pointer": "/cases/4/grade"
+        },
+        {
+          "case": "changed-protected-lead",
+          "pointer": "/cases/5/grade"
+        },
+        {
+          "case": "wrong-amount",
+          "pointer": "/cases/6/grade"
+        },
+        {
+          "case": "wrong-contact-link",
+          "pointer": "/cases/7/grade"
+        },
+        {
+          "case": "extra-opportunity-same-account",
+          "pointer": "/cases/8/grade"
+        },
+        {
+          "case": "deleted-original-account",
+          "pointer": "/cases/9/grade"
+        },
+        {
+          "case": "extra-account",
+          "pointer": "/cases/10/grade"
+        }
+      ],
+      "current_common_setup_reset_certificate_complete": false
+    },
+    {
+      "task": "022",
+      "grader_certificate_available": true,
+      "grader_certificate": {
+        "path": "apps/computer_use/.runtime/osworld-022-grader-02/result.json",
+        "sha256": "f65fde35035311f90822782c5513db81fbb9c9137b64162d888a04cdfe6697d8"
+      },
+      "case_count": 24,
+      "all_case_controls_passed": true,
+      "positive_control_candidates": [
+        {
+          "case": "all_23_hashes_and_submission",
+          "pointer": "/cases/0/grade",
+          "strict_success": true,
+          "native_process_proof": true
+        },
+        {
+          "case": "order_and_names_do_not_replace_content_identity",
+          "pointer": "/cases/1/grade",
+          "strict_success": true,
+          "native_process_proof": true
+        }
+      ],
+      "negative_control_candidates": [
+        {
+          "case": "missing_bank_statements",
+          "pointer": "/cases/2/grade"
+        },
+        {
+          "case": "missing_brokerage_statements",
+          "pointer": "/cases/3/grade"
+        },
+        {
+          "case": "missing_employment_letter",
+          "pointer": "/cases/4/grade"
+        },
+        {
+          "case": "missing_insurance_policy",
+          "pointer": "/cases/5/grade"
+        },
+        {
+          "case": "missing_pay_stubs",
+          "pointer": "/cases/6/grade"
+        },
+        {
+          "case": "missing_photo_id",
+          "pointer": "/cases/7/grade"
+        },
+        {
+          "case": "missing_property_tax",
+          "pointer": "/cases/8/grade"
+        },
+        {
+          "case": "missing_retirement_statements",
+          "pointer": "/cases/9/grade"
+        },
+        {
+          "case": "missing_secondary_id",
+          "pointer": "/cases/10/grade"
+        },
+        {
+          "case": "missing_w2_forms",
+          "pointer": "/cases/11/grade"
+        },
+        {
+          "case": "extra_old_document",
+          "pointer": "/cases/12/grade"
+        },
+        {
+          "case": "duplicate_document",
+          "pointer": "/cases/13/grade"
+        },
+        {
+          "case": "unverified_document",
+          "pointer": "/cases/14/grade"
+        },
+        {
+          "case": "correct_documents_wrong_categories",
+          "pointer": "/cases/15/grade"
+        },
+        {
+          "case": "missing_status",
+          "pointer": "/cases/16/grade"
+        },
+        {
+          "case": "missing_submittedAt",
+          "pointer": "/cases/17/grade"
+        },
+        {
+          "case": "unexpected_category",
+          "pointer": "/cases/18/grade"
+        },
+        {
+          "case": "correct_names_wrong_bytes",
+          "pointer": "/cases/19/grade"
+        },
+        {
+          "case": "missing_state",
+          "pointer": "/cases/20/grade"
+        },
+        {
+          "case": "malformed_data",
+          "pointer": "/cases/21/grade"
+        },
+        {
+          "case": "malformed_uploads",
+          "pointer": "/cases/22/grade"
+        },
+        {
+          "case": "initial",
+          "pointer": "/cases/23/grade"
+        }
+      ],
+      "current_common_setup_reset_certificate_complete": false
+    },
+    {
+      "task": "035",
+      "grader_certificate_available": true,
+      "grader_certificate": {
+        "path": "apps/computer_use/.runtime/osworld-035-grader-01/result.json",
+        "sha256": "3ea49d21d985580f60f74d845cd65e60e316f758a10dc21d91aed7a3f6a60a99"
+      },
+      "case_count": 16,
+      "all_case_controls_passed": true,
+      "positive_control_candidates": [
+        {
+          "case": "known_approved_requests",
+          "pointer": "/cases/0/grade",
+          "strict_success": true,
+          "native_process_proof": true
+        },
+        {
+          "case": "numeric_display_variants",
+          "pointer": "/cases/10/grade",
+          "strict_success": true,
+          "native_process_proof": true
+        },
+        {
+          "case": "order_independent",
+          "pointer": "/cases/14/grade",
+          "strict_success": true,
+          "native_process_proof": true
+        }
+      ],
+      "negative_control_candidates": [
+        {
+          "case": "initial_unfinished",
+          "pointer": "/cases/1/grade"
+        },
+        {
+          "case": "undelivered_late_changes",
+          "pointer": "/cases/2/grade"
+        },
+        {
+          "case": "wrong_vendor",
+          "pointer": "/cases/3/grade"
+        },
+        {
+          "case": "wrong_unit_price",
+          "pointer": "/cases/4/grade"
+        },
+        {
+          "case": "wrong_quantity",
+          "pointer": "/cases/5/grade"
+        },
+        {
+          "case": "wrong_total",
+          "pointer": "/cases/6/grade"
+        },
+        {
+          "case": "changed_protected_baseline",
+          "pointer": "/cases/7/grade"
+        },
+        {
+          "case": "changed_header",
+          "pointer": "/cases/8/grade"
+        },
+        {
+          "case": "extra_cell",
+          "pointer": "/cases/9/grade"
+        },
+        {
+          "case": "missing_approved_request",
+          "pointer": "/cases/11/grade"
+        },
+        {
+          "case": "duplicate_approved_request",
+          "pointer": "/cases/12/grade"
+        },
+        {
+          "case": "extra_request_outside_old_range",
+          "pointer": "/cases/13/grade"
+        },
+        {
+          "case": "missing_file",
+          "pointer": "/cases/15/grade"
+        }
+      ],
+      "current_common_setup_reset_certificate_complete": false
+    },
+    {
+      "task": "043",
+      "grader_certificate_available": true,
+      "grader_certificate": {
+        "path": "apps/computer_use/.runtime/osworld-043-grader-02/result.json",
+        "sha256": "b857726692eb64aa25c64c06113641d23c22f679f6a696b81e18d16fdfbc835e"
+      },
+      "case_count": 16,
+      "all_case_controls_passed": true,
+      "positive_control_candidates": [
+        {
+          "case": "source_rubric_positive_with_business_conflicts",
+          "pointer": "/cases/1/grade",
+          "strict_success": false,
+          "native_process_proof": true
+        },
+        {
+          "case": "equivalent_timestamp_offsets",
+          "pointer": "/cases/12/grade",
+          "strict_success": false,
+          "native_process_proof": true
+        }
+      ],
+      "negative_control_candidates": [
+        {
+          "case": "original_broken_calendar",
+          "pointer": "/cases/0/grade"
+        },
+        {
+          "case": "source_rubric_positive_with_business_conflicts",
+          "pointer": "/cases/1/grade"
+        },
+        {
+          "case": "missing_meeting",
+          "pointer": "/cases/2/grade"
+        },
+        {
+          "case": "duplicate_id",
+          "pointer": "/cases/3/grade"
+        },
+        {
+          "case": "missing_guest",
+          "pointer": "/cases/4/grade"
+        },
+        {
+          "case": "unbounded_recurrence",
+          "pointer": "/cases/5/grade"
+        },
+        {
+          "case": "unexpected_all_day",
+          "pointer": "/cases/6/grade"
+        },
+        {
+          "case": "wrong_calendar",
+          "pointer": "/cases/7/grade"
+        },
+        {
+          "case": "unknown_event",
+          "pointer": "/cases/8/grade"
+        },
+        {
+          "case": "unparsed_extra_event",
+          "pointer": "/cases/9/grade"
+        },
+        {
+          "case": "wrong_duration",
+          "pointer": "/cases/10/grade"
+        },
+        {
+          "case": "protected_event_moved_inside_original_tolerance",
+          "pointer": "/cases/11/grade"
+        },
+        {
+          "case": "equivalent_timestamp_offsets",
+          "pointer": "/cases/12/grade"
+        },
+        {
+          "case": "naive_timestamp_rejected",
+          "pointer": "/cases/13/grade"
+        },
+        {
+          "case": "missing_reference",
+          "pointer": "/cases/14/grade"
+        },
+        {
+          "case": "changed_reference",
+          "pointer": "/cases/15/grade"
+        }
+      ],
+      "current_common_setup_reset_certificate_complete": false
+    },
+    {
+      "task": "080",
+      "grader_certificate_available": true,
+      "grader_certificate": {
+        "path": "apps/computer_use/.runtime/osworld-080-grader-06/result.json",
+        "sha256": "4c670f4af13d12678b9d0eddaeffdd93d14d6a14542920062494460ff255c3b7"
+      },
+      "case_count": 12,
+      "all_case_controls_passed": true,
+      "positive_control_candidates": [
+        {
+          "case": "qualified_positive",
+          "pointer": "/cases/2/grade",
+          "strict_success": true,
+          "native_process_proof": true
+        },
+        {
+          "case": "equivalent_relative_relationships",
+          "pointer": "/cases/5/grade",
+          "strict_success": true,
+          "native_process_proof": true
+        }
+      ],
+      "negative_control_candidates": [
+        {
+          "case": "unmodified_source",
+          "pointer": "/cases/0/grade"
+        },
+        {
+          "case": "published_positive_has_known_omissions",
+          "pointer": "/cases/1/grade"
+        },
+        {
+          "case": "missing_output",
+          "pointer": "/cases/3/grade"
+        },
+        {
+          "case": "invalid_workbook",
+          "pointer": "/cases/4/grade"
+        },
+        {
+          "case": "wrong_overlay_quota",
+          "pointer": "/cases/6/grade"
+        },
+        {
+          "case": "wrong_saved_formula_cache",
+          "pointer": "/cases/7/grade"
+        },
+        {
+          "case": "missing_formula",
+          "pointer": "/cases/8/grade"
+        },
+        {
+          "case": "missing_summary_label",
+          "pointer": "/cases/9/grade"
+        },
+        {
+          "case": "missing_title_format",
+          "pointer": "/cases/10/grade"
+        },
+        {
+          "case": "wrong_chart_range",
+          "pointer": "/cases/11/grade"
+        }
+      ],
+      "current_common_setup_reset_certificate_complete": false
+    },
+    {
+      "task": "051",
+      "grader_certificate_available": true,
+      "grader_certificate": {
+        "path": "apps/computer_use/.runtime/osworld-051-grader-02/result.json",
+        "sha256": "5505a2678163a99d86e406fd95ec3bdd51499671e6b125e61d7c0c20a0cf0b2a"
+      },
+      "case_count": 17,
+      "all_case_controls_passed": true,
+      "positive_control_candidates": [
+        {
+          "case": "synthetic_audit_binding_acceptance",
+          "pointer": "/cases/11/grade",
+          "strict_success": true,
+          "native_process_proof": false
+        }
+      ],
+      "negative_control_candidates": [
+        {
+          "case": "missing",
+          "pointer": "/cases/0/grade"
+        },
+        {
+          "case": "truncated",
+          "pointer": "/cases/1/grade"
+        },
+        {
+          "case": "unmodified_input",
+          "pointer": "/cases/2/grade"
+        },
+        {
+          "case": "reference_artifact_not_process_proof",
+          "pointer": "/cases/3/grade"
+        },
+        {
+          "case": "hidden_character2",
+          "pointer": "/cases/4/grade"
+        },
+        {
+          "case": "transparent_character3",
+          "pointer": "/cases/5/grade"
+        },
+        {
+          "case": "background_moved_within_original_tolerance",
+          "pointer": "/cases/6/grade"
+        },
+        {
+          "case": "background_renamed",
+          "pointer": "/cases/7/grade"
+        },
+        {
+          "case": "wrong_layer_order",
+          "pointer": "/cases/8/grade"
+        },
+        {
+          "case": "wrong_character_position",
+          "pointer": "/cases/9/grade"
+        },
+        {
+          "case": "renamed_character",
+          "pointer": "/cases/10/grade"
+        },
+        {
+          "case": "audit_for_different_file_rejected",
+          "pointer": "/cases/12/grade"
+        },
+        {
+          "case": "incomplete_trajectory_audit_rejected",
+          "pointer": "/cases/13/grade"
+        },
+        {
+          "case": "missing_evidence_rejected",
+          "pointer": "/cases/14/grade"
+        },
+        {
+          "case": "wrong_evidence_hash_rejected",
+          "pointer": "/cases/15/grade"
+        },
+        {
+          "case": "reported_process_violation_rejected",
+          "pointer": "/cases/16/grade"
+        }
+      ],
+      "current_common_setup_reset_certificate_complete": false
+    },
+    {
+      "task": "006",
+      "original_materials_complete": false,
+      "required_original_missing": "Yiren_Lin.pdf",
+      "full_business_grading_and_setup_qualified": false
+    }
+  ],
+  "remaining": [
+    "Bind each original task to setup/reset receipts and selected positive/initial/incorrect/missing grade references under the frozen common profile.",
+    "006 still requires the original missing CV; never replace or omit it.",
+    "051 synthetic audit acceptance is not a native from-scratch process-positive control.",
+    "043 strict business diagnostic conflicts with the published rubric; retain both without promoting contradictory strict checks."
+  ]
+}

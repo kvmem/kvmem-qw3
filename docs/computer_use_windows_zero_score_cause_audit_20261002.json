@@ -1,0 +1,137 @@
+{
+  "kind": "observed_capability_and_zero_score_cause_audit",
+  "formal_run": false,
+  "original_ten_formal_results_completed": 0,
+  "sources": {
+    "basic_10_calibration": {
+      "path": "apps/computer_use/.runtime/windows-capability-analysis-01/summary.json",
+      "sha256": "3612ac5bcb71f2e99b5203f0c067b10f96d8db68e91d31fc6b4720dc0e33bbc8"
+    },
+    "gimp_backend_capacity": {
+      "path": "apps/computer_use/.runtime/gimp051-visual-budget-replay-01/result.json",
+      "sha256": "9fd9f00692aadcb06aeca7434d82f1871c9f3f7fac0900de0187e44602eac659"
+    },
+    "size12_original_interrupted": {
+      "path": "apps/computer_use/.runtime/windows-capability-size12-05/capability-size12-cap11-off-05/result.json",
+      "sha256": "935f73959ab1ee07b55c3489a79da17c9d08f8a454f9befaeeb999ff1868f79f"
+    },
+    "neutral_exact_win32_probe": {
+      "path": "apps/computer_use/.runtime/windows/shared-archive-capability-size12-cap11-off-06/saveas-message-diagnostic-03-result.json",
+      "sha256": "e5a0b49e8b066eed12d031e97001f39100da1fa7a4d98f3919ed64bc8b67b862"
+    },
+    "neutral_real_executor_probe": {
+      "path": "apps/computer_use/.runtime/saveas-executor-diagnostic-04/result.json",
+      "sha256": "68c793cc191af054ba83b61a543c952afc8844720f9661b45ed8ce4e0767a09c"
+    },
+    "client16_native_contract_and_transport": {
+      "path": "apps/computer_use/.runtime/windows-client-16-qualification-01/result.json",
+      "sha256": "1f81537e56d4ed939b155018926e34411fb942e2474c15d1bc341779d3d2808d"
+    }
+  },
+  "first_basic_ten_paired_scenarios": {
+    "completed_paired_scenarios": 10,
+    "valid_attempts": 20,
+    "complete_passes": 18,
+    "artifact_correct": 19,
+    "on_complete_passes": 10,
+    "off_complete_passes": 8,
+    "additional_paired_retests": 1
+  },
+  "read_basic_matrix_from": {
+    "path": "apps/computer_use/.runtime/windows-capability-analysis-01/summary.json",
+    "sha256": "3612ac5bcb71f2e99b5203f0c067b10f96d8db68e91d31fc6b4720dc0e33bbc8"
+  },
+  "causes": [
+    {
+      "class": "reasoning_and_constraint_violation",
+      "example_task": "013",
+      "first_infeasible_allocation_request": 21,
+      "guest_seconds": 96.70645141601562,
+      "recognized_bad_budget_request": 63,
+      "recognized_at_guest_seconds": 468.63895773887634,
+      "candidate": "Extract and verify the complete constraint set before editing; hypothesis only, V1 not implemented",
+      "evidence": "apps/computer_use/.runtime/osworld-013-preflight-on-01/failure-analysis.json"
+    },
+    {
+      "class": "incorrect_visual_target_and_repeated_no_progress",
+      "example_task": "035",
+      "candidate": "Locate the intended observed control again after no progress, and verify foreground after app launch; hypothesis only",
+      "evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-01/osworld-web035-on-02/failure-analysis.json"
+    },
+    {
+      "class": "backend_visual_pinning_capacity",
+      "example_task": "051",
+      "pinned_tokens": 132096,
+      "active_budget_tokens": 131072,
+      "same_input_on_retrievable_and_off_replay_completed": true,
+      "desktop_task_completion_proved": false,
+      "source_request_bytes": 65952096,
+      "source_request_exceeded_old_64_mib_transport_limit": false
+    },
+    {
+      "class": "uncertain_input_delivery",
+      "example_task": "cap11",
+      "file_saved": false,
+      "exact_windows_error_known": false,
+      "fresh_neutral_same_executor_probe_passed": true,
+      "old_failure_preserved": true
+    },
+    {
+      "class": "additional_transport_boundary",
+      "old_limit_bytes": 67108864,
+      "new_bound_bytes": 536870912,
+      "actually_qualified_wire_bytes": 69675554,
+      "scripted_not_model_accuracy": true
+    }
+  ],
+  "new_four_attempt_batch": "apps/computer_use/.runtime/windows-capability-size12-06/result.json",
+  "limitations": [
+    "First small ten paired scenarios are custom calibration, not official OSWorld results.",
+    "One attempt per condition does not establish stable reliability.",
+    "Current on/off profiles include prefix reuse and guided-refresh differences; these results do not isolate KV selection alone.",
+    "Successful scripted transport does not demonstrate completion of the GIMP task.",
+    "The upper model capability boundary remains under exploration; interrupted infrastructure trials do not establish that boundary."
+  ],
+  "in_progress_observer_note": {
+    "task": "cap11",
+    "run": "capability-size12-cap11-off-06",
+    "read_only_vnc_observer": true,
+    "executor_observe_calls": 0,
+    "input_events": 0,
+    "screenshot": {
+      "path": "apps/computer_use/.runtime/size12-cap11-off-06-observer-01.png",
+      "sha256": "6da44ee509ba5178e6422a318a7ba1d079d46f1aa59010fd28a6cc41eed77865"
+    },
+    "finding": "WPS Office with a blank Sheet1 and a subscription upsell window is visible; no final causal classification or completed grade yet",
+    "task_intervened": false
+  },
+  "runtime_dflash_note": {
+    "current_off_trace_contains_native_dflash_summaries": true,
+    "dispatch_plain_does_not_mean_speculation_disabled": true,
+    "proof": "src/qw3_server.cpp logs serialized dispatch independently of speculation; native dflash_spec_summary enabled=true is the relevant evidence",
+    "native_summary_count": 71,
+    "enabled_summary_count": 71
+  },
+  "size12_first_new_terminal": {
+    "run": "capability-size12-cap11-off-06",
+    "status": "timed_out",
+    "outcome": "time_limit",
+    "task_seconds": 1801.0949885,
+    "valid_timed_out_trial": true,
+    "output_saved": false,
+    "original_unchanged": true,
+    "actual_completed_actions": 6,
+    "rejected_actions": 47,
+    "outside_scope_rejections": 46,
+    "first_unsupported_application": "wpscloudsvr",
+    "unsupported_window_title": "Payment Page",
+    "repeated_click_at_849_775": 36,
+    "backend_failures": [],
+    "recording_complete": true,
+    "video_seconds": 1841.2,
+    "original_result_sha256": "18236f264b37b3d9e28168b8e634a269f84237972ac9adfd0e2900cad32d28b1",
+    "classification": "Mixed harness/application-boundary failure and ineffective agent recovery; no evidence for twelve-row mathematical incapability",
+    "arithmetic_completion_measured": false,
+    "review_scope": "Read-only review of all recorded action receipts and selected observations; not a complete visual review of the full video"
+  }
+}

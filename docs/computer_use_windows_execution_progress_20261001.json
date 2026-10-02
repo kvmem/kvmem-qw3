@@ -2590,7 +2590,7 @@
     "apps/computer_use/.runtime/windows-capability-size12-03/result.json",
     "apps/computer_use/.runtime/windows-capability-size12-04/result.json"
   ],
-  "size12_current_status": "Previous trial remains interrupted; new four-attempt plan uses client16 after 82 Windows contracts and all six 69.7MB scripted transport controls passed; actual launch pending",
+  "size12_current_status": "First new off trial timed out after 1801 seconds; 46 actions rejected on WPS helper Payment Page, no saved file; on formula trial running, both sorting trials unstarted",
   "console_provision_input_probe": {
     "path": "apps/computer_use/.runtime/provision-input-qualification-01-result.json",
     "sha256": "23f084285795d6659cb5ec6503b9e866feea26a2faf94606fb2ab05bf91ac4a0",
@@ -2645,9 +2645,37 @@
     "implemented": true,
     "host_control_tests_passed": 5,
     "selected_client15_archive_verified": true,
-    "actual_restored_windows_candidate_install_qualified": false,
+    "actual_restored_windows_candidate_install_qualified": true,
     "same_snapshot_baseline_and_candidate_supported": true,
     "model_prompt_changed": false,
-    "formal_dispatch_qualified": false
-  }
+    "formal_dispatch_qualified": false,
+    "proof_run": "capability-size12-cap11-off-06",
+    "fresh_install": true,
+    "installed_source_files": 28,
+    "bundle_sha256": "f6831b7708da4ee341a478aa5e38f590b43e70336cf086b3b2d4a051032d263f"
+  },
+  "size12_latest_execution": {
+    "queue": "apps/computer_use/.runtime/windows-capability-size12-06/result.json",
+    "plan": "docs/computer_use_windows_capability_size_plan_06_20261002.json",
+    "client": "windows-native-client-16",
+    "completed_attempts": 1,
+    "off_formula_status": "timed_out",
+    "off_formula_valid_trial": true,
+    "off_formula_strict_success": false,
+    "on_formula_status": "running",
+    "sort_on_status": "unstarted",
+    "sort_off_status": "unstarted",
+    "formal_run": false,
+    "videos_url": "http://127.0.0.1:18089/capability-size/index.html",
+    "cause_audit": "docs/computer_use_windows_zero_score_cause_audit_20261002.json"
+  },
+  "read_only_report_runtime_pairing_qualification": {
+    "host_controls_passed": 4,
+    "actual_archived_trials_rechecked": 25,
+    "all_old_task_scores_unchanged": true,
+    "basic_matched_tasks": 10,
+    "evidence": "apps/computer_use/.runtime/capability-comparison-identity-qualification-01/result.json",
+    "matching_includes_client_engine_sources_and_waits": true
+  },
+  "original_task_readiness_inventory": "docs/computer_use_windows_task_readiness_inventory_20261002.json"
 }

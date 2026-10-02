@@ -10,18 +10,29 @@ import re
 import sqlite3
 import statistics
 
-from osworld_windows.capabilities import DEFINITIONS
+from osworld_windows.capabilities import DEFINITIONS as BASIC_DEFINITIONS
+from osworld_windows.capability_boundary import DEFINITIONS as BOUNDARY_DEFINITIONS
+
+DEFINITIONS = BASIC_DEFINITIONS | BOUNDARY_DEFINITIONS
 
 DISPLAY_NAMES = dict(zip((f'cap{i:02d}' for i in range(1, 11)), [
     '创建并保存笔记', '修改笔记并保留原文件', '浏览器提取信息后保存', '网页填表并下载结果',
     '表格公式及求和', '文档标题与文字替换', '修改与删除指定幻灯片',
     '读取新旧规则并计算', '文件改名与归档', '表格整行排序及求和']))
+DISPLAY_NAMES.update(cap11='12 行公式与求和', cap12='12 行排序、并列值与记录保留')
 
 
 def summarize(directory):
     directory = Path(directory)
     result = json.loads((directory / 'result.json').read_text())
     terminal = result['native_result']['task']
+    launch_path = directory / 'launch/manifest.json'
+    engine_path = directory / 'engine/manifest.json'
+    launch = json.loads(launch_path.read_text()) if launch_path.is_file() else {}
+    engine = json.loads(engine_path.read_text()) if engine_path.is_file() else {}
+    source_identity = (hashlib.sha256(json.dumps(result['source_sha256'],
+        sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        if result.get('source_sha256') else None)
     started = terminal['started_unix_ns'] / 1e9
     database = directory / 'guest/app/desktop/desktop.sqlite'
     with sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True) as db:
@@ -106,18 +117,26 @@ def summarize(directory):
         timeout_seconds=result.get('timeout_seconds'),
         tool_call_limit=result.get('tool_call_limit'),
         visual_history=result.get('visual_history'),
+        client_bundle_sha256=launch.get('bundle_sha256'),
+        engine_binary_sha256=engine.get('binary_sha256'),
+        shared_runner_identity_sha256=source_identity,
+        backend_timeout_seconds=result.get('backend_timeout_seconds', 600),
+        backend_read_timeout_seconds=result.get('backend_read_timeout_seconds', 180),
         directory=str(directory.resolve()), video_seconds=result.get('recording', {}).get('video_duration_seconds'))
 
 
 def cohort_key(row):
     return tuple(row.get(key) for key in ('task', 'prompt_sha256', 'snapshot',
-                                         'timeout_seconds', 'tool_call_limit', 'visual_history'))
+        'timeout_seconds', 'tool_call_limit', 'visual_history', 'client_bundle_sha256',
+        'engine_binary_sha256', 'shared_runner_identity_sha256',
+        'backend_timeout_seconds', 'backend_read_timeout_seconds'))
 
 
 def matched_pairs(rows):
     groups = {}
     for row in rows:
-        if row['valid_trial']:
+        if row['valid_trial'] and all(row.get(key) for key in (
+                'client_bundle_sha256', 'engine_binary_sha256', 'shared_runner_identity_sha256')):
             groups.setdefault(cohort_key(row), {}).setdefault(row['kvmem'], []).append(row)
     pairs = []
     for key, arms in groups.items():
@@ -143,7 +162,7 @@ def write_markdown(result, output):
         f"{result['passed']} 条按时完整通过，{result['valid_artifact_correct']} 条有效试次产物正确。", '',
         '## 同配置开关结果', '',
         '| 场景 | 预算 | KVMem 开 | KVMem 关 |', '|---|---:|---|---|']
-    matrix = result['first_ten_scenario_matrix']
+    matrix = result['paired_scenario_matrix']
     lines[6:6] = [
         f"首次配对已完成 {matrix['completed_paired_scenarios']} 个场景："
         f"{matrix['valid_attempts']} 条有效试次，{matrix['complete_passes']} 条按时通过，"
@@ -181,7 +200,7 @@ def write_markdown(result, output):
         '- 每配置单次摸底只能证明已观察到的可行性，不能证明稳定可靠或统计显著收益。',
         '- 开关使用当前产品配置，包含前缀缓存差异；轨迹不同也会改变耗时。',
         '- 任务时间不包含快照恢复和模型加载；录像包含启动与收尾，未按动作对齐。',
-        '- 不同快照、提示或预算分组展示，保留全部失败和受阻录像。', '',
+        '- 按快照、提示、预算、客户端、引擎、共用执行代码与连接等待配置分组；保留全部失败和受阻录像。', '',
         f"[完整统计与轨迹说明]({(output / 'summary.json').resolve()}) · "
         '[连续录像回放](http://127.0.0.1:18089/capability/index.html)', '']
     (output / 'report.md').write_text('\n'.join(lines))
@@ -209,14 +228,17 @@ def build(queues, output, preview):
     first_pairs = {}
     for pair in result['matched_pairs']:
         first_pairs.setdefault(pair['task'], pair)
-    result['first_ten_scenario_matrix'] = dict(
-        completed_paired_scenarios=len(first_pairs),
-        valid_attempts=2 * len(first_pairs),
-        complete_passes=sum(p['on_passed'] + p['off_passed'] for p in first_pairs.values()),
-        artifact_correct=sum(p['on_artifact_correct'] + p['off_artifact_correct'] for p in first_pairs.values()),
-        on_complete_passes=sum(p['on_passed'] for p in first_pairs.values()),
-        off_complete_passes=sum(p['off_passed'] for p in first_pairs.values()),
-        additional_paired_retests=len(result['matched_pairs']) - len(first_pairs))
+    def matrix(pairs, all_pairs):
+        return dict(completed_paired_scenarios=len(pairs), valid_attempts=2 * len(pairs),
+            complete_passes=sum(p['on_passed'] + p['off_passed'] for p in pairs.values()),
+            artifact_correct=sum(p['on_artifact_correct'] + p['off_artifact_correct'] for p in pairs.values()),
+            on_complete_passes=sum(p['on_passed'] for p in pairs.values()),
+            off_complete_passes=sum(p['off_passed'] for p in pairs.values()),
+            additional_paired_retests=len(all_pairs) - len(pairs))
+    result['paired_scenario_matrix'] = matrix(first_pairs, result['matched_pairs'])
+    basic_pairs = {task: pair for task, pair in first_pairs.items() if task in BASIC_DEFINITIONS}
+    result['first_ten_scenario_matrix'] = matrix(basic_pairs,
+        [pair for pair in result['matched_pairs'] if pair['task'] in BASIC_DEFINITIONS])
     (output / 'summary.json').write_text(json.dumps(result, indent=2, ensure_ascii=False) + '\n')
     write_markdown(result, output)
     fields = ['task', 'name', 'kvmem', 'run', 'status', 'passed', 'partial_check_fraction', 'task_seconds',
@@ -281,7 +303,7 @@ def build(queues, output, preview):
                 f'<div class="pair current">{main_videos}</div>{history}</section>')
         page = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Windows 能力边界回放</title>
 <style>body{font:16px system-ui;background:#f3f5f8;color:#172b40;margin:0}main{max-width:1400px;margin:auto;padding:28px}section{background:white;padding:20px;border-radius:12px;margin:22px 0}.pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}video{width:100%;background:#161b22}button{padding:9px 16px}pre{white-space:pre-wrap}.note{padding:16px;background:#e8edf7}@media(max-width:800px){.pair{grid-template-columns:1fr}}</style>
-<main><h1>Windows 能力边界回放</h1><p class="note">自定义短任务 · 真实 QW3+DFlash2 与原生 Codex · 相同快照、提示与预算的开关配对。连续录像包含启动和收尾，从录像开头播放，未按操作步骤对齐。结果不是官方 OSWorld 分数；单次结果不能证明稳定性或 KVMem 长历史收益。</p>'''
+<main><h1>Windows 能力边界回放</h1><p class="note">自定义能力校准任务 · 真实 QW3+DFlash2 与原生 Codex · 按共同快照、提示、预算、客户端、引擎与执行代码配对。连续录像包含启动和收尾，从录像开头播放，未按操作步骤对齐。结果不是官方 OSWorld 分数；单次结果不能证明稳定性或 KVMem 长历史收益。</p>'''
         page += f'<p>已完成 {len(rows)} 次：{result["valid_attempts"]} 次有效、{result["invalid_attempts"]} 次受阻或无效；{result["passed"]} 次完整通过，{result["valid_artifact_correct"]} 次有效试次产物正确。受阻或无效测试单独保留。运行中请刷新查看已完成结果。</p>' + ''.join(sections)
         page += '''</main><script>for(const s of document.querySelectorAll('section')){const vs=[...s.querySelectorAll('.current video')];s.querySelector('.play').onclick=()=>{for(const v of document.querySelectorAll('video'))v.pause();for(const v of vs)v.currentTime=0;Promise.allSettled(vs.map(v=>v.play()));};s.querySelector('.pause').onclick=()=>s.querySelectorAll('video').forEach(v=>v.pause());}</script></html>'''
         (preview / 'index.html').write_text(page)
