@@ -5,7 +5,7 @@
   "status": "active",
   "local_plan": "docs/computer_use_local_diagnostic_plan_20261002.json",
   "combined_goal": "docs/computer_use_local_advisor_goal_20261002.md",
-  "current_stage": "p3_native_preflight_passed_baseline_freeze_next",
+  "current_stage": "p3_frozen_baseline_running_gui_action_id_collision_observed",
   "source_baseline": "56896791b41b6aa5c022c99dac4996f719bd4ba0",
   "stages": {
     "P0": {
@@ -99,13 +99,13 @@
       "native_report": "docs/computer_use_native_thinking_20261003.md"
     },
     "P3": {
-      "status": "native_preflight_passed_baseline_freeze_next",
-      "trials_completed": 0,
+      "status": "frozen_baseline_running",
+      "trials_completed": 1,
       "planned_trials": 32,
       "report": "docs/computer_use_recovery_diagnostic_p3_20261003.md",
       "baseline_bundle": "windows-native-client-30",
       "condition_count": 8,
-      "model_trials_completed": 0,
+      "model_trials_completed": 1,
       "scripted_conditions_qualified": [
         "normal",
         "wrong_focus",
@@ -135,7 +135,19 @@
       "model_preflight_completed": 1,
       "model_preflight_passed": 1,
       "model_preflight_evidence": "apps/computer_use/.runtime/p3-native-preflight-01/summary.json",
-      "formal_baseline_completed": 0
+      "formal_baseline_completed": 1,
+      "formal_baseline_passed": 1,
+      "baseline_frozen": true,
+      "baseline_acceptance": "apps/computer_use/.runtime/p3-baseline-20261003/acceptance.json",
+      "baseline_campaign": "apps/computer_use/.runtime/p3-baseline-20261003/campaign.json",
+      "active_trial": "p3-baseline-r1-02",
+      "candidate_changes_implemented": 0,
+      "observed_baseline_issue": {
+        "kind": "cross_task_gui_action_id_collision",
+        "first_evidence": "apps/computer_use/.runtime/p3-baseline-r1-01/fixture/state.json",
+        "impact": "First completed baseline normal trial required 7 tools and 46.46 seconds; executor rejected a semantic action ID already used by the preceding preflight; model recovered with a new ID. Fresh native clients share the retained VM executor ledger.",
+        "candidate": "Namespace both local GUI action ledger and executor wire IDs by task while preserving legacy receipt reconciliation; implement only after baseline evidence is complete."
+      }
     },
     "P4": {
       "status": "planned",
@@ -260,7 +272,7 @@
     "gpu_compute_processes": 0,
     "checked_at": 1790982486.6385703
   },
-  "next_action": "Complete remaining P3 fixture qualifications, freeze baseline 16 real-model attempts, record independent request artifacts and continuous video; analyze actual failures before at most two general recovery changes and 16 candidate attempts. Keep all pending P4/P5, original ten V0/V1, advisor and resource qualification requirements active.",
+  "next_action": "Let the frozen P3 baseline queue finish, audit every failure and transport identity, then implement at most two generic recovery improvements and qualify a new Windows client before the same 16 candidate trials. First observed defect is cross-task GUI action ID collision; confirmed-delivery reconciliation remains a candidate pending model fault evidence. Keep all P4/P5, original ten V0/V1, advisor and resource requirements active.",
   "advisor_provider": {
     "provider": "deepseek",
     "model": "deepseek-flash",
