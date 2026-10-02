@@ -73,6 +73,29 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await other.close()
 
+    async def test_wire_limit_rejects_before_forwarding_and_preserves_auth(self):
+        from qw3_computer.limits import MAX_MODEL_REQUEST_BYTES
+        for limit in (True, 0, -1, MAX_MODEL_REQUEST_BYTES + 1):
+            with self.assertRaises(ValueError):
+                create_app('http://127.0.0.1:1', '127.0.0.1', 'test-token', max_request_bytes=limit)
+        client = TestClient(TestServer(create_app(str(self.upstream.make_url('/')).rstrip('/'),
+            '127.0.0.1', 'test-token', max_request_bytes=1024)))
+        await client.start_server()
+        try:
+            body = dict(finish=True, messages=[dict(role='user', content='x' * 2048)])
+            async with client.post('/v1/chat/completions', json=body,
+                    headers={'Authorization': 'Bearer test-token'}) as response:
+                self.assertEqual(response.status, 413)
+            self.assertEqual(self.requests, [])
+            async with client.post('/v1/chat/completions', json=dict(finish=True),
+                    headers={'Authorization': 'Bearer test-token'}) as response:
+                self.assertEqual(response.status, 200)
+                await response.read()
+            async with client.post('/v1/chat/completions', json=body) as response:
+                self.assertEqual(response.status, 401)
+        finally:
+            await client.close()
+
     async def test_stream_disconnect_closes_upstream(self):
         response = await self.client.post("/v1/chat/completions", json={"stream": True},
                                           headers={"Authorization": "Bearer test-token"})

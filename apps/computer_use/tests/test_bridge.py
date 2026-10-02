@@ -38,6 +38,10 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             self.entered.set()
             if self.mode == "http_error":
                 return web.Response(status=503)
+            if self.mode == 'payload_error':
+                return web.json_response({'error': 'multimodal mandatory spans exceed budget'}, status=413)
+            if self.mode == 'long_error':
+                return web.Response(text='x' * 5000, status=500)
             try:
                 if self.mode == "hang":
                     await asyncio.Future()
@@ -206,6 +210,45 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 502)
         async with self.client.post(self.url + "/v1/responses", json=request() | {"store": True}) as response:
             self.assertEqual(response.status, 400)
+
+    async def test_backend_error_body_is_retained_and_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            trace = Path(temporary)
+            bridge, url = await serve(create_app(self.backend_url + '/v1', trace_dir=trace))
+            try:
+                for mode, status, truncated in [('payload_error', 413, False), ('long_error', 500, True)]:
+                    self.mode = mode
+                    async with self.client.post(url + '/v1/responses', json=request()) as response:
+                        self.assertEqual(response.status, 502)
+                        error = (await response.json())['error']
+                        self.assertEqual(error['upstream_status'], status)
+                        self.assertLessEqual(len(error['message']), 4200)
+                    metrics = sorted(trace.glob('*/metrics.json'), key=lambda p: p.stat().st_mtime_ns)[-1]
+                    receipt = json.loads(metrics.read_text())
+                    self.assertEqual(receipt['http_status'], status)
+                    self.assertEqual(receipt['backend_error_truncated'], truncated)
+                    self.assertLessEqual(len(receipt['backend_error_response']), 4096)
+                    if mode == 'payload_error':
+                        self.assertIn('mandatory spans exceed budget', receipt['backend_error_response'])
+            finally:
+                await bridge.cleanup()
+
+    async def test_wire_limit_rejects_oversized_requests_before_forwarding(self):
+        from qw3_computer.limits import MAX_MODEL_REQUEST_BYTES
+        self.assertEqual(MAX_MODEL_REQUEST_BYTES, 512 * 1024 * 1024)
+        for limit in (True, 0, -1, MAX_MODEL_REQUEST_BYTES + 1):
+            with self.assertRaises(ValueError):
+                create_app(self.backend_url + '/v1', max_request_bytes=limit)
+        bridge, url = await serve(create_app(self.backend_url + '/v1', max_request_bytes=1024))
+        try:
+            async with self.client.post(url + '/v1/responses', json=request([{'role': 'user', 'content': 'x' * 2048}])) as response:
+                self.assertEqual(response.status, 413)
+            self.assertEqual(self.backend_bodies, [])
+            async with self.client.post(url + '/v1/responses', json=request()) as response:
+                self.assertEqual(response.status, 200)
+                await response.read()
+        finally:
+            await bridge.cleanup()
 
     async def test_disconnect_during_prefill_cancels_backend_and_releases_slot(self):
         self.mode = "hang"

@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T11:18:11+00:00",
+  "updated_at": "2026-10-02T11:40:48.204779+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -2590,10 +2590,57 @@
     "apps/computer_use/.runtime/windows-capability-size12-03/result.json",
     "apps/computer_use/.runtime/windows-capability-size12-04/result.json"
   ],
-  "size12_current_status": "Neutral console input probe passed; next version pending launch",
+  "size12_current_status": "First actual native 12-row task interrupted at Save As text delivery; no saved output; remaining three attempts not run",
   "console_provision_input_probe": {
     "path": "apps/computer_use/.runtime/provision-input-qualification-01-result.json",
     "sha256": "23f084285795d6659cb5ec6503b9e866feea26a2faf94606fb2ab05bf91ac4a0",
     "passed": true
+  },
+  "size12_active_execution": {
+    "output": "apps/computer_use/.runtime/windows-capability-size12-05/capability-size12-cap11-off-05",
+    "queue": "apps/computer_use/.runtime/windows-capability-size12-05/result.json",
+    "source_commit": "4c0f94c7e184ef8eb9e937c5f69a667f0a8e47ad",
+    "task": "cap11",
+    "kvmem": "off",
+    "visual_history": "retrievable",
+    "initialization_passed": true,
+    "completed_http200_receipts_at_status": 17,
+    "formal_run": false,
+    "strict_result_pending": false,
+    "status": "interrupted",
+    "queue_may_continue": false,
+    "strict_passed": false,
+    "output_saved": false,
+    "elapsed_seconds": 113.4615122,
+    "tool_calls_used": 17,
+    "terminal_cause": "paused_uncertain: EM_REPLACESEL returned zero; original generic message Text delivery timed out; exact Windows error was not recorded",
+    "original_result_sha256": "935f73959ab1ee07b55c3489a79da17c9d08f8a454f9befaeeb999ff1868f79f",
+    "remote_uncertain_receipt": "apps/computer_use/.runtime/windows-capability-size12-05/capability-size12-cap11-off-05/remote-uncertain-action-receipt.json",
+    "initial_finding": "Neutral fresh Save As probes succeeded under both flags=3 and flags=0 with matching high integrity; original cause remains unconfirmed",
+    "neutral_real_executor_diagnostic": "apps/computer_use/.runtime/saveas-executor-diagnostic-04/result.json",
+    "neutral_real_executor_passed": true,
+    "old_remote_receipt_unchanged": true,
+    "root_cause_confirmed": false
+  },
+  "long_visual_transport_candidate": {
+    "request_limit_bytes": 536870912,
+    "host_capacity_proof": "apps/computer_use/.runtime/model-transport-capacity-host-01/result.json",
+    "host_passed": true,
+    "windows_qualified": false,
+    "real_model_test": false,
+    "formal_run": false,
+    "drops_history": false,
+    "host_proof_sha256": "72c33d0e9193934c195d712e3b75303512330cd2bc30cb6a37ddecb3e6bc763f",
+    "input_wire_bytes": 69675554,
+    "checks_passed": 6
+  },
+  "restored_native_bundle_installer": {
+    "implemented": true,
+    "host_control_tests_passed": 5,
+    "selected_client15_archive_verified": true,
+    "actual_restored_windows_candidate_install_qualified": false,
+    "same_snapshot_baseline_and_candidate_supported": true,
+    "model_prompt_changed": false,
+    "formal_dispatch_qualified": false
   }
 }

@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tarfile
 import zipfile
+from qw3_computer.limits import MAX_MODEL_REQUEST_BYTES
 
 NATIVE_TEST_FILES = (
     "test_protocol.py", "test_bridge.py", "test_controller.py", "test_desktop.py",
@@ -69,6 +70,7 @@ def main():
         shutil.copy2(root / "tests" / name, app / "tests" / name)
     (app / "vm").mkdir()
     shutil.copyfile(root / "vm/model_relay.py", app / "vm/model_relay.py")
+    shutil.copyfile(root / "vm/qualify_model_transport.py", app / "vm/qualify_model_transport.py")
     shutil.copyfile(root / "windows_task.py", app / "windows_task.py")
     shutil.copyfile(root / "windows_long_task.py", app / "windows_long_task.py")
     shutil.copyfile(root / "probe_compaction.py", app / "probe_compaction.py")
@@ -108,7 +110,8 @@ exit $LASTEXITCODE
         "kind": "windows_native_client_offline_bundle", "qualified": False,
         "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
         "python_version": "3.13.13", "codex_version": "0.159.2",
-        "runtime_capabilities": ["configurable_backend_waits"],
+        "runtime_capabilities": ["configurable_backend_waits", "large_visual_history_requests", "backend_error_receipts"],
+        "model_request_limit_bytes": MAX_MODEL_REQUEST_BYTES,
         "backend_wait_defaults": {"total_seconds": 600, "read_seconds": 180, "heartbeat_seconds": 30},
         "test_scope": "Windows runtime contracts; host OSWorld/scoring tests remain in the repository",
         "assets": {p.name: {"sha256": digest(p), "bytes": p.stat().st_size} for p in [python, codex, *wheels]},

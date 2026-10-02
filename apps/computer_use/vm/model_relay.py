@@ -17,6 +17,7 @@ import subprocess
 
 import aiohttp
 from aiohttp import web
+from qw3_computer.limits import MAX_MODEL_REQUEST_BYTES, model_request_limit
 
 
 def request_evidence(raw):
@@ -50,7 +51,8 @@ def request_evidence(raw):
 
 
 def create_app(backend, allowed_peer, token, *, receipt_path=None,
-               backend_timeout_seconds=600, backend_read_timeout_seconds=180):
+               backend_timeout_seconds=600, backend_read_timeout_seconds=180,
+               max_request_bytes=MAX_MODEL_REQUEST_BYTES):
     if not 0 < backend_read_timeout_seconds <= backend_timeout_seconds:
         raise ValueError("Require positive read timeout <= total timeout")
     @web.middleware
@@ -60,7 +62,7 @@ def create_app(backend, allowed_peer, token, *, receipt_path=None,
             raise web.HTTPUnauthorized()
         return await handler(request)
 
-    app = web.Application(middlewares=[authorize], client_max_size=64 * 1024 * 1024)
+    app = web.Application(middlewares=[authorize], client_max_size=model_request_limit(max_request_bytes))
     key = web.AppKey("upstream", aiohttp.ClientSession)
 
     async def session(app):
@@ -154,6 +156,7 @@ def main():
     (run / "manifest.json").write_text(json.dumps({"container_id": info["Id"], "bind": gateway,
                                                   "allowed_peer": peer, "port": args.port,
                                                   "backend": "http://127.0.0.1:18080",
+                                                  "model_request_limit_bytes": MAX_MODEL_REQUEST_BYTES,
                                                   "backend_timeout_seconds": args.backend_timeout,
                                                   "backend_read_timeout_seconds": args.backend_read_timeout}, indent=2))
     print(f"VM-only authenticated model relay: http://{gateway}:{args.port}", flush=True)

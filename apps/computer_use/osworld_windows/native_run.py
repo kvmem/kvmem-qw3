@@ -46,6 +46,7 @@ def runner_sources():
         'client_resources.ps1', 'provision.py', 'vnc_admin.py')]
     sources += [app / name for name in ('run_engine.py', 'windows_suite.py',
         'compare_replay.py', 'collect_artifacts.py')]
+    sources.append(app / 'qw3_computer/limits.py')
     return sources + [SITE_PLATFORM]
 
 
@@ -113,7 +114,8 @@ def inference_failures(paths):
         if metrics.get('status') in {'http_error', 'failed'}:
             failures.append(dict(request_id=path.parent.name, metrics_path=str(path),
                 **{key: metrics[key] for key in ('status', 'http_status', 'error',
-                    'elapsed_seconds', 'backend_trace_tag') if key in metrics}))
+                    'elapsed_seconds', 'backend_trace_tag', 'backend_error_response',
+                    'backend_error_truncated') if key in metrics}))
     return failures
 
 
@@ -140,6 +142,8 @@ async def run(args):
     validate_task(args.task)
     waits = connection_waits(getattr(args, 'backend_timeout', 600), getattr(args, 'backend_read_timeout', 180))
     verify_wait_capability(args.bundle, waits)
+    from .bundle import verify_bundle, prepare as prepare_bundle
+    verify_bundle(args.bundle)
     if not 1 <= args.timeout <= 14400 or not 1 <= args.tool_limit <= 10000:
         raise ValueError("Invalid attempt budget")
     output = args.output.resolve()
@@ -249,6 +253,14 @@ async def run(args):
             if not report['initial_health']['paused'] or (await get('http://127.0.0.1:18082/files', True))['files']:
                 raise ValueError('Restored desktop is not empty and paused')
             event('clean_desktop_ready')
+            report['bundle_install_identity'] = await asyncio.to_thread(
+                prepare_bundle, args.bundle, run_id, share, output / 'bundle-install')
+            await command(sys.executable, app / 'vm/provision.py', output / 'bundle-install/install.ps1')
+            report['bundle_install'] = await wait_json(share / (run_id + '-bundle-install.json'), 120)
+            if (report['bundle_install'].get('passed') is not True
+                    or report['bundle_install'].get('bundle_sha256') != report['bundle_install_identity']['archive']['sha256']):
+                raise ValueError('Frozen native bundle installation failed')
+            event('qualified_native_bundle_verified_after_restore')
             manifest = await asyncio.to_thread(prepare_task, args.task, run_id, output / 'task', args.bundle)
             site_initialized = bool(SITES.get(args.task))
             staged = share / (run_id + '-inputs')

@@ -11,6 +11,7 @@ import uuid
 
 import aiohttp
 from aiohttp import web
+from .limits import MAX_MODEL_REQUEST_BYTES, model_request_limit
 
 from .protocol import ProtocolError, convert_request, read_sse, require
 
@@ -144,12 +145,13 @@ class ResponseStream:
 
 def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", max_tokens=4096, trace_dir=None,
                backend_token=None, trace_backend=False, *, backend_timeout_seconds=600,
-               backend_read_timeout_seconds=180, heartbeat_seconds=30):
+               backend_read_timeout_seconds=180, heartbeat_seconds=30,
+               max_request_bytes=MAX_MODEL_REQUEST_BYTES):
     if trace_backend and trace_dir is None:
         raise ValueError("Backend trace tags require a local trace directory")
     if not 0 < heartbeat_seconds <= backend_read_timeout_seconds <= backend_timeout_seconds:
         raise ValueError("Require positive heartbeat <= read timeout <= total timeout")
-    app = web.Application(client_max_size=64 * 1024 * 1024)
+    app = web.Application(client_max_size=model_request_limit(max_request_bytes))
     lock = asyncio.Lock()
 
     async def sessions(app):
@@ -208,8 +210,20 @@ def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", ma
                 async with app[BACKEND].post(backend_url.rstrip("/") + "/chat/completions",
                                                 json=converted.body) as upstream:
                     if upstream.status != 200:
-                        metrics.update(status="http_error", http_status=upstream.status)
-                        return web.json_response({"error": {"message": f"QW3 returned HTTP {upstream.status}"}}, status=502)
+                        payload = b''
+                        while len(payload) < 4097:
+                            fragment = await upstream.content.read(4097 - len(payload))
+                            if not fragment:
+                                break
+                            payload += fragment
+                        detail = payload[:4096].decode('utf-8', errors='replace')
+                        metrics.update(status="http_error", http_status=upstream.status,
+                                       backend_error_response=detail, backend_error_truncated=len(payload) > 4096)
+                        message = f"QW3 returned HTTP {upstream.status}"
+                        if detail:
+                            message += ": " + detail
+                        return web.json_response({"error": {"message": message,
+                            "upstream_status": upstream.status}}, status=502)
                     await output.prepare(request)
                     await stream.start()
                     heartbeat = asyncio.create_task(progress())
