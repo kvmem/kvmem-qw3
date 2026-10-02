@@ -5,7 +5,7 @@
   "status": "active",
   "local_plan": "docs/computer_use_local_diagnostic_plan_20261002.json",
   "combined_goal": "docs/computer_use_local_advisor_goal_20261002.md",
-  "current_stage": "latex_repair_development_passed_client30_qualification_running",
+  "current_stage": "latex_repair_formal_campaign_running_first_pass_audited",
   "source_baseline": "56896791b41b6aa5c022c99dac4996f719bd4ba0",
   "stages": {
     "P0": {
@@ -210,15 +210,18 @@
     "apps/computer_use/.runtime/latex-repair-fixture-01/result.json",
     "apps/computer_use/.runtime/product-latex-repair-01/result.json",
     "apps/computer_use/.runtime/product-latex-repair-01/audit.json",
-    "apps/computer_use/.runtime/windows-client-30-qualification-01/result.json"
+    "apps/computer_use/.runtime/windows-client-30-qualification-01/result.json",
+    "apps/computer_use/.runtime/latex-repair-formal-20261003/acceptance.json",
+    "apps/computer_use/.runtime/latex-repair-formal-01/result.json",
+    "apps/computer_use/.runtime/latex-repair-formal-20261003/audit-partial-1.json"
   ],
   "latest_checks": {
-    "gpu_idle": true,
+    "gpu_idle": false,
     "root_available_approx_gib": 227,
-    "previous_queue_status": "latex_repair_01_terminal_engine_stopped_client30_qualification_live",
-    "gpu_compute_processes": 0
+    "previous_queue_status": "latex_repair_formal_queue_live_first_pass_audited",
+    "gpu_compute_processes": 1
   },
-  "next_action": "Finish existing client30 native qualification; freeze formal LaTeX repair inputs and three trials. Each reset must first prove healthy projects and then reproduce the same missing-class bytes/metadata state; keep VM and cache warm, restart owned app/engine, require full independent PDF/launcher/reopen checks.",
+  "next_action": "Continue existing latex-repair-formal-20261003 campaign (do not start a duplicate), inspect its live handles and terminal results. Run its audit.py after all three complete, export full repair replay, then update product completion and advance P3 recovery/short-context resource work while preserving P4-P8 and original ten scenarios.",
   "advisor_provider": {
     "provider": "deepseek",
     "model": "deepseek-flash",
@@ -240,7 +243,7 @@
   ],
   "product_trials": {
     "status": "three_product_scenarios_formal_complete_latex_repair_pending",
-    "completed": 9,
+    "completed": 10,
     "planned": 12,
     "development_attempts_completed": 10,
     "development_passed": 7,
@@ -253,9 +256,9 @@
       "product-python-new": "formal_3_of_3_passed_with_launcher_and_reopen",
       "product-python-repair": "formal_3_of_3_passed_with_launcher_and_reopen",
       "product-latex-new": "formal_3_of_3_passed_with_pdf_launcher_and_reopen",
-      "product-latex-repair": "development_passed_formal_next"
+      "product-latex-repair": "formal_1_of_3_passed_queue_running"
     },
-    "formal_passed": 9,
+    "formal_passed": 10,
     "formal_report": "docs/computer_use_python_formal_20261003.md",
     "formal_acceptance": "apps/computer_use/.runtime/python-new-formal-20261003/acceptance.json",
     "repair_fixture": {
@@ -417,6 +420,18 @@
     "repair_fixture_qualified": true,
     "repair_development": "apps/computer_use/.runtime/product-latex-repair-01/result.json",
     "repair_development_passed": true,
-    "repair_development_audit": "apps/computer_use/.runtime/product-latex-repair-01/audit.json"
+    "repair_development_audit": "apps/computer_use/.runtime/product-latex-repair-01/audit.json",
+    "repair_formal": {
+      "status": "running",
+      "planned": 3,
+      "completed": 1,
+      "passed": 1,
+      "acceptance": "apps/computer_use/.runtime/latex-repair-formal-20261003/acceptance.json",
+      "progress": "apps/computer_use/.runtime/latex-repair-formal-20261003/campaign.json",
+      "partial_audit": "apps/computer_use/.runtime/latex-repair-formal-20261003/audit-partial-1.json",
+      "same_missing_class_bytes_and_metadata": true,
+      "cache": "warm verified downloads and existing managed toolchain",
+      "reset_policy": "prove both projects healthy, then inject same missing-class fault; retained OS, fresh app/engine"
+    }
   }
 }
