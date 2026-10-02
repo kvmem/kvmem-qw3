@@ -200,6 +200,10 @@ async def run(args):
                         await asyncio.sleep(1)
         try:
             report['snapshot_qualification'] = snapshot_qualification(app, args.snapshot)
+            if not info['State']['Running']:
+                await command('docker', 'start', 'qw3-computer-windows')
+                await ready('http://127.0.0.1:18082/health', True)
+                event('owned_vm_started_for_restore')
             health = await get('http://127.0.0.1:18082/health', True)
             if not health['paused']:
                 raise ValueError('VM is active; refusing to restore it')

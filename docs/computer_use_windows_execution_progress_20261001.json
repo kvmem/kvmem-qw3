@@ -2581,7 +2581,13 @@
     "formal_counts_created": 0,
     "evidence": "Host controls and actual old launcher request bindings only; readiness certificates and V1 installation path still pending"
   },
-  "next_size_boundary_plan": "docs/computer_use_windows_capability_size_plan_20261002.json",
+  "next_size_boundary_plan": "docs/computer_use_windows_capability_size_plan_04_20261002.json",
   "current_v0_candidate_visual_history": "retrievable",
-  "evidence_storage_preservation": "apps/computer_use/.runtime/gimp051-terminal-preservation-01/result.json"
+  "evidence_storage_preservation": "apps/computer_use/.runtime/gimp051-terminal-preservation-01/result.json",
+  "size12_startup_failures_preserved": [
+    "apps/computer_use/.runtime/size12-launch-01.json",
+    "apps/computer_use/.runtime/windows-capability-size12-02/result.json",
+    "apps/computer_use/.runtime/windows-capability-size12-03/result.json"
+  ],
+  "size12_current_status": "Pre-inference launcher allowlist fixed; next version to start from stopped owned VM"
 }
