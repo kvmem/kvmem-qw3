@@ -4,13 +4,15 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import aiohttp
 
 from qw3_computer.app import Controller, web_app
 from qw3_computer.desktop import DesktopError, DesktopRejected
-from test_bridge import serve
+from test_bridge import chunk, serve
+from test_protocol import request as response_request
+from qw3_computer.protocol import read_sse
 
 
 class FixtureDesktop:
@@ -21,6 +23,7 @@ class FixtureDesktop:
         self.observe = AsyncMock(return_value=self.latest | {"image": "fixture"})
         self.request = AsyncMock(return_value={"files": []})
         self.close = AsyncMock()
+        self.start = AsyncMock()
 
     def unresolved(self):
         return []
@@ -222,6 +225,52 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         for limit in (0, -1, True, 1.5, 10001):
             with self.assertRaises(ValueError):
                 Controller(self.temp.name, self.desktop, "unused", 1, tool_call_limit=limit)
+
+    async def test_backend_wait_limits_reject_invalid_values_before_start(self):
+        for waits in [dict(backend_timeout_seconds=True), dict(backend_timeout_seconds=float('inf')),
+                      dict(backend_read_timeout_seconds=float('nan')), dict(heartbeat_seconds=0),
+                      dict(backend_read_timeout_seconds=601), dict(backend_timeout_seconds=14401)]:
+            with self.subTest(waits=waits), self.assertRaises(ValueError):
+                Controller(self.temp.name, self.desktop, "unused", 1, **waits)
+
+    async def test_controller_bridge_honors_explicit_wait_and_read_deadline(self):
+        async def delayed_backend(req):
+            await req.json()
+            response = aiohttp.web.StreamResponse(headers={'Content-Type': 'text/event-stream'})
+            await response.prepare(req)
+            await asyncio.sleep(.08)
+            await chunk(response, {'content': 'finished'})
+            await chunk(response, finish='stop')
+            await response.write(b'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}}\n\n')
+            await response.write(b'data: [DONE]\n\n')
+            return response
+        backend = aiohttp.web.Application()
+        backend.router.add_post('/v1/chat/completions', delayed_backend)
+        runner, url = await serve(backend)
+        try:
+            for read_wait, expected in ((.3, 'response.completed'), (.03, 'response.failed')):
+                with tempfile.TemporaryDirectory() as directory:
+                    desktop = FixtureDesktop()
+                    client = FixtureCodex()
+                    client.start = AsyncMock()
+                    controller = Controller(directory, desktop, url + '/v1', 1,
+                        backend_timeout_seconds=.5, backend_read_timeout_seconds=read_wait, heartbeat_seconds=.01)
+                    try:
+                        with patch('qw3_computer.app.CodexClient', return_value=client):
+                            await controller.start()
+                        port = controller.bridge.addresses[0][1]
+                        async with aiohttp.ClientSession() as session:
+                            async with session.post(f'http://127.0.0.1:{port}/v1/responses', json=response_request()) as response:
+                                events = [json.loads(s) async for s in read_sse(response.content)]
+                        self.assertEqual(events[-1]['type'], expected)
+                        self.assertGreaterEqual(sum(e['type'] == 'response.in_progress' for e in events), 2)
+                        if expected == 'response.failed':
+                            self.assertFalse(any(e['type'] == 'response.output_item.done' for e in events))
+                        self.assertTrue(desktop.paused)
+                    finally:
+                        await controller.close()
+        finally:
+            await runner.cleanup()
 
     def completed_review(self):
         self.controller.state.update(id="owned-task", status="completed", thread_id="same-history",

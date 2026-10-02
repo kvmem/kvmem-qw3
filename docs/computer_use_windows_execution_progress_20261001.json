@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T07:55:41.990160+00:00",
+  "updated_at": "2026-10-02T08:16:05.603986+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -248,7 +248,7 @@
     "Complete remaining common platform and task preparation; JPG/PNG/JPEG snapshot restoration and same-budget 051 actual-model retest have passed platform checks, while task remains incomplete",
     "Complete 006 missing original availability and application focus qualification; original mirror/initializer and neutral folder export are now native-verified, with full scenario still unready",
     "Keep scripted four-review 035 platform qualification separate from actual QW3 failure; dynamic event rules and 022 nonrequired broken links are frozen in the adaptation contract",
-    "Qualify actual-model near-1M context/compaction and choose a disclosed common history policy; native Windows interruption control-plane passed with scripted inference; then freeze model/engine/history/budgets",
+    "Actual-model KVMem on near-1M compaction and two-marker retention passed; off native readonly qualification is running with explicitly longer component waits; finish shared application/relay connection-profile qualification and common freeze",
     "043 source-conflict handling is disclosed; complete 051 full process audit when an artifact could pass; retain failures as failures",
     "Freeze common model/engine/history/budgets and qualified clean snapshot before formal comparisons",
     "20 V0 on/off baseline runs; diagnose; at most two generic candidates; V1 comparison and conditional repetition"
@@ -2204,7 +2204,7 @@
     "earlier_visual_only_hypothesis_not_supported": true,
     "gpu_oom_observed": false,
     "off_long_context_diagnostic_completed": false,
-    "host_services_stopped": true,
+    "host_services_stopped": false,
     "desktop_paused": true,
     "audit_unit_controls_passed": 4,
     "report": "docs/computer_use_windows_long_context_boundary_20261002.md",
@@ -2318,7 +2318,27 @@
         "video/screen.mp4": "e4c605dea7bfe12342b1a15dabee6717d96bcfb32b5a04f9bef8d6d32584fe65"
       }
     },
-    "qualification_scope": "Single synthetic padded live-observation probe with two markers; not general 1M business-task reliability or an on/off native compaction comparison."
+    "qualification_scope": "Single synthetic padded live-observation probe with two markers; not general 1M business-task reliability or an on/off native compaction comparison.",
+    "off_native_diagnostic": {
+      "status": "running",
+      "directory": "apps/computer_use/.runtime/native-long-context-wait-off-01/long-context-off-01",
+      "engine_directory": "apps/computer_use/.runtime/native-long-context-wait-off-01/engine",
+      "engine_pid": 1587991,
+      "engine_session": 3372,
+      "orchestrator_session": 9738,
+      "bundle": "windows-native-client-14",
+      "observations_requested": 17,
+      "segment_tokens": 59994,
+      "auto_compact_token_limit": 950000,
+      "timeout_seconds": 7200,
+      "backend_timeout_seconds": 1800,
+      "backend_read_timeout_seconds": 1500,
+      "formal_run": false,
+      "not_matched_latency_comparison": "Off component qualification uses longer wait budgets after observed 883K cold inference took 929s; not a same-budget product timing pair",
+      "last_host_process_identity_verified": true,
+      "desktop_actions_available": false,
+      "caller_must_stop_engine_after_terminal": true
+    }
   },
   "task_adaptation_contract": {
     "version": 1,
@@ -2345,5 +2365,22 @@
     "future_context_probe_min_free_gib": 2,
     "sampler_error_no_longer_bypasses_terminal_report": true,
     "new_error_path_native_requalification_pending": true
+  },
+  "formal_connection_profile_preparation": {
+    "status": "linux_runtime_and_host_queue_tests_passed_windows_requalification_pending",
+    "app_source": "apps/computer_use/qw3_computer/app.py",
+    "native_launch_source": "apps/computer_use/vm/run_native_task.ps1",
+    "queue_source": "apps/computer_use/osworld_windows/campaign.py",
+    "linux_evidence": "apps/computer_use/.runtime/transport-application-linux-01/result.json",
+    "native_contract_tests": 79,
+    "host_queue_tests": 15,
+    "real_codex_used": true,
+    "real_qw3_used": false,
+    "extended_waits_explicit_and_shared_across_on_off": true,
+    "default_waits_changed": false,
+    "legacy_bundle_nondefault_waits_rejected": true,
+    "new_candidate_bundle_not_yet_windows_qualified": true,
+    "formal_v0_frozen": false,
+    "v1_strategy_change": false
   }
 }

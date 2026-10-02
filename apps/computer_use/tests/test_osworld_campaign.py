@@ -11,6 +11,7 @@ from osworld_windows.campaign import execute, validate
 from osworld_windows.native_run import DEFAULT_SNAPSHOT, SNAPSHOT_QUALIFICATIONS, snapshot_qualification, terminal_status
 from osworld_windows.scenarios import collection, prepare, verify_collection
 from osworld_windows.source import sha256
+from osworld_windows.launch import connection_waits, prepare as prepare_launch, verify_wait_capability
 
 
 def plan():
@@ -26,6 +27,25 @@ def report(outcome='agent_completed', success=False):
 
 
 class CampaignTests(unittest.IsolatedAsyncioTestCase):
+    async def test_one_explicit_connection_profile_reaches_both_attempts(self):
+        waits = []
+        async def runner(args):
+            waits.append((args.kvmem, args.backend_timeout, args.backend_read_timeout))
+            r = report()
+            return r | terminal_status(r)
+        with tempfile.TemporaryDirectory() as temporary:
+            selected = plan() | dict(backend_timeout_seconds=1800, backend_read_timeout_seconds=1500)
+            result = await execute(selected, SimpleNamespace(output=Path(temporary) / 'queue'), runner=runner)
+            self.assertEqual(waits, [('on', 1800, 1500), ('off', 1800, 1500)])
+            self.assertEqual(result['plan'], selected)
+
+    def test_invalid_or_partial_connection_profile_is_rejected(self):
+        for change in [dict(backend_timeout_seconds=1800), dict(backend_read_timeout_seconds=1500),
+                       dict(backend_timeout_seconds=600, backend_read_timeout_seconds=900),
+                       dict(backend_timeout_seconds=True, backend_read_timeout_seconds=30)]:
+            with self.assertRaises(ValueError):
+                validate(plan() | change)
+
     async def test_cancellation_records_terminal_and_preserves_unstarted_task(self):
         started = asyncio.Event()
         async def runner(args):
@@ -122,6 +142,29 @@ class CampaignTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CollectionBindingTests(unittest.TestCase):
+    def test_legacy_bundle_is_compatible_only_with_default_waits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            (bundle / 'manifest.json').write_text('{}')
+            verify_wait_capability(bundle, connection_waits())
+            with self.assertRaisesRegex(ValueError, 'configurable_backend_waits'):
+                verify_wait_capability(bundle, connection_waits(1800, 1500))
+
+    def test_native_configuration_binds_the_explicit_connection_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); bundle = root / 'bundle';bundle.mkdir()
+            (bundle / 'archive.json').write_text(json.dumps({'sha256': 'a' * 64}))
+            (bundle / 'manifest.json').write_text(json.dumps({'runtime_capabilities': ['configurable_backend_waits']}))
+            staged = root / 'profile-check-001-inputs';staged.mkdir()
+            config = prepare_launch('004', 'profile-check-001', 'Reviewed task prompt.', {'files': []},
+                bundle, staged, root / 'launch', timeout=1800, tool_limit=300,
+                backend='http://172.17.0.1:18084/v1', backend_timeout=1800, backend_read_timeout=1500)
+            exported = json.loads((staged / 'native-task.json').read_text())
+            self.assertEqual(exported, config)
+            self.assertEqual(exported['backend_timeout_seconds'], 1800)
+            self.assertEqual(exported['backend_read_timeout_seconds'], 1500)
+            self.assertEqual(exported['public_sha256']['prompt.txt'], sha256(staged / 'prompt.txt'))
+
     def test_purchase_initializer_supplies_exact_review_prompt(self):
         from osworld_windows import prepare035
         class LocalSite:

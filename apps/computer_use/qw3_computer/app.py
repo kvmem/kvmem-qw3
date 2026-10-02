@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import math
 from pathlib import Path
 import re
 import secrets
@@ -20,11 +21,19 @@ from .desktop import Desktop, DesktopError, DesktopRejected, mcp_observation
 
 class Controller:
     def __init__(self, runtime, desktop, backend, port, backend_token=None, trace_backend=False,
-                 tool_call_limit=100, output_policy="outputs"):
+                 tool_call_limit=100, output_policy="outputs", *, backend_timeout_seconds=600,
+                 backend_read_timeout_seconds=180, heartbeat_seconds=30):
         if type(tool_call_limit) is not int or not 1 <= tool_call_limit <= 10000:
             raise ValueError("Tool-call limit must be an integer between 1 and 10000")
         if output_policy not in ("outputs", "task"):
             raise ValueError("Output policy must be outputs or task")
+        waits = (heartbeat_seconds, backend_read_timeout_seconds, backend_timeout_seconds)
+        if (any(type(value) not in (int, float) or not math.isfinite(value) for value in waits)
+                or not 0 < heartbeat_seconds <= backend_read_timeout_seconds <= backend_timeout_seconds <= 14400):
+            raise ValueError("Require positive heartbeat <= backend read timeout <= total timeout <= 14400")
+        self.backend_timeout_seconds = backend_timeout_seconds
+        self.backend_read_timeout_seconds = backend_read_timeout_seconds
+        self.heartbeat_seconds = heartbeat_seconds
         self.tool_call_limit = tool_call_limit
         self.output_policy = output_policy
         self.runtime = Path(runtime).resolve()
@@ -75,7 +84,10 @@ class Controller:
     async def start(self):
         await self.desktop.start()
         self.bridge = web.AppRunner(bridge_app(self.backend, trace_dir=self.runtime / "inference",
-                                              backend_token=self.backend_token, trace_backend=self.trace_backend),
+                                              backend_token=self.backend_token, trace_backend=self.trace_backend,
+                                              backend_timeout_seconds=self.backend_timeout_seconds,
+                                              backend_read_timeout_seconds=self.backend_read_timeout_seconds,
+                                              heartbeat_seconds=self.heartbeat_seconds),
                                     handler_cancellation=True)
         await self.bridge.setup()
         site = web.TCPSite(self.bridge, "127.0.0.1", 0)
@@ -424,7 +436,8 @@ async def run(args):
         raise ValueError("Backend token file is empty")
     controller = Controller(args.runtime, desktop, args.backend, args.port, backend_token=token,
                             trace_backend=args.trace_backend, tool_call_limit=args.tool_call_limit,
-                            output_policy=args.output_policy)
+                            output_policy=args.output_policy, backend_timeout_seconds=args.backend_timeout,
+                            backend_read_timeout_seconds=args.backend_read_timeout)
     runner = web.AppRunner(web_app(controller), handler_cancellation=True)
     try:
         await runner.setup()
@@ -446,6 +459,8 @@ def main():
     parser.add_argument("--port", type=int, default=18083)
     parser.add_argument("--backend", default="http://127.0.0.1:18080/v1")
     parser.add_argument("--backend-token", type=Path, help="Optional private VM relay token file")
+    parser.add_argument("--backend-timeout", type=int, default=600, help="Total model request deadline in seconds")
+    parser.add_argument("--backend-read-timeout", type=int, default=180, help="Model socket read deadline in seconds")
     parser.add_argument("--desktop", default="http://127.0.0.1:18082")
     parser.add_argument("--desktop-token", type=Path, required=True)
     parser.add_argument("--runtime", type=Path, required=True)

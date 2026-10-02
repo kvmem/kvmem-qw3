@@ -8,7 +8,23 @@ from .source import ROOT, sha256
 from .capabilities import TASKS as CAPABILITY_TASKS
 
 
-def prepare(task, run, prompt, collection, bundle, staged, output, *, timeout, tool_limit, backend):
+def connection_waits(total=600, read=180):
+    if type(total) is not int or type(read) is not int or not 30 <= read <= total <= 14400:
+        raise ValueError('Require integer 30 <= backend read timeout <= total timeout <= 14400')
+    return dict(backend_timeout_seconds=total, backend_read_timeout_seconds=read)
+
+
+def verify_wait_capability(bundle, waits):
+    if waits != connection_waits():
+        manifest = json.loads((Path(bundle) / 'manifest.json').read_text())
+        if 'configurable_backend_waits' not in manifest.get('runtime_capabilities', []):
+            raise ValueError('Extended backend waits require a bundle with configurable_backend_waits')
+
+
+def prepare(task, run, prompt, collection, bundle, staged, output, *, timeout, tool_limit, backend,
+            backend_timeout=600, backend_read_timeout=180):
+    waits = connection_waits(backend_timeout, backend_read_timeout)
+    verify_wait_capability(bundle, waits)
     if (task not in {'013','004','006','010','038','022','035','043','080','051', *CAPABILITY_TASKS}
             or not re.fullmatch(r'[a-zA-Z0-9_-]{8,60}',run) or not isinstance(prompt,str) or not prompt.strip()
             or type(timeout) is not int or not 1 <= timeout <= 14400
@@ -31,6 +47,7 @@ def prepare(task, run, prompt, collection, bundle, staged, output, *, timeout, t
     configuration = dict(run=run,task=task,bundle_sha256=archive['sha256'],backend=backend,
         timeout_seconds=timeout,tool_call_limit=tool_limit,review_batches=3 if task=='035' else 0,
         public_sha256={name:sha256(staged/name) for name in ('prompt.txt','collection.json','client_resources.ps1')})
+    configuration.update(waits)
     with (staged/'native-task.json').open('x',encoding='utf-8') as handle:json.dump(configuration,handle,indent=2)
     script = ("$ErrorActionPreference='Stop'\n"
               f"$script='\\\\host.lan\\Data\\{run}-inputs\\run_native_task.ps1'\n"

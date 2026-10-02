@@ -80,15 +80,19 @@ def main():
     [string]$Desktop = 'http://127.0.0.1:5000',
     [string]$DesktopToken = 'C:\\Qw3Computer\\executor-token.txt',
     [string]$Runtime = '',
+    [ValidateRange(30,14400)][int]$BackendTimeout = 600,
+    [ValidateRange(30,14400)][int]$BackendReadTimeout = 180,
     [ValidateRange(1,10000)][int]$ToolCallLimit = 100,
     [ValidateSet('outputs','task')][string]$OutputPolicy = 'outputs'
 )
 $ErrorActionPreference = 'Stop'
+if ($BackendReadTimeout -gt $BackendTimeout) {throw 'Read timeout exceeds total backend timeout'}
 $env:PATH = "$PSScriptRoot\\codex\\bin;$env:PATH"
 $env:PYTHONUTF8 = '1'
 if (!$Runtime) { $Runtime = Join-Path $PSScriptRoot 'runtime' }
 $clientArgs = @('-X','utf8','-m','qw3_computer.app','--backend',$Backend,'--desktop',$Desktop,'--desktop-token',$DesktopToken,'--runtime',$Runtime)
 $clientArgs += @('--tool-call-limit',"$ToolCallLimit",'--output-policy',$OutputPolicy)
+$clientArgs += @('--backend-timeout',"$BackendTimeout",'--backend-read-timeout',"$BackendReadTimeout")
 if ($BackendToken) { $clientArgs += @('--backend-token',$BackendToken) }
 & "$PSScriptRoot\\python\\python.exe" @clientArgs
 exit $LASTEXITCODE
@@ -104,6 +108,8 @@ exit $LASTEXITCODE
         "kind": "windows_native_client_offline_bundle", "qualified": False,
         "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
         "python_version": "3.13.13", "codex_version": "0.159.2",
+        "runtime_capabilities": ["configurable_backend_waits"],
+        "backend_wait_defaults": {"total_seconds": 600, "read_seconds": 180, "heartbeat_seconds": 30},
         "test_scope": "Windows runtime contracts; host OSWorld/scoring tests remain in the repository",
         "assets": {p.name: {"sha256": digest(p), "bytes": p.stat().st_size} for p in [python, codex, *wheels]},
         "source_files": {str(p.relative_to(app)): digest(p) for p in app.rglob("*") if p.is_file()},

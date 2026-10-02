@@ -29,6 +29,15 @@ try {
     if ($configuration.run -cne $RunId -or $configuration.task -notin @('013','004','006','010','038','022','035','043','080','051','cap01','cap02','cap03','cap04','cap05','cap06','cap07','cap08','cap09','cap10')) {throw 'Task configuration identity mismatch'}
     if ($configuration.bundle_sha256 -cnotmatch '^[a-f0-9]{64}$' -or $configuration.backend -cnotmatch '^http://[0-9.]+:18084/v1$') {throw 'Invalid frozen client/backend identity'}
     if ($configuration.timeout_seconds -lt 1 -or $configuration.timeout_seconds -gt 14400 -or $configuration.tool_call_limit -lt 1 -or $configuration.tool_call_limit -gt 10000) {throw 'Invalid frozen task budget'}
+    $modelWait=600; $modelReadWait=180
+    $waitFields=@($configuration.PSObject.Properties.Name | Where-Object {$_ -in @('backend_timeout_seconds','backend_read_timeout_seconds')})
+    if ($waitFields.Count -notin @(0,2)) {throw 'Incomplete model wait configuration'}
+    if ($waitFields.Count -eq 2) {
+        $modelWait=$configuration.backend_timeout_seconds; $modelReadWait=$configuration.backend_read_timeout_seconds
+        if ($modelWait -is [bool] -or $modelReadWait -is [bool] -or "$modelWait" -cnotmatch '^[0-9]+$' -or "$modelReadWait" -cnotmatch '^[0-9]+$') {throw 'Model waits must be integer seconds'}
+    }
+    if ($modelReadWait -lt 30 -or $modelWait -lt $modelReadWait -or $modelWait -gt 14400) {throw 'Invalid model wait configuration'}
+    $result.backend_timeout_seconds=$modelWait; $result.backend_read_timeout_seconds=$modelReadWait
     if ($configuration.review_batches -notin @(0,3) -or ($configuration.review_batches -eq 3 -and $configuration.task -ne '035')) {throw 'Unrecognized dynamic event plan'}
     $client=Join-Path 'C:\Qw3Computer\clients' $configuration.bundle_sha256.Substring(0,12)
     $python=Join-Path $client 'python\python.exe'
@@ -53,6 +62,11 @@ try {
     $appArguments='-X utf8 -m qw3_computer.app --desktop http://127.0.0.1:5000 --desktop-token C:\Qw3Computer\executor-token.txt'+
         ' --backend '+$configuration.backend+' --backend-token "'+$runtime+'\model-token.txt" --runtime "'+$runtime+'\app"'+
         ' --tool-call-limit '+$configuration.tool_call_limit+' --output-policy task'
+    # Historical bundles keep their original default CLI. Extended waits
+    # require a newly qualified bundle that supports these explicit options.
+    if ($modelWait -ne 600 -or $modelReadWait -ne 180) {
+        $appArguments+=' --backend-timeout '+$modelWait+' --backend-read-timeout '+$modelReadWait
+    }
     $app=Start-Process $python -ArgumentList $appArguments -WindowStyle Hidden -PassThru -RedirectStandardOutput "$runtime\app.stdout.log" -RedirectStandardError "$runtime\app.stderr.log"
     $appHandle=$app.Handle
     $deadline=[DateTime]::UtcNow.AddSeconds(60)

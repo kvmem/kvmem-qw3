@@ -12,6 +12,7 @@ import re
 from types import SimpleNamespace
 
 from .native_run import DEFAULT_SNAPSHOT, run as run_attempt
+from .launch import connection_waits
 from .scenarios import validate_task
 from .source import ROOT, sha256
 from .capabilities import TASKS as CAPABILITY_TASKS, INPUT_ROOT, input_sources
@@ -39,6 +40,9 @@ def validate(plan):
                 raise ValueError('Invalid explicit attempt budget: ' + key)
     if plan.get('visual_history') not in {'pin-all', 'retrievable'}:
         raise ValueError('One common visual history policy must be specified')
+    if ('backend_timeout_seconds' in plan) != ('backend_read_timeout_seconds' in plan):
+        raise ValueError('Specify both backend wait limits in the queue plan')
+    connection_waits(plan.get('backend_timeout_seconds', 600), plan.get('backend_read_timeout_seconds', 180))
 
 
 async def execute(plan, args, *, runner=run_attempt):
@@ -80,6 +84,8 @@ async def execute(plan, args, *, runner=run_attempt):
             options.timeout = attempt['timeout_seconds']
             options.tool_limit = attempt['tool_call_limit']
             options.visual_history = plan['visual_history']
+            options.backend_timeout = plan.get('backend_timeout_seconds', 600)
+            options.backend_read_timeout = plan.get('backend_read_timeout_seconds', 180)
             result = await runner(options)
             entry.update(status=result['status'], pipeline_passed=result['pipeline_passed'],
                          queue_may_continue=result['queue_may_continue'],

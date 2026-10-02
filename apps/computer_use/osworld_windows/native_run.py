@@ -19,7 +19,7 @@ import aiohttp
 from compare_replay import monitor
 from windows_suite import command, stop
 from .entries import prepare as prepare_entries
-from .launch import prepare as prepare_launch
+from .launch import connection_waits, prepare as prepare_launch, verify_wait_capability
 from .scenarios import IMPLEMENTED, SITES, collection, prepare as prepare_task, validate_task
 from .sites import Site
 from .site_platform import PLATFORM as SITE_PLATFORM, qualify_runtime as qualify_sites
@@ -92,6 +92,8 @@ if ($LASTEXITCODE -ne 0) {throw 'Browser collector failed'}
 
 async def run(args):
     validate_task(args.task)
+    waits = connection_waits(getattr(args, 'backend_timeout', 600), getattr(args, 'backend_read_timeout', 180))
+    verify_wait_capability(args.bundle, waits)
     if not 1 <= args.timeout <= 14400 or not 1 <= args.tool_limit <= 10000:
         raise ValueError("Invalid attempt budget")
     output = args.output.resolve()
@@ -114,6 +116,7 @@ async def run(args):
                   v0_frozen=False, qw3_backend_selected=True, task=args.task, run=run_id,
                   kvmem=args.kvmem, timeout_seconds=args.timeout, tool_call_limit=args.tool_limit, visual_history=args.visual_history,
                   pipeline_passed=False, task_success_claimed=False, events=[])
+    report.update(waits)
     engine = relay = recorder = sampler = reviews = None
     owns_desktop = False
     grading_started = False
@@ -218,7 +221,9 @@ async def run(args):
                 '--lock-timeout', '30', '--run-dir', output / 'engine'])
             sampler = asyncio.create_task(monitor(engine.pid, output / 'engine-resources.jsonl', monitoring_stopped))
             await ready('http://127.0.0.1:18080/health', process=engine)
-            relay = await launch('relay', [sys.executable, app / 'vm/model_relay.py', '--run-dir', output / 'relay'])
+            relay = await launch('relay', [sys.executable, app / 'vm/model_relay.py', '--run-dir', output / 'relay',
+                '--backend-timeout', waits['backend_timeout_seconds'],
+                '--backend-read-timeout', waits['backend_read_timeout_seconds']])
             relay_info = await wait_json(output / 'relay/manifest.json', 20, relay)
             await asyncio.sleep(.5)
             if relay.returncode is not None:
@@ -227,7 +232,9 @@ async def run(args):
             (share / 'native-model-token.txt').chmod(0o600)
             prepare_launch(args.task, run_id, manifest['instruction'], collection(args.task), args.bundle, staged,
                 output / 'launch', timeout=args.timeout, tool_limit=args.tool_limit,
-                backend=f"http://{relay_info['bind']}:18084/v1")
+                backend=f"http://{relay_info['bind']}:18084/v1",
+                backend_timeout=waits['backend_timeout_seconds'],
+                backend_read_timeout=waits['backend_read_timeout_seconds'])
             recorder = await launch('recorder', [sys.executable, app / 'vm/record_console.py',
                 '--output', output / 'video', '--ffmpeg', args.ffmpeg, '--fps', '10'])
             await wait_json(output / 'video/recording.json', 20, recorder,
@@ -342,5 +349,7 @@ if __name__ == '__main__':
     parser.add_argument('--ffmpeg', type=Path, required=True)
     parser.add_argument('--kvmem', choices=('on', 'off'), default='on')
     parser.add_argument('--timeout', type=int, default=900)
+    parser.add_argument('--backend-timeout', type=int, default=600)
+    parser.add_argument('--backend-read-timeout', type=int, default=180)
     args = parser.parse_args()
     raise SystemExit(0 if asyncio.run(run(args))['pipeline_passed'] else 1)
