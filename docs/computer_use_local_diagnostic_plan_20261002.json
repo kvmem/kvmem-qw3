@@ -1,0 +1,485 @@
+{
+  "schema_version": 1,
+  "plan_id": "computer-use-local-diagnostic-20261002",
+  "date": "2026-10-02",
+  "timezone": "Asia/Shanghai",
+  "status": "planned",
+  "manifest_type": "planning_only_not_a_runner_input",
+  "description": "先诊断纯本地能力，按首个错误逐步优化，之后再设计 Super-Advisor。",
+  "new_diagnostic_trials_executed": 0,
+  "advisor": {
+    "status": "deferred",
+    "external_model_calls_allowed_in_this_plan": false
+  },
+  "baseline": {
+    "source_commit": "56896791b41b6aa5c022c99dac4996f719bd4ba0",
+    "diagnostic_version": "D0",
+    "formal_v0_frozen": false,
+    "formal_original_task_runs": 0,
+    "model": "Qwen3.8-27B Q8_0",
+    "vision": "matching vision encoder; exact asset hashes to freeze at P0",
+    "speculative_decoding": "DFlash2; same profile across compared groups",
+    "harness": "existing Codex + QW3 bridge + Computer MCP",
+    "environment": "current host inference and Windows VM executor",
+    "thinking_supported_by_current_bridge": false,
+    "initial_kvmem": "off",
+    "initial_context": "short, below retrieval threshold",
+    "hash_manifest_status": "pending_P0",
+    "evidence": [
+      "docs/computer_use_windows_execution_optimization_20261001.md",
+      "docs/computer_use_windows_capability_size_plan_06_20261002.json",
+      "apps/computer_use/qw3_computer/protocol.py",
+      "apps/computer_use/qw3_computer/bridge.py",
+      "apps/computer_use/vm/executor.ps1",
+      "apps/computer_use/.runtime/windows-capability-analysis-01/report.md",
+      "apps/computer_use/.runtime/storage-maintenance-20261002-01/result.json"
+    ]
+  },
+  "controls": {
+    "freeze_before_execution": [
+      "source, engine, model, vision and client identities",
+      "VM snapshot, input files and sample split",
+      "independent answers, target bounds and grading rules",
+      "tool scope, sampling, token, wall-time and tool-call budgets",
+      "run order and exact request configuration"
+    ],
+    "change_one_factor_per_comparison": true,
+    "same_total_output_token_cap_for_thinking_pair": true,
+    "verify_actual_backend_thinking_mode": true,
+    "no_gold_answer_driven_image_crop": true,
+    "same_visible_facts_and_distractors_in_text_control": true,
+    "maximum_generic_fixes_per_iteration": 2,
+    "preserve_all_failed_and_invalid_attempts": true,
+    "uncertain_action_blind_replay": false,
+    "holdout_policy": "Freeze candidates before held-out scoring; consumed holdouts are no longer unseen.",
+    "completion_policy": "Complete evidence and diagnosis, not mandatory model success. Continue independent stages when a platform dependency fails."
+  },
+  "stages": [
+    {
+      "id": "P0",
+      "status": "planned",
+      "title": "固定基线和验证执行器、推理接口",
+      "depends_on": [],
+      "matrix": {
+        "operation_classes": 4,
+        "repetitions": 3,
+        "planned_scripted_trials": 12
+      },
+      "operation_classes": [
+        "应用启动与焦点切换",
+        "已知控件点击",
+        "精确文字输入",
+        "另存为并保留原件"
+      ],
+      "additional_work": [
+        "Freeze D0 identities and current failure evidence",
+        "Add optional thinking support without changing the old default",
+        "Validate reasoning/final separation, terminal tool delivery, cancellation, truncation, IDs and history",
+        "Run targeted contracts and real local short/across-tool smoke checks"
+      ],
+      "gate": "Record all 12 outcomes and unresolved executor defects; only dependent live actions wait for their fix. P1 may continue if thinking remains blocked.",
+      "model_success_credit": false,
+      "deliverables": [
+        "D0 identity manifest",
+        "executor results",
+        "thinking compatibility report"
+      ]
+    },
+    {
+      "id": "P1",
+      "status": "planned",
+      "title": "读屏和定位",
+      "depends_on": [
+        "P0:D0_identity"
+      ],
+      "matrix": {
+        "samples": 24,
+        "presentations": 2,
+        "repetitions": 1,
+        "planned_requests": 48
+      },
+      "split": {
+        "development": 12,
+        "held_out": 12
+      },
+      "categories": [
+        "小字和表格",
+        "按钮和字段定位",
+        "窗口文档弹窗状态",
+        "空间关系和选中区域"
+      ],
+      "samples_per_category": 6,
+      "applications": [
+        "Edge",
+        "Notepad",
+        "Calc",
+        "Writer",
+        "Impress",
+        "GIMP"
+      ],
+      "conditions": {
+        "presentation": [
+          "raw",
+          "predefined_tiles_or_zoom"
+        ],
+        "thinking": "off",
+        "kvmem": "off"
+      },
+      "metrics": [
+        "OCR/field accuracy",
+        "target-box hit rate",
+        "original-screen coordinate error",
+        "state accuracy",
+        "format error",
+        "response latency",
+        "visual tokens"
+      ],
+      "gate": "Score every request against frozen references, retain failures, and classify first errors without requiring a target accuracy.",
+      "deliverables": [
+        "frozen sample and target manifest",
+        "per-application error matrix",
+        "raw/zoom paired results"
+      ]
+    },
+    {
+      "id": "P2",
+      "status": "planned",
+      "title": "等价信息与 thinking 的 2×2 推理对照",
+      "depends_on": [
+        "P0:D0_identity"
+      ],
+      "conditional_dependency": "thinking-on cells require real backend and bridge qualification; never substitute a prompt instruction",
+      "matrix": {
+        "samples": 12,
+        "representations": 2,
+        "thinking_modes": 2,
+        "repetitions": 2,
+        "planned_requests": 96
+      },
+      "split": {
+        "development": 8,
+        "held_out": 4
+      },
+      "categories": [
+        "约束计算",
+        "新规则覆盖旧规则",
+        "跨材料选择",
+        "顺序和验收判断"
+      ],
+      "samples_per_category": 3,
+      "conditions": {
+        "representation": [
+          "screenshot",
+          "verified_equivalent_facts"
+        ],
+        "thinking": [
+          "off",
+          "on"
+        ],
+        "kvmem": "off"
+      },
+      "metrics": [
+        "all-constraint satisfaction",
+        "latest-rule selection",
+        "conclusion/plan correctness",
+        "self-correction",
+        "budget exhaustion",
+        "latency",
+        "input/output tokens"
+      ],
+      "gate": "Complete or explicitly mark blocked cells; review matched first errors before attributing perception versus reasoning.",
+      "model_end_to_end_success_credit": false,
+      "deliverables": [
+        "2x2 paired report",
+        "selected frozen local inference profile with reasons"
+      ]
+    },
+    {
+      "id": "P3",
+      "status": "planned",
+      "title": "异常恢复与误触发对照",
+      "depends_on": [
+        "P0:dependent_executor_operations",
+        "P2:selected_local_profile"
+      ],
+      "matrix": {
+        "fault_types": 6,
+        "workflow_versions": 2,
+        "repetitions": 2,
+        "planned_fault_trials": 24,
+        "healthy_control_types": 2,
+        "planned_control_trials": 8,
+        "planned_trials": 32
+      },
+      "fault_types": [
+        "错误焦点",
+        "普通保存确认弹窗",
+        "前台超出操作范围",
+        "界面延迟",
+        "错误页面",
+        "动作投递不确定"
+      ],
+      "healthy_controls": [
+        "normal_response",
+        "normal_slow_loading"
+      ],
+      "conditions": {
+        "workflow": [
+          "original",
+          "candidate"
+        ],
+        "model_profile": "frozen_after_P2",
+        "kvmem": "off"
+      },
+      "budget": {
+        "seconds": 180,
+        "tool_calls": 40
+      },
+      "candidate_recovery_or_handoff_target_seconds": 60,
+      "handoff_counts_as_autonomous_success": false,
+      "metrics": [
+        "automatic recovery",
+        "controlled termination",
+        "stall detection time",
+        "unproductive calls",
+        "recovery cost",
+        "wrong-window input",
+        "duplicate writes",
+        "false positive recovery"
+      ],
+      "gate": "Retain original/candidate fault and healthy results; distinguish business recovery from safe handoff and do not widen tool scope.",
+      "deliverables": [
+        "paired recovery report",
+        "bounded workflow candidate",
+        "annotated failure/recovery videos"
+      ]
+    },
+    {
+      "id": "P4",
+      "status": "planned",
+      "title": "完整任务难度阶梯",
+      "depends_on": [
+        "P1",
+        "P2",
+        "P3"
+      ],
+      "matrix": {
+        "families": 3,
+        "difficulty_levels": 3,
+        "repetitions": 3,
+        "planned_trials": 27
+      },
+      "families": [
+        {
+          "name": "表格公式和排序",
+          "variable": "rows",
+          "levels": [
+            3,
+            12,
+            30
+          ]
+        },
+        {
+          "name": "办公文档指定修改",
+          "variable": "edit_points",
+          "levels": [
+            2,
+            5,
+            10
+          ]
+        },
+        {
+          "name": "多材料规则和归档",
+          "variable": "materials",
+          "levels": [
+            2,
+            5,
+            10
+          ]
+        }
+      ],
+      "budget_by_level": [
+        {
+          "seconds": 300,
+          "tool_calls": 60
+        },
+        {
+          "seconds": 600,
+          "tool_calls": 120
+        },
+        {
+          "seconds": 1200,
+          "tool_calls": 240
+        }
+      ],
+      "conditions": {
+        "model_and_workflow": "one frozen local candidate",
+        "kvmem": "off"
+      },
+      "independent_artifact_grading": true,
+      "metrics": [
+        "unassisted correct completion",
+        "original preserved",
+        "allowed edit scope",
+        "saved artifact",
+        "successful latency",
+        "failure latency",
+        "partial progress",
+        "handoffs",
+        "first error",
+        "resources"
+      ],
+      "gate": "Report all levels including failures; three repeats support exploratory boundaries, not production reliability or cross-version improvement claims.",
+      "deliverables": [
+        "capability boundary table",
+        "independently graded artifacts",
+        "representative replay evidence"
+      ]
+    },
+    {
+      "id": "P5",
+      "status": "planned",
+      "title": "固定流程下的 KVMem 开关对照",
+      "depends_on": [
+        "P4:frozen_profile_and_graders"
+      ],
+      "matrix": {
+        "tasks": 4,
+        "kvmem_modes": 2,
+        "repetitions": 3,
+        "planned_trials": 24
+      },
+      "history_mix": {
+        "short_tasks": 2,
+        "above_retrieval_threshold_tasks": 2
+      },
+      "conditions": {
+        "kvmem": [
+          "off",
+          "on"
+        ],
+        "thinking_and_dflash": "frozen",
+        "order": "interleaved",
+        "snapshot_and_budgets": "matched"
+      },
+      "comparison_scope": "whole product profiles; disclose prefix reuse and guided/query-refresh differences",
+      "optional_fixed_input_replay": {
+        "enabled_by_default": false,
+        "prefix_reuse": "off on both sides",
+        "task_success_credit": false
+      },
+      "metrics": [
+        "task success",
+        "artifact correctness",
+        "successful elapsed time",
+        "step latency P50/P95 with counts",
+        "inference wait",
+        "GPU/CPU memory",
+        "context/retrieval tokens",
+        "historical fact retention",
+        "recovery cost",
+        "evidence bytes"
+      ],
+      "gate": "Report every attempt and capacity failure; no asymmetric screenshot deletion or context reduction.",
+      "deliverables": [
+        "paired local KVMem report",
+        "continuous-video comparisons",
+        "remaining bottleneck classification"
+      ]
+    },
+    {
+      "id": "P6",
+      "status": "planned",
+      "title": "恢复原十场景正式测试并交付纯本地结论",
+      "depends_on": [
+        "P1",
+        "P2",
+        "P3",
+        "P4",
+        "P5"
+      ],
+      "original_task_ids": [
+        "013",
+        "004",
+        "006",
+        "010",
+        "038",
+        "022",
+        "035",
+        "043",
+        "080",
+        "051"
+      ],
+      "original_held_out_ids": [
+        "043",
+        "080",
+        "051"
+      ],
+      "known_readiness_gaps": [
+        "006 missing original resume",
+        "051 positive full-process qualification",
+        "043 original-rule/grader discrepancy"
+      ],
+      "formal_plan": "docs/computer_use_windows_execution_optimization_20261001.json",
+      "formal_v0_v1_separate_from_diagnostic_d0_d1": true,
+      "gate": "Resolve readiness or record blocked items without substitution, freeze formal baseline, execute original paired protocol and publish local-only conclusions.",
+      "advisor_implementation_in_scope": false,
+      "deliverables": [
+        "local capability report",
+        "original ten-scene results per formal plan",
+        "evidence for a later advisor design"
+      ]
+    }
+  ],
+  "recording": {
+    "required_fields": [
+      "sample_id",
+      "split",
+      "source_and_config_identity",
+      "input_and_reference_hashes",
+      "actual_request_mode",
+      "run_order",
+      "repetition",
+      "start_and_end",
+      "budgets",
+      "raw_output",
+      "independent_grade",
+      "evidence_paths",
+      "first_error"
+    ],
+    "first_error_categories": [
+      "perception",
+      "fact_extraction",
+      "reasoning",
+      "action_selection",
+      "delivery_or_focus",
+      "recovery",
+      "result_verification",
+      "infrastructure",
+      "unattributed"
+    ],
+    "attempt_outcomes": [
+      "planned",
+      "running",
+      "passed",
+      "failed",
+      "timed_out",
+      "infra_invalid",
+      "blocked"
+    ],
+    "distinguish_unassisted_assisted_and_partial": true,
+    "all_attempts_denominator_required": true,
+    "continuous_video_for_live_trials": true,
+    "content_addressed_images": "only after request reconstruction validation",
+    "capacity_checks": [
+      "evidence volume",
+      "shared directory volume",
+      "VM disk"
+    ],
+    "low_space_behavior": "controlled stop with terminal evidence, never overwrite prior failures"
+  },
+  "next_action": "P0: freeze D0, validate the four executor operations, and qualify optional thinking; prepare P1 neutral examples.",
+  "launch_policy": "one stage or dependency-independent small batch at a time; no full-plan long queue",
+  "execution_progress": "docs/computer_use_local_advisor_progress_20261002.json",
+  "execution_counts_scope": "Snapshot at plan creation. Current execution and product scope are tracked in execution_progress."
+}

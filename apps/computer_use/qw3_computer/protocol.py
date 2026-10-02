@@ -64,7 +64,7 @@ class ConvertedRequest:
     names: dict
 
 
-def convert_request(request, backend_model, max_tokens=4096):
+def convert_request(request, backend_model, max_tokens=4096, *, allow_thinking=False):
     require(isinstance(request, dict), "request must be an object")
     allowed = {"model", "instructions", "input", "tools", "tool_choice",
                "parallel_tool_calls", "reasoning", "store", "stream", "include",
@@ -79,9 +79,11 @@ def convert_request(request, backend_model, max_tokens=4096):
     reasoning = request.get("reasoning") or {}
     require(isinstance(reasoning, dict), "reasoning must be an object")
     require(set(reasoning) <= {"effort", "summary"}, "unsupported reasoning fields")
-    # An effort budget has no direct QW3 equivalent. Only none is accepted
-    # until local thinking/history round trips have their own qualification.
-    require(reasoning.get("effort", "none") == "none", "only reasoning effort=none is qualified")
+    # Opt-in medium enables QW3 thinking; it does not claim to implement an
+    # OpenAI effort budget. The same max_tokens cap includes reasoning/output.
+    effort = reasoning.get("effort", "none")
+    require(effort == "none" or (allow_thinking and effort == "medium"),
+            "only reasoning effort=none is qualified unless local thinking is enabled")
     require(reasoning.get("summary", "none") in ("none", "auto"), "reasoning summaries are unsupported")
     text = request.get("text") or {}
     require(text in ({}, {"format": {"type": "text"}}), "structured text output is unsupported")
@@ -128,7 +130,26 @@ def convert_request(request, backend_model, max_tokens=4096):
             role = item.get("role")
             require(role in ("system", "developer", "user", "assistant"), "invalid message role")
             require(not pending_calls, "tool outputs are missing before the next message")
-            messages.append({"role": role, "content": content_parts(item.get("content", []))})
+            content = content_parts(item.get("content", []))
+            if (role == "assistant" and messages and messages[-1]["role"] == "assistant"
+                    and "reasoning_content" in messages[-1] and messages[-1]["content"] == ""
+                    and not messages[-1].get("tool_calls")):
+                messages[-1]["content"] = content
+            else:
+                messages.append({"role": role, "content": content})
+        elif kind == "reasoning":
+            require(allow_thinking, "reasoning history requires local thinking support")
+            require(not pending_calls, "tool outputs are missing before reasoning")
+            require(not item.get("encrypted_content"), "foreign encrypted reasoning is unsupported")
+            require(item.get("summary", []) == [], "reasoning summaries cannot replace raw local reasoning")
+            parts = item.get("content")
+            require(isinstance(parts, list) and bool(parts), "local reasoning content is missing")
+            text = []
+            for part in parts:
+                require(isinstance(part, dict) and part.get("type") == "reasoning_text",
+                        "unsupported local reasoning content")
+                text.append(string(part.get("text"), "reasoning text"))
+            messages.append({"role": "assistant", "content": "", "reasoning_content": "".join(text)})
         elif kind == "function_call":
             call_id = string(item.get("call_id"), "call_id")
             require(call_id and call_id not in seen_calls, "duplicate or empty call_id")
@@ -161,7 +182,7 @@ def convert_request(request, backend_model, max_tokens=4096):
             f"max_output_tokens must be between 1 and {max_tokens}")
     body = {"model": backend_model, "messages": messages, "stream": True,
             "stream_options": {"include_usage": True}, "max_tokens": limit,
-            "enable_thinking": False}
+            "enable_thinking": effort == "medium"}
     if tools:
         body["tools"] = tools
     choice = request.get("tool_choice", "auto")

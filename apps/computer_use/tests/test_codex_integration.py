@@ -30,6 +30,7 @@ class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
             calls.append(body)
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
             await response.prepare(request)
+            await chunk(response, {"reasoning_content": f"Review thought {len(calls)}."})
             if len(calls) % 2:
                 name = next(t["function"]["name"] for t in body["tools"]
                             if t["function"]["name"].endswith("observe"))
@@ -50,7 +51,8 @@ class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
             pixels = io.BytesIO()
             Image.new("RGB", (128, 96), "blue").save(pixels, format="PNG")
             desktop.observe.return_value = desktop.latest | {"image": base64.b64encode(pixels.getvalue()).decode()}
-            controller = Controller(runtime, desktop, url + "/v1", 0, tool_call_limit=4, output_policy="task")
+            controller = Controller(runtime, desktop, url + "/v1", 0, tool_call_limit=4,
+                                    output_policy="task", thinking=True)
             app_runner, app_url = await serve(web_app(controller))
             controller.port = int(app_url.rsplit(":", 1)[1])
             try:
@@ -74,6 +76,9 @@ class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     # Retrying a confirmed owner request must not run again.
                     await controller.followup(task_id, turn_id, f"batch-{batch:03}", f"New public message batch {batch}.")
                 self.assertEqual(len(calls), 8)
+                self.assertTrue(all(c["enable_thinking"] for c in calls))
+                self.assertTrue(controller.state["thinking"])
+                self.assertEqual(sum(bool(m.get("reasoning_content")) for m in calls[-1]["messages"]), 7)
                 self.assertEqual(controller.state["tool_calls_used"], 4)
                 self.assertEqual(controller.budget_remaining(), 0)
                 self.assertEqual(len(controller.state["messages"]), 4)

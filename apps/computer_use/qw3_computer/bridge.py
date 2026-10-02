@@ -20,12 +20,16 @@ BACKEND = web.AppKey("backend", aiohttp.ClientSession)
 
 
 class ResponseStream:
-    def __init__(self, response, model, names):
+    def __init__(self, response, model, names, *, enable_thinking=False):
         self.http = response
         self.names = names
         self.sequence = 0
         self.items = []
         self.text_item = None
+        self.text_index = None
+        self.enable_thinking = enable_thinking
+        self.reasoning_item = None
+        self.reasoning_text = ""
         self.calls = {}
         self.usage = None
         self.finish_reason = None
@@ -61,20 +65,31 @@ class ResponseStream:
         delta = choice.get("delta", {})
         require(isinstance(delta, dict), "backend delta must be an object")
         require(self.finish_reason is None, "backend emitted a choice after finish")
-        require(not delta.get("reasoning_content"), "backend ignored enable_thinking=false")
+        if delta.get("reasoning_content"):
+            require(self.enable_thinking, "backend ignored enable_thinking=false")
+            require(isinstance(delta["reasoning_content"], str), "backend reasoning must be a string")
+            require(self.text_item is None and not self.calls, "reasoning arrived after final output")
+            if self.reasoning_item is None:
+                self.reasoning_item = {"id": "rs_" + uuid.uuid4().hex, "type": "reasoning",
+                                       "status": "in_progress", "summary": [], "content": []}
+                self.items.append(self.reasoning_item)
+                await self.emit("response.output_item.added", output_index=0, item=self.reasoning_item)
+            self.reasoning_text += delta["reasoning_content"]
         if delta.get("content"):
             require(isinstance(delta["content"], str), "backend text must be a string")
             if self.text_item is None:
                 self.text_item = {"id": "msg_" + uuid.uuid4().hex, "type": "message",
                                   "role": "assistant", "status": "in_progress", "content": []}
-                await self.emit("response.output_item.added", output_index=0, item=self.text_item)
+                self.text_index = len(self.items)
+                self.items.append(self.text_item)
+                await self.emit("response.output_item.added", output_index=self.text_index, item=self.text_item)
                 part = {"type": "output_text", "text": "", "annotations": []}
                 self.text_item["content"].append(part)
                 await self.emit("response.content_part.added", item_id=self.text_item["id"],
-                                output_index=0, content_index=0, part=part)
+                                output_index=self.text_index, content_index=0, part=part)
             self.text_item["content"][0]["text"] += delta["content"]
             await self.emit("response.output_text.delta", item_id=self.text_item["id"],
-                            output_index=0, content_index=0, delta=delta["content"])
+                            output_index=self.text_index, content_index=0, delta=delta["content"])
         for call in delta.get("tool_calls", []):
             require(isinstance(call, dict), "backend tool call must be an object")
             index = call.get("index", 0)
@@ -94,16 +109,21 @@ class ResponseStream:
         require(self.finish_reason in ("stop", "tool_calls", "length"),
                 "backend stream has no supported finish_reason")
         require(self.finish_reason != "tool_calls" or self.calls, "backend returned no tool calls")
+        if self.reasoning_item:
+            # Return open-model reasoning in its own item for full-history
+            # replay. It is never a function call or a user-facing message.
+            self.reasoning_item.update(content=[{"type": "reasoning_text", "text": self.reasoning_text}],
+                status="incomplete" if self.finish_reason == "length" else "completed")
+            await self.emit("response.output_item.done", output_index=0, item=self.reasoning_item)
         if self.text_item:
             item = self.text_item
             part = item["content"][0]
-            await self.emit("response.output_text.done", item_id=item["id"], output_index=0,
+            await self.emit("response.output_text.done", item_id=item["id"], output_index=self.text_index,
                             content_index=0, text=part["text"])
-            await self.emit("response.content_part.done", item_id=item["id"], output_index=0,
+            await self.emit("response.content_part.done", item_id=item["id"], output_index=self.text_index,
                             content_index=0, part=part)
             item["status"] = "incomplete" if self.finish_reason == "length" else "completed"
-            await self.emit("response.output_item.done", output_index=0, item=item)
-            self.items.append(item)
+            await self.emit("response.output_item.done", output_index=self.text_index, item=item)
         # Never release a partial/invalid action to Codex. Even with a valid
         # JSON prefix, a length-truncated generation must not execute a tool.
         if self.finish_reason != "length":
@@ -146,7 +166,7 @@ class ResponseStream:
 def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", max_tokens=4096, trace_dir=None,
                backend_token=None, trace_backend=False, *, backend_timeout_seconds=600,
                backend_read_timeout_seconds=180, heartbeat_seconds=30,
-               max_request_bytes=MAX_MODEL_REQUEST_BYTES):
+               max_request_bytes=MAX_MODEL_REQUEST_BYTES, allow_thinking=False):
     if trace_backend and trace_dir is None:
         raise ValueError("Backend trace tags require a local trace directory")
     if not 0 < heartbeat_seconds <= backend_read_timeout_seconds <= backend_timeout_seconds:
@@ -168,7 +188,7 @@ def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", ma
         try:
             raw = await request.json()
             require(raw.get("model") == public_model, "unknown local model")
-            converted = convert_request(raw, backend_model, max_tokens)
+            converted = convert_request(raw, backend_model, max_tokens, allow_thinking=allow_thinking)
         except (ProtocolError, ValueError, TypeError, AttributeError) as exc:
             return web.json_response({"error": {"type": "invalid_request_error", "message": str(exc)}}, status=400)
         if lock.locked():
@@ -190,7 +210,8 @@ def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", ma
                 metrics["backend_trace_tag"] = converted.body["kvmem_trace_tag"]
             output = web.StreamResponse(headers={"Content-Type": "text/event-stream",
                                                  "Cache-Control": "no-cache"})
-            stream = ResponseStream(output, public_model, converted.names)
+            stream = ResponseStream(output, public_model, converted.names,
+                                    enable_thinking=converted.body["enable_thinking"])
             heartbeat = None
 
             async def progress():
@@ -281,6 +302,7 @@ def main():
     parser.add_argument("--backend-token", type=Path, help="Optional token file for the private VM model relay")
     parser.add_argument("--trace-dir", type=Path, help="Retain exact local inference requests and metrics")
     parser.add_argument("--trace-backend", action="store_true", help="Send request tags for QW3 retrieval diagnostics")
+    parser.add_argument("--allow-thinking", action="store_true", help="Accept medium as an opt-in local thinking mode")
     args = parser.parse_args()
     if args.trace_backend and args.trace_dir is None:
         parser.error("--trace-backend requires --trace-dir")
@@ -289,7 +311,8 @@ def main():
         parser.error("backend token file is empty")
     logging.basicConfig(level=logging.INFO)
     web.run_app(create_app(args.backend, args.backend_model, backend_token=token,
-                           trace_dir=args.trace_dir, trace_backend=args.trace_backend), host="127.0.0.1",
+                           trace_dir=args.trace_dir, trace_backend=args.trace_backend,
+                           allow_thinking=args.allow_thinking), host="127.0.0.1",
                 port=args.port, handler_cancellation=True)
 
 

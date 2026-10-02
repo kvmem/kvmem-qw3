@@ -14,6 +14,33 @@ def request(inputs=None):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_opt_in_thinking_preserves_reasoning_tool_and_final_message(self):
+        thought = {"type": "reasoning", "summary": [], "content": [
+            {"type": "reasoning_text", "text": "Check the actual window before typing."}]}
+        call = {"type": "function_call", "name": "observe", "call_id": "check1", "arguments": "{}"}
+        output = {"type": "function_call_output", "call_id": "check1", "output": "Notepad is focused."}
+        history = [{"role": "user", "content": "Inspect"}, thought, call, output,
+                   thought, {"role": "assistant", "content": "Verified."}, {"role": "user", "content": "Continue"}]
+        body = convert_request(request(history) | {"reasoning": {"effort": "medium"}}, "qw3",
+                               allow_thinking=True).body
+        self.assertTrue(body["enable_thinking"])
+        assistant = [m for m in body["messages"] if m["role"] == "assistant"]
+        self.assertEqual(len(assistant), 2)
+        self.assertEqual(assistant[0]["tool_calls"][0]["id"], "check1")
+        self.assertEqual(assistant[1]["content"], "Verified.")
+        self.assertTrue(all(m["reasoning_content"] == thought["content"][0]["text"] for m in assistant))
+        # Explicit none still disables generation but keeps prior reasoning.
+        off = convert_request(request(history), "qw3", allow_thinking=True).body
+        self.assertFalse(off["enable_thinking"])
+        self.assertEqual(off["messages"], body["messages"])
+
+    def test_thinking_rejects_unrecoverable_or_summary_only_history(self):
+        for thought in ({"type": "reasoning", "summary": []},
+                        {"type": "reasoning", "encrypted_content": "foreign-opaque-state"},
+                        {"type": "reasoning", "summary": [], "content": [{"type": "output_text", "text": "x"}]}):
+            with self.subTest(thought=thought), self.assertRaises(ProtocolError):
+                convert_request(request([thought]), "qw3", allow_thinking=True)
+
     def test_full_history_keeps_tool_image_order_and_prefix(self):
         history = [{"role": "user", "content": [{"type": "input_text", "text": "Inspect"},
                                                      {"type": "input_image", "image_url": IMAGE}]},

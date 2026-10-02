@@ -22,7 +22,10 @@ from .desktop import Desktop, DesktopError, DesktopRejected, mcp_observation
 class Controller:
     def __init__(self, runtime, desktop, backend, port, backend_token=None, trace_backend=False,
                  tool_call_limit=100, output_policy="outputs", *, backend_timeout_seconds=600,
-                 backend_read_timeout_seconds=180, heartbeat_seconds=30):
+                 backend_read_timeout_seconds=180, heartbeat_seconds=30, thinking=False):
+        if type(thinking) is not bool:
+            raise ValueError("Thinking mode must be a boolean")
+        self.thinking = thinking
         if type(tool_call_limit) is not int or not 1 <= tool_call_limit <= 10000:
             raise ValueError("Tool-call limit must be an integer between 1 and 10000")
         if output_policy not in ("outputs", "task"):
@@ -50,7 +53,8 @@ class Controller:
         self.state_path = self.runtime / "task.json"
         self.state = json.loads(self.state_path.read_text()) if self.state_path.exists() else {
             "status": "idle", "tool_calls_used": 0, "tool_call_limit": tool_call_limit,
-            "output_policy": output_policy}
+            "output_policy": output_policy, "thinking": thinking}
+        self.state.setdefault("thinking", False)
         if self.state["status"] in ("starting", "running", "verifying", "paused"):
             self.state["status"] = "paused"
             self.state["notice"] = "应用已重新启动。请核对当前桌面后继续。"
@@ -81,13 +85,18 @@ class Controller:
             raise DesktopError("任务缺少有效的累计调用记录，请停止旧任务后新建任务。")
         return limit - used
 
+    def require_saved_inference_mode(self):
+        if self.state.get("thinking", False) != self.thinking:
+            raise DesktopError("当前推理模式与该任务记录不同。请用原模式继续，或停止旧任务后新建任务。")
+
     async def start(self):
         await self.desktop.start()
         self.bridge = web.AppRunner(bridge_app(self.backend, trace_dir=self.runtime / "inference",
                                               backend_token=self.backend_token, trace_backend=self.trace_backend,
                                               backend_timeout_seconds=self.backend_timeout_seconds,
                                               backend_read_timeout_seconds=self.backend_read_timeout_seconds,
-                                              heartbeat_seconds=self.heartbeat_seconds),
+                                              heartbeat_seconds=self.heartbeat_seconds,
+                                              allow_thinking=self.thinking),
                                     handler_cancellation=True)
         await self.bridge.setup()
         site = web.TCPSite(self.bridge, "127.0.0.1", 0)
@@ -95,7 +104,7 @@ class Controller:
         bridge_port = site._server.sockets[0].getsockname()[1]
         write_config(self.runtime / "codex", f"http://127.0.0.1:{bridge_port}/v1", sys.executable,
                      [str(Path(__file__).with_name("mcp_proxy.py")), "--endpoint", f"http://127.0.0.1:{self.port}",
-                      "--token-file", str(self.runtime / "mcp-token.txt")])
+                      "--token-file", str(self.runtime / "mcp-token.txt")], thinking=self.thinking)
         self.client = CodexClient(self.runtime / "codex")
         await self.client.start()
         self.consume_task = asyncio.create_task(self.consume())
@@ -164,7 +173,7 @@ class Controller:
             self.state = {"id": uuid.uuid4().hex, "prompt": prompt, "status": "starting",
                           "messages": [], "files": [], "started_at": time.time(), "current_action": None,
                           "tool_calls_used": 0, "tool_call_limit": self.tool_call_limit,
-                          "output_policy": self.output_policy}
+                          "output_policy": self.output_policy, "thinking": self.thinking}
             self.desktop.task_id = self.state["id"]
             self.save()
             try:
@@ -218,6 +227,7 @@ class Controller:
                 raise DesktopError("Follow-up requires the identified completed, verified and paused turn")
             if self.budget_remaining() == 0:
                 raise DesktopError("任务调用额度已用尽；后续消息不会重置额度。")
+            self.require_saved_inference_mode()
             receipt = request | {"delivery": "pending", "requested_at": time.time(),
                                  "tool_calls_used_before": self.state["tool_calls_used"]}
             self.state.setdefault("followups", []).append(receipt)
@@ -257,6 +267,7 @@ class Controller:
                     raise DesktopError("只有暂停的任务可以继续。")
                 if self.budget_remaining() == 0:
                     raise DesktopError("任务调用额度已用尽；暂停或重启不会重置额度。")
+                self.require_saved_inference_mode()
                 try:
                     await self.desktop.control("resume", acknowledge_uncertain)
                     observation = await self.desktop.observe()
@@ -437,7 +448,8 @@ async def run(args):
     controller = Controller(args.runtime, desktop, args.backend, args.port, backend_token=token,
                             trace_backend=args.trace_backend, tool_call_limit=args.tool_call_limit,
                             output_policy=args.output_policy, backend_timeout_seconds=args.backend_timeout,
-                            backend_read_timeout_seconds=args.backend_read_timeout)
+                            backend_read_timeout_seconds=args.backend_read_timeout,
+                            thinking=getattr(args, "thinking", False))
     runner = web.AppRunner(web_app(controller), handler_cancellation=True)
     try:
         await runner.setup()
@@ -465,6 +477,7 @@ def main():
     parser.add_argument("--desktop-token", type=Path, required=True)
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--trace-backend", action="store_true", help="Tag QW3 requests for retrieval diagnostics")
+    parser.add_argument("--thinking", action="store_true", help="Enable local thinking for new tasks; defaults to off")
     parser.add_argument("--tool-call-limit", type=int, default=100,
                         help="Lifetime observe/act budget for new tasks; resume keeps the saved budget")
     parser.add_argument("--output-policy", choices=("outputs", "task"), default="outputs",

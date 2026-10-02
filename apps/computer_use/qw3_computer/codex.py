@@ -29,13 +29,15 @@ than repeating actions without progress. Host shell tools are unavailable.
 """
 
 
-def write_config(runtime, bridge_url, mcp_command=None, mcp_args=()):
+def write_config(runtime, bridge_url, mcp_command=None, mcp_args=(), *, thinking=False):
     runtime = Path(runtime).resolve()
     runtime.mkdir(parents=True, exist_ok=True)
     catalog = {"models": [{
         "slug": "qw3-computer", "display_name": "QW3 Computer",
         "description": "Local QW3/KVMem vision with DFlash",
-        "default_reasoning_level": "none", "supported_reasoning_levels": [],
+        "default_reasoning_level": "medium" if thinking else "none",
+        "supported_reasoning_levels": ([{"effort": "medium", "description": "Enable local QW3 thinking within the shared output budget"}]
+                                       if thinking else []),
         "shell_type": "unified_exec", "visibility": "list", "supported_in_api": True,
         "priority": 0, "base_instructions": INSTRUCTIONS,
         "input_modalities": ["text", "image"], "context_window": 1048576,
@@ -50,6 +52,7 @@ def write_config(runtime, bridge_url, mcp_command=None, mcp_args=()):
     config = f'''model = "qw3-computer"
 model_provider = "qw3"
 model_catalog_json = {json.dumps(str(catalog_path))}
+model_reasoning_effort = {json.dumps("medium" if thinking else "none")}
 web_search = "disabled"
 model_auto_compact_token_limit = 950000
 model_reasoning_summary = "none"

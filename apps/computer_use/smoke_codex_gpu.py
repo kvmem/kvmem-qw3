@@ -18,16 +18,18 @@ from qw3_computer.codex import CodexClient, write_config
 async def run(args):
     output = args.run_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    bridge = web.AppRunner(create_app(args.backend), handler_cancellation=True)
+    thinking = getattr(args, "thinking", False)
+    bridge = web.AppRunner(create_app(args.backend, allow_thinking=thinking,
+                                      trace_dir=output / "inference"), handler_cancellation=True)
     await bridge.setup()
     site = web.TCPSite(bridge, "127.0.0.1", 0)
     await site.start()
     port = site._server.sockets[0].getsockname()[1]
     write_config(output / "codex", f"http://127.0.0.1:{port}/v1", sys.executable,
-                 [str(Path(__file__).resolve().parent / "tests/fixture_mcp.py")])
+                 [str(Path(__file__).resolve().parent / "tests/fixture_mcp.py")], thinking=thinking)
     client = CodexClient(output / "codex")
     started = time.monotonic()
-    result = {"backend": args.backend, "kind": "real_model_fixture_mcp", "passed": False}
+    result = {"backend": args.backend, "kind": "real_model_fixture_mcp", "thinking": thinking, "passed": False}
     try:
         await client.start()
         thread = await client.new_thread()
@@ -79,4 +81,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", default="http://127.0.0.1:18080/v1")
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--thinking", action="store_true", help="Opt-in local reasoning and full-history replay")
     asyncio.run(run(parser.parse_args()))

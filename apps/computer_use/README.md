@@ -43,11 +43,26 @@ The current protocol subset supports text, inline PNG/JPEG/WebP images,
 function schemas, namespace mapping, tool outputs containing images, full
 history replay and Responses SSE events. It rejects stored/previous-response
 state, remote/file-ID images, custom tools, strict schema enforcement, reasoning
-efforts other than `none` and unknown input item types. It is **not** a general
-Responses API implementation. Native QW3 thinking is disabled in this initial
-profile; DFlash remains active. Tool calls are validated and released only
+efforts other than `none` in its default profile and unknown input item types.
+It is **not** a general Responses API implementation. Native QW3 thinking is
+disabled by default; DFlash remains active. Tool calls are validated and released only
 after the backend's complete terminal event. Partial or malformed tool calls
 are never delivered for execution.
+
+The application now accepts an explicit `--thinking` candidate option. It selects
+local QW3 thinking via the bridge's opt-in `medium` mode; this is a mode switch,
+not an implementation of OpenAI effort budgets. Raw local reasoning travels in
+separate `reasoning` items and is replayed across tool/user turns. The same output
+token cap includes reasoning. Resume/follow-up requires the task's saved mode.
+Default launches retain the original non-thinking behavior. This candidate passed
+real local-model image/tool smoke checks and pinned Codex contracts; it has not
+yet been packaged and qualified as a new native Windows bundle or shown business
+task improvement. See the [P0 report](../../docs/computer_use_local_diagnostic_p0_20261002.md).
+
+The current [product delivery goal](../../docs/computer_use_product_delivery_20261002.md)
+prioritizes complete Python/LaTeX software workflows, using diagnostic results to
+improve execution, verification and recovery. Optional DeepSeek advisory support
+is planned after local baselines; it is not enabled or implemented yet.
 
 The model catalog advertises image input and a 1M logical context. Automatic
 compaction starts at 950K tokens, above the 128K KVMem retrieval threshold.

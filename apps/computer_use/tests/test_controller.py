@@ -90,6 +90,22 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.desktop.paused)
         self.assertEqual(json.loads(self.controller.state_path.read_text())["status"], "paused")
 
+    async def test_changed_thinking_mode_cannot_resume_old_task(self):
+        self.controller.state.update(status="paused", id="task", thread_id="test-thread", thinking=False)
+        self.controller.thinking = True
+        with self.assertRaisesRegex(DesktopError, "推理模式"):
+            await self.controller.control("resume")
+        self.assertTrue(self.desktop.paused)
+        self.controller.client.rpc.assert_not_called()
+        self.assertEqual(self.controller.state["status"], "paused")
+
+    async def test_new_task_records_requested_thinking_mode(self):
+        self.controller.thinking = True
+        self.controller.consume_task = asyncio.create_task(self.controller.consume())
+        state = await self.controller.start_task("new thinking task")
+        self.assertTrue(state["thinking"])
+        self.assertTrue(json.loads(self.controller.state_path.read_text())["thinking"])
+
     async def test_missing_result_evidence_does_not_publish_completion(self):
         self.desktop.request.side_effect = DesktopError("Desktop unavailable")
         self.controller.consume_task = asyncio.create_task(self.controller.consume())
