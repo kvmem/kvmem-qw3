@@ -41,6 +41,9 @@ def write_config(runtime, bridge_url, mcp_command=None, mcp_args=(), *, thinking
         instructions = instructions.replace("Operate only the selected\ndesktop using the computer tools.",
             "Use computer tools for the selected desktop and the software tool for the explicitly selected local workspace.")
         instructions += ("\nSoftware mode is explicitly enabled. First inspect the workspace and reviewed profiles. "
+            "For a supported installation or repair, proceed using the software job: its first diagnosis and final verification "
+            "provide the environment evidence. Use GUI tools only when the user's goal or the software result requires a UI step. "
+            "Do not browse project folders to repeat checks already supplied by the software tool. "
             "Software jobs are asynchronous: starting a job is not completing the task. Use job_status with bounded waits "
             "until its terminal result; require verification.passed=true before reporting successful setup. "
             "Do not run installers or shell commands through GUI typing. Preserve existing installations and project files. "

@@ -99,6 +99,37 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(done[0]["call_id"], "call_one")
         self.assertEqual(done[0]["arguments"], "{}")
 
+    async def test_application_tool_policy_hides_unavailable_tools_but_keeps_old_history(self):
+        old = [{"type": "function_call", "name": "read_mcp_resource", "call_id": "old", "arguments": "{}"},
+               {"type": "function_call_output", "call_id": "old", "output": "Unsupported MCP method"}]
+        body = request(old)
+        body["tools"].append({"type": "function", "name": "read_mcp_resource", "parameters": {"type": "object"}})
+        with tempfile.TemporaryDirectory() as directory:
+            runner, url = await serve(create_app(self.backend_url + "/v1", allowed_tools={"observe"}, trace_dir=Path(directory)))
+            try:
+                async with self.client.post(url + "/v1/responses", json=body) as response:
+                    events = [json.loads(s) async for s in read_sse(response.content)]
+                self.assertEqual(events[-1]["type"], "response.completed")
+                sent = self.backend_bodies[-1]
+                self.assertEqual([t["function"]["name"] for t in sent["tools"]], ["observe"])
+                self.assertEqual(sent["messages"][1]["tool_calls"][0]["function"]["name"], "read_mcp_resource")
+                policy = json.loads(next(Path(directory).glob("*/tool-policy.json")).read_text())
+                self.assertEqual(policy["excluded"], ["read_mcp_resource"])
+            finally:
+                await runner.cleanup()
+
+    async def test_backend_cannot_release_a_tool_outside_application_policy(self):
+        self.mode = "tool"  # Fixture tries to return observe, which is unavailable here.
+        runner, url = await serve(create_app(self.backend_url + "/v1", allowed_tools={"different_tool"}))
+        try:
+            async with self.client.post(url + "/v1/responses", json=request()) as response:
+                events = [json.loads(s) async for s in read_sse(response.content)]
+            self.assertEqual(events[-1]["type"], "response.failed")
+            self.assertFalse(any(e["type"] == "response.function_call_arguments.done" for e in events))
+            self.assertNotIn("tools", self.backend_bodies[-1])
+        finally:
+            await runner.cleanup()
+
     async def test_silent_prefill_keeps_connection_live_without_fake_output(self):
         self.mode = "slow"
         runner, url = await serve(create_app(self.backend_url + "/v1", backend_timeout_seconds=1,

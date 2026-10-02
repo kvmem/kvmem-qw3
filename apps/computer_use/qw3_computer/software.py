@@ -58,7 +58,7 @@ def process_environment():
 
 def job_receipt(job):
     """Expose the identifier accepted by job_status, not its private owner ID."""
-    receipt = {k: v for k, v in job.items() if k != "task_id"}
+    receipt = {k: v for k, v in job.items() if k not in {"task_id", "action_id"}}
     receipt["job_id"] = job["id"]
     if job["status"] in ACTIVE:
         receipt["next_poll"] = {"operation": "job_status", "job_id": job["id"], "wait_seconds": 10}
@@ -180,18 +180,29 @@ class Software:
         return job_receipt(job)
 
     def start(self, task_id, arguments):
-        project, profile, identity = (arguments.get(k) for k in ("project", "profile", "action_id"))
+        project, profile, action_id = (arguments.get(k) for k in ("project", "profile", "action_id"))
         if (not isinstance(project, str) or not PROJECT.fullmatch(project) or project in RESERVED
                 or not isinstance(profile, str) or profile not in self.catalog["profiles"]
-                or not isinstance(identity, str) or not ACTION_ID.fullmatch(identity)):
+                or not isinstance(action_id, str) or not ACTION_ID.fullmatch(action_id)):
             raise DesktopError("Invalid project, reviewed profile, or action identity")
+        if not isinstance(task_id, str) or not task_id:
+            raise DesktopError("Software job needs an owning task")
+        # The model's idempotency key is scoped to this task. Older clients used
+        # that key directly as a global directory name. Preserve their receipts
+        # and same-task retries without allowing another task to adopt them.
+        identity = next((j["id"] for j in self.jobs.values()
+                         if j["task_id"] == task_id and j.get("action_id", j["id"]) == action_id), None)
+        if identity is None:
+            encoded = json.dumps([task_id, action_id], ensure_ascii=True).encode("utf-8")
+            identity = "job-" + hashlib.sha256(encoded).hexdigest()[:24]
         request = {"task_id": task_id, "project": project, "profile": profile,
-                   "operation": arguments.get("operation", "setup_python")}
+                   "operation": arguments.get("operation", "setup_python"), "action_id": action_id}
         if request["operation"] not in {"setup_python", "repair_python"}:
             raise DesktopError("Unsupported software operation")
         if identity in self.jobs:
             job = self.jobs[identity]
-            if any(job.get(k, "setup_python" if k == "operation" else None) != v for k, v in request.items()):
+            previous = job | {"operation": job.get("operation", "setup_python"), "action_id": job.get("action_id", job["id"])}
+            if any(previous[k] != v for k, v in request.items()):
                 raise DesktopError("Software action identity was reused with different arguments")
             return job_receipt(job) | {"duplicate": True}
         if sys.platform != "win32":

@@ -166,11 +166,15 @@ class ResponseStream:
 def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", max_tokens=4096, trace_dir=None,
                backend_token=None, trace_backend=False, *, backend_timeout_seconds=600,
                backend_read_timeout_seconds=180, heartbeat_seconds=30,
-               max_request_bytes=MAX_MODEL_REQUEST_BYTES, allow_thinking=False):
+               max_request_bytes=MAX_MODEL_REQUEST_BYTES, allow_thinking=False, allowed_tools=None):
     if trace_backend and trace_dir is None:
         raise ValueError("Backend trace tags require a local trace directory")
     if not 0 < heartbeat_seconds <= backend_read_timeout_seconds <= backend_timeout_seconds:
         raise ValueError("Require positive heartbeat <= read timeout <= total timeout")
+    if allowed_tools is not None:
+        if not isinstance(allowed_tools, (set, frozenset, list, tuple)) or any(not isinstance(n, str) or not n for n in allowed_tools):
+            raise ValueError("Allowed tool names must be a collection of nonempty strings")
+        allowed_tools = frozenset(allowed_tools)
     app = web.Application(client_max_size=model_request_limit(max_request_bytes))
     lock = asyncio.Lock()
 
@@ -189,6 +193,15 @@ def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", ma
             raw = await request.json()
             require(raw.get("model") == public_model, "unknown local model")
             converted = convert_request(raw, backend_model, max_tokens, allow_thinking=allow_thinking)
+            offered = set(converted.names)
+            if allowed_tools is not None:
+                converted.names = {name: value for name, value in converted.names.items() if name in allowed_tools}
+                selected = [t for t in converted.body.get("tools", []) if t["function"]["name"] in converted.names]
+                if selected:
+                    converted.body["tools"] = selected
+                else:
+                    converted.body.pop("tools", None)
+                    require(converted.body["tool_choice"] != "required", "no supported tools are available")
         except (ProtocolError, ValueError, TypeError, AttributeError) as exc:
             return web.json_response({"error": {"type": "invalid_request_error", "message": str(exc)}}, status=400)
         if lock.locked():
@@ -204,6 +217,9 @@ def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", ma
                 # Keep exact local inputs for paired on/off replay. This opt-in
                 # trace belongs to the application runtime, never source control.
                 (trace / "request.json").write_text(json.dumps(converted.body, ensure_ascii=False))
+                if allowed_tools is not None:
+                    (trace / "tool-policy.json").write_text(json.dumps({"offered": sorted(offered),
+                        "available": sorted(converted.names), "excluded": sorted(offered - converted.names.keys())}))
             started = time.monotonic()
             metrics = {"started_at": time.time(), "status": "in_progress"}
             if trace_backend:

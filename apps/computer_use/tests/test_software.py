@@ -53,6 +53,41 @@ class SoftwareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "running")
         self.assertFalse(self.software.tasks[first["id"]].done())
 
+    async def test_same_action_key_in_a_new_task_creates_a_distinct_owned_job(self):
+        first = self.start(); await self.entered.wait()
+        await self.software.pause("task-1")
+        args = {"operation": "setup_python", "action_id": "software-check-001", "project": "demo", "profile": "python-web"}
+        with patch("qw3_computer.software.sys.platform", "win32"):
+            second = self.software.start("task-2", args)
+        self.assertNotEqual(second["job_id"], first["job_id"])
+        self.assertNotIn("action_id", second)
+        with self.assertRaises(DesktopError):
+            await self.software.invoke("task-2", {"operation": "job_status", "job_id": first["job_id"]})
+        await self.software.pause("task-2")
+        await self.software.close()
+        self.software = Software(self.software.root)
+        with patch("qw3_computer.software.sys.platform", "win32"):
+            duplicate = self.software.start("task-2", args)
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(duplicate["job_id"], second["job_id"])
+        self.assertEqual(len(self.software.jobs), 2)
+
+    async def test_legacy_global_job_preserves_same_task_retry_after_upgrade(self):
+        identity = "legacy-action-001"
+        job = {"task_id": "legacy-task", "project": "demo", "profile": "python-web", "id": identity,
+               "status": "completed", "attempt": 1, "steps": [], "needs_reconciliation": False}
+        directory = self.software.path("jobs", identity); directory.mkdir()
+        atomic_json(directory / "job.json", job)
+        original = (directory / "job.json").read_bytes()
+        await self.software.close(); self.software = Software(self.software.root)
+        args = {"operation": "setup_python", "action_id": identity, "project": "demo", "profile": "python-web"}
+        duplicate = self.software.start("legacy-task", args)
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(duplicate["job_id"], identity)
+        self.assertEqual((directory / "job.json").read_bytes(), original)
+        with self.assertRaises(DesktopError):
+            self.software.start("legacy-task", args | {"project": "changed"})
+
     async def test_receipt_poll_targets_owned_job_without_exposing_task_identifier(self):
         first = self.start(); await self.entered.wait()
         self.assertNotIn("task_id", first)

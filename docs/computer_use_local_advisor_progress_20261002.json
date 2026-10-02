@@ -5,7 +5,7 @@
   "status": "active",
   "local_plan": "docs/computer_use_local_diagnostic_plan_20261002.json",
   "combined_goal": "docs/computer_use_local_advisor_goal_20261002.md",
-  "current_stage": "python_new_and_repair_formal_complete_latex_and_recovery_next",
+  "current_stage": "python_routing_retest_complete_latex_install_compile_qualification",
   "source_baseline": "56896791b41b6aa5c022c99dac4996f719bd4ba0",
   "stages": {
     "P0": {
@@ -170,15 +170,28 @@
     "apps/computer_use/.runtime/python-repair-formal-01/result.json",
     "apps/computer_use/.runtime/python-repair-formal-02/result.json",
     "apps/computer_use/.runtime/python-repair-formal-03/result.json",
-    "apps/computer_use/.runtime/python-repair-full-replay-20261003/browser-check.json"
+    "apps/computer_use/.runtime/python-repair-full-replay-20261003/browser-check.json",
+    "apps/computer_use/.runtime/windows-client-25-qualification-01/result.json",
+    "apps/computer_use/.runtime/windows-client-26-qualification-01/result.json",
+    "apps/computer_use/.runtime/product-python-repair-03/result.json",
+    "apps/computer_use/.runtime/product-python-repair-04/result.json",
+    "apps/computer_use/.runtime/python-repair-routing-audit-20261003.json",
+    "apps/computer_use/.runtime/python-repair-routing-replay-20261003/browser-check.json",
+    "apps/computer_use/.runtime/latex-assets-01/download-result.json",
+    "apps/computer_use/.runtime/latex-preflight-01/result.json",
+    "apps/computer_use/.runtime/latex-preflight-01/reconciliation.json",
+    "apps/computer_use/.runtime/latex-preflight-02/result.json",
+    "apps/computer_use/.runtime/latex-install-qualification-01/result.json",
+    "apps/computer_use/.runtime/latex-install-qualification-01/reconciliation/result.json",
+    "apps/computer_use/.runtime/latex-install-qualification-02/result.json"
   ],
   "latest_checks": {
     "gpu_idle": true,
-    "root_available_approx_gib": 221,
-    "previous_queue_status": "python_repair_formal_campaign_complete_all_owned_engines_stopped",
+    "root_available_approx_gib": 216,
+    "previous_queue_status": "python_routing_pair_complete_owned_engine_stopped_latex_qualification_active",
     "gpu_compute_processes": 0
   },
-  "next_action": "Improve task-scoped software action identities and avoid unavailable resource tools with complete call accounting; targeted retest. Then implement MiKTeX-based LaTeX new/repair workflows from official assets. Continue P3-P6, KVMem and advisor gates; goal remains active.",
+  "next_action": "Qualify Chinese/math PDF compilation and frozen dependencies, integrate LaTeX jobs and independent grader, then real local-model development and formal new/repair trials. Continue recovery P3-P6, KVMem and advisor gates; goal active.",
   "advisor_provider": {
     "provider": "deepseek",
     "model": "deepseek-flash",
@@ -202,13 +215,13 @@
     "status": "python_two_scenarios_formal_complete_latex_pending",
     "completed": 6,
     "planned": 12,
-    "development_attempts_completed": 5,
-    "development_passed": 3,
+    "development_attempts_completed": 7,
+    "development_passed": 5,
     "development_failed": 2,
     "formal_template_frozen": true,
     "report": "docs/computer_use_python_workflow_20261003.md",
-    "latest_native_bundle": "apps/computer_use/.runtime/windows-native-client-24",
-    "native_contract_tests_passed": 111,
+    "latest_native_bundle": "apps/computer_use/.runtime/windows-native-client-26",
+    "native_contract_tests_passed": 115,
     "scenario_status": {
       "product-python-new": "formal_3_of_3_passed_with_launcher_and_reopen",
       "product-python-repair": "formal_3_of_3_passed_with_launcher_and_reopen",
@@ -230,15 +243,45 @@
     "repair_report": "docs/computer_use_python_repair_20261003.md",
     "repair_acceptance": "apps/computer_use/.runtime/python-repair-formal-20261003/acceptance.json",
     "repair_development": {
-      "completed": 2,
-      "passed": 2,
+      "completed": 4,
+      "passed": 4,
       "candidate_query_errors": 0,
       "prior_query_errors": 2,
       "latency_improvement_claimed": false,
       "first_formal_extra_errors": [
         "unsupported_resource_tools",
         "action_identity_reused_from_prior_task"
-      ]
+      ],
+      "routing_report": "docs/computer_use_software_routing_20261003.md",
+      "routing_pair": {
+        "task_seconds": [
+          142.40774941444397,
+          43.3271324634552
+        ],
+        "calls": [
+          9,
+          4
+        ],
+        "tool_errors": [
+          0,
+          0
+        ],
+        "app_budget_counts": [
+          9,
+          4
+        ],
+        "actual_thinking_requests": [
+          10,
+          5
+        ],
+        "dflash_enabled_requests": [
+          10,
+          5
+        ],
+        "stable_latency_improvement_claimed": false,
+        "audit": "apps/computer_use/.runtime/python-repair-routing-audit-20261003.json",
+        "replay": "apps/computer_use/.runtime/python-repair-routing-replay-20261003/index.html"
+      }
     },
     "repair_formal": {
       "completed": 3,

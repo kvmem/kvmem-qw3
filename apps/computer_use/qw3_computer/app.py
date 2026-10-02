@@ -103,7 +103,9 @@ class Controller:
                                               backend_timeout_seconds=self.backend_timeout_seconds,
                                               backend_read_timeout_seconds=self.backend_read_timeout_seconds,
                                               heartbeat_seconds=self.heartbeat_seconds,
-                                              allow_thinking=self.thinking),
+                                              allow_thinking=self.thinking,
+                                              allowed_tools={"mcp__computer__observe", "mcp__computer__act"}
+                                              | ({"mcp__computer__software"} if self.software else set())),
                                     handler_cancellation=True)
         await self.bridge.setup()
         site = web.TCPSite(self.bridge, "127.0.0.1", 0)
