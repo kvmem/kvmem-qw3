@@ -50,6 +50,8 @@ async def run(args):
     report = {"kind": "local_model_software_product_trial", "status": "preparing", "passed": False,
               "task": f"product-{args.scenario}-" + ("repair" if args.repair_fixture else "new"), "model_used": True, "advisor_used": False,
               "execution_mode": "local_model_with_controlled_software_tools", "started_at": time.time()}
+    report['workflow_mode']=args.execution_mode
+    report['model_output_tokens']=args.model_output_tokens
     recorder = None; relay = None; sampler = None
     sampled = asyncio.Event()
 
@@ -65,6 +67,10 @@ async def run(args):
                 raise ValueError("Run identity, task or budget differs from frozen acceptance")
             if args.thinking != frozen.get("thinking", False):
                 raise ValueError("Thinking mode differs from frozen acceptance")
+            if args.execution_mode != frozen.get('workflow_mode','legacy'):
+                raise ValueError('Execution workflow differs from frozen acceptance')
+            if args.model_output_tokens != frozen.get('model_output_tokens',4096):
+                raise ValueError('Output budget differs from frozen acceptance')
             for relative, expected in frozen["source_sha256"].items():
                 if sha256(ROOT / relative) != expected:
                     raise ValueError("Frozen acceptance source changed: " + relative)
@@ -164,6 +170,8 @@ async def run(args):
         configuration = {"run": identity, "bundle_sha256": install["archive"]["sha256"],
                          "backend": f"http://{network['Gateway']}:18084/v1", "timeout_seconds": args.timeout,
                          "task": report["task"], "thinking": args.thinking,
+                         "workflow_mode": args.execution_mode,
+                         'model_output_tokens':args.model_output_tokens,
                          "guest_script_sha256": sha256(guest_path), "executor_sha256": sha256(output / "executed-executor.ps1")}
         if args.repair_fixture:
             fixture = json.loads(args.repair_fixture.read_text())
@@ -237,6 +245,9 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--repair-fixture", type=Path, help="Use an independently prepared broken project, preserving the current VM")
     parser.add_argument("--thinking", action="store_true")
+    parser.add_argument('--execution-mode',choices=['legacy','verified'],default='legacy',
+                        help='Opt into the shared verified cross-device execution workflow')
+    parser.add_argument('--model-output-tokens',type=int,default=4096)
     parser.add_argument("--acceptance-manifest", type=Path, help="Require a predeclared frozen formal-acceptance trial")
     result = asyncio.run(run(parser.parse_args()))
     raise SystemExit(0 if result["status"] == "complete" else 1)

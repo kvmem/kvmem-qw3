@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import aiohttp
+from aiohttp import web
 
 from qw3_computer.app import Controller, web_app
 from qw3_computer.desktop import DesktopError, DesktopRejected
@@ -50,6 +51,48 @@ class FixtureCodex:
 
 
 class ControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_configured_output_budget_reaches_the_backend_and_respects_explicit_smaller_limits(self):
+        import tomllib
+        seen=[]
+        async def backend(request):
+            body=await request.json();seen.append(body['max_tokens'])
+            response=web.StreamResponse(headers={'Content-Type':'text/event-stream'})
+            await response.prepare(request)
+            await chunk(response,{'content':'Verified fixture response.'})
+            await chunk(response,finish='stop')
+            await response.write(b'data: [DONE]\n\n')
+            return response
+        backend_app=web.Application();backend_app.router.add_post('/v1/chat/completions',backend)
+        runner,url=await serve(backend_app)
+        controller=Controller(self.temp.name,self.desktop,url+'/v1',1,model_output_tokens=16384)
+        fake=FixtureCodex();fake.start=AsyncMock()
+        try:
+            with patch('qw3_computer.app.CodexClient',return_value=fake):
+                await controller.start()
+            config=tomllib.loads((Path(self.temp.name)/'codex/config.toml').read_text())
+            bridge=config['model_providers']['qw3']['base_url']
+            async with aiohttp.ClientSession(trust_env=False) as client:
+                for smaller in [None,1024]:
+                    body=response_request([{'role':'user','content':'Fixture'}]);body['tools']=[]
+                    if smaller:body['max_output_tokens']=smaller
+                    async with client.post(bridge+'/responses',json=body) as response:
+                        self.assertEqual(response.status,200)
+                        self.assertIn('response.completed',await response.text())
+            self.assertEqual(seen,[16384,1024])
+        finally:
+            await controller.close();await runner.cleanup()
+
+    async def test_output_budget_is_checkpointed_and_resume_cannot_silently_change_it(self):
+        controller=Controller(self.temp.name,self.desktop,'unused',1,model_output_tokens=16384)
+        controller.ready=True;controller.client=FixtureCodex()
+        state=await controller.start_task('Configure a local environment')
+        self.assertEqual(state['model_output_tokens'],16384)
+        self.assertEqual(controller.state['model_output_tokens'],16384)
+        controller.model_output_tokens=4096
+        with self.assertRaisesRegex(DesktopError,'输出预算'):
+            controller.require_saved_inference_mode()
+        await controller.close()
+
     async def test_discovered_context_is_bound_to_resume_checkpoint(self):
         from aiohttp import web
         app=web.Application()

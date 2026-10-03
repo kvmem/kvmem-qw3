@@ -5,6 +5,8 @@ import io
 import json
 import tempfile
 import unittest
+import time
+from pathlib import Path
 
 from aiohttp import web
 from PIL import Image
@@ -116,6 +118,49 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.effects, 1)
         with self.assertRaisesRegex(DesktopError, "different arguments"):
             await self.desktop.act(request | {"action": {"kind": "key", "key": "ENTER"}})
+
+    async def enable_expired_step(self):
+        from qw3_computer.execution import Execution
+        self.execution=Execution(self.desktop,Path(self.temp.name))
+        self.desktop.execution=self.execution
+        self.desktop.latest['captured_at']=int(time.time()*1000)-65000
+        return {'goal':'Perform the requested action','conditions':[{'kind':'screen_changed'}]}
+
+    async def test_expired_identical_view_refreshes_before_exactly_one_effect(self):
+        step=await self.enable_expired_step()
+        action=self.action(step=step)
+        source=action['observation_id']
+        result=await self.desktop.act(action)
+        self.assertNotEqual(self.last_dispatched['observation_id'],source)
+        self.assertTrue(result['observation_revalidation']['same_view'])
+        self.assertTrue(result['observation_revalidation']['input_sent'])
+        await self.desktop.act(action)
+        self.assertEqual(self.effects,1)
+        self.execution.close()
+
+    async def test_expired_changed_view_returns_current_evidence_without_input(self):
+        step=await self.enable_expired_step()
+        action=self.action(step=step)
+        pixels=io.BytesIO();Image.new('RGB',(8,8),'red').save(pixels,format='PNG')
+        self.png=pixels.getvalue()
+        with self.assertRaises(DesktopRejected) as caught:
+            await self.desktop.act(action)
+        self.assertEqual(caught.exception.observation['observation_id'],self.desktop.latest['observation_id'])
+        self.assertEqual(self.effects,0)
+        self.assertEqual(self.desktop.unresolved(),[])
+        self.execution.close()
+
+    async def test_expired_open_app_revalidates_explicit_app_intent_without_repeating(self):
+        step=await self.enable_expired_step()
+        pixels=io.BytesIO();Image.new('RGB',(8,8),'red').save(pixels,format='PNG')
+        self.png=pixels.getvalue()
+        action=self.action(step=step,action={'kind':'open_app','app':'edge'})
+        result=await self.desktop.act(action)
+        self.assertFalse(result['observation_revalidation']['same_view'])
+        self.assertEqual(result['observation_revalidation']['scope'],'Explicit allowed app intent')
+        await self.desktop.act(action)
+        self.assertEqual(self.effects,1)
+        self.execution.close()
 
     async def test_fresh_observation_verifies_pending_step_without_resending_input(self):
         from pathlib import Path

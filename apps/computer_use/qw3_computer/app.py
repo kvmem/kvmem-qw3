@@ -29,10 +29,13 @@ class Controller:
     def __init__(self, runtime, desktop, backend, port, backend_token=None, trace_backend=False,
                  tool_call_limit=100, output_policy="outputs", *, backend_timeout_seconds=600,
                  backend_read_timeout_seconds=180, heartbeat_seconds=30, thinking=False, software=None,
-                 workflow=False, device_platform="windows"):
+                 workflow=False, device_platform="windows", model_output_tokens=4096):
         if type(thinking) is not bool:
             raise ValueError("Thinking mode must be a boolean")
         self.thinking = thinking
+        if type(model_output_tokens) is not int or not 256<=model_output_tokens<=32768:
+            raise ValueError('Model output limit must be256..32768 tokens')
+        self.model_output_tokens=model_output_tokens
         self.software = software
         if type(tool_call_limit) is not int or not 1 <= tool_call_limit <= 10000:
             raise ValueError("Tool-call limit must be an integer between 1 and 10000")
@@ -91,6 +94,7 @@ class Controller:
 
     def snapshot(self):
         return self.state | {"ready": self.ready, "observation": self.desktop.latest,
+                             'model_output_tokens':self.model_output_tokens,
                              'model_context_window':self.model_context_window,
                              "device_capabilities": self.device_capabilities,
                              "devices": self.desktop.catalogue() if isinstance(self.desktop, RegisteredDesktop) else None,
@@ -108,6 +112,8 @@ class Controller:
         return limit - used
 
     def require_saved_inference_mode(self):
+        if self.state.get('model_output_tokens',4096)!=self.model_output_tokens:
+            raise DesktopError('当前模型输出预算与任务检查点不一致，请使用原预算继续或新建任务。')
         if self.state.get('model_context_window',1048576)!=self.model_context_window:
             raise DesktopError('当前模型上下文容量与任务检查点不一致，请使用原配置继续或新建任务。')
         identity = self.desktop.selected if isinstance(self.desktop, RegisteredDesktop) else self.desktop.endpoint if hasattr(self.desktop, "endpoint") else None
@@ -134,6 +140,7 @@ class Controller:
                                               backend_read_timeout_seconds=self.backend_read_timeout_seconds,
                                               heartbeat_seconds=self.heartbeat_seconds,
                                               allow_thinking=self.thinking,
+                                              max_tokens=self.model_output_tokens,
                                               allowed_tools={"mcp__computer__observe", "mcp__computer__act"}
                                               | ({"mcp__computer__workflow"} if self.workflow else set())
                                               | ({"mcp__computer__software"} if self.software else set())),
@@ -269,6 +276,7 @@ class Controller:
                           "output_policy": self.output_policy, "thinking": self.thinking}
             self.state["execution_mode"] = "verified" if self.workflow else "legacy"
             self.state['model_context_window'] = self.model_context_window
+            self.state['model_output_tokens']=self.model_output_tokens
             self.state["device_platform"] = self.device_platform
             self.state["device_identity"] = self.desktop.selected if isinstance(self.desktop, RegisteredDesktop) else getattr(self.desktop, "endpoint", None)
             self.state["software_root"] = str(self.software.root) if self.software else None
@@ -565,7 +573,7 @@ class Controller:
             # Return a current screen so recovery need not spend a model turn
             # requesting observe. The rejected action ID stays reserved.
             try:
-                observation = await self.desktop.observe()
+                observation = exc.observation or await self.desktop.observe()
             except DesktopError:
                 raise exc
             problem = executor_rejection_problem(str(exc))
@@ -744,6 +752,7 @@ async def run(args):
                             thinking=getattr(args, "thinking", False),
                             software=Software(software_root) if software_root else None,
                             workflow=getattr(args, "execution_mode", "legacy") == "verified",
+                            model_output_tokens=getattr(args,'model_output_tokens',4096),
                             device_platform=getattr(args, "device_platform", "windows"))
     runner = web.AppRunner(web_app(controller), handler_cancellation=True)
     try:
@@ -778,6 +787,8 @@ def main():
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--trace-backend", action="store_true", help="Tag QW3 requests for retrieval diagnostics")
     parser.add_argument("--thinking", action="store_true", help="Enable local thinking for new tasks; defaults to off")
+    parser.add_argument('--model-output-tokens',type=int,default=4096,
+                        help='Bound combined reasoning and output per inference request; saved in the task checkpoint')
     parser.add_argument("--software-root", type=Path,
                         help="Explicitly enable reviewed native Windows installation workflows in this local workspace")
     parser.add_argument("--tool-call-limit", type=int, default=100,

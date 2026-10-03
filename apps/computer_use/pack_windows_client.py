@@ -91,6 +91,7 @@ def main():
     [ValidateRange(1,10000)][int]$ToolCallLimit = 100,
     [ValidateSet('outputs','task')][string]$OutputPolicy = 'outputs',
     [switch]$Thinking,
+    [ValidateRange(256,32768)][int]$ModelOutputTokens = 4096,
     [ValidateSet('legacy','verified')][string]$ExecutionMode = 'legacy',
     [string]$SoftwareRoot = ''
 )
@@ -102,6 +103,7 @@ if (!$Runtime) { $Runtime = Join-Path $PSScriptRoot 'runtime' }
 $clientArgs = @('-X','utf8','-m','qw3_computer.app','--backend',$Backend,'--desktop',$Desktop,'--desktop-token',$DesktopToken,'--runtime',$Runtime)
 $clientArgs += @('--tool-call-limit',"$ToolCallLimit",'--output-policy',$OutputPolicy)
 $clientArgs += @('--execution-mode',$ExecutionMode)
+$clientArgs += @('--model-output-tokens',"$ModelOutputTokens")
 $clientArgs += @('--backend-timeout',"$BackendTimeout",'--backend-read-timeout',"$BackendReadTimeout")
 if ($BackendToken) { $clientArgs += @('--backend-token',$BackendToken) }
 if ($Thinking) { $clientArgs += '--thinking' }
@@ -120,7 +122,7 @@ exit $LASTEXITCODE
         "kind": "windows_native_client_offline_bundle", "qualified": False,
         "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
         "python_version": "3.13.13", "codex_version": "0.159.2",
-        "runtime_capabilities": ["configurable_backend_waits", "large_visual_history_requests", "backend_error_receipts", "opt_in_local_thinking", "application_focus_receipts", "opt_in_software_workflows", "task_scoped_gui_receipts", "bounded_gui_error_recovery", "observation_scoped_control_targets"],
+        "runtime_capabilities": ["configurable_backend_waits", "large_visual_history_requests", "backend_error_receipts", "opt_in_local_thinking", "application_focus_receipts", "opt_in_software_workflows", "task_scoped_gui_receipts", "bounded_gui_error_recovery", "observation_scoped_control_targets", "cross_device_steps", "explicit_visual_coordinates", "configurable_model_output_budget", "expired_observation_revalidation"],
         "model_request_limit_bytes": MAX_MODEL_REQUEST_BYTES,
         "backend_wait_defaults": {"total_seconds": 600, "read_seconds": 180, "heartbeat_seconds": 30},
         "test_scope": "Windows runtime and cross-device execution contracts; host OSWorld/scoring tests remain in the repository",

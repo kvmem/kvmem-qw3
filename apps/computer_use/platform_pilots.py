@@ -56,16 +56,18 @@ def run(args):
     state = request(args.app, "/api/state")
     if state["status"] not in {"idle", "completed", "failed", "stopped"} or state["uncertain_actions"]:
         raise ValueError("Finish the existing task and reconcile uncertain input before a pilot")
-    android = args.case == "android_settings"
+    android = args.case.startswith('android_')
     info = owned_container("qw3-computer-android" if android else "qw3-computer-linux",
                            "qw3.goal", "cross-device-20261003")
     desired = "android-emulator" if android else "linux-vm"
     state = request(args.app, "/api/device", {"device_id": desired})
-    seconds = 180 if android else 360
+    seconds = 180 if args.case=='android_settings' else 360
     prompt = ANDROID_PROMPT if android else LINUX_PROMPT
     manifest = {"kind": "integration-pilot-not-formal", "case": args.case, "prompt": prompt,
                 "deadline_seconds": seconds, "container_id": info["Id"], "app_runtime": str(args.runtime.resolve()),
                 "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                'video_mode':args.video_mode if android else 'official-osworld-recorder',
+                'model_output_tokens':state.get('model_output_tokens',4096),
                 "no_model_access_to_initializer_or_grader": True}
     save(directory / "pilot-manifest.json", manifest)
     video = None
@@ -76,18 +78,29 @@ def run(args):
             metadata = json.loads((ROOT / "apps/computer_use/.runtime/android/emulator-container-manifest.json").read_text())
             if metadata["container_id"] != info["Id"]:
                 raise ValueError("Android emulator identity changed")
-            android_command(["shell", "settings", "put", "system", "screen_off_timeout", "2147483647"], capture_output=True)
-            android_command(["shell", "am", "force-stop", "com.android.settings"], capture_output=True)
-            android_command(["shell", "am", "start", "-a", "android.settings.SETTINGS"], capture_output=True)
-            time.sleep(2)
-            before_settings = android_system_settings()
-            save(directory / "initial-system-settings.json", before_settings)
-            remote = "/sdcard/qw3-pilot-" + str(int(time.time() * 1000)) + ".mp4"
-            command = ["docker", "exec", "qw3-computer-android",
-                       str(ROOT / "apps/computer_use/.runtime/android/sdk/platform-tools/adb"), "-s", "emulator-5556",
-                       "shell", "screenrecord", "--bit-rate", "2000000", "--time-limit", "180", remote]
-            with (directory / "recording.log").open("wb") as log:
-                video = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+            if args.case=='android_settings':
+                android_command(["shell", "settings", "put", "system", "screen_off_timeout", "2147483647"], capture_output=True)
+                android_command(["shell", "am", "force-stop", "com.android.settings"], capture_output=True)
+                android_command(["shell", "am", "start", "-a", "android.settings.SETTINGS"], capture_output=True)
+                time.sleep(2)
+                before_settings = android_system_settings()
+                save(directory / "initial-system-settings.json", before_settings)
+            else:
+                from android_contacts_pilot import initialize
+                fixture,prompt=initialize(android_command,directory.name)
+                save(directory/'contacts-fixture.json',fixture)
+                manifest['prompt']=prompt
+                save(directory/'pilot-manifest.json',manifest)
+                android_command(['shell','am','force-stop','com.google.android.contacts'],capture_output=True)
+                android_command(['shell','am','start','-a','android.intent.action.MAIN',
+                                 '-c','android.intent.category.LAUNCHER','-p','com.google.android.contacts'],capture_output=True)
+            if args.video_mode=='live':
+                from live_android_recording import LiveAndroidRecording as Recorder
+            else:
+                from android_recording import AndroidRecording as Recorder
+            video=Recorder(['docker','exec','qw3-computer-android',
+                str(ROOT/'apps/computer_use/.runtime/android/sdk/platform-tools/adb'),'-s','emulator-5556'],directory)
+            video.start()
         else:
             # Preserve the previous task artifact before removing that exact file.
             code = ("from pathlib import Path; import json,base64; p=Path('/home/user/Desktop/qw3-pilot-note.txt'); "
@@ -131,19 +144,22 @@ def run(args):
                   "seconds": time.monotonic() - started, "tool_calls": state["tool_calls_used"],
                   "turn_error": state.get("turn_error"), "uncertain_actions": len(state["uncertain_actions"])}
         if android:
-            value = android_command(["shell", "settings", "get", "system", "screen_off_timeout"],
-                                    capture_output=True, text=True).stdout.strip()
-            result.update(independent_setting_value=value, artifact_passed=value == "300000")
-            after_settings = android_system_settings()
-            save(directory / "final-system-settings.json", after_settings)
-            others = {key: {"before": before_settings.get(key), "after": after_settings.get(key)}
-                      for key in set(before_settings) | set(after_settings)
-                      if key != "screen_off_timeout" and before_settings.get(key) != after_settings.get(key)}
-            result.update(other_system_setting_changes=others, artifact_passed=value == "300000" and not others)
-            video.wait(timeout=max(10, 195 - (time.monotonic() - started)))
-            with (directory / "continuous.mp4").open("wb") as f:
-                android_command(["exec-out", "cat", remote], stdout=f)
-            result["video_collection_passed"] = video.returncode == 0
+            if args.case=='android_settings':
+                value = android_command(["shell", "settings", "get", "system", "screen_off_timeout"],
+                                        capture_output=True, text=True).stdout.strip()
+                result.update(independent_setting_value=value, artifact_passed=value == "300000")
+                after_settings = android_system_settings()
+                save(directory / "final-system-settings.json", after_settings)
+                others = {key: {"before": before_settings.get(key), "after": after_settings.get(key)}
+                          for key in set(before_settings) | set(after_settings)
+                          if key != "screen_off_timeout" and before_settings.get(key) != after_settings.get(key)}
+                result.update(other_system_setting_changes=others, artifact_passed=value == "300000" and not others)
+            else:
+                from android_contacts_pilot import grade
+                independent=grade(android_command,fixture)
+                save(directory/'independent-contacts.json',independent)
+                result['artifact_passed']=independent['passed']
+            result['video_collection_passed']=video.finish()['passed']
         else:
             import base64
             artifact = json.loads(linux_execute(
@@ -183,6 +199,11 @@ def run(args):
         save(directory / "integration-result.json", failed)
         return failed
     finally:
+        if video is not None and not video.collected:
+            try:
+                video.finish('interrupted.mp4')
+            except Exception as exc:
+                save(directory/'recording-error.json',{'error':type(exc).__name__+': '+str(exc)})
         if recording:
             # The native recorder stops on the bounded VM endpoint. Preserve
             # failure details; a partial recording is not a passed task.
@@ -198,10 +219,12 @@ def run(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--case", choices=["android_settings", "linux_text"], required=True)
+    p.add_argument("--case", choices=["android_settings", "android_contacts", "linux_text"], required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--runtime", type=Path, required=True)
     p.add_argument("--app", default="http://127.0.0.1:18205")
+    p.add_argument('--video-mode',choices=['live','native'],default='live',
+                   help='Live1Hz measured captures preserve static waits; native video may omit a stationary tail')
     args = p.parse_args()
     print(json.dumps(run(args), ensure_ascii=False), flush=True)
 

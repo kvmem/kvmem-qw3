@@ -39,7 +39,7 @@
     "execution_core": "in_progress",
     "platform_contracts": "in_progress",
     "product_tasks": "pending",
-    "osworld_matched_comparison": "pending",
+    "osworld_matched_comparison": "in_progress",
     "diagnosis_and_retest": "pending",
     "kvmem_and_delivery": "pending"
   },
@@ -52,15 +52,72 @@
       "score": 0,
       "model_score_valid": false,
       "path": "apps/computer_use/.runtime/linux/campaign-20261004/013-legacy-r1/result.json"
+    },
+    {
+      "task": "013",
+      "arm": "legacy",
+      "repetition": 1,
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 694.603716163896,
+      "tool_calls": 17,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/013-legacy-r1/result.json"
+    },
+    {
+      "task": "013",
+      "arm": "verified",
+      "repetition": 1,
+      "score": 0.0,
+      "agent_status": "failed",
+      "seconds": 122.45599528495222,
+      "tool_calls": 6,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/013-verified-r1/result.json"
+    },
+    {
+      "task": "004",
+      "arm": "verified",
+      "repetition": 1,
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 95.71614843606949,
+      "tool_calls": 7,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/004-verified-r1/result.json"
+    },
+    {
+      "task": "004",
+      "arm": "legacy",
+      "repetition": 1,
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 907.1707902657799,
+      "tool_calls": 22,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/004-legacy-r1/result.json"
+    },
+    {
+      "task": "006",
+      "arm": "legacy",
+      "repetition": 1,
+      "score": null,
+      "agent_status": "paused",
+      "seconds": 860.3544154330157,
+      "tool_calls": 32,
+      "model_score_valid": false,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/006-legacy-r1/result.json"
     }
   ],
   "warnings": [
-    "Formal OSWorld still has no valid model comparison pair.",
     "Current Android settings candidate: pilot08 passed; pilot09 had correct result and no other system setting changes but reached180s deadline.",
     "Linux pilot04 passed declared visible checks but failed exact file bytes (extra final newline).",
-    "Client36 native176 are contract checks, not real-model desktop task success.",
     "Task006 qualification checks filenames only; applicant materials require separate availability audit.",
-    "Task043 original rubric has known business constraint conflicts; task035 original cloud judge remains disabled."
+    "Task043 original rubric has known business constraint conflicts; task035 original cloud judge remains disabled.",
+    "First four frozen attempts all scored0; no improvement demonstrated.",
+    "Task013 verified reached4096 combined output tokens during reasoning; later budget and freshness changes are a separate candidate.",
+    "Client37 native181 and independent grader/recording qualification are not real-model task successes.",
+    "Android live video is sampled at1Hz and can miss subsecond UI changes."
   ],
   "contract_checks": {
     "core_regression": {
@@ -111,6 +168,45 @@
       "passed": 6,
       "python": "third_party/OSWorld-V2/.venv/bin/python",
       "scope": "original score format, campaign balance, timeouts, scheduler data validation and optional worksheet dimensions"
+    },
+    "post_freeze_candidate_regression": {
+      "run": 124,
+      "passed": 121,
+      "skipped": 3,
+      "optional_original_evaluator_checks": {
+        "passed": 6
+      },
+      "linux_actual_codex_checks": {
+        "passed": 3,
+        "model_used": false
+      }
+    },
+    "native_windows_client37": {
+      "run": 181,
+      "passed": 181,
+      "real_model": false,
+      "bundle_sha256": "a89fabbbbfe0f365b0817dc976d35109e83678c152ccb15adcfec40848f2a995"
+    },
+    "real_browser_device_selector": {
+      "passed": true,
+      "devices": [
+        "linux-vm",
+        "windows-vm",
+        "android-emulator"
+      ],
+      "path": "apps/computer_use/.runtime/cross-device-ui-browser-03/result.json"
+    },
+    "android_contacts_saved_data": {
+      "negative": false,
+      "positive": true,
+      "model_used": false,
+      "path": "apps/computer_use/.runtime/android/contacts-grader-qualification-02/result.json"
+    },
+    "android_live_video_timestamps": {
+      "passed": true,
+      "sample_hz": 1,
+      "historical_reconstruction": false,
+      "path": "apps/computer_use/.runtime/android/live-recording-qualification-01/recording.json"
     }
   },
   "integration_pilots": [
@@ -348,5 +444,21 @@
     "health_reply": "OK",
     "health_seconds": 0.274758,
     "same_configuration_required_for_both_arms": true
+  },
+  "frozen_campaign": {
+    "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/plan.json",
+    "commit": "9fe52d3ee254786012652ec9fc85f340b71e9dc9",
+    "finished": 5,
+    "total": 40,
+    "current": [
+      "006-verified-r1"
+    ]
+  },
+  "post_freeze_optimizations": {
+    "candidate": "cross-device-ui-09",
+    "formal_campaign_changes": false,
+    "output_tokens": 16384,
+    "expired_observations": "Recapture; exact unchanged view or explicit allowed app intent can dispatch once; other changes return current view without input",
+    "real_model_retest": "pending"
   }
 }

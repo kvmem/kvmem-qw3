@@ -225,6 +225,10 @@ async def run(configuration):
               "model_used": True, "advisor_used": False, "execution_mode": "local_model_with_controlled_software_tools",
               "bundle_sha256": config["bundle_sha256"], "cold_workspace": not repair, "started_at": time.time(),
               "scenario": config["task"], "thinking": config.get("thinking", False)}
+    report['workflow_mode']=config.get('workflow_mode','legacy')
+    report['model_output_tokens']=config.get('model_output_tokens',4096)
+    if report['workflow_mode'] not in {'legacy','verified'}:
+        raise ValueError('Unsupported execution workflow')
     app = None
     owned_ready = False
     token_path = Path("C:/Qw3Computer") / (identity + "-model-token.txt")
@@ -273,6 +277,8 @@ async def run(configuration):
                     "--desktop-token", "C:/Qw3Computer/executor-token.txt", "--backend", config["backend"],
                     "--backend-token", str(token_path), "--runtime", str(output / "app"), "--software-root", str(workspace),
                     "--tool-call-limit", "100", "--output-policy", "task", "--trace-backend"]
+            args.extend(['--execution-mode',report['workflow_mode']])
+            args.extend(['--model-output-tokens',str(report['model_output_tokens'])])
             if config.get("thinking"):
                 args.append("--thinking")
             with (output / "app.stdout.log").open("wb") as stdout, (output / "app.stderr.log").open("wb") as stderr:

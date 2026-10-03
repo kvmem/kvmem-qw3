@@ -19,6 +19,9 @@ class DesktopError(RuntimeError):
 
 class DesktopRejected(DesktopError):
     """The executor explicitly rejected a request before dispatching it."""
+    def __init__(self,message,*,observation=None):
+        super().__init__(message)
+        self.observation=observation
 
 
 class DesktopValidationError(DesktopError):
@@ -41,6 +44,7 @@ class Desktop:
         self.db.execute("CREATE TABLE IF NOT EXISTS actions (id TEXT PRIMARY KEY, task TEXT, request TEXT, status TEXT, result TEXT, created REAL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS observations (id TEXT PRIMARY KEY, task TEXT, metadata TEXT, created REAL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS coordinate_dispatches (id TEXT PRIMARY KEY, mapping TEXT)")
+        self.db.execute('CREATE TABLE IF NOT EXISTS revalidations(id TEXT,source TEXT,evidence TEXT,PRIMARY KEY(id,source))')
         self.db.commit()
         self.session = None
         self.latest = None
@@ -194,6 +198,31 @@ class Desktop:
             except (ValueError, TypeError, KeyError) as exc:
                 raise DesktopValidationError({"code": "invalid_coordinates", "path": "$.coordinate_space",
                     "message": str(exc), "hint": "normalized_1000 is only for click, drag or scroll, with integers from 0 to 1000. Use pixels or omit this field for key, type and open_app."}) from exc
+            revalidation=None
+            captured=self.latest.get('captured_at')
+            if self.execution and type(captured) in (int,float) and time.time()*1000-captured>=50000:
+                old=self.latest
+                fresh=self.remember(await self.request('GET','/observe'))
+                identity=('desktop_id','device_id','session_id','display_id','width','height','rotation')
+                same_device=all(old.get(k)==fresh.get(k) for k in identity)
+                def controls(observation):
+                    a11y=observation.get('accessibility',{})
+                    return a11y | {'controls':[{k:v for k,v in c.items() if k!='control_id'}
+                        for c in a11y.get('controls',[])]}
+                same_view=(old.get('sha256')==fresh.get('sha256') and old.get('foreground')==fresh.get('foreground')
+                           and controls(old)==controls(fresh))
+                independent_app_intent=arguments['action']['kind']=='open_app'
+                revalidation={'source_observation_id':old['observation_id'],'fresh_observation_id':fresh['observation_id'],
+                    'age_milliseconds':time.time()*1000-captured,'same_device':same_device,'same_view':same_view,
+                    'scope':'Explicit allowed app intent' if independent_app_intent else 'Exact screenshot, foreground and control evidence',
+                    'input_sent':False}
+                self.db.execute('INSERT INTO revalidations VALUES (?,?,?)',(receipt_id,old['observation_id'],json.dumps(revalidation)))
+                self.db.commit()
+                if not same_device or not (same_view or independent_app_intent):
+                    raise DesktopRejected('The observation aged while reasoning and the current view changed. '
+                        'No input was sent. Retain the existing plan; reassess its next target against this current observation.',
+                        observation=self.with_image(fresh))
+                dispatched=dispatched | {'desktop_id':fresh['desktop_id'],'observation_id':fresh['observation_id']}
             if self.execution:
                 self.execution.before_dispatch(arguments, dispatched, receipt_id)
             elif "step" in arguments:
@@ -210,6 +239,8 @@ class Desktop:
                 result = self.checked_receipt(result, receipt_id, arguments)
                 if mapping:
                     result = result | {"coordinate_mapping": mapping}
+                if revalidation:
+                    result=result | {'observation_revalidation':revalidation | {'input_sent':True}}
                 metadata = self.remember(result["observation"])
                 result = result | {"observation": metadata | {"image": result["observation"]["image"]}}
                 self.db.execute("UPDATE actions SET status='completed', result=? WHERE id=?",

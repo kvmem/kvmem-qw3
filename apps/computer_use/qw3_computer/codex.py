@@ -57,6 +57,8 @@ def write_config(runtime, bridge_url, mcp_command=None, mcp_args=(), *, thinking
             "Use workflow wait to verify a result or bounded loading, rather than re-clicking. "
             "After a waiting result inspect the actual screen; diagnose focus, dialogs or incomplete loading. "
             "Keep a step pending until verified, or abandon it with a concrete recovery reason before another approach. "
+            "Long reasoning may age a capture. The tool rechecks old evidence before input; if the view changed, "
+            "it returns a current observation without input. Retain the valid plan and reassess only its next target. "
             "For launching an app choose foreground_app with the device's advertised app alias; do not invent native process names. "
             "Never invent evidence. A changed screen proves a transition, not business completion. "
             "For screenshot-estimated click/drag/scroll use only explicit coordinate_space=normalized_1000, "
