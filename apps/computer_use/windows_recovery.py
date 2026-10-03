@@ -85,7 +85,7 @@ async def run(args):
                 raise AssertionError("Action was allowed while paused")
             await desktop.control("resume"); await desktop.observe()
             action_id = uuid.uuid4().hex
-            intercept["id"] = action_id
+            intercept["id"] = desktop.action_receipt_id(action_id)
             arguments = {"desktop_id": desktop.latest["desktop_id"],
                          "observation_id": desktop.latest["observation_id"],
                          "action_id": action_id, "action": {"kind": "key", "key": "CTRL+L"}}

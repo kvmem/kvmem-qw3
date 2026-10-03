@@ -200,3 +200,87 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(DesktopError):
             await self.desktop.act(self.action("action_002"))
         self.assertEqual(self.effects, 1)
+
+    async def test_same_model_id_in_different_tasks_and_clients_has_distinct_receipts(self):
+        self.desktop.task_id = 'first-task'
+        first_request = self.action('click-name-field')
+        first = await self.desktop.act(first_request)
+        self.assertEqual(first['action_id'], 'click-name-field')
+        first_wire = self.last_dispatched['action_id']
+        self.desktop.task_id = 'second-task'
+        second_request = self.action('click-name-field')
+        await self.desktop.act(second_request)
+        second_wire = self.last_dispatched['action_id']
+        self.assertNotEqual(first_wire, second_wire)
+        self.assertEqual(self.effects, 2)
+        self.assertTrue((await self.desktop.act(second_request))['duplicate'])
+        self.assertEqual(self.effects, 2)
+        self.desktop.task_id = 'first-task'
+        self.assertTrue((await self.desktop.act(first_request))['duplicate'])
+        self.assertEqual(self.effects, 2)
+        # A fresh application has a new local DB but shares the remote ledger.
+        with tempfile.TemporaryDirectory() as directory:
+            other = Desktop(self.url, 'fixture-token', directory)
+            try:
+                other.task_id = 'third-task'
+                await other.start(); await other.control('resume')
+                request = first_request | {'observation_id': other.latest['observation_id']}
+                await other.act(request)
+                self.assertNotIn(self.last_dispatched['action_id'], (first_wire, second_wire))
+                self.assertEqual(self.effects, 3)
+            finally:
+                await other.close()
+
+    async def test_legacy_completed_action_is_never_adopted_by_another_task(self):
+        request = self.action('legacy-action-01')
+        result = {'action_id': request['action_id'], 'status': 'completed', 'observation': self.desktop.latest}
+        self.desktop.db.execute('INSERT INTO actions VALUES (?, ?, ?, ?, ?, ?)',
+            (request['action_id'], 'old-task', json.dumps(request, sort_keys=True, ensure_ascii=False), 'completed', json.dumps(result), 1))
+        self.desktop.db.commit()
+        self.desktop.task_id = 'old-task'
+        self.assertTrue((await self.desktop.act(request))['duplicate'])
+        self.assertEqual(self.effects, 0)
+        self.desktop.task_id = 'new-task'
+        self.assertFalse((await self.desktop.act(request)).get('duplicate', False))
+        self.assertEqual(self.effects, 1)
+        self.assertNotEqual(self.last_dispatched['action_id'], request['action_id'])
+        self.assertEqual(self.desktop.db.execute('SELECT task FROM actions WHERE id=?', (request['action_id'],)).fetchone()[0], 'old-task')
+
+    async def test_legacy_uncertain_receipt_keeps_original_remote_identity(self):
+        request = self.action('legacy-action-02')
+        self.desktop.db.execute('INSERT INTO actions VALUES (?, ?, ?, ?, ?, ?)',
+            (request['action_id'], 'old-task', json.dumps(request, sort_keys=True, ensure_ascii=False), 'uncertain', None, 1))
+        self.desktop.db.commit()
+        self.receipts[request['action_id']] = {'status':'completed', 'result':{
+            'action_id':request['action_id'], 'status':'completed', 'observation':self.observation()}}
+        self.desktop.task_id = 'old-task'
+        await self.desktop.control('pause'); await self.desktop.control('resume')
+        self.assertFalse(self.desktop.unresolved())
+        self.assertTrue((await self.desktop.act(request))['duplicate'])
+        self.assertEqual(self.effects, 0)
+
+    async def test_reconciliation_rejects_receipt_for_a_different_action(self):
+        request = self.action()
+        self.mode = 'lost_response'
+        with self.assertRaises(DesktopError): await self.desktop.act(request)
+        key = self.desktop.unresolved()[0]['receipt_id']
+        self.receipts[key]['result']['action_id'] = 'another-action'
+        with self.assertRaisesRegex(DesktopError, 'does not match'):
+            await self.desktop.control('resume')
+        self.assertTrue(self.desktop.paused)
+        self.assertEqual(len(self.desktop.unresolved()), 1)
+        self.assertEqual(self.effects, 1)
+
+    async def test_misplaced_action_id_reports_location_without_dispatch_or_reservation(self):
+        from qw3_computer.desktop import DesktopValidationError
+        request = self.action()
+        request['action']['action_id'] = request.pop('action_id')
+        with self.assertRaises(DesktopValidationError) as raised:
+            await self.desktop.act(request)
+        self.assertEqual(raised.exception.problem['path'], '$.action_id')
+        self.assertIn('$.action.action_id', raised.exception.problem['hint'])
+        self.assertEqual(self.effects, 0)
+        self.assertEqual(self.desktop.db.execute('SELECT COUNT(*) FROM actions').fetchone()[0], 0)
+        request['action_id'] = request['action'].pop('action_id')
+        await self.desktop.act(request)
+        self.assertEqual(self.effects, 1)

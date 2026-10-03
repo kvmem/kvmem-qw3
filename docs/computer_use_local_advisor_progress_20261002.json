@@ -5,7 +5,7 @@
   "status": "active",
   "local_plan": "docs/computer_use_local_diagnostic_plan_20261002.json",
   "combined_goal": "docs/computer_use_local_advisor_goal_20261002.md",
-  "current_stage": "p3_baseline_running_action_scope_and_schema_recovery_failures_observed",
+  "current_stage": "p3_baseline_running_candidate_host_contracts_passed",
   "source_baseline": "56896791b41b6aa5c022c99dac4996f719bd4ba0",
   "stages": {
     "P0": {
@@ -99,13 +99,13 @@
       "native_report": "docs/computer_use_native_thinking_20261003.md"
     },
     "P3": {
-      "status": "frozen_baseline_running",
-      "trials_completed": 3,
+      "status": "baseline_running_candidate_implemented_host_checked",
+      "trials_completed": 9,
       "planned_trials": 32,
       "report": "docs/computer_use_recovery_diagnostic_p3_20261003.md",
       "baseline_bundle": "windows-native-client-30",
       "condition_count": 8,
-      "model_trials_completed": 3,
+      "model_trials_completed": 9,
       "scripted_conditions_qualified": [
         "normal",
         "wrong_focus",
@@ -135,13 +135,13 @@
       "model_preflight_completed": 1,
       "model_preflight_passed": 1,
       "model_preflight_evidence": "apps/computer_use/.runtime/p3-native-preflight-01/summary.json",
-      "formal_baseline_completed": 3,
-      "formal_baseline_passed": 2,
+      "formal_baseline_completed": 9,
+      "formal_baseline_passed": 7,
       "baseline_frozen": true,
       "baseline_acceptance": "apps/computer_use/.runtime/p3-baseline-20261003/acceptance.json",
       "baseline_campaign": "apps/computer_use/.runtime/p3-baseline-20261003/campaign.json",
-      "active_trial": "p3-baseline-r1-04",
-      "candidate_changes_implemented": 0,
+      "active_trial": "p3-baseline-r2-07",
+      "candidate_changes_implemented": 2,
       "observed_baseline_issue": {
         "kind": "cross_task_gui_action_id_collision",
         "first_evidence": "apps/computer_use/.runtime/p3-baseline-r1-01/fixture/state.json",
@@ -168,7 +168,18 @@
         "visual_localization_claim": "No action reached the executor, so this attempt cannot establish click accuracy.",
         "proposed_generic_candidate": "Report the exact missing/invalid field path and bounded repeated-error recovery, keeping strict validation and no automatic reinterpretation of actions.",
         "candidate_implemented": false
-      }
+      },
+      "candidate_native_qualified": false,
+      "candidate_host_contracts": {
+        "run": 138,
+        "passed": 134,
+        "skipped": 4,
+        "scope": "The same selected contract modules shipped by pack_windows_client; Windows/native Codex checks still pending."
+      },
+      "candidate_changes": [
+        "Task-scoped GUI wire/ledger IDs with legacy receipt lookup and strict received-action/desktop identity checks.",
+        "Exact public action field validation; after three known non-deliveries pause; observe-only unchanged foreground requires >=3 observations and >=30 monotonic seconds; active software jobs exempt; explicit resume resets recovery streak, not tool budget."
+      ]
     },
     "P4": {
       "status": "planned",
@@ -293,7 +304,7 @@
     "gpu_compute_processes": 0,
     "checked_at": 1790982486.6385703
   },
-  "next_action": "Continue frozen 16-trial P3 baseline. Preserve completed-turn vs actual business success distinction: wrong_focus requested takeover after 14 malformed calls and 135 seconds. After baseline, choose at most two generic improvements; current candidates are task-scoped GUI action identities and precise/bounded tool validation-error recovery. Then qualify candidate Windows client and run same 16 conditions. Do not narrow remaining P4/P5, original-ten, advisor or resource deliverables.",
+  "next_action": "Complete the frozen client30 P3 baseline while preparing client31 from the isolated candidate source. Baseline hashes and zip remain unchanged. After VM queue ends, qualify all client31 contracts in Windows, freeze candidate 16-trial acceptance, run paired conditions, and audit real improvements and false pauses. Preserve remaining P4/P5, original ten V0/V1, advisor and resource deliverables.",
   "advisor_provider": {
     "provider": "deepseek",
     "model": "deepseek-flash",

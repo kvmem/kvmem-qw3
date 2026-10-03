@@ -17,7 +17,7 @@ from aiohttp import web
 
 from .bridge import create_app as bridge_app
 from .codex import CodexClient, write_config
-from .desktop import Desktop, DesktopError, DesktopRejected, mcp_observation
+from .desktop import Desktop, DesktopError, DesktopRejected, DesktopValidationError, mcp_observation
 from .software import Software
 
 
@@ -68,6 +68,7 @@ class Controller:
         self.consume_task = None
         self.bridge = None
         self.control_lock = asyncio.Lock()
+        self.recovery_clock = time.monotonic
         self.save()
 
     def save(self):
@@ -305,6 +306,9 @@ class Controller:
                     text += "Do not blindly repeat any interrupted action. Current observation:\n"
                     text += json.dumps({k: v for k, v in observation.items() if k != "image"})
                     self.state.update(status="starting", notice="", draft="")
+                    # An explicit user resume grants a new recovery attempt,
+                    # but never a new cumulative tool-call budget.
+                    self.state.pop("gui_recovery", None)
                     self.save()
                     self.state["turn_id"] = await self.client.turn(self.state["thread_id"], text,
                                                                    ["data:image/png;base64," + observation["image"]])
@@ -333,6 +337,56 @@ class Controller:
             self.save()
             return self.snapshot()
 
+    def reset_gui_recovery(self):
+        self.state.pop("gui_recovery", None)
+        self.save()
+
+    async def note_gui_rejection(self, problem, task_id):
+        """Bound repeated known non-deliveries; observe alone cannot reset it."""
+        if self.state["status"] != "running" or self.state.get("id") != task_id:
+            return {"paused": self.state["status"] == "paused"}
+        guard = self.state.setdefault("gui_recovery", {})
+        guard.setdefault("first_rejection_at", time.time())
+        guard["rejected_calls"] = guard.get("rejected_calls", 0) + 1
+        guard["last_error"] = problem
+        self.save()
+        if guard["rejected_calls"] >= 3:
+            await self.control("pause")
+            guard["paused_reason"] = "repeated_rejection"
+            self.state["notice"] = "任务连续三次未能发出有效操作，已暂停等待检查或接管。"
+            self.save()
+        return {"rejected_calls": guard["rejected_calls"], "limit": 3,
+                "paused": self.state["status"] == "paused"}
+
+    async def note_gui_observation(self, observation, task_id):
+        if self.state["status"] != "running" or self.state.get("id") != task_id:
+            return None
+        # An installation job can be making real progress while its desktop
+        # is unchanged. Its own bounded job polling and receipts govern it.
+        if self.software and any(j["status"] in ("running", "queued")
+                for j in self.software.snapshot(task_id)["jobs"]):
+            return None
+        guard = self.state.setdefault("gui_recovery", {})
+        token = json.dumps([observation.get("foreground"),
+                            observation.get("progress_sha256", observation.get("sha256"))], sort_keys=True)
+        now = self.recovery_clock()
+        if guard.get("observation_token") != token:
+            guard.update(observation_token=token, unchanged_since_monotonic=now, unchanged_observations=1)
+        else:
+            guard["unchanged_observations"] += 1
+        self.save()
+        # A single slow inference is not an observe-only loop. Real changing
+        # foreground content resets this window; taskbar clocks do not.
+        if guard["unchanged_observations"] >= 3 and now - guard["unchanged_since_monotonic"] >= 30:
+            await self.control("pause")
+            guard["paused_reason"] = "unchanged_observation_loop"
+            self.state["notice"] = "反复查看的窗口持续没有变化，已暂停。请确认是否仍需等待或接管。"
+            self.save()
+            return {"status": "paused", "reason": guard["paused_reason"],
+                    "unchanged_seconds": now - guard["unchanged_since_monotonic"],
+                    "hint": "No desktop input was sent. Repeated unchanged observations were paused for user review."}
+        return None
+
     async def tool(self, name, arguments):
         if name not in ("observe", "act") and not (name == "software" and self.software):
             raise DesktopError("Unknown desktop tool")
@@ -350,18 +404,24 @@ class Controller:
         if exhausted:
             await self.control("pause")
             raise DesktopError("Tool-call limit reached; task paused for review")
+        task_id = self.state.get("id")
         if name == "observe":
-            return mcp_observation(await self.desktop.observe())
+            observation = await self.desktop.observe()
+            recovery = await self.note_gui_observation(observation, task_id)
+            return mcp_observation(observation, recovery) | ({"isError": True} if recovery else {})
         if self.state["status"] != "running":
             raise DesktopError("Task is not running; wait for user resume")
         if name == "software":
             result = await self.software.invoke(self.state["id"], arguments)
+            self.reset_gui_recovery()
             return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
                     "isError": result.get("status") in ("failed", "uncertain")}
-        self.state["current_action"] = arguments.get("action")
+        self.state["current_action"] = arguments.get("action") if isinstance(arguments, dict) else None
         self.save()
         try:
             result = await self.desktop.act(arguments)
+            if self.state.get("id") == task_id:
+                self.reset_gui_recovery()
             if result.get("no_progress"):
                 self.state["status"] = "paused"
                 self.state["notice"] = "连续操作没有改变桌面，任务已暂停。"
@@ -375,6 +435,11 @@ class Controller:
                              "Use the resulting screen to recover; do not type until the intended window is foreground."
                 }) | {"isError": True}
             return mcp_observation(result["observation"], result)
+        except DesktopValidationError as exc:
+            recovery = await self.note_gui_rejection(exc.problem, task_id)
+            return {"isError": True, "content": [{"type": "text", "text": json.dumps({
+                "status": "invalid_arguments", "dispatched": False, "error": exc.problem,
+                "recovery": recovery}, ensure_ascii=False)}]}
         except DesktopRejected as exc:
             # The guest explicitly confirms that no input was dispatched.
             # Return a current screen so recovery need not spend a model turn
@@ -383,8 +448,10 @@ class Controller:
                 observation = await self.desktop.observe()
             except DesktopError:
                 raise exc
+            recovery = await self.note_gui_rejection({"code": "executor_rejected", "path": "$.action",
+                "message": str(exc), "hint": "No input was dispatched. Use the fresh observation to correct the action."}, task_id)
             return mcp_observation(observation, {"action_id": arguments.get("action_id"),
-                "status": "rejected", "dispatched": False, "error": str(exc)}) | {"isError": True}
+                "status": "rejected", "dispatched": False, "error": str(exc), "recovery": recovery}) | {"isError": True}
         except BaseException:
             if self.desktop.paused:
                 self.state["status"] = "paused"

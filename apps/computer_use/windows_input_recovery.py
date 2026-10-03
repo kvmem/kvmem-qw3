@@ -157,7 +157,8 @@ async def run(args):
         ready_name = action_id + '-ready.json'
         result_name = action_id + '-result.json'
         worker_name = action_id + '-worker.ps1'
-        (shared / request_name).write_text(json.dumps({'action_id': action_id}))
+        receipt_id = desktop.action_receipt_id(action_id)
+        (shared / request_name).write_text(json.dumps({'action_id': receipt_id}))
         helper_text = (APP / 'vm/kill_on_dispatch.ps1').read_text()
         for old, new in [('input-kill-request.json', request_name),
                          ('input-kill-ready.json', ready_name),
@@ -168,15 +169,16 @@ async def run(args):
         helper.write_text(helper_text)
         shutil.copyfile(helper, shared / worker_name)
         await setup(helper)
-        ready = await wait_json(ready_name, lambda x: x.get('action_id') == action_id)
+        ready = await wait_json(ready_name, lambda x: x.get('action_id') == receipt_id)
         assert ready['executor_pid'] == before['process_id'], 'Unexpected executor identity'
         await focus_notepad()
         await notepad_focus()
         arguments = {'desktop_id': desktop.latest['desktop_id'], 'observation_id': desktop.latest['observation_id'],
                      'action_id': action_id, 'action': {'kind': 'type', 'text': 'ONCE'}}
         result['selected_action_id'] = action_id
+        result['selected_receipt_id'] = receipt_id
         action_task = asyncio.create_task(desktop.act(arguments))
-        killed = await wait_json(result_name, lambda x: x.get('action_id') == action_id)
+        killed = await wait_json(result_name, lambda x: x.get('action_id') == receipt_id)
         result['fault'] = killed
         assert killed['passed'] and killed['executor_sha256'] == expected_hash, 'Fault injection did not hit the candidate dispatch window'
         assert killed['status_after_kill'] == 'dispatching' and killed['clipboard_sequence_unchanged']
@@ -200,11 +202,11 @@ async def run(args):
             raise TimeoutError('Owned executor did not restart')
         assert after['paused'] and before['desktop_id'] == after['desktop_id']
         result['restart'] = {'before': before, 'after': after}
-        receipt = await desktop.request('GET', '/actions/' + action_id)
+        receipt = await desktop.request('GET', '/actions/' + receipt_id)
         assert receipt['status'] == 'dispatching'
         result['retained_remote_status'] = receipt['status']
         try:
-            await desktop.request('POST', '/act', arguments)
+            await desktop.request('POST', '/act', arguments | {'action_id': receipt_id})
         except DesktopError as exc:
             assert 'uncertain' in str(exc).lower()
             result['remote_duplicate_rejected'] = True

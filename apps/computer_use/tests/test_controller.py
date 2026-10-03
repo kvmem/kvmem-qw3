@@ -444,3 +444,77 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(response.status, 200)
         finally:
             await runner.cleanup()
+
+    async def test_repeated_validation_errors_pause_without_reset_from_observe(self):
+        from qw3_computer.desktop import DesktopValidationError
+        await self.controller.start_task('Test bounded GUI recovery')
+        self.desktop.act = AsyncMock(side_effect=DesktopValidationError({
+            'code':'missing_field','path':'$.action_id','message':'Required field missing',
+            'hint':'Move $.action.action_id to $.action_id'}))
+        for attempt in range(3):
+            result = await self.controller.tool('act', {'action': {'action_id': f'name-{attempt}', 'kind':'click'}})
+            payload = json.loads(result['content'][0]['text'])
+            self.assertFalse(payload['dispatched'])
+            self.assertEqual(payload['error']['path'], '$.action_id')
+            if attempt < 2:
+                self.assertEqual(self.controller.state['status'], 'running')
+                await self.controller.tool('observe', {})
+        self.assertEqual(self.controller.state['status'], 'paused')
+        self.assertTrue(self.desktop.paused)
+        self.assertEqual(self.controller.state['tool_calls_used'], 5)
+        self.assertEqual(self.controller.state['gui_recovery']['paused_reason'], 'repeated_rejection')
+        self.controller.client.interrupt.assert_awaited_once()
+        await self.controller.control('resume')
+        self.assertNotIn('gui_recovery', self.controller.state)
+        self.assertEqual(self.controller.state['tool_calls_used'], 5)
+
+    async def test_successful_action_clears_rejection_streak(self):
+        from qw3_computer.desktop import DesktopValidationError
+        await self.controller.start_task('Correct one malformed call')
+        self.desktop.act = AsyncMock(side_effect=DesktopValidationError({
+            'code':'missing_field','path':'$.action_id','message':'Required field missing','hint':'Use root field'}))
+        await self.controller.tool('act', {})
+        self.desktop.act = AsyncMock(return_value={'status':'completed','observation':self.desktop.latest | {'image':'fixture'}})
+        await self.controller.tool('act', {})
+        self.assertNotIn('gui_recovery', self.controller.state)
+        self.assertEqual(self.controller.state['status'], 'running')
+
+    async def test_unchanged_observe_loop_pauses_but_changing_loading_does_not(self):
+        await self.controller.start_task('Observe progress')
+        with patch.object(self.controller, 'recovery_clock', return_value=100):
+            await self.controller.tool('observe', {})
+        with patch.object(self.controller, 'recovery_clock', return_value=120):
+            await self.controller.tool('observe', {})
+        self.assertEqual(self.controller.state['status'], 'running')
+        self.desktop.observe.return_value = self.desktop.latest | {'image':'fixture','progress_sha256':'loading-progress-2'}
+        with patch.object(self.controller, 'recovery_clock', return_value=131):
+            await self.controller.tool('observe', {})
+        self.assertEqual(self.controller.state['status'], 'running')
+        with patch.object(self.controller, 'recovery_clock', return_value=151):
+            await self.controller.tool('observe', {})
+        with patch.object(self.controller, 'recovery_clock', return_value=162):
+            result = await self.controller.tool('observe', {})
+        self.assertTrue(result['isError'])
+        self.assertEqual(self.controller.state['status'], 'paused')
+        self.assertEqual(self.controller.state['gui_recovery']['paused_reason'], 'unchanged_observation_loop')
+
+    async def test_active_software_job_is_not_a_static_desktop_stall(self):
+        from types import SimpleNamespace
+        await self.controller.start_task('Wait for a real background installation')
+        self.controller.software = SimpleNamespace(root=Path('test'),snapshot=lambda task:{'jobs':[{'status':'running'}]},
+            close=AsyncMock(),pause=AsyncMock())
+        for clock in (100,120,140,160):
+            with patch.object(self.controller, 'recovery_clock', return_value=clock):
+                await self.controller.tool('observe', {})
+        self.assertEqual(self.controller.state['status'], 'running')
+        self.controller.client.interrupt.assert_not_called()
+
+    async def test_repeated_known_executor_rejections_are_bounded(self):
+        await self.controller.start_task('Leave a blocked foreground safely')
+        self.desktop.act = AsyncMock(side_effect=DesktopRejected('Foreground application is outside the allowed scope'))
+        for attempt in range(3):
+            result = await self.controller.tool('act', {'action_id':f'scope-action-{attempt}'})
+            self.assertFalse(json.loads(result['content'][0]['text'])['dispatched'])
+        self.assertEqual(self.controller.state['status'], 'paused')
+        self.assertEqual(self.controller.state['tool_calls_used'], 3)
+        self.assertEqual(self.desktop.act.await_count, 3)

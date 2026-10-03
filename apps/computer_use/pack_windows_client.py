@@ -117,7 +117,7 @@ exit $LASTEXITCODE
         "kind": "windows_native_client_offline_bundle", "qualified": False,
         "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
         "python_version": "3.13.13", "codex_version": "0.159.2",
-        "runtime_capabilities": ["configurable_backend_waits", "large_visual_history_requests", "backend_error_receipts", "opt_in_local_thinking", "application_focus_receipts", "opt_in_software_workflows"],
+        "runtime_capabilities": ["configurable_backend_waits", "large_visual_history_requests", "backend_error_receipts", "opt_in_local_thinking", "application_focus_receipts", "opt_in_software_workflows", "task_scoped_gui_receipts", "bounded_gui_error_recovery"],
         "model_request_limit_bytes": MAX_MODEL_REQUEST_BYTES,
         "backend_wait_defaults": {"total_seconds": 600, "read_seconds": 180, "heartbeat_seconds": 30},
         "test_scope": "Windows runtime contracts; host OSWorld/scoring tests remain in the repository",
