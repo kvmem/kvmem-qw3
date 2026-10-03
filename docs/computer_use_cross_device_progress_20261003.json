@@ -114,10 +114,10 @@
     "Linux pilot04 passed declared visible checks but failed exact file bytes (extra final newline).",
     "Task006 qualification checks filenames only; applicant materials require separate availability audit.",
     "Task043 original rubric has known business constraint conflicts; task035 original cloud judge remains disabled.",
-    "First four frozen attempts all scored0; no improvement demonstrated.",
     "Task013 verified reached4096 combined output tokens during reasoning; later budget and freshness changes are a separate candidate.",
     "Client37 native181 and independent grader/recording qualification are not real-model task successes.",
-    "Android live video is sampled at1Hz and can miss subsecond UI changes."
+    "Android live video is sampled at1Hz and can miss subsecond UI changes.",
+    "The frozen campaign has not yet demonstrated a successful task or success-rate improvement."
   ],
   "contract_checks": {
     "core_regression": {
@@ -207,6 +207,14 @@
       "sample_hz": 1,
       "historical_reconstruction": false,
       "path": "apps/computer_use/.runtime/android/live-recording-qualification-01/recording.json"
+    },
+    "control_id_copy_error": {
+      "passed": 36,
+      "scope": "desktop gateway regression; malformed references never guessed or dispatched"
+    },
+    "real_browser_new_candidate": {
+      "passed": true,
+      "path": "apps/computer_use/.runtime/cross-device-ui-browser-04/result.json"
     }
   },
   "integration_pilots": [
@@ -459,6 +467,7 @@
     "formal_campaign_changes": false,
     "output_tokens": 16384,
     "expired_observations": "Recapture; exact unchanged view or explicit allowed app intent can dispatch once; other changes return current view without input",
-    "real_model_retest": "pending"
+    "real_model_retest": "pending",
+    "control_id_copy_hint": "Complete20-character observed IDs; the server currently does not enforce identifier enums during decoding, no constrained-decoding benefit claimed"
   }
 }
