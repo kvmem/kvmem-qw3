@@ -1,4 +1,4 @@
-"""Start the serialized GPU profile; requires exclusive use of the local GPU."""
+"""Start an owned QW3 profile, optionally sharing spare GPU capacity."""
 import argparse
 import fcntl
 import hashlib
@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import time
+import socket
 
 
 def main():
@@ -24,18 +25,33 @@ def main():
     parser.add_argument("--trace-memory", action="store_true",
                         help="Separate diagnostic: trace CUDA tensor allocations and workspace capacities")
     parser.add_argument("--port", type=int, default=18080)
+    parser.add_argument('--context-tokens',type=int,default=1048576,
+                        help='Owned engine context allocation; reduce to preserve shared GPU headroom')
+    parser.add_argument("--gpu-sharing", choices=["exclusive", "spare-capacity"], default="exclusive",
+                        help="spare-capacity allows other user processes; never terminates them")
+    parser.add_argument("--min-free-mib", type=int, default=74000,
+                        help="Free GPU memory required at shared startup, including profile headroom")
     parser.add_argument("--lock-timeout", type=float, default=0,
                         help="Wait briefly for a previous owned engine's GPU lock to be released")
     parser.add_argument("--run-dir", type=Path, required=True)
     args = parser.parse_args()
     if args.kvmem == "on" and args.guided_refresh != "off" and args.method == "none":
         parser.error("--guided-refresh both requires --method dflash2 or mtp when KVMem is on")
+    if args.min_free_mib < 1:
+        parser.error("--min-free-mib must be positive")
+    if not 32768<=args.context_tokens<=1048576:
+        parser.error('--context-tokens must be 32768..1048576')
+    with socket.socket() as listener:
+        try:
+            listener.bind(("127.0.0.1", args.port))
+        except OSError:
+            parser.error("Requested engine port is already in use; select an unused port")
     root = Path(__file__).resolve().parents[2]
     run = args.run_dir.resolve()
     run.mkdir(parents=True, exist_ok=False)
     locks = [Path("/tmp/qw3-computer-gpu.lock")]
     shared = root.parent / "qw3-dflash2/benchmark/dflash2/long_running_gpu.lock"
-    if shared.exists():
+    if shared.exists() and args.gpu_sharing == "exclusive":
         locks.append(shared)
     handles = []
     for path in locks:
@@ -55,10 +71,18 @@ def main():
     while True:
         users = subprocess.check_output(["nvidia-smi", "--query-compute-apps=pid",
                                          "--format=csv,noheader"], text=True).strip()
-        if not users:
+        if args.gpu_sharing == "spare-capacity":
+            free = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.free",
+                                           "--format=csv,noheader,nounits"], text=True).strip().splitlines()
+            if len(free) != 1:
+                raise SystemExit("Shared profile currently requires exactly one GPU; explicit device selection is needed")
+            if int(free[0]) >= args.min_free_mib:
+                break
+        elif not users:
             break
         if time.monotonic() >= deadline:
-            raise SystemExit("GPU has existing compute processes; refusing to start: " + users)
+            raise SystemExit("Insufficient free GPU memory for the shared profile" if args.gpu_sharing == "spare-capacity"
+                             else "GPU has existing compute processes; refusing to start: " + users)
         # A terminated process can briefly remain visible to the driver after
         # its file locks disappear. Never start over its outstanding context.
         time.sleep(0.2)
@@ -67,7 +91,7 @@ def main():
     binary = root / "build-dflash-integration/qw3"
     command = [str(binary), "serve", "--model", str(root / "models/Qwen3.8-27B-Q8_0.gguf"),
                "--vision-model", str(root / "models/Qwen3.8-27B-BF16"), "--vision-device", "cuda",
-               "--host", "127.0.0.1", "--port", str(args.port), "--ctx", "1048576",
+               "--host", "127.0.0.1", "--port", str(args.port), "--ctx", str(args.context_tokens),
                "--kv-dtype", "fp8", "--speculative-method", args.method,
                "--prefill-chunk", "2048"]
     if args.kvmem == "on":
@@ -104,6 +128,10 @@ def main():
                 "kvmem": args.kvmem, "prefix_reuse": args.kvmem == "on" and args.prefix_reuse == "auto",
                 "visual_history": args.visual_history,
                 "guided_refresh": args.guided_refresh if args.kvmem == "on" else "off",
+                "gpu_sharing": args.gpu_sharing, "min_free_mib": args.min_free_mib,
+                'context_tokens':args.context_tokens,
+                "existing_compute_pids": users.splitlines(),
+                "owns_process_only": True,
                 "launcher_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "pid": os.getpid()}
     (run / "manifest.json").write_text(json.dumps(manifest, indent=2))

@@ -9,8 +9,28 @@ import unittest
 from aiohttp import web
 from PIL import Image
 
-from qw3_computer.desktop import Desktop, DesktopError, DesktopRejected, DesktopValidationError
+from qw3_computer.desktop import Desktop, DesktopError, DesktopRejected, DesktopValidationError, model_observation
 from test_bridge import serve
+
+
+class ModelObservationTests(unittest.TestCase):
+    def test_compact_view_preserves_targets_values_and_negative_selection_without_mutation(self):
+        observation = {"desktop_id": "test", "observation_id": "fresh", "image": "full-screenshot",
+            "accessibility": {"status": "ok", "truncated": False, "controls": [{
+                "control_id": "toggle", "name": "Enabled", "value": "Off", "kind": "CheckBox",
+                "x": 12, "y": 24, "width": 36, "height": 48, "center_x": 30, "center_y": 48,
+                "states": {"checkable": True, "checked": False, "clickable": True, "scrollable": False}}]}}
+        original = json.loads(json.dumps(observation))
+        result = model_observation(observation)
+        control = result["accessibility"]["controls"][0]
+        self.assertEqual(control["control_id"], "toggle")
+        self.assertEqual(control["value"], "Off")
+        self.assertEqual(control["bounds"], [12, 24, 36, 48])
+        self.assertEqual((control["center_x"], control["center_y"]), (30, 48))
+        self.assertFalse(control["states"]["checked"])
+        self.assertFalse(result["accessibility"]["truncated"])
+        self.assertEqual(observation, original)
+        self.assertNotIn("image", result)
 
 
 class DesktopTests(unittest.IsolatedAsyncioTestCase):
@@ -96,6 +116,23 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.effects, 1)
         with self.assertRaisesRegex(DesktopError, "different arguments"):
             await self.desktop.act(request | {"action": {"kind": "key", "key": "ENTER"}})
+
+    async def test_fresh_observation_verifies_pending_step_without_resending_input(self):
+        from pathlib import Path
+        from qw3_computer.execution import Execution
+        execution=Execution(self.desktop,Path(self.temp.name))
+        self.desktop.execution=execution
+        try:
+            request=self.action(step={'goal':'Wait for save','conditions':[{'kind':'control_text','text':'Saved'}]})
+            self.assertFalse((await self.desktop.act(request))['step_check']['verified'])
+            self.controls=[{'name':'Saved','kind':'Label','x':0,'y':0,'width':4,'height':4,'center_x':2,'center_y':2}]
+            observation=await self.desktop.observe()
+            self.assertTrue(observation['step_check']['verified'])
+            self.assertEqual(execution.steps()[0]['status'],'verified')
+            self.assertEqual(self.effects,1)
+        finally:
+            self.desktop.execution=None
+            execution.close()
 
     async def test_normalized_click_converts_once_and_keeps_pixel_actions_unchanged(self):
         request = self.action(coordinate_space="normalized_1000",
@@ -291,6 +328,8 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.desktop.act(first_request))['duplicate'])
         self.assertEqual(self.effects, 2)
         # A fresh application has a new local DB but shares the remote ledger.
+        # Transfer the device lease; two applications must not own input together.
+        await self.desktop.close()
         with tempfile.TemporaryDirectory() as directory:
             other = Desktop(self.url, 'fixture-token', directory)
             try:
@@ -300,6 +339,16 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
                 await other.act(request)
                 self.assertNotIn(self.last_dispatched['action_id'], (first_wire, second_wire))
                 self.assertEqual(self.effects, 3)
+            finally:
+                await other.close()
+
+    async def test_second_client_cannot_own_same_device_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            other = Desktop(self.url, 'fixture-token', directory)
+            try:
+                with self.assertRaisesRegex(RuntimeError, 'input owner'):
+                    await other.start()
+                self.assertEqual(self.effects, 0)
             finally:
                 await other.close()
 

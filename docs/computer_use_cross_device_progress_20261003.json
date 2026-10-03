@@ -1,0 +1,223 @@
+{
+  "schema_version": 1,
+  "goal_status": "active",
+  "baseline_commit": "e237c72e2971f281ee7ec76adbe2f840ec9332cf",
+  "model": "local-qw3",
+  "advisor_enabled": false,
+  "platforms": [
+    "windows-vm",
+    "linux-vm",
+    "android-emulator"
+  ],
+  "osworld_task_ids": [
+    "013",
+    "004",
+    "006",
+    "010",
+    "038",
+    "022",
+    "035",
+    "043",
+    "080",
+    "051"
+  ],
+  "formal_budget": {
+    "seconds": 1800,
+    "tool_calls": 250,
+    "repeats_per_arm": 2
+  },
+  "formal_arms": [
+    "legacy",
+    "verified"
+  ],
+  "kvmem_task_ids": [
+    "035",
+    "080"
+  ],
+  "stages": {
+    "baseline_and_resources": "complete",
+    "execution_core": "in_progress",
+    "platform_contracts": "in_progress",
+    "product_tasks": "pending",
+    "osworld_matched_comparison": "pending",
+    "diagnosis_and_retest": "pending",
+    "kvmem_and_delivery": "pending"
+  },
+  "formal_attempts": [
+    {
+      "task": "013",
+      "arm": "legacy",
+      "repetition": 1,
+      "status": "resource-interruption",
+      "score": 0,
+      "model_score_valid": false,
+      "path": "apps/computer_use/.runtime/linux/campaign-20261004/013-legacy-r1/result.json"
+    }
+  ],
+  "warnings": [
+    "Formal OSWorld still has no valid model comparison pair.",
+    "Android pilot07 is one successful development task; repeat and other apps remain unqualified.",
+    "Client35 native175 are contract checks, not real-model desktop task success."
+  ],
+  "contract_checks": {
+    "core_regression": {
+      "run": 112,
+      "passed": 110,
+      "skipped": 2,
+      "scope": "execution controller desktop gateway registry trace bridge relay codex"
+    },
+    "execution_gateway": {
+      "run": 14,
+      "passed": 14
+    },
+    "linux_clipboard": {
+      "completed_receipts": 2,
+      "unresolved": 0,
+      "unicode_observed": true
+    },
+    "android_settings_open": {
+      "completed_receipts": 1,
+      "unresolved": 0
+    },
+    "android_accessibility": {
+      "parsed_controls": 51,
+      "status": "ok",
+      "source": "Appium UiAutomator2 widget-class XML"
+    },
+    "native_windows_client34": {
+      "run": 168,
+      "passed": 168,
+      "real_model": false,
+      "bundle_sha256": "f1667d6a083568c962ab1a9eeee44bf206404b3431e7eae3f33b3d1b7fb6dace"
+    },
+    "native_windows_client35": {
+      "run": 175,
+      "passed": 175,
+      "real_model": false,
+      "bundle_sha256": "75ad0922ca42554f686f2ba33f8a2487a3160c4b4e159f142b6f4f3ef361349e"
+    }
+  },
+  "integration_pilots": [
+    {
+      "id": "linux-qw3-pilot-01",
+      "formal": false,
+      "status": "failed",
+      "category": "clipboard-delivery-reply-timeout",
+      "path": "apps/computer_use/.runtime/linux/qw3-pilot-01/integration-result.json"
+    },
+    {
+      "id": "linux-qw3-pilot-02",
+      "formal": false,
+      "status": "failed",
+      "categories": [
+        "model-http-connection",
+        "extra-final-newline"
+      ],
+      "path": "apps/computer_use/.runtime/linux/qw3-pilot-02/integration-result.json"
+    },
+    {
+      "id": "android-qw3-pilot-01",
+      "formal": false,
+      "status": "failed",
+      "categories": [
+        "workflow-interface-overhead",
+        "navigation"
+      ],
+      "path": "apps/computer_use/.runtime/android/qw3-pilot-01/integration-result.json",
+      "tool_calls": 12,
+      "artifact_passed": false
+    },
+    {
+      "id": "android-qw3-pilot-02",
+      "formal": false,
+      "status": "failed",
+      "categories": [
+        "workflow-interface-overhead",
+        "navigation"
+      ],
+      "path": "apps/computer_use/.runtime/android/qw3-pilot-02/integration-result.json",
+      "tool_calls": 14,
+      "artifact_passed": false
+    },
+    {
+      "id": "android-qw3-pilot-03",
+      "formal": false,
+      "status": "paused",
+      "categories": [
+        "final-tool-extra-goal-field"
+      ],
+      "path": "apps/computer_use/.runtime/android/qw3-pilot-03/integration-result.json",
+      "artifact_passed": true,
+      "unassisted_passed": false,
+      "seconds": 140.86647,
+      "tool_calls": 11,
+      "unexpected_initial_dialog": true
+    },
+    {
+      "id": "android-qw3-pilot-04",
+      "formal": false,
+      "status": "resource-timeout",
+      "tool_calls": 0,
+      "artifact_passed": false,
+      "path": "apps/computer_use/.runtime/android/qw3-pilot-04/integration-result.json"
+    },
+    {
+      "id": "android-qw3-pilot-05",
+      "formal": false,
+      "path": "apps/computer_use/.runtime/android/qw3-pilot-05/integration-result.json",
+      "app_status": "stopped",
+      "seconds": 181.19432139396667,
+      "tool_calls": 7,
+      "artifact_passed": true,
+      "unassisted_passed": false,
+      "video_bytes": 1239418
+    },
+    {
+      "id": "android-qw3-pilot-06",
+      "formal": false,
+      "path": "apps/computer_use/.runtime/android/qw3-pilot-06/integration-result.json",
+      "app_status": "stopped",
+      "seconds": 181.29282546043396,
+      "tool_calls": 7,
+      "artifact_passed": true,
+      "unassisted_passed": false,
+      "video_bytes": 1649857
+    },
+    {
+      "id": "android-qw3-pilot-07",
+      "formal": false,
+      "path": "apps/computer_use/.runtime/android/qw3-pilot-07/integration-result.json",
+      "app_status": "completed",
+      "seconds": 126.09912085533142,
+      "tool_calls": 6,
+      "artifact_passed": true,
+      "unassisted_passed": true,
+      "video_bytes": 1430225
+    }
+  ],
+  "app_entry": "http://127.0.0.1:18205/",
+  "notes": [
+    "Registry UI now selects a stopped task device; Windows/Linux/Android endpoints use independent observation ledgers.",
+    "First formal013 was retained as resource interruption; the valid matched campaign must freeze the512K engine configuration for both arms."
+  ],
+  "osworld_qualification": {
+    "013": {
+      "negative": 0,
+      "positive": 1,
+      "passed": true
+    },
+    "004": {
+      "negative": 0,
+      "positive": null,
+      "passed": false
+    }
+  },
+  "resource_revision": {
+    "engine_context_tokens": 524288,
+    "reason": "VRAM headroom reached5MiB; prefill fell from3765tok/s to40–52tok/s",
+    "other_gpu_processes_preserved": true,
+    "health_reply": "OK",
+    "health_seconds": 0.274758,
+    "same_configuration_required_for_both_arms": true
+  }
+}

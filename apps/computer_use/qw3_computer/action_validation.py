@@ -54,6 +54,13 @@ def validate_action(arguments):
                 if name not in schema.get('properties', {}):
                     fail('unexpected_field', path + '.' + name, 'This field is not accepted at this location.')
                 check(member, schema['properties'][name], path + '.' + name)
+        elif expected == 'array':
+            if not isinstance(value, list):
+                fail('wrong_type', path, 'Expected an array.')
+            if not schema.get('minItems', 0) <= len(value) <= schema.get('maxItems', float('inf')):
+                fail('invalid_length', path, 'Array length is outside the accepted range.')
+            for index, item in enumerate(value):
+                check(item, schema['items'], f'{path}[{index}]')
         elif expected == 'string':
             if not isinstance(value, str):
                 fail('wrong_type', path, 'Expected a string.')

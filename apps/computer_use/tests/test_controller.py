@@ -50,6 +50,22 @@ class FixtureCodex:
 
 
 class ControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_discovered_context_is_bound_to_resume_checkpoint(self):
+        from aiohttp import web
+        app=web.Application()
+        async def metadata(request):return web.json_response({'data':[{'context_window':524288}]})
+        app.router.add_get('/v1/models',metadata)
+        runner,url=await serve(app)
+        try:
+            controller=Controller(self.temp.name,self.desktop,url+'/v1',1)
+            await controller.discover_backend_context()
+            self.assertEqual(controller.model_context_window,524288)
+            self.assertEqual(controller.snapshot()['model_context_window'],524288)
+            controller.state['model_context_window']=1048576
+            with self.assertRaisesRegex(DesktopError,'上下文'):
+                controller.require_saved_inference_mode()
+        finally:await runner.cleanup()
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.desktop = FixtureDesktop()

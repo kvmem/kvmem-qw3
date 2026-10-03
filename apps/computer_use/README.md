@@ -1,5 +1,30 @@
 # Local Codex computer use
 
+The active [cross-device delivery goal](../../docs/computer_use_cross_device_goal_20261003.md)
+adds a shared execution boundary for Windows VM, Linux VM and Android emulator.
+`--execution-mode verified` enables durable expected-result steps, bounded waits,
+repeated-intent checks and declared final-condition verification. The model
+must submit `step={goal, conditions}` in the same `act` call; this binds to the
+exact observation without a hidden capture. A different pending plan requires
+an explicit recovery reason. Input receipts include the step's verification.
+The `workflow` tool polls or inspects persisted steps and checks final results.
+A model turn ending does not pass this gate. Declared visible conditions still need separate
+business acceptance. `legacy` remains available for matched comparisons.
+Successful `workflow finish` pauses input and completes the checked task immediately;
+remaining model narration is interrupted without discarding the verified receipt.
+`qw3-device` wraps OSWorld PyAutoGUI/AT-SPI or Appium UiAutomator2 with the same
+authenticated observation/action/receipt protocol. The existing Windows executor
+remains its backend. This is under qualification; it has no new OSWorld success
+rate claim yet.
+
+An owner-supplied `--device-registry` JSON contains `devices`, each with `id`,
+`label`, `platform`, local `endpoint` and `token_file` path. No tokens are returned
+to the agent or UI. `--selected-device` chooses the initial entry. The UI can
+switch devices after ending a task; paused or uncertain input retains ownership.
+Separate device runtimes and archived task records preserve earlier evidence.
+`--gpu-sharing spare-capacity` on `run_engine.py` permits user GPU work when
+the startup memory headroom is available; it never stops other GPU processes.
+
 The current product goal is tracked in the
 [delivery plan](../../docs/computer_use_product_delivery_20261002.md).
 The four managed Windows workflows—Python setup/repair and LaTeX setup/repair—

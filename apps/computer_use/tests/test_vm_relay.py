@@ -40,6 +40,9 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
                 self.cancelled.set()
 
         upstream.router.add_get("/health", health)
+        async def models(request):
+            return web.json_response({'data':[{'context_window':524288}]})
+        upstream.router.add_get('/v1/models',models)
         upstream.router.add_post("/v1/chat/completions", stream)
         self.upstream = TestServer(upstream, handler_cancellation=True)
         await self.upstream.start_server()
@@ -72,6 +75,13 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.requests, ["/health"])
         finally:
             await other.close()
+
+    async def test_model_capacity_route_requires_same_peer_and_token(self):
+        self.assertEqual((await self.client.get('/v1/models')).status,401)
+        response=await self.client.get('/v1/models',headers={'Authorization':'Bearer test-token'})
+        self.assertEqual(response.status,200)
+        self.assertEqual((await response.json())['data'][0]['context_window'],524288)
+        self.assertEqual(self.receipts.read_text(),'')
 
     async def test_wire_limit_rejects_before_forwarding_and_preserves_auth(self):
         from qw3_computer.limits import MAX_MODEL_REQUEST_BYTES

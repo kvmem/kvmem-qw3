@@ -12,8 +12,9 @@ KEYS = [
     "CTRL+B", "CTRL+I", "CTRL+U", "CTRL+P", "CTRL+1", "CTRL+0",
     "F2", "F4", "F5", "F6", "F11", "F12", "ALT+TAB", "ALT+F4",
     "M", "R", "S", "T", "V", "Z", "SHIFT+R", "SHIFT+T", "SHIFT+M",
+    "ANDROID_BACK", "ANDROID_HOME", "ANDROID_RECENTS",
 ]
-APPS = ["notepad", "edge", "explorer", "writer", "calc", "impress", "thunderbird", "gimp", "wps_spreadsheets"]
+APPS = ["notepad", "edge", "explorer", "writer", "calc", "impress", "thunderbird", "gimp", "wps_spreadsheets", "settings", "contacts", "browser"]
 
 ACTION = {"oneOf": [
     {"type": "object", "properties": {"kind": {"const": "click_control"},
@@ -104,3 +105,90 @@ SOFTWARE_TOOLS[0]["inputSchema"]["properties"] = {
     "action_id": {"type": "string"}, "project": {"type": "string"}, "profile": {"type": "string"},
     "job_id": {"type": "string"}, "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 10}
 }
+
+WORKFLOW_TOOLS = [{"name": "workflow", "description":
+    "Track observable expected results on the selected device. Prefer act with an inline step to perform input and "
+    "record its expected result in one call. An input receipt's step_check says if its conditions are verified. "
+    "After a verified step begin the next inline step; do not abandon the verified step. "
+    "Alternatively before input use begin_step with a short goal, "
+    "unique step_id and nonempty conditions. It returns a fresh observation: use its IDs for the next act. "
+    "wait checks conditions without sending input, polling for at most 20 seconds and returning a fresh screen. "
+    "step_id may be omitted to wait for the unique pending step; timeout_seconds defaults to 0. "
+    "A waiting result is not success and is not evidence that input failed; diagnose focus/dialog/loading before repeating. "
+    "For another recovery approach abandon_step with a concrete reason, then begin another step. "
+    "status returns durable steps and uncertain receipts. Restarting does not replay input. "
+    "finish requires checked steps and explicit final visible result conditions. screen_changed can verify "
+    "a transition but cannot verify final task completion. Conditions: control_text means a visible control name contains text; "
+    "control_absent requires a complete accessibility read; control_value requires a unique exact name and exact value; "
+    "Condition examples: {kind:control_text,text:Saved}, {kind:control_value,text:Name,value:Alice}, "
+    "{kind:foreground_app,text:settings}, {kind:screen_changed}. Use text, never value, for foreground_app. "
+    "foreground_title contains text; foreground_app is an observed exact process or an app alias explicitly listed in "
+    "device capabilities app_processes. Do not guess a process name before launch; use the provided app alias. screen_changed compares foreground "
+    "image evidence with step start. Conditions describe task evidence, never commands or grader answers. "
+    "Declared visible conditions do not replace independent business acceptance.",
+    "inputSchema": {"type": "object", "properties": {
+        "operation": {"type": "string", "enum": ["status", "begin_step", "wait", "abandon_step", "finish"]},
+        "step_id": {"type": "string"}, "goal": {"type": "string"}, "reason": {"type": "string"},
+        "timeout_seconds": {"type": "integer", "minimum": 0, "maximum": 20},
+        "conditions": {"type": "array", "minItems": 1, "maxItems": 12, "items": {
+            "type": "object", "properties": {
+                "kind": {"type": "string", "enum": ["control_text", "control_absent", "control_value", "foreground_title", "foreground_app", "screen_changed"]},
+                "text": {"type": "string"}, "value": {"type": "string"}},
+            "required": ["kind"], "additionalProperties": False}}},
+        "required": ["operation"], "additionalProperties": False},
+    "annotations": {"readOnlyHint": False, "idempotentHint": False}}]
+
+
+STEP_SCHEMA = {"type":"object","properties":{
+    "goal":{"type":"string","minLength":1,"maxLength":1024},
+    "conditions":WORKFLOW_TOOLS[0]["inputSchema"]["properties"]["conditions"],
+    "recovery_reason":{"type":"string","minLength":1,"maxLength":1024}},
+    "required":["goal","conditions"],"additionalProperties":False}
+workflow_schema = WORKFLOW_TOOLS[0]['inputSchema']
+workflow_fields = workflow_schema['properties']
+workflow_schema['oneOf'] = [
+    {'type':'object','properties':{'operation':{'const':op}, **{key:workflow_fields[key] for key in fields}},
+     'required':['operation', *required],'additionalProperties':False}
+    for op, fields, required in [
+        ('status',[],[]),('begin_step',['step_id','goal','conditions'],['step_id','goal','conditions']),
+        ('wait',['step_id','timeout_seconds'],[]),('abandon_step',['step_id','reason'],['step_id','reason']),
+        ('finish',['conditions','timeout_seconds','goal'],['conditions'])]
+]
+check_fields = WORKFLOW_TOOLS[0]['inputSchema']['properties']['conditions']['items']['properties']
+WORKFLOW_TOOLS[0]['inputSchema']['properties']['conditions']['items']['oneOf'] = [
+    {'type':'object','properties':{'kind':{'const':kind}, **{key:check_fields[key] for key in fields}},
+     'required':['kind', *fields],'additionalProperties':False}
+    for kind, fields in [('control_text',['text']),('control_absent',['text']),('control_value',['text','value']),
+                         ('foreground_title',['text']),('foreground_app',['text']),('screen_changed',[])]
+]
+# Public validation admits this only when Execution is enabled; the executor
+# never receives model planning fields.
+TOOLS[1]["inputSchema"]["properties"]["step"] = STEP_SCHEMA
+
+
+def tools_for_platform(platform, workflow=False):
+    """Advertise only actions supported by the selected platform, never guess."""
+    import copy
+    tools = copy.deepcopy(TOOLS)
+    if workflow:
+        tools[1]["inputSchema"]["required"].append("step")
+        tools[1]["description"] = ("Supply step={goal:<expected result>,conditions:[...]} alongside action. "
+            "The framework records a step on this exact observation and performs one input in the same call. "
+            "Check step_check in the receipt: verified permits a new step; pending needs bounded workflow wait "
+            "or further inputs with the same goal/conditions. To replace a pending step explicitly include "
+            "step.recovery_reason. Do not abandon an already verified step. " + tools[1]["description"])
+    else:
+        tools[1]["inputSchema"]["properties"].pop("step",None)
+    apps = {"windows": APPS[:9], "linux": APPS[:8], "android": ["settings", "contacts", "browser"]}[platform]
+    if platform == "android":
+        keys = ["ENTER", "TAB", "BACKSPACE", "DELETE", "SPACE", "UP", "DOWN", "LEFT", "RIGHT", "HOME", "END", "CTRL+A", "CTRL+C", "CTRL+V", "CTRL+X", "ANDROID_BACK", "ANDROID_HOME", "ANDROID_RECENTS"]
+        tools[1]["description"] += " On Android, click is tap, drag is swipe (modifier none), scroll is a vertical swipe; supported installed apps are settings, contacts, browser. Android navigation uses ANDROID_BACK/ANDROID_HOME/ANDROID_RECENTS."
+    else:
+        keys = [key for key in KEYS if not key.startswith("ANDROID_")]
+        if platform == "linux":
+            tools[1]["description"] += " On Linux, notepad opens Gedit, edge opens Chrome, explorer opens Files; Office entries open LibreOffice."
+    for branch in tools[1]["inputSchema"]["properties"]["action"]["oneOf"]:
+        kind = branch["properties"]["kind"]["const"]
+        if kind == "open_app": branch["properties"]["app"]["enum"] = apps
+        if kind == "key": branch["properties"]["key"]["enum"] = keys
+    return tools

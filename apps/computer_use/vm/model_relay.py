@@ -131,6 +131,7 @@ def create_app(backend, allowed_peer, token, *, receipt_path=None,
 
     app.router.add_get("/health", forward)
     app.router.add_post("/v1/chat/completions", forward)
+    app.router.add_get('/v1/models', forward)
     return app
 
 

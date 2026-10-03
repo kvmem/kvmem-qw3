@@ -47,8 +47,14 @@ class Desktop:
         self.paused = True
         self.task_id = "manual"
         self.lock = asyncio.Lock()
+        self.execution = None
+        self.lease = None
 
     async def start(self):
+        if self.session and not self.session.closed:
+            return await self.observe()
+        from .device_lease import DeviceLease
+        self.lease = DeviceLease(self.endpoint).acquire()
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), trust_env=False,
                                              headers={"Authorization": "Bearer " + self.token})
         await self.control("pause")
@@ -89,7 +95,10 @@ class Desktop:
         async with self.lock:
             observation = await self.request("GET", "/observe")
             metadata = self.remember(observation)
-            return metadata | {"image": observation["image"]}
+            result = metadata | {"image": observation["image"]}
+            if self.execution:
+                result["step_check"] = self.execution.after_delivery(metadata)
+            return result
 
     def unresolved(self):
         return [{"action_id": json.loads(row[1])["action_id"], "receipt_id": row[0],
@@ -179,6 +188,12 @@ class Desktop:
             except (ValueError, TypeError, KeyError) as exc:
                 raise DesktopValidationError({"code": "invalid_coordinates", "path": "$.coordinate_space",
                     "message": str(exc), "hint": "normalized_1000 is only for click, drag or scroll, with integers from 0 to 1000. Use pixels or omit this field for key, type and open_app."}) from exc
+            if self.execution:
+                self.execution.before_dispatch(arguments, dispatched, receipt_id)
+            elif "step" in arguments:
+                raise DesktopValidationError({"code":"unsupported_step","path":"$.step",
+                    "message":"Expected-result steps require verified execution mode","hint":"Use the selected mode's advertised tool schema."})
+            dispatched = {k: v for k, v in dispatched.items() if k != "step"}
             self.db.execute("INSERT INTO actions VALUES (?, ?, ?, 'dispatching', NULL, ?)",
                             (receipt_id, self.task_id, serialized, time.time()))
             if mapping:
@@ -196,6 +211,8 @@ class Desktop:
                 self.db.commit()
                 if result.get("no_progress"):
                     self.paused = True
+                if self.execution:
+                    result = result | {"step_check": self.execution.after_delivery(result["observation"])}
                 return result
             except DesktopRejected as exc:
                 self.db.execute("UPDATE actions SET status='rejected', result=? WHERE id=?",
@@ -218,10 +235,36 @@ class Desktop:
         if self.session:
             await self.session.close()
         self.db.close()
+        if self.lease:
+            self.lease.close()
+
+
+def model_observation(observation):
+    """Compact presentation only; the executor retains full evidence unchanged."""
+    metadata = {k: v for k, v in observation.items() if k != "image"}
+    accessibility = observation.get("accessibility")
+    if isinstance(accessibility, dict):
+        controls = []
+        for control in accessibility.get("controls", []):
+            visible = {k: v for k, v in control.items() if k not in {
+                "x", "y", "width", "height", "resource_id"}}
+            if visible.get("value") in (None, "", visible.get("name")):
+                visible.pop("value", None)
+            states = visible.get("states")
+            if isinstance(states, dict):
+                # Explicit unchecked/unselected is useful for toggles; false
+                # scroll/click flags are redundant when positive flags exist.
+                visible["states"] = {k: v for k, v in states.items()
+                                     if v or k in {"checked", "selected", "enabled", "focused"}}
+            if all(k in control for k in ("x", "y", "width", "height")):
+                visible["bounds"] = [control[k] for k in ("x", "y", "width", "height")]
+            controls.append(visible)
+        metadata["accessibility"] = accessibility | {"controls": controls}
+    return metadata
 
 
 def mcp_observation(observation, result=None):
-    metadata = {k: v for k, v in observation.items() if k != "image"}
+    metadata = model_observation(observation)
     text = {"observation": metadata}
     if result:
         text.update({k: v for k, v in result.items() if k != "observation"})

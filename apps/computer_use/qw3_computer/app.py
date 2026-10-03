@@ -18,14 +18,18 @@ from aiohttp import web
 from .bridge import create_app as bridge_app
 from .action_validation import executor_rejection_problem
 from .codex import CodexClient, write_config
-from .desktop import Desktop, DesktopError, DesktopRejected, DesktopValidationError, mcp_observation
+from .desktop import Desktop, DesktopError, DesktopRejected, DesktopValidationError, mcp_observation, model_observation
 from .software import Software
+from .execution import Execution
+from .device_protocol import capabilities
+from .device_registry import RegisteredDesktop
 
 
 class Controller:
     def __init__(self, runtime, desktop, backend, port, backend_token=None, trace_backend=False,
                  tool_call_limit=100, output_policy="outputs", *, backend_timeout_seconds=600,
-                 backend_read_timeout_seconds=180, heartbeat_seconds=30, thinking=False, software=None):
+                 backend_read_timeout_seconds=180, heartbeat_seconds=30, thinking=False, software=None,
+                 workflow=False, device_platform="windows"):
         if type(thinking) is not bool:
             raise ValueError("Thinking mode must be a boolean")
         self.thinking = thinking
@@ -46,8 +50,14 @@ class Controller:
         self.runtime = Path(runtime).resolve()
         self.runtime.mkdir(parents=True, exist_ok=True)
         self.desktop = desktop
+        self.workflow = Execution(desktop, self.runtime) if workflow else None
+        self.device_platform = device_platform
+        self.device_capabilities = capabilities(device_platform)
+        if self.workflow:
+            desktop.execution = self.workflow
         self.backend = backend
         self.backend_token = backend_token
+        self.model_context_window = 1048576
         self.trace_backend = trace_backend
         self.port = port
         self.token = secrets.token_hex(32)
@@ -67,8 +77,10 @@ class Controller:
         self.ready = False
         self.client = None
         self.consume_task = None
+        self.finish_interrupt_task = None
         self.bridge = None
         self.control_lock = asyncio.Lock()
+        self.tool_lock = asyncio.Lock()
         self.recovery_clock = time.monotonic
         self.save()
 
@@ -79,6 +91,10 @@ class Controller:
 
     def snapshot(self):
         return self.state | {"ready": self.ready, "observation": self.desktop.latest,
+                             'model_context_window':self.model_context_window,
+                             "device_capabilities": self.device_capabilities,
+                             "devices": self.desktop.catalogue() if isinstance(self.desktop, RegisteredDesktop) else None,
+                             "workflow": self.workflow.status() if self.workflow else None,
                              "uncertain_actions": self.desktop.unresolved(), "desktop_paused": self.desktop.paused,
                              "software": self.software.snapshot(self.state.get("id")) if self.software else None}
 
@@ -92,6 +108,15 @@ class Controller:
         return limit - used
 
     def require_saved_inference_mode(self):
+        if self.state.get('model_context_window',1048576)!=self.model_context_window:
+            raise DesktopError('当前模型上下文容量与任务检查点不一致，请使用原配置继续或新建任务。')
+        identity = self.desktop.selected if isinstance(self.desktop, RegisteredDesktop) else self.desktop.endpoint if hasattr(self.desktop, "endpoint") else None
+        if self.state.get("device_identity") is not None and self.state["device_identity"] != identity:
+            raise DesktopError("当前设备与任务检查点不一致，请切回任务的原设备。")
+        if self.state.get("execution_mode", "legacy") != ("verified" if self.workflow else "legacy"):
+            raise DesktopError("该任务的执行流程配置发生变化，请用原流程继续。")
+        if self.state.get("device_platform", "windows") != self.device_platform:
+            raise DesktopError("任务记录的设备平台与当前选择不同，请切回原设备后继续。")
         if self.state.get("thinking", False) != self.thinking:
             raise DesktopError("当前推理模式与该任务记录不同。请用原模式继续，或停止旧任务后新建任务。")
         selected = str(self.software.root) if self.software else None
@@ -99,7 +124,10 @@ class Controller:
             raise DesktopError("该任务的系统配置权限或工作目录发生变化，请用原配置继续。")
 
     async def start(self):
-        await self.desktop.start()
+        await self.discover_backend_context()
+        observation = await self.desktop.start()
+        if isinstance(observation, dict) and observation.get("capabilities"):
+            self.device_capabilities = observation["capabilities"]
         self.bridge = web.AppRunner(bridge_app(self.backend, trace_dir=self.runtime / "inference",
                                               backend_token=self.backend_token, trace_backend=self.trace_backend,
                                               backend_timeout_seconds=self.backend_timeout_seconds,
@@ -107,6 +135,7 @@ class Controller:
                                               heartbeat_seconds=self.heartbeat_seconds,
                                               allow_thinking=self.thinking,
                                               allowed_tools={"mcp__computer__observe", "mcp__computer__act"}
+                                              | ({"mcp__computer__workflow"} if self.workflow else set())
                                               | ({"mcp__computer__software"} if self.software else set())),
                                     handler_cancellation=True)
         await self.bridge.setup()
@@ -114,15 +143,35 @@ class Controller:
         await site.start()
         bridge_port = site._server.sockets[0].getsockname()[1]
         proxy_args = [str(Path(__file__).with_name("mcp_proxy.py")), "--endpoint", f"http://127.0.0.1:{self.port}",
-                      "--token-file", str(self.runtime / "mcp-token.txt")]
+                      "--token-file", str(self.runtime / "mcp-token.txt"), "--platform", self.device_platform]
         if self.software:
             proxy_args.append("--software")
+        if self.workflow:
+            proxy_args.append("--workflow")
         write_config(self.runtime / "codex", f"http://127.0.0.1:{bridge_port}/v1", sys.executable,
-                     proxy_args, thinking=self.thinking, software=self.software is not None)
+                     proxy_args, thinking=self.thinking, software=self.software is not None, workflow=self.workflow is not None,
+                     context_window=self.model_context_window)
         self.client = CodexClient(self.runtime / "codex")
         await self.client.start()
         self.consume_task = asyncio.create_task(self.consume())
         self.ready = True
+
+    async def discover_backend_context(self):
+        import aiohttp
+        headers={'Authorization':'Bearer '+self.backend_token} if self.backend_token else {}
+        try:
+            async with aiohttp.ClientSession(trust_env=False,timeout=aiohttp.ClientTimeout(total=5)) as session:
+                async with session.get(self.backend.rstrip('/')+'/models',headers=headers) as response:
+                    if response.status!=200:return
+                    body=await response.json()
+            models=body.get('data',[])
+            if len(models)==1:
+                context=models[0].get('context_window',models[0].get('context_length'))
+                if type(context) is int and 4096<=context<=16777216:self.model_context_window=context
+        except (aiohttp.ClientError,TimeoutError,ValueError,TypeError,AttributeError):
+            # Older compatible backends omit metadata; preserve their original
+            # configured contract. Do not leak credentials into UI or history.
+            pass
 
     async def consume(self):
         with (self.runtime / "codex-events.jsonl").open("a") as log:
@@ -155,6 +204,14 @@ class Controller:
                         self.state["draft"] = ""
                 elif method == "turn/completed" and params["turn"]["id"] == self.state.get("turn_id"):
                     status = params["turn"]["status"]
+                    if self.state.get("completion_origin") == "checked_workflow":
+                        # The verified tool already ended this task. Interrupting
+                        # the remaining narration cannot invalidate its receipt.
+                        self.state["turn_status"] = status
+                        self.state["turn_error"] = params["turn"].get("error")
+                        self.state["current_action"] = None
+                        self.save()
+                        continue
                     if self.state["status"] not in ("paused", "stopped"):
                         self.state["status"] = "verifying"
                     self.state["turn_status"] = status
@@ -181,7 +238,16 @@ class Controller:
                         if self.state["status"] == "verifying":
                             self.state["status"] = "paused"
                     if self.state["status"] == "verifying":
-                        self.state["status"] = "completed" if status == "completed" else "failed"
+                        if status != "completed":
+                            self.state["status"] = "failed"
+                        elif self.workflow and not (self.software and self.state.get("software_verified")):
+                            declared = self.workflow.completion(self.desktop.latest)
+                            if declared and declared.get("verified"):
+                                self.state.update(status="completed", verification_scope=declared["verification_scope"])
+                            else:
+                                self.state.update(status="paused", notice="模型已结束，但完成条件尚未验证。请核对结果或继续验证。")
+                        else:
+                            self.state["status"] = "completed"
                     self.state["finished_at"] = time.time()
                 self.save()
 
@@ -196,10 +262,15 @@ class Controller:
             if self.desktop.unresolved():
                 await self.desktop.control("resume", acknowledge_uncertain)
                 await self.desktop.control("pause")
+            self.archive_task()
             self.state = {"id": uuid.uuid4().hex, "prompt": prompt, "status": "starting",
                           "messages": [], "files": [], "started_at": time.time(), "current_action": None,
                           "tool_calls_used": 0, "tool_call_limit": self.tool_call_limit,
                           "output_policy": self.output_policy, "thinking": self.thinking}
+            self.state["execution_mode"] = "verified" if self.workflow else "legacy"
+            self.state['model_context_window'] = self.model_context_window
+            self.state["device_platform"] = self.device_platform
+            self.state["device_identity"] = self.desktop.selected if isinstance(self.desktop, RegisteredDesktop) else getattr(self.desktop, "endpoint", None)
             self.state["software_root"] = str(self.software.root) if self.software else None
             self.desktop.task_id = self.state["id"]
             self.save()
@@ -207,8 +278,9 @@ class Controller:
                 await self.desktop.control("resume")
                 observation = await self.desktop.observe()
                 self.state["thread_id"] = await self.client.new_thread()
-                description = json.dumps({k: v for k, v in observation.items() if k != "image"}, ensure_ascii=False)
+                description = json.dumps(model_observation(observation), ensure_ascii=False)
                 text = prompt + "\n\nInitial desktop observation (prefer click_control for a matching visible control_id; visually estimated actions use coordinate_space=normalized_1000):\n" + description
+                text += "\nSelected device capabilities:\n" + json.dumps(self.device_capabilities)
                 if self.software:
                     text += "\nAuthorized local software workspace:\n" + json.dumps(self.software.inspect(self.state["id"]), ensure_ascii=False)
                 if self.state["output_policy"] == "outputs":
@@ -224,6 +296,37 @@ class Controller:
                 with contextlib.suppress(DesktopError):
                     await self.desktop.control("pause")
                 raise
+            return self.snapshot()
+
+    def archive_task(self):
+        id = self.state.get("id")
+        if isinstance(id, str) and re.fullmatch(r"[a-f0-9]{32}", id):
+            folder = self.runtime / "task-history"
+            folder.mkdir(exist_ok=True)
+            (folder / (id + ".json")).write_text(json.dumps(self.state, ensure_ascii=False, indent=2))
+
+    async def select_device(self, id):
+        async with self.control_lock:
+            if not isinstance(self.desktop, RegisteredDesktop):
+                raise DesktopError("This application was started with one fixed device")
+            if self.software:
+                raise DesktopError("Stop the software workspace application before changing devices")
+            if self.state["status"] in ("starting", "running", "verifying", "paused"):
+                raise DesktopError("请先结束当前任务；暂停的任务仍保留设备所有权。")
+            self.archive_task()
+            observation = await self.desktop.select(id)
+            self.ready = False
+            if self.consume_task:
+                self.consume_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError): await self.consume_task
+            if self.client: await self.client.close()
+            if self.bridge: await self.bridge.cleanup()
+            self.device_platform = self.desktop.platform
+            self.device_capabilities = observation.get("capabilities", capabilities(self.device_platform))
+            self.state = {"status":"idle", "messages":[], "files":[], "thinking":self.thinking,
+                          "tool_calls_used":0, "tool_call_limit":self.tool_call_limit}
+            self.save()
+            await self.start()
             return self.snapshot()
 
     async def followup(self, task_id, completed_turn_id, event_id, prompt):
@@ -261,6 +364,7 @@ class Controller:
                                  "tool_calls_used_before": self.state["tool_calls_used"]}
             self.state.setdefault("followups", []).append(receipt)
             self.state.update(status="starting", notice="", draft="")
+            self.state.pop("completion_origin", None)
             self.state.pop("finished_at", None)
             self.state.pop("turn_id", None)
             self.save()
@@ -269,7 +373,7 @@ class Controller:
                 observation = await self.desktop.observe()
                 self.desktop.task_id = task_id
                 await self.client.rpc("thread/resume", {"threadId": self.state["thread_id"]})
-                description = json.dumps({k: v for k, v in observation.items() if k != "image"}, ensure_ascii=False)
+                description = json.dumps(model_observation(observation), ensure_ascii=False)
                 text = prompt + "\nContinue the same task using its existing history. Current desktop observation:\n" + description
                 turn_id = await self.client.turn(self.state["thread_id"], text,
                                                 ["data:image/png;base64," + observation["image"]])
@@ -305,7 +409,9 @@ class Controller:
                     await self.client.rpc("thread/resume", {"threadId": self.state["thread_id"]})
                     text = "The user resumed the task. Reconcile the current desktop against the task history. "
                     text += "Do not blindly repeat any interrupted action. Current observation:\n"
-                    text += json.dumps({k: v for k, v in observation.items() if k != "image"})
+                    text += json.dumps(model_observation(observation))
+                    if self.workflow:
+                        text += "\nDurable checked/pending steps (do not replay them):\n" + json.dumps(self.workflow.status(), ensure_ascii=False)
                     self.state.update(status="starting", notice="", draft="")
                     # An explicit user resume grants a new recovery attempt,
                     # but never a new cumulative tool-call budget.
@@ -389,7 +495,13 @@ class Controller:
         return None
 
     async def tool(self, name, arguments):
-        if name not in ("observe", "act") and not (name == "software" and self.software):
+        # Serialize model calls across input, observations and step mutations.
+        # User pause/stop uses the separate control lock and remains available.
+        async with self.tool_lock:
+            return await self._tool(name, arguments)
+
+    async def _tool(self, name, arguments):
+        if name not in ("observe", "act") and not (name == "software" and self.software) and not (name == "workflow" and self.workflow):
             raise DesktopError("Unknown desktop tool")
         exhausted = False
         async with self.control_lock:
@@ -412,6 +524,13 @@ class Controller:
             return mcp_observation(observation, recovery) | ({"isError": True} if recovery else {})
         if self.state["status"] != "running":
             raise DesktopError("Task is not running; wait for user resume")
+        if name == "workflow":
+            result = await self.workflow.invoke(arguments)
+            if arguments.get("operation") == "finish" and result.get("verified"):
+                result["task_completed"] = await self.complete_checked_workflow(task_id, result)
+            if "observation" in result:
+                return mcp_observation(result["observation"], result)
+            return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}
         if name == "software":
             result = await self.software.invoke(self.state["id"], arguments)
             self.reset_gui_recovery()
@@ -463,6 +582,45 @@ class Controller:
             self.state["current_action"] = None
             self.save()
 
+    async def complete_checked_workflow(self, task_id, result):
+        """End a checked GUI task without requiring another inference round."""
+        async with self.control_lock:
+            if self.state.get("id") != task_id or self.state["status"] != "running":
+                return False
+            declared = self.workflow.completion(result["observation"])
+            if not declared or not declared.get("verified") or self.desktop.unresolved():
+                return False
+            if self.software:
+                jobs = self.software.snapshot(task_id)["jobs"]
+                if not jobs or not all(j["status"] == "completed" and
+                        j.get("verification", {}).get("passed") is True for j in jobs):
+                    return False
+                self.state["software_verified"] = True
+            # Stop inputs before recording completion. Failed evidence collection
+            # leaves the task running/paused for recovery, never a false pass.
+            await self.desktop.control("pause")
+            if self.software:
+                await self.software.pause(task_id)
+            self.state["files"] = (await self.desktop.request("GET", "/files"))["files"]
+            self.state.update(status="completed", completion_origin="checked_workflow",
+                              verification_scope=declared["verification_scope"], finished_at=time.time(),
+                              notice="已验证声明的可见结果，操作已结束。业务结果仍需独立验收。")
+            self.save()
+            thread, turn = self.state.get("thread_id"), self.state.get("turn_id")
+            if thread and turn:
+                async def interrupt_narration():
+                    # Yield so the verified tool receipt can be returned first.
+                    await asyncio.sleep(0.1)
+                    if (self.state.get("id") == task_id and self.state.get("turn_id") == turn
+                            and self.state.get("completion_origin") == "checked_workflow"):
+                        try:
+                            await self.client.interrupt(thread, turn)
+                        except Exception:
+                            self.state["completion_interrupt_error"] = "Remaining model narration could not be interrupted"
+                            self.save()
+                self.finish_interrupt_task = asyncio.create_task(interrupt_narration())
+            return True
+
     async def close(self):
         self.ready = False
         if self.state["status"] in ("starting", "running", "verifying"):
@@ -472,6 +630,10 @@ class Controller:
             self.consume_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.consume_task
+        if self.finish_interrupt_task:
+            self.finish_interrupt_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.finish_interrupt_task
         if self.desktop.session:
             with contextlib.suppress(DesktopError):
                 await self.desktop.control("pause")
@@ -480,6 +642,8 @@ class Controller:
         if self.software:
             await self.software.close()
         await self.desktop.close()
+        if self.workflow:
+            self.workflow.close()
         if self.bridge:
             await self.bridge.cleanup()
 
@@ -506,6 +670,10 @@ def web_app(controller):
 
     async def state(request):
         return web.json_response(controller.snapshot())
+
+    async def select_device(request):
+        body = await request.json()
+        return web.json_response(await controller.select_device(body.get("device_id")))
 
     async def screenshot(request):
         latest = controller.desktop.latest
@@ -545,6 +713,7 @@ def web_app(controller):
 
     app.router.add_get("/", index)
     app.router.add_get("/api/state", state)
+    app.router.add_post("/api/device", select_device)
     app.router.add_get("/api/screenshot", screenshot)
     app.router.add_post("/api/task", start)
     app.router.add_post("/api/control", control)
@@ -558,7 +727,13 @@ async def run(args):
     software_root = getattr(args, "software_root", None)
     if software_root and (sys.platform != "win32" or urlparse(args.desktop).hostname not in {"localhost", "127.0.0.1"}):
         raise ValueError("Software mode requires the native Windows client with its local desktop executor")
-    desktop = Desktop(args.desktop, args.desktop_token.read_text().strip(), args.runtime / "desktop")
+    if getattr(args, "device_registry", None):
+        if software_root: raise ValueError("Registry mode and software workspace mode are separate permissions")
+        desktop = RegisteredDesktop(args.device_registry, args.selected_device, args.runtime / "devices")
+        args.device_platform = desktop.platform
+    else:
+        if args.desktop_token is None: raise ValueError("A desktop token or a device registry is required")
+        desktop = Desktop(args.desktop, args.desktop_token.read_text().strip(), args.runtime / "desktop")
     token = args.backend_token.read_text(encoding="utf-8-sig").strip() if args.backend_token else None
     if args.backend_token and not token:
         raise ValueError("Backend token file is empty")
@@ -567,7 +742,9 @@ async def run(args):
                             output_policy=args.output_policy, backend_timeout_seconds=args.backend_timeout,
                             backend_read_timeout_seconds=args.backend_read_timeout,
                             thinking=getattr(args, "thinking", False),
-                            software=Software(software_root) if software_root else None)
+                            software=Software(software_root) if software_root else None,
+                            workflow=getattr(args, "execution_mode", "legacy") == "verified",
+                            device_platform=getattr(args, "device_platform", "windows"))
     runner = web.AppRunner(web_app(controller), handler_cancellation=True)
     try:
         await runner.setup()
@@ -592,7 +769,12 @@ def main():
     parser.add_argument("--backend-timeout", type=int, default=600, help="Total model request deadline in seconds")
     parser.add_argument("--backend-read-timeout", type=int, default=180, help="Model socket read deadline in seconds")
     parser.add_argument("--desktop", default="http://127.0.0.1:18082")
-    parser.add_argument("--desktop-token", type=Path, required=True)
+    parser.add_argument("--desktop-token", type=Path)
+    parser.add_argument("--device-registry", type=Path, help="Owner-created local device catalogue; includes token file references")
+    parser.add_argument("--selected-device", help="Initial registry device identity")
+    parser.add_argument("--device-platform", choices=("windows", "linux", "android"), default="windows")
+    parser.add_argument("--execution-mode", choices=("legacy", "verified"), default="legacy",
+                        help="Verified mode adds conditions, bounded waits and durable steps; legacy retains old execution")
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--trace-backend", action="store_true", help="Tag QW3 requests for retrieval diagnostics")
     parser.add_argument("--thinking", action="store_true", help="Enable local thinking for new tasks; defaults to off")

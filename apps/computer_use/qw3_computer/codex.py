@@ -41,10 +41,26 @@ than repeating actions without progress. Host shell tools are unavailable.
 """
 
 
-def write_config(runtime, bridge_url, mcp_command=None, mcp_args=(), *, thinking=False, software=False):
+def write_config(runtime, bridge_url, mcp_command=None, mcp_args=(), *, thinking=False, software=False, workflow=False, context_window=1048576):
+    if type(context_window) is not int or not 4096<=context_window<=16777216:
+        raise ValueError('Invalid backend context window')
     runtime = Path(runtime).resolve()
     runtime.mkdir(parents=True, exist_ok=True)
     instructions = INSTRUCTIONS
+    if workflow:
+        instructions += ("\nVerified execution mode: for a desktop action supply step={goal,conditions} alongside action, "
+            "using the current observation IDs. This performs input and records the expected result in ONE call. "
+            "Read step_check in its receipt: if verified, start a new inline step for the next expected result; "
+            "if pending, use workflow wait or continue with the SAME pending goal/conditions. "
+            "You do not need to abandon verified steps. If you need to replace a pending step with a different approach, "
+            "include a concrete step.recovery_reason. workflow begin_step is available for multi-action plans but optional. "
+            "Use workflow wait to verify a result or bounded loading, rather than re-clicking. "
+            "After a waiting result inspect the actual screen; diagnose focus, dialogs or incomplete loading. "
+            "Keep a step pending until verified, or abandon it with a concrete recovery reason before another approach. "
+            "For launching an app choose foreground_app with the device's advertised app alias; do not invent native process names. "
+            "Never invent evidence. A changed screen proves a transition, not business completion. "
+            "Before your final answer call workflow finish with final visible result conditions and report the "
+            "verification scope accurately. Without checked final conditions the app leaves the task pending review.\n")
     if software:
         instructions = instructions.replace("Operate only the selected\ndesktop using the computer tools.",
             "Use computer tools for the selected desktop and the software tool for the explicitly selected local workspace.")
@@ -66,7 +82,7 @@ def write_config(runtime, bridge_url, mcp_command=None, mcp_args=(), *, thinking
                                        if thinking else []),
         "shell_type": "unified_exec", "visibility": "list", "supported_in_api": True,
         "priority": 0, "base_instructions": instructions,
-        "input_modalities": ["text", "image"], "context_window": 1048576,
+        "input_modalities": ["text", "image"], "context_window": context_window,
         "effective_context_window_percent": 95,
         "truncation_policy": {"mode": "tokens", "limit": 100000},
         "support_verbosity": False, "apply_patch_tool_type": None,
@@ -80,7 +96,7 @@ model_provider = "qw3"
 model_catalog_json = {json.dumps(str(catalog_path))}
 model_reasoning_effort = {json.dumps("medium" if thinking else "none")}
 web_search = "disabled"
-model_auto_compact_token_limit = 950000
+model_auto_compact_token_limit = {min(950000,int(context_window*.9))}
 model_reasoning_summary = "none"
 suppress_unstable_features_warning = true
 [analytics]
@@ -120,7 +136,7 @@ command = {json.dumps(str(mcp_command))}
 args = {json.dumps(list(mcp_args))}
 startup_timeout_sec = 20
 tool_timeout_sec = 30
-enabled_tools = {json.dumps(["observe", "act"] + (["software"] if software else []))}
+enabled_tools = {json.dumps(["observe", "act"] + (["software"] if software else []) + (["workflow"] if workflow else []))}
 default_tools_approval_mode = "approve"
 '''
     (runtime / "config.toml").write_text(config, encoding="utf-8")

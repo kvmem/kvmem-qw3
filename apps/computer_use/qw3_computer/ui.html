@@ -18,6 +18,7 @@ button{border:1px solid #c6cfdc;background:white;border-radius:7px;padding:10px 
 </style>
 <header><div><h1>QW3 桌面助手 <small>本地运行</small></h1></div><span class="badge" id="status">连接中</span></header>
 <main><aside>
+<section class="card" id="deviceCard" hidden><h2>操作设备</h2><select id="device" aria-label="选择操作设备" style="width:100%;padding:10px;font:inherit"></select><p class="note">先结束当前任务，再切换设备。</p></section>
 <section class="card"><h2>让电脑帮你完成任务</h2><textarea id="prompt" placeholder="例如：打开记事本，写下会议要点并保存到指定文件。"></textarea>
 <div class="row"><button class="primary" id="start">开始任务</button><button id="stop">停止</button></div>
 <p class="note">助手只操作选中的测试桌面。你可以随时暂停接管，核对当前画面后继续。</p><div class="warning" id="notice"></div></section>
@@ -25,6 +26,7 @@ button{border:1px solid #c6cfdc;background:white;border-radius:7px;padding:10px 
 <div class="row"><button id="pause">暂停接管</button><button id="resume">继续任务</button></div>
 <label id="ackrow"><input id="ack" type="checkbox"> 我已核对画面，确认可以从当前状态继续。</label>
 <p class="note" id="target"></p></section>
+<section class="card" id="stepsCard" hidden><h2>结果核对</h2><div id="steps" class="messages note"></div><p class="note">每步核对预期结果；最后仍需确认是否满足你的实际需求。</p></section>
 <section class="card" id="softwareCard" hidden><h2>环境配置</h2><p class="note" id="softwareRoot"></p><div id="softwareJobs" class="messages"></div></section>
 <section class="card"><h2>输出文件</h2><div id="files" class="note">完成后将在这里显示文件证据。</div></section>
 </aside><div>
@@ -38,6 +40,10 @@ const labels={idle:'就绪',starting:'准备中',running:'正在执行',verifyin
 function error(message){el('notice').textContent=message;el('notice').style.display=message?'block':'none'}
 async function post(path,body){const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json();if(!response.ok)throw Error(data.error||'操作失败');return data}
 function render(s){state=s;el('status').textContent=s.ready?(labels[s.status]||s.status):'尚未就绪';
+ el('deviceCard').hidden=!s.devices;
+ if(s.devices){const signature=JSON.stringify(s.devices.devices);if(el('device').dataset.catalogue!==signature){el('device').replaceChildren(...s.devices.devices.map(d=>{const o=document.createElement('option');o.value=d.id;o.textContent=d.label;return o}));el('device').dataset.catalogue=signature}el('device').value=s.devices.selected;el('device').disabled=!s.ready||['starting','running','verifying','paused'].includes(s.status)}
+ el('stepsCard').hidden=!s.workflow;
+ if(s.workflow){const stepLabels={pending:'等待核对',verified:'已验证',abandoned:'改用其他步骤'};el('steps').replaceChildren(...s.workflow.steps.map(step=>{const p=document.createElement('div');p.className='message';p.textContent=(stepLabels[step.status]||step.status)+' · '+step.goal;return p}))}
  el('softwareCard').hidden=!s.software;
  if(s.software){el('softwareRoot').textContent='工作目录：'+s.software.root;
   const stages={download_python:'下载并校验 Python',install_python:'安装并核对解释器',create_venv:'创建项目环境',install_dependencies:'安装固定依赖',verify_project:'在新进程中验证',diagnose_project:'诊断项目与终端环境',repair_dependencies:'修复项目依赖',repair_terminal_launcher:'修复终端启动器并保留备份',verify_repair:'验证修复后的环境',download_latex_assets:'下载并校验 LaTeX 安装文件',install_latex:'安装项目专用 LaTeX',configure_latex_packages:'配置中文与公式依赖',check_latex_version:'核对 LaTeX 程序',diagnose_latex:'诊断实际编译错误',repair_latex_package:'修复缺失宏包',check_latex_repair:'检查补包结果',verify_latex:'重复编译并核对 PDF'};
@@ -47,7 +53,8 @@ function render(s){state=s;el('status').textContent=s.ready?(labels[s.status]||s
  const running=['starting','running'].includes(s.status),busy=running||s.status==='verifying',paused=s.status==='paused';
  el('start').disabled=!s.ready||busy||paused;el('pause').disabled=!running;el('resume').disabled=!paused||!s.ready;el('stop').disabled=!busy&&!paused;el('refresh').disabled=!s.desktop_paused;
  el('ackrow').style.display=s.uncertain_actions?.length?'block':'none';error(s.notice||s.turn_error?.message||'');
- el('action').textContent=s.current_action?JSON.stringify(s.current_action,null,2):(running?'正在观察和思考…':labels[s.status]||'等待任务');
+ const actions={click:'点击界面',click_control:'点击控件',type:'输入文字',key:'使用键盘',drag:'拖动',scroll:'滚动',open_app:'打开应用'};
+ el('action').textContent=s.current_action?(actions[s.current_action.kind]||'正在操作'):(running?'正在观察和思考…':labels[s.status]||'等待任务');
  const o=s.observation;if(o){el('window').textContent=o.foreground.title||'Windows 桌面';el('target').textContent=`${o.width} × ${o.height} · ${o.foreground.process||'桌面'}`;if(o.sha256!==lastImage){lastImage=o.sha256;el('screen').src='/api/screenshot?v='+encodeURIComponent(lastImage)}}
  const messages=[...(s.messages||[]),...(s.draft?[s.draft]:[])];el('messages').replaceChildren(...messages.map(text=>{const p=document.createElement('div');p.className='message';p.textContent=text;return p}));
  el('files').replaceChildren(...(s.files||[]).map(f=>{const d=document.createElement('details');d.className='file';const summary=document.createElement('summary');summary.textContent=f.name+' · '+f.size+' 字节';d.append(summary,document.createTextNode(f.content));return d}));
@@ -55,5 +62,6 @@ function render(s){state=s;el('status').textContent=s.ready?(labels[s.status]||s
 el('start').onclick=()=>post('/api/task',{prompt:el('prompt').value,acknowledge_uncertain:el('ack').checked}).then(s=>{el('ack').checked=false;render(s)}).catch(e=>error(e.message));
 for(const command of ['pause','stop','resume'])el(command).onclick=()=>post('/api/control',{command,acknowledge_uncertain:el('ack').checked}).then(s=>{el('ack').checked=false;render(s)}).catch(e=>error(e.message));
 el('refresh').onclick=()=>post('/api/observe',{}).then(render).catch(e=>error(e.message));
+el('device').onchange=()=>post('/api/device',{device_id:el('device').value}).then(s=>{lastImage='';render(s)}).catch(e=>{el('device').value=state.devices.selected;error(e.message)});
 async function poll(){try{const response=await fetch('/api/state');render(await response.json())}catch(e){error('连接已断开，请检查本地应用。')}setTimeout(poll,600)}poll();
 </script></html>

@@ -16,6 +16,7 @@ from qw3_computer.limits import MAX_MODEL_REQUEST_BYTES
 NATIVE_TEST_FILES = (
     "test_protocol.py", "test_bridge.py", "test_controller.py", "test_desktop.py",
     "test_collect_artifacts.py", "test_long_evidence.py", "test_task_driver.py",
+    "test_execution.py", "test_device_gateway.py", "test_device_registry.py",
     "test_vm_relay.py", "test_codex_integration.py", "test_thinking.py", "test_software.py", "test_software_latex.py", "fixture_mcp.py", "fixture_long_mcp.py",
 )
 
@@ -90,6 +91,7 @@ def main():
     [ValidateRange(1,10000)][int]$ToolCallLimit = 100,
     [ValidateSet('outputs','task')][string]$OutputPolicy = 'outputs',
     [switch]$Thinking,
+    [ValidateSet('legacy','verified')][string]$ExecutionMode = 'legacy',
     [string]$SoftwareRoot = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -99,6 +101,7 @@ $env:PYTHONUTF8 = '1'
 if (!$Runtime) { $Runtime = Join-Path $PSScriptRoot 'runtime' }
 $clientArgs = @('-X','utf8','-m','qw3_computer.app','--backend',$Backend,'--desktop',$Desktop,'--desktop-token',$DesktopToken,'--runtime',$Runtime)
 $clientArgs += @('--tool-call-limit',"$ToolCallLimit",'--output-policy',$OutputPolicy)
+$clientArgs += @('--execution-mode',$ExecutionMode)
 $clientArgs += @('--backend-timeout',"$BackendTimeout",'--backend-read-timeout',"$BackendReadTimeout")
 if ($BackendToken) { $clientArgs += @('--backend-token',$BackendToken) }
 if ($Thinking) { $clientArgs += '--thinking' }
@@ -120,7 +123,7 @@ exit $LASTEXITCODE
         "runtime_capabilities": ["configurable_backend_waits", "large_visual_history_requests", "backend_error_receipts", "opt_in_local_thinking", "application_focus_receipts", "opt_in_software_workflows", "task_scoped_gui_receipts", "bounded_gui_error_recovery", "observation_scoped_control_targets"],
         "model_request_limit_bytes": MAX_MODEL_REQUEST_BYTES,
         "backend_wait_defaults": {"total_seconds": 600, "read_seconds": 180, "heartbeat_seconds": 30},
-        "test_scope": "Windows runtime contracts; host OSWorld/scoring tests remain in the repository",
+        "test_scope": "Windows runtime and cross-device execution contracts; host OSWorld/scoring tests remain in the repository",
         "assets": {p.name: {"sha256": digest(p), "bytes": p.stat().st_size} for p in [python, codex, *wheels]},
         "source_files": {str(p.relative_to(app)): digest(p) for p in app.rglob("*") if p.is_file()},
     }

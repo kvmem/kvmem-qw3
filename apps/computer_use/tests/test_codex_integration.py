@@ -166,3 +166,13 @@ class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await client.close()
                 await bridge_runner.cleanup()
                 await backend_runner.cleanup()
+
+
+class CatalogContextTests(unittest.TestCase):
+    def test_reduced_backend_capacity_changes_catalog_and_compaction_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            write_config(directory,'http://127.0.0.1:1/v1',context_window=524288)
+            catalog=json.loads((Path(directory)/'models.json').read_text())
+            self.assertEqual(catalog['models'][0]['context_window'],524288)
+            self.assertIn('model_auto_compact_token_limit = 471859',(Path(directory)/'config.toml').read_text())
+            with self.assertRaises(ValueError):write_config(directory,'unused',context_window=True)

@@ -28,11 +28,13 @@ async def chunk(response, delta=None, finish=None):
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.backend_bodies = []
+        self.backend_connections = []
         self.mode = "text"
         self.entered = asyncio.Event()
         self.cancelled = asyncio.Event()
 
         async def backend(request):
+            self.backend_connections.append(request.transport.get_extra_info('peername'))
             self.backend_bodies.append(await request.json())
             self.backend_authorization = request.headers.get("Authorization")
             self.entered.set()
@@ -98,6 +100,12 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(done), 1)
         self.assertEqual(done[0]["call_id"], "call_one")
         self.assertEqual(done[0]["arguments"], "{}")
+
+    async def test_separate_model_turns_use_fresh_backend_connections(self):
+        await self.events()
+        await self.events()
+        self.assertEqual(len(self.backend_bodies), 2)
+        self.assertNotEqual(self.backend_connections[0], self.backend_connections[1])
 
     async def test_application_tool_policy_hides_unavailable_tools_but_keeps_old_history(self):
         old = [{"type": "function_call", "name": "read_mcp_resource", "call_id": "old", "arguments": "{}"},

@@ -182,6 +182,7 @@ def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", ma
         headers = {"Authorization": "Bearer " + backend_token} if backend_token else {}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=backend_timeout_seconds,
                                          sock_read=backend_read_timeout_seconds),
+                                         connector=aiohttp.TCPConnector(force_close=True),
                                          trust_env=False, headers=headers) as session:
             app[BACKEND] = session
             yield
@@ -271,6 +272,10 @@ def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", ma
                             done = True
                             break
                         chunk = json.loads(data)
+                        for choice in chunk.get('choices',[]):
+                            delta=choice.get('delta',{})
+                            if delta.get('content') or delta.get('reasoning_content') or delta.get('tool_calls'):
+                                metrics.setdefault('first_model_delta_seconds',time.monotonic()-started)
                         if trace is not None:
                             with (trace / "backend.jsonl").open("a") as log:
                                 log.write(data + "\n")
