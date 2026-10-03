@@ -5,7 +5,7 @@
   "status": "active",
   "local_plan": "docs/computer_use_local_diagnostic_plan_20261002.json",
   "combined_goal": "docs/computer_use_local_advisor_goal_20261002.md",
-  "current_stage": "p3_frozen_baseline_running_gui_action_id_collision_observed",
+  "current_stage": "p3_baseline_running_action_scope_and_schema_recovery_failures_observed",
   "source_baseline": "56896791b41b6aa5c022c99dac4996f719bd4ba0",
   "stages": {
     "P0": {
@@ -100,12 +100,12 @@
     },
     "P3": {
       "status": "frozen_baseline_running",
-      "trials_completed": 1,
+      "trials_completed": 3,
       "planned_trials": 32,
       "report": "docs/computer_use_recovery_diagnostic_p3_20261003.md",
       "baseline_bundle": "windows-native-client-30",
       "condition_count": 8,
-      "model_trials_completed": 1,
+      "model_trials_completed": 3,
       "scripted_conditions_qualified": [
         "normal",
         "wrong_focus",
@@ -135,18 +135,39 @@
       "model_preflight_completed": 1,
       "model_preflight_passed": 1,
       "model_preflight_evidence": "apps/computer_use/.runtime/p3-native-preflight-01/summary.json",
-      "formal_baseline_completed": 1,
-      "formal_baseline_passed": 1,
+      "formal_baseline_completed": 3,
+      "formal_baseline_passed": 2,
       "baseline_frozen": true,
       "baseline_acceptance": "apps/computer_use/.runtime/p3-baseline-20261003/acceptance.json",
       "baseline_campaign": "apps/computer_use/.runtime/p3-baseline-20261003/campaign.json",
-      "active_trial": "p3-baseline-r1-02",
+      "active_trial": "p3-baseline-r1-04",
       "candidate_changes_implemented": 0,
       "observed_baseline_issue": {
         "kind": "cross_task_gui_action_id_collision",
         "first_evidence": "apps/computer_use/.runtime/p3-baseline-r1-01/fixture/state.json",
         "impact": "First completed baseline normal trial required 7 tools and 46.46 seconds; executor rejected a semantic action ID already used by the preceding preflight; model recovered with a new ID. Fresh native clients share the retained VM executor ledger.",
         "candidate": "Namespace both local GUI action ledger and executor wire IDs by task while preserving legacy receipt reconciliation; implement only after baseline evidence is complete."
+      },
+      "baseline_runtime_handles": "apps/computer_use/.runtime/p3-baseline-20261003/run-handles.json",
+      "second_observed_issue": {
+        "evidence": "apps/computer_use/.runtime/p3-baseline-r1-02/first-error-analysis.json",
+        "kind": "first_error_analysis",
+        "condition": "wrong_focus",
+        "model_used": true,
+        "first_error": "Model placed action_id inside action instead of the required root property; desktop validation reported only length/character criteria.",
+        "repeated_act_failures": 14,
+        "observe_calls": 2,
+        "desktop_actions_dispatched": 0,
+        "duration_seconds": 135.3706917,
+        "final_outcome": "Explicit user takeover request, not a business completion claim. Native agent_completed denotes the completed conversation turn only.",
+        "attribution": [
+          "tool schema adherence failure",
+          "insufficiently specific validation feedback",
+          "unbounded repeated validation-error recovery"
+        ],
+        "visual_localization_claim": "No action reached the executor, so this attempt cannot establish click accuracy.",
+        "proposed_generic_candidate": "Report the exact missing/invalid field path and bounded repeated-error recovery, keeping strict validation and no automatic reinterpretation of actions.",
+        "candidate_implemented": false
       }
     },
     "P4": {
@@ -272,7 +293,7 @@
     "gpu_compute_processes": 0,
     "checked_at": 1790982486.6385703
   },
-  "next_action": "Let the frozen P3 baseline queue finish, audit every failure and transport identity, then implement at most two generic recovery improvements and qualify a new Windows client before the same 16 candidate trials. First observed defect is cross-task GUI action ID collision; confirmed-delivery reconciliation remains a candidate pending model fault evidence. Keep all P4/P5, original ten V0/V1, advisor and resource requirements active.",
+  "next_action": "Continue frozen 16-trial P3 baseline. Preserve completed-turn vs actual business success distinction: wrong_focus requested takeover after 14 malformed calls and 135 seconds. After baseline, choose at most two generic improvements; current candidates are task-scoped GUI action identities and precise/bounded tool validation-error recovery. Then qualify candidate Windows client and run same 16 conditions. Do not narrow remaining P4/P5, original-ten, advisor or resource deliverables.",
   "advisor_provider": {
     "provider": "deepseek",
     "model": "deepseek-flash",
