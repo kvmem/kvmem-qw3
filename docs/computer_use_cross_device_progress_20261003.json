@@ -540,6 +540,22 @@
       "fresh_target_checks": 10,
       "changed_target_rejections": 4,
       "path": "apps/computer_use/.runtime/candidate-interlude-contacts-02/pilot/integration-result.json"
+    },
+    {
+      "id": "candidate-interlude-linux-browser-01",
+      "formal": false,
+      "status": "failed",
+      "app_status": "paused",
+      "seconds": 15.484068754129112,
+      "tool_calls": 3,
+      "uncertain_actions": 0,
+      "artifact_passed": false,
+      "accepted": false,
+      "video_bytes": 147120,
+      "categories": [
+        "action-id-arbitrary-minimum-length"
+      ],
+      "path": "apps/computer_use/.runtime/candidate-interlude-linux-browser-01/pilot/integration-result.json"
     }
   ],
   "app_entry": "http://127.0.0.1:18205/",
@@ -638,12 +654,11 @@
   "frozen_campaign": {
     "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/plan.json",
     "commit": "9fe52d3ee254786012652ec9fc85f340b71e9dc9",
-    "finished": 13,
+    "finished": 14,
     "total": 40,
     "current": [
-      "035-verified-r1"
-    ],
-    "separate_pilot_queued": "candidate-interlude-linux-browser-01"
+      "043-legacy-r1"
+    ]
   },
   "post_freeze_optimizations": {
     "candidate": "cross-device-ui-11",
@@ -654,12 +669,12 @@
     "control_id_copy_hint": "Complete20-character observed IDs; the server currently does not enforce identifier enums during decoding, no constrained-decoding benefit claimed"
   },
   "formal_summary": {
-    "ended_attempts": 13,
+    "ended_attempts": 14,
     "valid_original_scores": 10,
     "infrastructure_failures": 2,
     "successes": 0,
     "improvement_demonstrated": false,
-    "unavailable_original_evaluators": 1
+    "unavailable_original_evaluators": 2
   },
   "candidate_changes_after_freeze": {
     "same_title_windows": "Unique AT-SPI active frame, real Linux browser qualification passed",
@@ -680,5 +695,5 @@
     "pending_step_checkpoint": "Future candidate returns concrete pending goal/conditions and permits continuing same result without copying goal;14 execution checks passed, UI11 and client38 keep their frozen source inventories",
     "linux_video": "Future platform pilots default to timestamped read-only VNC recorder; official frozen campaign unchanged"
   },
-  "updated_at": 1791062891.5985713
+  "updated_at": 1791063223.3339345
 }

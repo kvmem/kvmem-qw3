@@ -53,7 +53,7 @@ TOOLS = [{"name": "observe", "description": "Observe the selected desktop. Retur
               "desktop_id": {"type": "string"}, "observation_id": {"type": "string"},
               "coordinate_space": {"type": "string", "enum": ["pixels", "normalized_1000"],
                   "description": "For screenshot-estimated click/scroll/drag positions, use normalized_1000: both axes 0..1000; the program converts to pixels. For accessibility center_x/center_y, use pixels. Omitted means pixels. Never mix spaces within an action."},
-              "action_id": {"type": "string", "minLength": 8, "maxLength": 80, "pattern": "^[a-zA-Z0-9_-]+$",
+              "action_id": {"type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[a-zA-Z0-9_-]+$",
                   "description": "Required TOP-LEVEL field, alongside desktop_id, observation_id and action. Never put action_id inside action. Use a new identifier for each distinct action in this task."}, "action": ACTION},
               "required": ["desktop_id", "observation_id", "action_id", "action"], "additionalProperties": False},
           "annotations": {"readOnlyHint": False, "idempotentHint": False}}]

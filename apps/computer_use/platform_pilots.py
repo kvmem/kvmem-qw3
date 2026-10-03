@@ -152,6 +152,9 @@ def run(args):
             else:
                 request("http://127.0.0.1:18126", "/start_recording", {}, timeout=30)
                 recording = True
+        event_source=args.runtime/'codex-events.jsonl'
+        event_offset=event_source.stat().st_size if event_source.exists() else 0
+        manifest['codex_event_offset_bytes']=event_offset
         started = time.monotonic()
         state = request(args.app, "/api/task", {"prompt": prompt})
         task_id = state["id"]
@@ -233,7 +236,11 @@ def run(args):
         for name in ["codex-events.jsonl"]:
             source = args.runtime / name
             if source.exists():
-                shutil.copy2(source, directory / name)
+                # Device selection starts a fresh thread, but the app event
+                # journal is append-only across sessions. Export this attempt.
+                with source.open('rb') as log:
+                    log.seek(event_offset)
+                    (directory/name).write_bytes(log.read())
         save(directory / "integration-result.json", result)
         return result
     except Exception as exc:

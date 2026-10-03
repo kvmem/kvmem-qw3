@@ -111,8 +111,13 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.temp.cleanup()
 
     async def test_duplicate_returns_receipt_without_second_effect(self):
-        request = self.action()
+        with self.assertRaises(DesktopValidationError):
+            await self.desktop.act(self.action(''))
+        self.assertEqual(self.effects,0)
+        request = self.action('a1')
         first = await self.desktop.act(request)
+        self.assertEqual(first['action_id'],'a1')
+        self.assertRegex(self.last_dispatched['action_id'],r'^q3_[a-f0-9]{64}$')
         second = await self.desktop.act(request)
         self.assertEqual(first["observation"], second["observation"])
         self.assertTrue(second["duplicate"])
