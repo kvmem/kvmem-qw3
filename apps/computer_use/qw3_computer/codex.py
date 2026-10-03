@@ -59,6 +59,8 @@ def write_config(runtime, bridge_url, mcp_command=None, mcp_args=(), *, thinking
             "Keep a step pending until verified, or abandon it with a concrete recovery reason before another approach. "
             "For launching an app choose foreground_app with the device's advertised app alias; do not invent native process names. "
             "Never invent evidence. A changed screen proves a transition, not business completion. "
+            "For screenshot-estimated click/drag/scroll use only explicit coordinate_space=normalized_1000, "
+            "both axes0..1000; do not emit pixel estimates. For observed system targets use click_control. "
             "Before your final answer call workflow finish with final visible result conditions and report the "
             "verification scope accurately. Without checked final conditions the app leaves the task pending review.\n")
     if software:

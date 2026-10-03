@@ -181,6 +181,12 @@ class Desktop:
             if arguments.get("observation_id") != self.latest["observation_id"]:
                 raise DesktopValidationError({"code": "stale_observation", "path": "$.observation_id",
                     "message": "Stale observation; observe again", "hint": "Use the latest observation_id and reassess the current screen."})
+            if (self.execution and arguments["action"]["kind"] in {"click", "drag", "scroll"}
+                    and arguments.get("coordinate_space") != "normalized_1000"):
+                raise DesktopValidationError({"code": "normalized_coordinates_required", "path": "$.coordinate_space",
+                    "message": "Verified visual input requires explicit normalized_1000 coordinates.",
+                    "hint": "For screenshot estimates use0..1000 on both axes with coordinate_space=normalized_1000. "
+                            "For an exposed system control use click_control and its copied control_id. No input was sent; do not relabel pixel values as normalized."})
             try:
                 dispatched, mapping = dispatch_arguments(arguments, self.latest)
             except TargetError as exc:

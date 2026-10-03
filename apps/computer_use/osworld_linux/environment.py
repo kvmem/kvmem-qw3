@@ -16,7 +16,12 @@ def create(directory,name):
     from desktop_env.providers.docker.provider import DockerProvider
     from desktop_env.providers.docker.manager import DockerVMManager
 
+    providers=[]
+
     class PinnedProvider(DockerProvider):
+        def __init__(self,*args,**kwargs):
+            super().__init__(*args,**kwargs)
+            providers.append(self)
         def start_emulator(self,path_to_vm,headless,os_type):
             if Path(path_to_vm).resolve()!=DISK.resolve() or os_type!='Ubuntu':raise ValueError('Unexpected VM image')
             if self.container is not None:raise RuntimeError('VM already owned')
@@ -41,13 +46,28 @@ def create(directory,name):
         env=module.DesktopEnv(provider_name='docker',path_to_vm=str(DISK),headless=True,
             require_a11y_tree=False,enable_proxy=False,action_space='pyautogui',
             force_disable_vnc=True,force_disable_recording=True,cache_dir=str(directory/'env_cache'))
+    except BaseException:
+        # Constructor/readiness failures can occur before env is assigned in
+        # the runner. Reconcile only containers created by this provider.
+        for provider in providers:
+            if provider.container is not None:
+                provider.container.reload()
+                if provider.container.labels.get('qw3.goal')!='cross-device-20261003' or provider.container.name!=name:
+                    raise RuntimeError('Failed VM identity no longer matches this attempt')
+                provider.container.stop(timeout=20)
+                provider.container.remove()
+        raise
     finally:module.create_vm_manager_and_provider=original_factory
     domains=' '.join(app+'.qw3.test' for app in ['formcraft','teamchat','cloudcrm','calendar','mailhub'])
     # Setup-only fixed guest network mapping. No host /etc/hosts changes and no
     # arbitrary guest code is exposed to the model's tools.
     code="import subprocess; subprocess.run(['sudo','-S','sh','-c',"+repr('printf "172.17.0.1 '+domains+'\\n" >> /etc/hosts')+"],input='osworld-public-evaluation\\n',text=True,check=True)"
-    response=requests.post(f'http://127.0.0.1:{PORTS["server"]}/execute',json={'command':['python','-c',code],'shell':False},timeout=30)
-    response.raise_for_status();result=response.json()
-    if result.get('returncode',0)!=0 or result.get('status')=='error':
-        env.close();raise RuntimeError('Guest local website routing initialization failed')
+    try:
+        response=requests.post(f'http://127.0.0.1:{PORTS["server"]}/execute',json={'command':['python','-c',code],'shell':False},timeout=30)
+        response.raise_for_status();result=response.json()
+        if result.get('returncode',0)!=0 or result.get('status')=='error':
+            raise RuntimeError('Guest local website routing initialization failed')
+    except BaseException:
+        env.close()
+        raise
     return env

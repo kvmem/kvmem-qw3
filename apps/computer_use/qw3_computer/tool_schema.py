@@ -172,7 +172,17 @@ def tools_for_platform(platform, workflow=False):
     tools = copy.deepcopy(TOOLS)
     if workflow:
         tools[1]["inputSchema"]["required"].append("step")
+        tools[1]["inputSchema"]["properties"]["coordinate_space"]["enum"] = ["normalized_1000"]
+        tools[1]["inputSchema"]["properties"]["coordinate_space"]["description"] = (
+            "Required for estimated click/drag/scroll: normalized_1000, both axes0..1000. "
+            "For accessibility targets use click_control. Omit this field for key/type/open_app.")
+        for branch in tools[1]["inputSchema"]["properties"]["action"]["oneOf"]:
+            for key in ("x", "y", "from_x", "from_y", "to_x", "to_y"):
+                if key in branch["properties"]:
+                    branch["properties"][key]["maximum"] = 1000
         tools[1]["description"] = ("Supply step={goal:<expected result>,conditions:[...]} alongside action. "
+            "Estimated click/drag/scroll positions MUST use explicit normalized_1000; pixel estimates are rejected. "
+            "For system control targets use click_control, not pixel coordinates. "
             "The framework records a step on this exact observation and performs one input in the same call. "
             "Check step_check in the receipt: verified permits a new step; pending needs bounded workflow wait "
             "or further inputs with the same goal/conditions. To replace a pending step explicitly include "

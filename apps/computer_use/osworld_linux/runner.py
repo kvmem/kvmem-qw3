@@ -4,8 +4,10 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import shutil
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -17,6 +19,38 @@ from osworld_windows.source import ROOT, scenario, asset
 from .preflight import TASKS
 
 OSWORLD=ROOT/'third_party/OSWorld-V2'
+
+
+def cloud_grader_disabled(exc):
+    while exc is not None:
+        if 'External model grader disabled' in str(exc):
+            return True
+        exc=exc.__cause__
+    return False
+
+
+@contextlib.contextmanager
+def stage_deadline(seconds, stage):
+    """Bound official setup/evaluation without changing their task logic."""
+    previous = signal.getsignal(signal.SIGALRM)
+    def expired(*_):
+        raise TimeoutError(f'{stage} exceeded its {seconds}s infrastructure budget')
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def evaluation_score(value):
+    # Several official tasks return a score plus a separate safety report.
+    # Preserve the whole return value; normalize only the numeric comparison.
+    score=value.get('score') if isinstance(value,dict) else value
+    if type(score) not in (int,float) or not math.isfinite(score) or not 0<=score<=1:
+        raise ValueError('Original evaluator returned no valid score in0..1')
+    return float(score)
 
 
 def save(path,body):
@@ -43,7 +77,7 @@ def wait_ready(process,origin,timeout=150):
 
 def source_identity(framework):
     files={}
-    for folder in [framework/'qw3_computer',ROOT/'apps/computer_use/osworld_linux']:
+    for folder in [framework/'qw3_computer',ROOT/'apps/computer_use/osworld_linux',ROOT/'apps/computer_use/osworld_windows']:
         for path in sorted(folder.glob('*')):
             if path.suffix in {'.py','.html'}:files[folder.name+'/'+path.name]=hashlib.sha256(path.read_bytes()).hexdigest()
     return files
@@ -99,19 +133,39 @@ def run(args):
             if getattr(imported,'generate_text',None) is original_generate:
                 imported.generate_text=no_cloud
         task=load_task_from_file(str(ROOT/item['source_file']))
+        from .grader_dependencies import configure
+        manifest['evaluator_dependencies']=configure(task,directory)
+        save(directory/'manifest.json',manifest)
         from .environment import create, PORTS
-        env=create(directory,'qw3-linux-'+directory.name)
-        observation=env.reset(task_config=task,seed=0)
+        with stage_deadline(900, 'VM initialization and original task setup'):
+            env=create(directory,'qw3-linux-'+directory.name)
+            observation=env.reset(task_config=task,seed=0)
         (directory/'initial.png').write_bytes(observation['screenshot'])
         save(directory/'task_instruction.json',{'id':task.id,'instruction':task.instruction})
         manifest['initialized_at']=time.time();save(directory/'manifest.json',manifest)
         if args.qualification:
-            negative=env.evaluate();result.update(status='qualified-negative',negative_score=negative,score=negative)
+            try:
+                with stage_deadline(600, 'Negative evaluator qualification'):
+                    negative_raw=env.evaluate();negative=evaluation_score(negative_raw)
+            except RuntimeError as exc:
+                if args.task!='035' or not cloud_grader_disabled(exc):
+                    raise
+                negative_raw=negative=None
+                result['negative_evaluator_unavailable']=True
+            result.update(status='qualified-negative',negative_score=negative,score=negative,negative_evaluation=negative_raw)
             from .qualification import positive_control
-            positive, details = positive_control(args.task, task, env, directory, user)
-            result.update(positive_score=positive, positive_control=details,
-                passed=negative<1 and positive==1,
-                status='qualified' if negative<1 and positive==1 else 'qualification-failed')
+            with stage_deadline(600, 'Positive evaluator qualification'):
+                positive, details = positive_control(args.task, task, env, directory, user)
+            positive_score=evaluation_score(positive) if positive is not None else None
+            result.update(positive_score=positive_score,positive_evaluation=positive,positive_control=details,
+                passed=negative is not None and negative<1 and positive_score==1,
+                status='qualified' if negative is not None and negative<1 and positive_score==1 else 'qualification-failed')
+            if args.task=='035' and details.get('original_judge_unavailable'):
+                local_negative=details['local_saved_worksheet_negative']
+                local_positive=details['local_saved_worksheet_positive']
+                result.update(status='local-metric-qualified-original-unavailable',passed=False,
+                    local_metric_qualified='error' not in local_negative and 'error' not in local_positive and
+                    local_negative['local_deterministic_score']<1 and local_positive['strict_success'])
             return result
         raw_origin=f'http://127.0.0.1:{PORTS["server"]}'
         import requests
@@ -158,10 +212,37 @@ def run(args):
         (directory/'continuous.mp4').write_bytes(r.content);result['video_bytes']=len(r.content);recording=False
         manifest['agent_recording_ended_at']=time.time();save(directory/'manifest.json',manifest)
         try:
-            score=env.evaluate();result.update(score=score,passed=score==1,status='scored')
+            with stage_deadline(600, 'Original independent evaluator'):
+                evaluation=env.evaluate();score=evaluation_score(evaluation)
+            result.update(score=score,original_evaluation=evaluation,passed=score==1,status='scored')
         except Exception as exc:
             result.update(status='evaluator-unavailable',evaluator_error=type(exc).__name__+': '+str(exc))
             (directory/'evaluator-traceback.txt').write_text(traceback.format_exc())
+        if args.task=='035':
+            # A local metric is useful even when the official cloud judge is
+            # unavailable. It is a separate score, never substituted silently.
+            try:
+                with stage_deadline(120, 'Separate local worksheet metric'):
+                    from desktop_env.evaluators.getters.file import get_vm_file
+                    from osworld_windows.task035 import grade
+                    from osworld_windows.sites import Site
+                    from .sites import payload
+                    saved=get_vm_file(env,{'path':'/home/user/Desktop/purchase_order_form.xlsx','dest':'local_035_submission.xlsx'})
+                    source=payload(str(asset('035','dynamic_state_035.json')))
+                    scheduled={e['messageId'] for e in source['data']['time_data']}
+                    public=Site('teamchat',user,directory/'private_site_claims').state()
+                    conversations=public.get('data',{}).get('teamchat',{}).get('messages',{})
+                    observed={m.get('messageId') for messages in conversations.values() for m in messages}
+                    delivered=scheduled.issubset(observed)
+                    secondary=grade(saved or directory/'missing_035.xlsx',events_complete=delivered)
+                    secondary.update(scheduled_message_count=len(scheduled),delivered_message_count=len(scheduled&observed),
+                                     dynamic_delivery_policy='Original wall-clock schedule unchanged')
+                    save(directory/'independent-local-035.json',secondary)
+                    result['secondary_local_score']=secondary['local_deterministic_score']
+                    result['secondary_local_passed']=secondary['strict_success']
+            except Exception as exc:
+                result['secondary_local_error']=type(exc).__name__+': '+str(exc)
+                (directory/'secondary-traceback.txt').write_text(traceback.format_exc())
         result['unassisted_passed']=result['passed'] and state['status']=='completed' and not result['uncertain_actions']
         return result
     except Exception as exc:
@@ -189,6 +270,9 @@ def main():
     p.add_argument('--qualification',action='store_true');p.add_argument('--seconds',type=int,default=1800);p.add_argument('--tools',type=int,default=250)
     args=p.parse_args()
     if not 1<=args.seconds<=1800 or not 1<=args.tools<=250:p.error('Budget exceeds frozen campaign limits')
+    def interrupted(*_):
+        raise TimeoutError('Owned runner watchdog requested shutdown')
+    signal.signal(signal.SIGTERM, interrupted)
     print(json.dumps(run(args),ensure_ascii=False),flush=True)
 
 

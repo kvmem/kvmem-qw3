@@ -44,7 +44,8 @@ def install(claims):
         for target,raw in zip(apps,states):
             source=public_url(target);parsed=urlparse(source)
             site=Site(parsed.hostname.split('.')[0],user,claims)
-            site.initialize(payload(raw))
+            consumed=('time_data','action_data','enable_notifications') if site.app in {'teamchat','mailhub'} else ()
+            site.initialize(payload(raw),consumed_fields=consumed)
             query=dict(parse_qsl(parsed.query,keep_blank_values=True));query['cookie']=user
             final=urlunparse(parsed._replace(query=urlencode(query)))
             entries.append({'cookie':'user_id='+user,'cookie_dict':{'user_id':user},'user_id_cookie':user,

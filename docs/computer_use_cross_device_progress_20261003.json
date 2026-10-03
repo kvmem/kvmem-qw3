@@ -56,15 +56,19 @@
   ],
   "warnings": [
     "Formal OSWorld still has no valid model comparison pair.",
-    "Android pilot07 is one successful development task; repeat and other apps remain unqualified.",
-    "Client35 native175 are contract checks, not real-model desktop task success."
+    "Current Android settings candidate: pilot08 passed; pilot09 had correct result and no other system setting changes but reached180s deadline.",
+    "Linux pilot04 passed declared visible checks but failed exact file bytes (extra final newline).",
+    "Client36 native176 are contract checks, not real-model desktop task success.",
+    "Task006 qualification checks filenames only; applicant materials require separate availability audit.",
+    "Task043 original rubric has known business constraint conflicts; task035 original cloud judge remains disabled."
   ],
   "contract_checks": {
     "core_regression": {
-      "run": 112,
-      "passed": 110,
+      "run": 118,
+      "passed": 116,
       "skipped": 2,
-      "scope": "execution controller desktop gateway registry trace bridge relay codex"
+      "scope": "execution controller desktop gateway device_registry trace bridge vm_relay codex osworld_linux",
+      "log": "/tmp/qw3-cross-device-regression-118-final.log"
     },
     "execution_gateway": {
       "run": 14,
@@ -95,6 +99,18 @@
       "passed": 175,
       "real_model": false,
       "bundle_sha256": "75ad0922ca42554f686f2ba33f8a2487a3160c4b4e159f142b6f4f3ef361349e"
+    },
+    "native_windows_client36": {
+      "run": 176,
+      "passed": 176,
+      "real_model": false,
+      "bundle_sha256": "30fe15773ff8f5a6e6b3a113053aec93e0593564239bf9f0dac6f85b31448c2b"
+    },
+    "original_linux_evaluators": {
+      "run": 6,
+      "passed": 6,
+      "python": "third_party/OSWorld-V2/.venv/bin/python",
+      "scope": "original score format, campaign balance, timeouts, scheduler data validation and optional worksheet dimensions"
     }
   },
   "integration_pilots": [
@@ -193,6 +209,51 @@
       "artifact_passed": true,
       "unassisted_passed": true,
       "video_bytes": 1430225
+    },
+    {
+      "id": "linux-qw3-pilot-03",
+      "formal": false,
+      "path": "apps/computer_use/.runtime/linux/qw3-pilot-03/integration-result.json",
+      "app_status": "stopped",
+      "seconds": 365.6363334869966,
+      "tool_calls": 15,
+      "artifact_passed": false,
+      "unassisted_passed": false,
+      "video_bytes": 6408793
+    },
+    {
+      "id": "linux-qw3-pilot-04",
+      "formal": false,
+      "path": "apps/computer_use/.runtime/linux/qw3-pilot-04/integration-result.json",
+      "app_status": "completed",
+      "seconds": 250.63204139610752,
+      "tool_calls": 11,
+      "artifact_passed": false,
+      "unassisted_passed": false,
+      "video_bytes": 4757750
+    },
+    {
+      "id": "android-qw3-pilot-08",
+      "formal": false,
+      "path": "apps/computer_use/.runtime/android/qw3-pilot-08/integration-result.json",
+      "app_status": "completed",
+      "seconds": 150.7144292271696,
+      "tool_calls": 8,
+      "artifact_passed": true,
+      "unassisted_passed": true,
+      "video_bytes": 1923805
+    },
+    {
+      "id": "android-qw3-pilot-09",
+      "formal": false,
+      "path": "apps/computer_use/.runtime/android/qw3-pilot-09/integration-result.json",
+      "app_status": "stopped",
+      "seconds": 181.16801845422015,
+      "tool_calls": 8,
+      "artifact_passed": true,
+      "unassisted_passed": false,
+      "video_bytes": 1358760,
+      "other_system_setting_changes": {}
     }
   ],
   "app_entry": "http://127.0.0.1:18205/",
@@ -202,14 +263,82 @@
   ],
   "osworld_qualification": {
     "013": {
-      "negative": 0,
-      "positive": 1,
-      "passed": true
+      "negative": 0.0,
+      "positive": 1.0,
+      "passed": true,
+      "scope": null,
+      "path": "apps/computer_use/.runtime/linux/osworld-qualification-013-02/result.json"
     },
     "004": {
-      "negative": 0,
-      "positive": null,
-      "passed": false
+      "negative": 0.0,
+      "positive": 1.0,
+      "passed": true,
+      "scope": "Original evaluator and result retrieval",
+      "path": "apps/computer_use/.runtime/linux/osworld-qualification-004-02/result.json"
+    },
+    "010": {
+      "negative": 0.0,
+      "positive": 1.0,
+      "passed": true,
+      "scope": "Original evaluator and result retrieval",
+      "path": "apps/computer_use/.runtime/linux/osworld-qualification-010-02/result.json"
+    },
+    "038": {
+      "negative": 0.0,
+      "positive": 1.0,
+      "passed": true,
+      "scope": "Original evaluator and result retrieval",
+      "path": "apps/computer_use/.runtime/linux/osworld-qualification-038-01/result.json"
+    },
+    "043": {
+      "negative": 0.0,
+      "positive": 1.0,
+      "passed": true,
+      "scope": "Original rubric only; published business constraints have known conflicts",
+      "path": "apps/computer_use/.runtime/linux/osworld-qualification-043-01/result.json"
+    },
+    "080": {
+      "negative": 0.0,
+      "positive": 1.0,
+      "passed": true,
+      "scope": "Original evaluator and result retrieval",
+      "path": "apps/computer_use/.runtime/linux/osworld-qualification-080-03/result.json"
+    },
+    "051": {
+      "negative": 0.0,
+      "positive": 1.0,
+      "passed": true,
+      "scope": "Original evaluator and result retrieval",
+      "path": "apps/computer_use/.runtime/linux/osworld-qualification-051-01/result.json"
+    },
+    "006": {
+      "negative": 0.0,
+      "positive": 1.0,
+      "passed": true,
+      "scope": "Filename-only rubric using synthetic empty files; applicant material availability remains separate",
+      "path": "apps/computer_use/.runtime/linux/osworld-qualification-006-01/result.json"
+    },
+    "022": {
+      "negative": 0.0,
+      "positive": 1.0,
+      "passed": true,
+      "scope": "Original uploaded-hash/submission rubric; synthetic host-only state, no model used",
+      "path": "apps/computer_use/.runtime/linux/osworld-qualification-022-01/result.json"
+    },
+    "035": {
+      "status": "original-unavailable-local-metric-qualified",
+      "original_score": null,
+      "original_cloud_judge_disabled": true,
+      "local_negative": 0,
+      "local_positive": 1,
+      "local_metric_separate": true,
+      "path": "apps/computer_use/.runtime/linux/osworld-qualification-035-03/result.json",
+      "local_metric_path": "apps/computer_use/.runtime/linux/osworld-qualification-035-local-05/result.json",
+      "preserved_failures": [
+        "osworld-qualification-035-01",
+        "osworld-qualification-035-02",
+        "osworld-qualification-035-local-04"
+      ]
     }
   },
   "resource_revision": {

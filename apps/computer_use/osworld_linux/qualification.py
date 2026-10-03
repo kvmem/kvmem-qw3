@@ -26,7 +26,7 @@ def positive_control(task_id, task, env, directory, user):
             site, state = Site("calendar", user, claims), qualifying_calendar()
             details["scope"] = "Original rubric only; published business constraints have known conflicts"
         site.request("PUT", "/api/state", state)
-    elif task_id in {"004", "010", "080", "051"}:
+    elif task_id in {"004", "010", "080", "051", "035"}:
         if task_id == "004":
             from osworld_windows.qualify004 import positive
             path = directory / "private-positive.pptx"
@@ -36,11 +36,39 @@ def positive_control(task_id, task, env, directory, user):
             path = asset("010", "Reimbursement_Checklist_Completed.docx")
             destination = "/home/user/Desktop/Reimbursement_Checklist_Completed.docx"
         elif task_id == "080":
-            path = asset("080", "FY26_GTM_Planning_Model_Perfect_v2.xlsx")
+            from osworld_windows.qualify080 import positive, rewrite_zip
+            import posixpath
+            import xml.etree.ElementTree as ET
+            import zipfile
+            fixture = directory / "private-positive080"
+            fixture.mkdir(exist_ok=False)
+            path = positive(fixture)
+            # The untouched original parser assumes relative OPC targets.
+            # Normalize this host fixture's equivalent relationships; never
+            # modify the original source, submission or official evaluator.
+            replacements = {}
+            with zipfile.ZipFile(path) as archive:
+                for name in archive.namelist():
+                    if not name.endswith(".rels"):
+                        continue
+                    root = ET.fromstring(archive.read(name))
+                    source_directory = name.rsplit("/_rels/", 1)[0] if "/_rels/" in name else ""
+                    for relation in root:
+                        target = relation.get("Target", "")
+                        if target.startswith("/"):
+                            relation.set("Target", posixpath.relpath(target.lstrip("/"), source_directory))
+                    replacements[name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            relative = fixture / "positive-relative.xlsx"
+            rewrite_zip(path, relative, replacements)
+            path = relative
+            details["known_material_omissions"] = "Published Perfect_v2 lacks overlay quota, heading emphasis and a chart series label; repaired host-only fixture"
             destination = "/home/user/Desktop/FY26_GTM_Planning_Model_Broken.xlsx"
-        else:
+        elif task_id == "051":
             path = asset("051", "task_051_gt.xcf")
             destination = "/home/user/Desktop/final.xcf"
+        else:
+            path = asset("035", "purchase_order_form_gt.xlsx")
+            destination = "/home/user/Desktop/purchase_order_form.xlsx"
         if task_id in {"004", "080"}:
             # Only applications inside this disposable, agent-free VM. Prevent
             # an open old document from overwriting the known answer on save.
@@ -55,6 +83,37 @@ def positive_control(task_id, task, env, directory, user):
         env.setup_controller._upload_file_setup([{"local_path": str(path), "path": destination}])
         if task_id == "004":
             env.setup_controller._open_setup(path=destination)
+        if task_id == "035":
+            from osworld_windows.task035 import grade
+            details["local_saved_worksheet_negative"] = grade(asset("035", "purchase_order_form.xlsx"), events_complete=True)
+            details["local_saved_worksheet_positive"] = grade(path, events_complete=True)
+            details["scope"] = "Deterministic worksheet fixture only; no equivalence to original cloud judge or full dynamic task acceptance"
+            try:
+                return env.evaluate(), details
+            except RuntimeError as exc:
+                from .runner import cloud_grader_disabled
+                if not cloud_grader_disabled(exc):
+                    raise
+                details["original_judge_unavailable"] = True
+                return None, details
+    elif task_id == "022":
+        from playwright.sync_api import sync_playwright
+        hashes = task._load_expected_hashes(env)
+        if not hashes:
+            raise ValueError("Original setup produced no private expected document hashes")
+        state = {"uploads": {category: [{"sha256": digest, "name": "qualification-only.pdf"} for digest in digests]
+                             for category, digests in hashes.items()},
+                 "status": "submitted", "submittedAt": "2026-01-01T00:00:00Z"}
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(f"http://{env.vm_ip}:{env.chromium_port}", timeout=15000)
+            context = browser.contexts[0]
+            page = next((page for page in context.pages if ":8081" in page.url), None)
+            if page is None:
+                raise ValueError("Original LoanHub page missing after setup")
+            page.evaluate("state => localStorage.setItem('loanhub_state', JSON.stringify(state))", state)
+            page.reload(wait_until="domcontentloaded")
+            browser.close()
+        details["scope"] = "Original uploaded-hash/submission rubric; synthetic host-only state, no model used"
     elif task_id == "006":
         # This rubric only checks filenames. Do not describe synthetic names
         # as valid applicant documents or evidence that required CVs exist.

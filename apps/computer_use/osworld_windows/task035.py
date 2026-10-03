@@ -32,6 +32,10 @@ def rows(path):
         if len(book.sheetnames) != 1:
             raise ValueError("Expected the original single worksheet")
         sheet = book.worksheets[0]
+        if sheet.max_row is None or sheet.max_column is None:
+            # The published blank form omits the optional worksheet dimension.
+            # Read-only openpyxl must discover it before checking the bounds.
+            sheet.calculate_dimension(force=True)
         if sheet.max_row > 1000 or sheet.max_column > 40:
             raise ValueError("Worksheet exceeds this fixture's bounded table")
         result = []

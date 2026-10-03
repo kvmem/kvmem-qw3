@@ -38,7 +38,9 @@ class Site:
             raise ValueError("Private site returned another identity or malformed state")
         return response["state"]
 
-    def initialize(self, state):
+    def initialize(self, state, *, consumed_fields=()):
+        if consumed_fields and (self.app not in {'teamchat','mailhub'} or set(consumed_fields)-{'time_data','action_data','enable_notifications'}):
+            raise ValueError('Unknown scheduler-consumed initializer fields')
         # GET /state creates nonempty demo records on most upstream sites.
         # Claim locally before that first GET, then prove the backend created
         # this identity during this request. These containers share the host
@@ -63,7 +65,13 @@ class Site:
         if response.get("user_id") != self.user:
             raise ValueError("Private site initializer identity mismatch")
         actual = self.state()
-        if actual.get("data") != state.get("data"):
+        expected = state.get("data")
+        if consumed_fields:
+            expected = {k:v for k,v in expected.items() if k not in consumed_fields}
+            # These upstream backends move dynamic fields into the scheduler.
+            # Retain the exact schedule outside agent input for delivery audits.
+            (self.claims / (self.app + '-' + self.user + '-scheduled-input.json')).write_text(json.dumps(state,indent=2))
+        if actual.get("data") != expected:
             raise ValueError("Private site did not preserve initialized task data")
         claim.write_text(json.dumps({"app": self.app, "user": self.user, "status": "initialized", "at": time.time()}, indent=2))
         return actual

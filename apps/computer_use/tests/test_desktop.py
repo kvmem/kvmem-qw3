@@ -134,6 +134,29 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
             self.desktop.execution=None
             execution.close()
 
+    async def test_verified_visual_pixel_estimate_is_rejected_before_input_then_normalized_dispatches(self):
+        from pathlib import Path
+        from qw3_computer.execution import Execution
+        execution = Execution(self.desktop, Path(self.temp.name))
+        self.desktop.execution = execution
+        try:
+            request = self.action(action={"kind": "click", "x": 4, "y": 4, "button": "left", "clicks": 1},
+                                  coordinate_space="pixels", step={"goal": "Select target", "conditions": [{"kind": "screen_changed"}]})
+            with self.assertRaises(DesktopValidationError) as rejected:
+                await self.desktop.act(request)
+            self.assertEqual(rejected.exception.problem["code"], "normalized_coordinates_required")
+            self.assertEqual(self.effects, 0)
+            normalized = request | {"coordinate_space": "normalized_1000",
+                                    "action": request["action"] | {"x": 500, "y": 500}}
+            result = await self.desktop.act(normalized)
+            self.assertEqual(self.effects, 1)
+            self.assertIn("coordinate_mapping", result)
+            await self.desktop.act(normalized)
+            self.assertEqual(self.effects, 1)
+        finally:
+            self.desktop.execution = None
+            execution.close()
+
     async def test_normalized_click_converts_once_and_keeps_pixel_actions_unchanged(self):
         request = self.action(coordinate_space="normalized_1000",
             action={"kind": "click", "x": 500, "y": 1000, "button": "left", "clicks": 1})
