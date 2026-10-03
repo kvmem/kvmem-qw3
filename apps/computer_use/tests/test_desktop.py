@@ -9,7 +9,7 @@ import unittest
 from aiohttp import web
 from PIL import Image
 
-from qw3_computer.desktop import Desktop, DesktopError, DesktopRejected
+from qw3_computer.desktop import Desktop, DesktopError, DesktopRejected, DesktopValidationError
 from test_bridge import serve
 
 
@@ -19,6 +19,8 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.sequence = self.effects = 0
         self.paused = True
         self.mode = "normal"
+        self.controls = None
+        self.accessibility_status = "ok"
         self.receipts = {}
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
@@ -61,9 +63,19 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
 
     def observation(self):
         self.sequence += 1
-        return {"desktop_id": "fixture-desktop", "observation_id": str(self.sequence),
+        result = {"desktop_id": "fixture-desktop", "observation_id": str(self.sequence),
                 "image": base64.b64encode(self.png).decode(), "sha256": hashlib.sha256(self.png).hexdigest(),
                 "width": 8, "height": 8, "paused": self.paused}
+        if self.controls is not None:
+            result['accessibility'] = {'status': self.accessibility_status, 'controls': self.controls}
+        return result
+
+    async def observed_controls(self):
+        self.controls = [
+            {'name': 'Save', 'kind': 'Button', 'x': 0, 'y': 0, 'width': 4, 'height': 4, 'center_x': 2, 'center_y': 2},
+            {'name': 'Save', 'kind': 'Button', 'x': 4, 'y': 4, 'width': 4, 'height': 4, 'center_x': 6, 'center_y': 6},
+        ]
+        return (await self.desktop.observe())['accessibility']['controls']
 
     def action(self, id="action_001", **changes):
         return {"desktop_id": "fixture-desktop", "observation_id": self.desktop.latest["observation_id"],
@@ -101,6 +113,66 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
             action={"kind": "click", "x": 3, "y": 5, "button": "left", "clicks": 1}))
         self.assertEqual(self.last_dispatched["action"]["x"], 3)
         self.assertEqual(self.last_dispatched["action"]["y"], 5)
+
+    async def test_control_click_disambiguates_names_and_returns_new_observation_ids(self):
+        controls = await self.observed_controls()
+        self.assertNotEqual(controls[0]['control_id'], controls[1]['control_id'])
+        request = self.action(action={'kind': 'click_control', 'control_id': controls[1]['control_id']})
+        result = await self.desktop.act(request)
+        self.assertEqual(self.last_dispatched['action'], {'kind': 'click', 'x': 6, 'y': 6, 'button': 'left', 'clicks': 1})
+        self.assertEqual(result['coordinate_mapping']['source'], 'accessibility_control')
+        fresh = result['observation']['accessibility']['controls']
+        self.assertNotEqual(fresh[1]['control_id'], controls[1]['control_id'])
+        self.assertEqual(fresh, self.desktop.latest['accessibility']['controls'])
+        self.assertTrue((await self.desktop.act(request))['duplicate'])
+        self.assertEqual(self.effects, 1)
+
+    async def test_old_control_id_with_new_observation_is_rejected_before_dispatch(self):
+        controls = await self.observed_controls()
+        await self.desktop.observe()
+        with self.assertRaises(DesktopValidationError) as caught:
+            await self.desktop.act(self.action(action={'kind': 'click_control', 'control_id': controls[0]['control_id']}))
+        self.assertEqual(caught.exception.problem['path'], '$.action.control_id')
+        self.assertEqual(self.effects, 0)
+        self.assertEqual(self.desktop.unresolved(), [])
+
+    async def test_control_click_rejects_normalized_space_and_unavailable_accessibility(self):
+        controls = await self.observed_controls()
+        with self.assertRaises(DesktopValidationError):
+            await self.desktop.act(self.action(coordinate_space='normalized_1000',
+                action={'kind': 'click_control', 'control_id': controls[0]['control_id']}))
+        self.accessibility_status = 'timeout'
+        observation = await self.desktop.observe()
+        self.assertTrue(all('control_id' not in c for c in observation['accessibility']['controls']))
+        with self.assertRaises(DesktopValidationError):
+            await self.desktop.act(self.action(action={'kind': 'click_control', 'control_id': controls[0]['control_id']}))
+        self.assertEqual(self.effects, 0)
+
+    async def test_invalid_control_center_does_not_expose_a_dispatchable_id(self):
+        self.controls = [{'name': 'Wrong', 'kind': 'Button', 'x': 0, 'y': 0, 'width': 3, 'height': 3,
+                         'center_x': 7, 'center_y': 7, 'control_id': 'ctl_1234567890abcdef'}]
+        observation = await self.desktop.observe()
+        self.assertNotIn('control_id', observation['accessibility']['controls'][0])
+        with self.assertRaises(DesktopValidationError):
+            await self.desktop.act(self.action(action={'kind': 'click_control', 'control_id': 'ctl_1234567890abcdef'}))
+        self.assertEqual(self.effects, 0)
+
+    async def test_control_lost_response_reconciles_after_restart_without_resolving_new_target(self):
+        controls = await self.observed_controls()
+        request = self.action(action={'kind': 'click_control', 'control_id': controls[0]['control_id']})
+        self.mode = 'lost_response'
+        with self.assertRaises(DesktopError):
+            await self.desktop.act(request)
+        self.controls[0].update(x=4, y=4, center_x=6, center_y=6)
+        await self.desktop.close()
+        self.desktop = Desktop(self.url, 'fixture-token', self.temp.name)
+        await self.desktop.start()
+        await self.desktop.control('resume')
+        result = await self.desktop.act(request)
+        self.assertTrue(result['duplicate'])
+        self.assertEqual(result['coordinate_mapping']['control_id'], controls[0]['control_id'])
+        self.assertEqual(result['coordinate_mapping']['dispatched_action']['x'], 2)
+        self.assertEqual(self.effects, 1)
 
     async def test_invalid_normalized_actions_never_dispatch(self):
         for value in (True, "500", 500.5, -1, 1001):

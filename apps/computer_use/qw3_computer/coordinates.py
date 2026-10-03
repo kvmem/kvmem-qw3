@@ -1,4 +1,5 @@
 """Explicit image-coordinate conversion; never infer units from the numbers."""
+from .targeting import resolve_control
 
 
 def normalized_point(x, y, width, height):
@@ -12,6 +13,8 @@ def normalized_point(x, y, width, height):
 
 
 def dispatch_arguments(arguments, observation):
+    if arguments["action"].get("kind") == "click_control":
+        return resolve_control(arguments, observation)
     space = arguments.get("coordinate_space", "pixels")
     if space not in ("pixels", "normalized_1000"):
         raise ValueError("Unknown coordinate_space; use pixels or normalized_1000")

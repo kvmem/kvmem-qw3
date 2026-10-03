@@ -36,6 +36,15 @@ frozen bundle 06 task results above.
 
 ## Runtime
 
+The latest [targeting and recovery candidate](../../docs/computer_use_targeting_and_recovery_20261003.md)
+adds observation-bound `click_control` IDs for matching visible accessibility
+controls. The program resolves the pixel center and saves the original target
+and dispatched action. When no matching control is exposed, use explicit
+`normalized_1000` visual coordinates. Verify the resulting screen before typing.
+Old control IDs are rejected; lost replies are reconciled through the original
+receipt without resolving or clicking a new target. This interface is undergoing
+separate native qualification; its model-level improvement is not yet established.
+
 The intended application uses the pinned **Codex CLI/app-server 0.159.2** as its
 agent harness. `qw3_computer.codex` starts it over JSONL stdio, in an app-owned
 `CODEX_HOME`, with a local model catalog and provider. It does not load the

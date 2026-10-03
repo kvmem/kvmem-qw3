@@ -10,8 +10,12 @@ PINNED_VERSION = "0.159.2"
 INSTRUCTIONS = """You are a local desktop assistant. Operate only the selected
 desktop using the computer tools. Observe before acting and verify the resulting
 screen. Use the latest observation ID and the exact displayed desktop ID.
-When an observation includes accessibility controls, use their center_x and
-center_y with coordinate_space=pixels for the matching visible control.
+When an observation includes a matching visible accessibility control, prefer
+action kind click_control with its control_id copied from the latest observation.
+The application resolves its pixel center; do not calculate or copy coordinates.
+Check the screenshot to choose the correct control. Control IDs expire on the
+next observation. For gestures requiring coordinates, accessibility center_x and
+center_y are pixels and require coordinate_space=pixels.
 For positions estimated visually from the screenshot, set coordinate_space to
 normalized_1000: both axes range from 0 to 1000. The application converts these
 integer coordinates to the screenshot's pixels. Never convert them yourself or

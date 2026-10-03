@@ -10,6 +10,7 @@ import time
 import aiohttp
 from .coordinates import dispatch_arguments
 from .action_validation import ActionValidationError, validate_action
+from .targeting import TargetError, identify_controls
 
 
 class DesktopError(RuntimeError):
@@ -73,7 +74,7 @@ class Desktop:
         path = self.runtime / "screenshots" / (digest + ".png")
         if not path.exists():
             path.write_bytes(image)
-        metadata = {k: v for k, v in observation.items() if k != "image"}
+        metadata = identify_controls({k: v for k, v in observation.items() if k != "image"})
         self.db.execute("INSERT OR IGNORE INTO observations VALUES (?, ?, ?, ?)",
                         (metadata["observation_id"], self.task_id, json.dumps(metadata), time.time()))
         self.db.commit()
@@ -87,8 +88,8 @@ class Desktop:
     async def observe(self):
         async with self.lock:
             observation = await self.request("GET", "/observe")
-            self.remember(observation)
-            return observation
+            metadata = self.remember(observation)
+            return metadata | {"image": observation["image"]}
 
     def unresolved(self):
         return [{"action_id": json.loads(row[1])["action_id"], "receipt_id": row[0],
@@ -173,6 +174,8 @@ class Desktop:
                     "message": "Stale observation; observe again", "hint": "Use the latest observation_id and reassess the current screen."})
             try:
                 dispatched, mapping = dispatch_arguments(arguments, self.latest)
+            except TargetError as exc:
+                raise DesktopValidationError(exc.problem) from exc
             except (ValueError, TypeError, KeyError) as exc:
                 raise DesktopValidationError({"code": "invalid_coordinates", "path": "$.coordinate_space",
                     "message": str(exc), "hint": "normalized_1000 is only for click, drag or scroll, with integers from 0 to 1000. Use pixels or omit this field for key, type and open_app."}) from exc
@@ -187,6 +190,7 @@ class Desktop:
                 if mapping:
                     result = result | {"coordinate_mapping": mapping}
                 metadata = self.remember(result["observation"])
+                result = result | {"observation": metadata | {"image": result["observation"]["image"]}}
                 self.db.execute("UPDATE actions SET status='completed', result=? WHERE id=?",
                                 (json.dumps(result | {"observation": metadata}), receipt_id))
                 self.db.commit()

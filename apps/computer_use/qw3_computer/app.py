@@ -207,7 +207,7 @@ class Controller:
                 observation = await self.desktop.observe()
                 self.state["thread_id"] = await self.client.new_thread()
                 description = json.dumps({k: v for k, v in observation.items() if k != "image"}, ensure_ascii=False)
-                text = prompt + "\n\nInitial desktop observation (accessibility centers are pixels; visually estimated actions use coordinate_space=normalized_1000):\n" + description
+                text = prompt + "\n\nInitial desktop observation (prefer click_control for a matching visible control_id; visually estimated actions use coordinate_space=normalized_1000):\n" + description
                 if self.software:
                     text += "\nAuthorized local software workspace:\n" + json.dumps(self.software.inspect(self.state["id"]), ensure_ascii=False)
                 if self.state["output_policy"] == "outputs":

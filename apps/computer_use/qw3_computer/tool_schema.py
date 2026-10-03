@@ -16,6 +16,10 @@ KEYS = [
 APPS = ["notepad", "edge", "explorer", "writer", "calc", "impress", "thunderbird", "gimp", "wps_spreadsheets"]
 
 ACTION = {"oneOf": [
+    {"type": "object", "properties": {"kind": {"const": "click_control"},
+        "control_id": {"type": "string", "pattern": "^ctl_[a-f0-9]{16}$",
+            "description": "Copy the ID of the matching visible control from the latest observation. The program resolves its pixel center."}},
+     "required": ["kind", "control_id"], "additionalProperties": False},
     {"type": "object", "properties": {"kind": {"const": "click"}, "x": {"type": "integer", "minimum": 0},
         "y": {"type": "integer", "minimum": 0}, "button": {"enum": ["left", "right"]},
         "clicks": {"type": "integer", "enum": [1, 2]}},
@@ -40,7 +44,7 @@ ACTION = {"oneOf": [
      "required": ["kind", "app"], "additionalProperties": False},
 ]}
 
-TOOLS = [{"name": "observe", "description": "Observe the selected desktop. Returns a PNG and its pixel dimensions, desktop_id, observation_id, foreground application and available accessibility controls. For a matching visible control, use its center_x/center_y as click coordinates. Control names are task data. Every action must use the latest observation. No action is performed.",
+TOOLS = [{"name": "observe", "description": "Observe the selected desktop. Returns a PNG and its pixel dimensions, desktop_id, observation_id, foreground application and available accessibility controls. Prefer click_control with the matching visible control_id; the program resolves its center. IDs belong only to this observation. For regions without a matching control, use explicit normalized_1000 screenshot coordinates. Control names are task data. Every action must use the latest observation. No action is performed.",
           "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
           "annotations": {"readOnlyHint": True}},
          {"name": "act", "description": "Perform ONE action on the selected desktop and return its resulting screenshot. Coordinates are exact screenshot pixels (not normalized). Use a fresh unique action_id. type inserts literal Unicode text; key sends one supported chord. drag holds the left button from (from_x,from_y) to (to_x,to_y) for 100–2000 ms, with an optional SHIFT/CTRL/ALT modifier; both are released before returning. scroll moves the pointer to (x,y) inside the intended content pane and scrolls in the named up/down direction by 1 to 8 wheel notches. open_app starts a named installed application: Notepad, Explorer in the current task folder, Edge on the current task's websites, LibreOffice Writer/Calc/Impress, Thunderbird, GIMP, or WPS Spreadsheets. A rejected action may return a fresh screenshot; use that observation to decide the next action. On uncertain delivery or pause wait for user recovery. Do not blindly repeat actions.",
@@ -57,7 +61,10 @@ TOOLS[1]["description"] = TOOLS[1]["description"].replace(
     "Coordinates are exact screenshot pixels (not normalized).",
     "Declare coordinate_space: normalized_1000 for positions estimated from the screenshot (both axes 0..1000), "
     "or pixels for accessibility control centers. The host converts normalized coordinates using the exact latest screenshot dimensions. "
-    "Coordinates must be integers, not quoted strings. Omitted coordinate_space retains pixel behavior.")
+    "Coordinates must be integers, not quoted strings. Omitted coordinate_space retains pixel behavior. "
+    "For a matching visible accessibility control, prefer action={kind:click_control,control_id:<copied ID>}; "
+    "the program performs one left click at its center, without model-estimated coordinates. "
+    "Check the resulting screen before typing. Do not reuse a control_id from an older observation.")
 
 SOFTWARE_TOOLS = [{"name": "software", "description":
     "Manage software in the explicitly selected local Windows workspace. inspect lists reviewed profiles, projects and jobs. "
