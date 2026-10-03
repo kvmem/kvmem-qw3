@@ -39,6 +39,25 @@ async def wait_json(path, timeout):
         return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
+def validate_repair_fixture(path, definition=None):
+    fixture=json.loads(path.read_text())
+    if fixture.get('status')!='ready_fault_injected':
+        raise ValueError('Repair fixture is not ready')
+    if definition:
+        if (fixture.get('fixture_source_sha256')!=definition['reset_source_sha256']
+                or fixture.get('workspace')!=definition['workspace']):
+            raise ValueError('Repair fixture differs from frozen acceptance inputs')
+        mode=definition.get('input_mode','reset')
+        if mode=='initial':
+            if sha256(path)!=definition['initial_sha256'] or fixture.get('reset_from_sha256') is not None:
+                raise ValueError('Initial repair fixture differs from its frozen bytes')
+        elif mode=='reset':
+            if fixture.get('reset_from_sha256')!=definition['sha256']:
+                raise ValueError('Repair reset differs from frozen acceptance inputs')
+        else:raise ValueError('Unsupported repair fixture input mode')
+    return fixture
+
+
 async def run(args):
     output = args.output.resolve()
     identity = output.name
@@ -77,6 +96,10 @@ async def run(args):
             if json.loads((args.bundle / "archive.json").read_text())["sha256"] != frozen["bundle_sha256"]:
                 raise ValueError("Native bundle differs from frozen acceptance")
             report["acceptance"] = {"manifest_sha256": sha256(args.acceptance_manifest), "definition": frozen}
+        if args.repair_fixture:
+            # Reject invalid preparation before restoring a VM, installing a
+            # bundle, starting recording or allocating a model relay.
+            validate_repair_fixture(args.repair_fixture,frozen['repair_fixture'] if args.acceptance_manifest else None)
         info = json.loads(await command("docker", "inspect", "qw3-computer-windows"))[0]
         if info["Config"].get("Labels", {}).get("com.qw3.computer-use.owner") != "codex-goal-20260930":
             raise ValueError("VM ownership mismatch")
@@ -174,15 +197,7 @@ async def run(args):
                          'model_output_tokens':args.model_output_tokens,
                          "guest_script_sha256": sha256(guest_path), "executor_sha256": sha256(output / "executed-executor.ps1")}
         if args.repair_fixture:
-            fixture = json.loads(args.repair_fixture.read_text())
-            if fixture.get("status") != "ready_fault_injected":
-                raise ValueError("Repair fixture is not ready")
-            if args.acceptance_manifest:
-                definition = frozen["repair_fixture"]
-                if (fixture.get("reset_from_sha256") != definition["sha256"]
-                        or fixture.get("fixture_source_sha256") != definition["reset_source_sha256"]
-                        or fixture.get("workspace") != definition["workspace"]):
-                    raise ValueError("Repair reset differs from frozen acceptance inputs")
+            fixture=validate_repair_fixture(args.repair_fixture,frozen['repair_fixture'] if args.acceptance_manifest else None)
             shutil.copyfile(args.repair_fixture, SHARE / (identity + "-fixture.json"))
             shutil.copyfile(args.repair_fixture, output / "fixture.json")
             configuration["repair_fixture_sha256"] = sha256(args.repair_fixture)

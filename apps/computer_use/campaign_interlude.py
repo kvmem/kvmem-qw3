@@ -31,6 +31,10 @@ def pilot_spec(args):
     scenario,repair=WINDOWS_CASES[args.case]
     if not args.bundle or not args.engine or not args.ffmpeg or repair!=bool(args.repair_fixture):
         raise ValueError('Windows case requires qualified bundle, live engine, ffmpeg and the correct fixture kind')
+    if repair:
+        from software_product_run import validate_repair_fixture
+        definition=json.loads(args.acceptance_manifest.read_text())['repair_fixture'] if args.acceptance_manifest else None
+        validate_repair_fixture(args.repair_fixture,definition)
     # Product runner identities are 8..40 characters. Avoid the shared basename
     # "pilot", which would collide in the Windows SMB share across attempts.
     trial=args.output/(args.output.name+'-trial')
