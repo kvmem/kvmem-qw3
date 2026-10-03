@@ -19,7 +19,7 @@ APPS = ["notepad", "edge", "explorer", "writer", "calc", "impress", "thunderbird
 ACTION = {"oneOf": [
     {"type": "object", "properties": {"kind": {"const": "click_control"},
         "control_id": {"type": "string", "pattern": "^ctl_[a-f0-9]{16}$",
-            "description": "Copy the ID of the matching visible control from the latest observation. The program resolves its pixel center."}},
+            "description": "Copy the COMPLETE20-character ID of the matching visible control from the latest observation: ctl_ plus16 lowercase hexadecimal characters. Do not truncate it or use its label. The program resolves its pixel center."}},
      "required": ["kind", "control_id"], "additionalProperties": False},
     {"type": "object", "properties": {"kind": {"const": "click"}, "x": {"type": "integer", "minimum": 0},
         "y": {"type": "integer", "minimum": 0}, "button": {"enum": ["left", "right"]},

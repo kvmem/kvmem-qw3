@@ -119,6 +119,18 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(DesktopError, "different arguments"):
             await self.desktop.act(request | {"action": {"kind": "key", "key": "ENTER"}})
 
+    async def test_truncated_control_id_explains_copy_error_and_never_guesses_missing_characters(self):
+        controls=await self.observed_controls()
+        target=controls[0]['control_id']
+        with self.assertRaises(DesktopValidationError) as caught:
+            await self.desktop.act(self.action(action={'kind':'click_control','control_id':target[:-2]}))
+        self.assertEqual(caught.exception.problem['code'],'invalid_control_id')
+        self.assertIn('20 characters total',caught.exception.problem['hint'])
+        self.assertEqual(self.effects,0)
+        self.assertEqual(self.desktop.unresolved(),[])
+        await self.desktop.act(self.action('correct_copy',action={'kind':'click_control','control_id':target}))
+        self.assertEqual(self.effects,1)
+
     async def enable_expired_step(self):
         from qw3_computer.execution import Execution
         self.execution=Execution(self.desktop,Path(self.temp.name))

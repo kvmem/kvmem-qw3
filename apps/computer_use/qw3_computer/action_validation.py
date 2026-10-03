@@ -68,6 +68,10 @@ def validate_action(arguments):
                 fail('invalid_length', path, 'String length is outside the accepted range.',
                      f"Use {schema.get('minLength', 0)}..{schema.get('maxLength', 'unbounded')} characters.")
             if 'pattern' in schema and not re.fullmatch(schema['pattern'], value):
+                if path=='$.action.control_id':
+                    fail('invalid_control_id',path,'Control ID is not the complete observed identifier.',
+                         'Copy the full control_id from the latest observation: ctl_ followed by exactly16 lowercase hexadecimal characters (20 characters total). '
+                         'Do not shorten it, copy a label instead, or invent missing characters. No input was sent.')
                 fail('invalid_characters', path, 'String contains unsupported characters.',
                      'Use letters, digits, underscores or hyphens for this identifier.')
         elif expected == 'integer':
