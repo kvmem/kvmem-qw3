@@ -100,12 +100,12 @@
     },
     "P3": {
       "status": "baseline_running_candidate_implemented_host_checked",
-      "trials_completed": 9,
+      "trials_completed": 13,
       "planned_trials": 32,
       "report": "docs/computer_use_recovery_diagnostic_p3_20261003.md",
       "baseline_bundle": "windows-native-client-30",
       "condition_count": 8,
-      "model_trials_completed": 9,
+      "model_trials_completed": 13,
       "scripted_conditions_qualified": [
         "normal",
         "wrong_focus",
@@ -135,12 +135,12 @@
       "model_preflight_completed": 1,
       "model_preflight_passed": 1,
       "model_preflight_evidence": "apps/computer_use/.runtime/p3-native-preflight-01/summary.json",
-      "formal_baseline_completed": 9,
-      "formal_baseline_passed": 7,
+      "formal_baseline_completed": 13,
+      "formal_baseline_passed": 10,
       "baseline_frozen": true,
       "baseline_acceptance": "apps/computer_use/.runtime/p3-baseline-20261003/acceptance.json",
       "baseline_campaign": "apps/computer_use/.runtime/p3-baseline-20261003/campaign.json",
-      "active_trial": "p3-baseline-r2-07",
+      "active_trial": "p3-baseline-r2-03",
       "candidate_changes_implemented": 2,
       "observed_baseline_issue": {
         "kind": "cross_task_gui_action_id_collision",
@@ -179,7 +179,16 @@
       "candidate_changes": [
         "Task-scoped GUI wire/ledger IDs with legacy receipt lookup and strict received-action/desktop identity checks.",
         "Exact public action field validation; after three known non-deliveries pause; observe-only unchanged foreground requires >=3 observations and >=30 monotonic seconds; active software jobs exempt; explicit resume resets recovery streak, not tool budget."
-      ]
+      ],
+      "candidate_bundle": {
+        "directory": "apps/computer_use/.runtime/windows-native-client-31",
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-native-client-31.zip",
+        "sha256": "23be842ab569dd86d98a9dfc524e46a7efb269cebd82a26b7adfbae3550bfc3a",
+        "bytes": 175796498,
+        "native_qualified": false
+      },
+      "candidate_qualification_handle": "apps/computer_use/.runtime/p3-baseline-20261003/candidate-qualification-handle.json",
+      "baseline_partial_audit": "apps/computer_use/.runtime/p3-baseline-20261003/audit-partial-latest-check.json"
     },
     "P4": {
       "status": "planned",
