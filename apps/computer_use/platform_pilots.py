@@ -88,6 +88,22 @@ def run(args):
                                 for name in ['browser_pilot.py','browser_pilot_server.js','calc_pilot.py','android_contacts_pilot.py']}
     manifest['recording_sources']={name:hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest()
                                  for name in ['linux_recording.py','vm/record_console.py','vm/vnc_admin.py','live_android_recording.py']}
+    dependencies=args.runtime/'device-dependencies-canonical-20261004.json'
+    if dependencies.exists():
+        # This is a separate dependency upgrade, not a rewrite of the private
+        # core manifest or any earlier pilot's declared configuration.
+        declaration=json.loads(dependencies.read_text())
+        from device_receipt_qualification import owned_gateway
+        from qw3_computer.device_registry import load_registry
+        item=load_registry(ROOT/'apps/computer_use/.runtime/cross-device-catalogue.json')[desired]
+        live=owned_gateway(item)
+        declared=next(row for row in declaration['devices'] if row['catalogue_id']==desired)
+        entry=Path(__file__).with_name('device_gateway_entry.py')
+        if (live['pid']!=declared['pid'] or live['command']!=declared['command']
+                or hashlib.sha256(entry.read_bytes()).hexdigest()!=declaration['entry_sha256']):
+            raise ValueError('Declared candidate gateway dependency changed')
+        manifest['device_dependency_upgrade']={'sha256':hashlib.sha256(dependencies.read_bytes()).hexdigest(),
+            'entry_sha256':declaration['entry_sha256'],'gateway_pid':live['pid'],'gateway_device_id':live['device_id']}
     save(directory / "pilot-manifest.json", manifest)
     video = None
     fixture = None
