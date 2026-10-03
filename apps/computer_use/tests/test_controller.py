@@ -553,6 +553,27 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('gui_recovery', self.controller.state)
         self.assertEqual(self.controller.state['status'], 'running')
 
+    async def test_evidence_refresh_preserves_error_count_without_triggering_third_format_rejection(self):
+        from qw3_computer.desktop import DesktopValidationError
+        await self.controller.start_task('Recover after two format corrections and an aged view')
+        problem={'code':'wrong_type','path':'$.action.steps','message':'Expected integer','hint':'Correct this field'}
+        self.desktop.act=AsyncMock(side_effect=DesktopValidationError(problem))
+        for _ in range(2):await self.controller.tool('act',{})
+        self.desktop.act=AsyncMock(side_effect=DesktopRejected('Old view changed; no input sent',
+            observation=self.desktop.latest | {'image':'fixture'},evidence_refreshed=True))
+        result=await self.controller.tool('act',{})
+        payload=json.loads(result['content'][0]['text'])
+        self.assertEqual(payload['problem']['code'],'evidence_refreshed')
+        self.assertFalse(payload['dispatched'])
+        self.assertEqual(self.controller.state['status'],'running')
+        self.assertEqual(self.controller.state['gui_recovery']['rejected_calls'],2)
+        self.assertEqual(self.controller.state['tool_calls_used'],3)
+        self.controller.client.interrupt.assert_not_called()
+        self.desktop.act=AsyncMock(side_effect=DesktopValidationError(problem))
+        await self.controller.tool('act',{})
+        self.assertEqual(self.controller.state['status'],'paused')
+        self.assertEqual(self.controller.state['gui_recovery']['rejected_calls'],3)
+
     async def test_unchanged_observe_loop_pauses_but_changing_loading_does_not(self):
         await self.controller.start_task('Observe progress')
         with patch.object(self.controller, 'recovery_clock', return_value=100):

@@ -19,9 +19,10 @@ class DesktopError(RuntimeError):
 
 class DesktopRejected(DesktopError):
     """The executor explicitly rejected a request before dispatching it."""
-    def __init__(self,message,*,observation=None):
+    def __init__(self,message,*,observation=None,evidence_refreshed=False):
         super().__init__(message)
         self.observation=observation
+        self.evidence_refreshed=evidence_refreshed
 
 
 class DesktopValidationError(DesktopError):
@@ -200,28 +201,49 @@ class Desktop:
                     "message": str(exc), "hint": "normalized_1000 is only for click, drag or scroll, with integers from 0 to 1000. Use pixels or omit this field for key, type and open_app."}) from exc
             revalidation=None
             captured=self.latest.get('captured_at')
-            if self.execution and type(captured) in (int,float) and time.time()*1000-captured>=50000:
+            aged=type(captured) in (int,float) and time.time()*1000-captured>=50000
+            guarded_control=self.execution and arguments['action']['kind']=='click_control'
+            if self.execution and (aged or guarded_control):
                 old=self.latest
                 fresh=self.remember(await self.request('GET','/observe'))
                 identity=('desktop_id','device_id','session_id','display_id','width','height','rotation')
                 same_device=all(old.get(k)==fresh.get(k) for k in identity)
                 def controls(observation):
                     a11y=observation.get('accessibility',{})
-                    return a11y | {'controls':[{k:v for k,v in c.items() if k!='control_id'}
+                    return {k:a11y.get(k) for k in ('status','truncated')} | {'controls':[{k:v for k,v in c.items() if k!='control_id'}
                         for c in a11y.get('controls',[])]}
                 same_view=(old.get('sha256')==fresh.get('sha256') and old.get('foreground')==fresh.get('foreground')
                            and controls(old)==controls(fresh))
+                target_valid=False
+                if guarded_control and same_device:
+                    target=mapping['control']
+                    signature={k:v for k,v in target.items() if k!='control_id'}
+                    matches=[c for c in fresh.get('accessibility',{}).get('controls',[])
+                             if {k:v for k,v in c.items() if k!='control_id'}==signature]
+                    if fresh.get('accessibility',{}).get('status')=='ok' and len(matches)==1 and old.get('foreground')==fresh.get('foreground'):
+                        from PIL import Image
+                        bounds=(max(0,target['x']),max(0,target['y']),
+                                min(old['width'],target['x']+target['width']),min(old['height'],target['y']+target['height']))
+                        with Image.open(self.runtime/'screenshots'/(old['sha256']+'.png')) as first, \
+                             Image.open(self.runtime/'screenshots'/(fresh['sha256']+'.png')) as second:
+                            target_valid=first.crop(bounds).convert('RGBA').tobytes()==second.crop(bounds).convert('RGBA').tobytes()
                 independent_app_intent=arguments['action']['kind']=='open_app'
                 revalidation={'source_observation_id':old['observation_id'],'fresh_observation_id':fresh['observation_id'],
-                    'age_milliseconds':time.time()*1000-captured,'same_device':same_device,'same_view':same_view,
-                    'scope':'Explicit allowed app intent' if independent_app_intent else 'Exact screenshot, foreground and control evidence',
+                    'age_milliseconds':time.time()*1000-captured if type(captured) in (int,float) else None,
+                    'same_device':same_device,'same_view':same_view,'target_control_valid':target_valid if guarded_control else None,
+                    'scope':('Explicit allowed app intent' if independent_app_intent else
+                             'Fresh control identity, bounds and target image region' if guarded_control and not aged else
+                             'Exact screenshot, foreground and control evidence'),
                     'input_sent':False}
                 self.db.execute('INSERT INTO revalidations VALUES (?,?,?)',(receipt_id,old['observation_id'],json.dumps(revalidation)))
                 self.db.commit()
-                if not same_device or not (same_view or independent_app_intent):
-                    raise DesktopRejected('The observation aged while reasoning and the current view changed. '
+                allowed=same_view or independent_app_intent
+                if guarded_control:
+                    allowed=target_valid and (same_view if aged else True)
+                if not same_device or not allowed:
+                    raise DesktopRejected('The current target or view changed since the observation. '
                         'No input was sent. Retain the existing plan; reassess its next target against this current observation.',
-                        observation=self.with_image(fresh))
+                        observation=self.with_image(fresh),evidence_refreshed=same_device)
                 dispatched=dispatched | {'desktop_id':fresh['desktop_id'],'observation_id':fresh['observation_id']}
             if self.execution:
                 self.execution.before_dispatch(arguments, dispatched, receipt_id)

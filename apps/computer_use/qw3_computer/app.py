@@ -576,8 +576,19 @@ class Controller:
                 observation = exc.observation or await self.desktop.observe()
             except DesktopError:
                 raise exc
-            problem = executor_rejection_problem(str(exc))
-            recovery = await self.note_gui_rejection(problem, task_id)
+            if exc.evidence_refreshed:
+                # A valid action whose old view changed is a synchronization
+                # response, not another malformed model call. Keep previous
+                # format-error counts; never replay input or erase budgets.
+                problem={'code':'evidence_refreshed','path':'$.observation_id','message':str(exc),
+                         'hint':'Use this fresh observation to reassess only the next target. No input was sent.'}
+                stalled=await self.note_gui_observation(observation,task_id)
+                recovery=stalled or {'evidence_refreshed':True,
+                    'rejected_calls':self.state.get('gui_recovery',{}).get('rejected_calls',0),'limit':3,
+                    'paused':self.state['status']=='paused'}
+            else:
+                problem = executor_rejection_problem(str(exc))
+                recovery = await self.note_gui_rejection(problem, task_id)
             return mcp_observation(observation, {"action_id": arguments.get("action_id"),
                 "status": "rejected", "dispatched": False, "error": str(exc), "problem": problem,
                 "recovery": recovery}) | {"isError": True}

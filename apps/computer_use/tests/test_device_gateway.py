@@ -8,7 +8,7 @@ from PIL import Image
 
 from qw3_computer.device_gateway import Gateway, DeviceRejected
 from qw3_computer.device_protocol import capabilities
-from qw3_computer.linux_driver import controls_from_xml as linux_controls
+from qw3_computer.linux_driver import controls_from_xml as linux_controls, foreground_tree_script
 from qw3_computer.android_driver import controls_from_xml as android_controls
 
 
@@ -130,6 +130,29 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             result=linux_controls(xml,{'title':'Same title'},32,32)
             self.assertEqual(result['status'],'foreground_unmatched')
             self.assertEqual(result['controls'],[])
+
+    def test_linux_foreground_title_cannot_become_driver_code(self):
+        # A visible UI title is untrusted task data even in an internal driver.
+        title="';raise RuntimeError('title executed');#\nSecond line"
+        import contextlib
+        import json
+        import sys
+        from types import SimpleNamespace, ModuleType
+        from unittest.mock import patch
+        frame=SimpleNamespace(name=title,getRoleName=lambda:'frame')
+        source=ModuleType('src')
+        source.accessibility=SimpleNamespace(
+            pyatspi=SimpleNamespace(Registry=SimpleNamespace(getDesktop=lambda _: [[frame]])),
+            get_libreoffice_version=lambda:(7,3),create_atspi_node=lambda _: 'node',
+            lxml=SimpleNamespace(etree=SimpleNamespace(tostring=lambda *_args,**_kwargs:'safe tree')))
+        stream=io.StringIO()
+        previous_path=list(sys.path)
+        try:
+            with patch.dict(sys.modules,{'src':source}),contextlib.redirect_stdout(stream):
+                exec(compile(foreground_tree_script(title),'<internal-driver-title-test>','exec'),{})
+        finally:
+            sys.path[:]=previous_path
+        self.assertEqual(json.loads(stream.getvalue()),{'status':'ok','AT':'safe tree'})
 
     def test_android_keeps_unlabeled_inputs_but_not_passive_container_ids(self):
         xml='''<hierarchy><node resource-id="layout" enabled="true" clickable="false" bounds="[0,0][30,30]"/><node resource-id="search" enabled="true" focusable="true" bounds="[0,0][20,10]"/><node text="5 minutes" enabled="true" checkable="true" checked="true" bounds="[0,10][20,20]"/></hierarchy>'''

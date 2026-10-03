@@ -16,7 +16,7 @@ from qw3_computer.limits import MAX_MODEL_REQUEST_BYTES
 NATIVE_TEST_FILES = (
     "test_protocol.py", "test_bridge.py", "test_controller.py", "test_desktop.py",
     "test_collect_artifacts.py", "test_long_evidence.py", "test_task_driver.py",
-    "test_execution.py", "test_device_gateway.py", "test_device_registry.py",
+    "test_execution.py", "test_device_gateway.py", "test_device_registry.py", "test_linux_capture.py",
     "test_vm_relay.py", "test_codex_integration.py", "test_thinking.py", "test_software.py", "test_software_latex.py", "fixture_mcp.py", "fixture_long_mcp.py",
 )
 
@@ -122,7 +122,7 @@ exit $LASTEXITCODE
         "kind": "windows_native_client_offline_bundle", "qualified": False,
         "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
         "python_version": "3.13.13", "codex_version": "0.159.2",
-        "runtime_capabilities": ["configurable_backend_waits", "large_visual_history_requests", "backend_error_receipts", "opt_in_local_thinking", "application_focus_receipts", "opt_in_software_workflows", "task_scoped_gui_receipts", "bounded_gui_error_recovery", "observation_scoped_control_targets", "cross_device_steps", "explicit_visual_coordinates", "configurable_model_output_budget", "expired_observation_revalidation"],
+        "runtime_capabilities": ["configurable_backend_waits", "large_visual_history_requests", "backend_error_receipts", "opt_in_local_thinking", "application_focus_receipts", "opt_in_software_workflows", "task_scoped_gui_receipts", "bounded_gui_error_recovery", "observation_scoped_control_targets", "cross_device_steps", "explicit_visual_coordinates", "configurable_model_output_budget", "expired_observation_revalidation", "refreshed_observation_recovery", "foreground_scoped_linux_capture", "fresh_control_target_guard"],
         "model_request_limit_bytes": MAX_MODEL_REQUEST_BYTES,
         "backend_wait_defaults": {"total_seconds": 600, "read_seconds": 180, "heartbeat_seconds": 30},
         "test_scope": "Windows runtime and cross-device execution contracts; host OSWorld/scoring tests remain in the repository",

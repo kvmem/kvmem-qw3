@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import re
+import time
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 
@@ -36,6 +37,26 @@ else:
 APPS = {"notepad": ["gedit"], "edge": ["google-chrome"], "explorer": ["nautilus"],
         "writer": ["libreoffice","--writer"], "calc": ["libreoffice","--calc"],
         "impress": ["libreoffice","--impress"], "thunderbird": ["thunderbird"], "gimp": ["gimp"]}
+
+
+def foreground_tree_script(title):
+    # Reuse the pinned OSWorld server's traversal and Calc handling. The
+    # model cannot submit code through this driver; the title is a data literal.
+    return '''import sys,json
+sys.path.insert(0,'/home/user/server')
+from src import accessibility as a
+frames=[]
+for app in a.pyatspi.Registry.getDesktop(0):
+ for frame in app:
+  if frame.getRoleName() in ('frame','dialog') and frame.name==''' + repr(title) + ''':frames.append(frame)
+if len(frames)>1:frames=[f for f in frames if f.getState().contains(a.pyatspi.STATE_ACTIVE)]
+if len(frames)!=1:
+ print(json.dumps({'status':'foreground_unmatched','AT':None}))
+else:
+ a.libreoffice_version_tuple=a.get_libreoffice_version()
+ xml=a.lxml.etree.tostring(a.create_atspi_node(frames[0]),encoding='unicode')
+ print(json.dumps({'status':'ok','AT':xml}))
+'''
 
 
 def attrs(node):
@@ -94,9 +115,14 @@ class LinuxDriver:
     async def start(self):
         self.session=aiohttp.ClientSession(trust_env=False,timeout=aiohttp.ClientTimeout(total=8))
 
-    async def execute(self,code):
+    async def execute(self,code,*,read_timeout=None):
         # One POST only: even OSWorld's default controller retry would be unsafe here.
-        async with self.session.post(self.endpoint+'/execute',json={'command':['python','-c',code],'shell':False}) as r:
+        body={'command':['python','-c',code],'shell':False}
+        options={}
+        if read_timeout is not None:
+            body['timeout']=read_timeout
+            options['timeout']=aiohttp.ClientTimeout(total=read_timeout+2)
+        async with self.session.post(self.endpoint+'/execute',json=body,**options) as r:
             result=await r.json()
             if r.status!=200 or result.get('returncode',0)!=0 or result.get('status')=='error':
                 if 'QW3_PRE_DISPATCH_FOCUS_REJECT' in str(result.get('error','')):
@@ -117,12 +143,19 @@ class LinuxDriver:
             # Exclude the desktop's clock, dock and cursor from foreground progress.
             region=image.crop((75,30,width,max(31,height-45))).convert('RGB')
             progress=hashlib.sha256(region.tobytes()).hexdigest()
-        accessibility={'status':'unavailable','controls':[],'truncated':False}
+        accessibility={'status':'unavailable','controls':[],'truncated':False,'scope':'foreground_window'}
+        began=time.monotonic()
         try:
-            async with self.session.get(self.endpoint+'/accessibility',timeout=aiohttp.ClientTimeout(total=4)) as r:
-                r.raise_for_status();tree=(await r.json())['AT']
-            accessibility=controls_from_xml(tree,before,width,height)
-        except (aiohttp.ClientError,TimeoutError,ET.ParseError,KeyError):pass
+            result=await self.execute(foreground_tree_script(before['title']),read_timeout=4)
+            tree=json.loads(result['output'])
+            if tree['status']=='ok':
+                accessibility=controls_from_xml(tree['AT'],before,width,height)
+            else:
+                accessibility={'status':'foreground_unmatched','controls':[],'truncated':False}
+        except (aiohttp.ClientError,TimeoutError,RuntimeError,ET.ParseError,KeyError,ValueError) as exc:
+            accessibility['error_kind']=type(exc).__name__
+        accessibility.update(scope='foreground_window',read_seconds=time.monotonic()-began,
+                             provider='official-osworld-create_atspi_node',read_deadline_seconds=4)
         after=await self.foreground()
         if before!=after:accessibility={'status':'foreground_changed','controls':[],'truncated':False}
         return {'png':png,'foreground':after,'accessibility':accessibility,'progress_sha256':progress}

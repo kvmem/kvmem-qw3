@@ -38,9 +38,9 @@
     "baseline_and_resources": "complete",
     "execution_core": "in_progress",
     "platform_contracts": "in_progress",
-    "product_tasks": "pending",
+    "product_tasks": "in_progress",
     "osworld_matched_comparison": "in_progress",
-    "diagnosis_and_retest": "pending",
+    "diagnosis_and_retest": "in_progress",
     "kvmem_and_delivery": "pending"
   },
   "formal_attempts": [
@@ -148,6 +148,30 @@
       "tool_calls": 47,
       "model_score_valid": true,
       "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/010-legacy-r1/result.json"
+    },
+    {
+      "task": "038",
+      "arm": "legacy",
+      "repetition": 1,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 898.4291156781837,
+      "tool_calls": 22,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/038-legacy-r1/result.json"
+    },
+    {
+      "task": "038",
+      "arm": "verified",
+      "repetition": 1,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 667.8779564290307,
+      "tool_calls": 20,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/038-verified-r1/result.json"
     }
   ],
   "warnings": [
@@ -284,6 +308,35 @@
       "model_used": false,
       "log": "/tmp/qw3-platform-fixtures-qualified-tests.log",
       "scope": "Browser submissions, Calc saved data, media failure preservation, replacement-container cleanup guard and device gateway regression"
+    },
+    "foreground_capture_candidate": {
+      "passed": true,
+      "model_used": false,
+      "captures": 3,
+      "control_counts": [
+        80,
+        80,
+        80
+      ],
+      "seconds": [
+        3.6545,
+        3.5378,
+        3.7196
+      ],
+      "path": "apps/computer_use/.runtime/linux/foreground-capture-qualification-01/result.json"
+    },
+    "evidence_refresh_recovery": {
+      "run": 83,
+      "passed": 83,
+      "model_used": false,
+      "log": "/tmp/qw3-evidence-refresh-recovery-tests.log"
+    },
+    "control_target_revalidation": {
+      "run": 86,
+      "passed": 86,
+      "real_model": false,
+      "log": "/tmp/qw3-control-target-refresh-tests.log",
+      "scope": "Fresh control identity and target-image region, recovery accounting, execution and controller regression"
     }
   },
   "integration_pilots": [
@@ -427,6 +480,22 @@
       "unassisted_passed": false,
       "video_bytes": 1358760,
       "other_system_setting_changes": {}
+    },
+    {
+      "id": "candidate-interlude-contacts-01",
+      "formal": false,
+      "status": "failed",
+      "seconds": 210.33237604191527,
+      "tool_calls": 14,
+      "uncertain_actions": 0,
+      "video_bytes": 1309819,
+      "categories": [
+        "control-click-under-keyboard",
+        "quoted-scroll-steps",
+        "pixel-values-relabeled-normalized",
+        "evidence-refresh-counted-as-third-rejection"
+      ],
+      "path": "apps/computer_use/.runtime/candidate-interlude-contacts-01/pilot/integration-result.json"
     }
   ],
   "app_entry": "http://127.0.0.1:18205/",
@@ -525,23 +594,23 @@
   "frozen_campaign": {
     "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/plan.json",
     "commit": "9fe52d3ee254786012652ec9fc85f340b71e9dc9",
-    "finished": 8,
+    "finished": 10,
     "total": 40,
     "current": [
-      "038-legacy-r1"
+      "022-verified-r1"
     ]
   },
   "post_freeze_optimizations": {
-    "candidate": "cross-device-ui-09",
+    "candidate": "cross-device-ui-10",
     "formal_campaign_changes": false,
     "output_tokens": 16384,
     "expired_observations": "Recapture; exact unchanged view or explicit allowed app intent can dispatch once; other changes return current view without input",
-    "real_model_retest": "pending",
+    "real_model_retest": "contacts01 failed with saved video; corrected candidate retest pending",
     "control_id_copy_hint": "Complete20-character observed IDs; the server currently does not enforce identifier enums during decoding, no constrained-decoding benefit claimed"
   },
   "formal_summary": {
-    "ended_attempts": 8,
-    "valid_original_scores": 6,
+    "ended_attempts": 10,
+    "valid_original_scores": 8,
     "infrastructure_failures": 2,
     "successes": 0,
     "improvement_demonstrated": false
@@ -557,8 +626,10 @@
       "linux_browser",
       "linux_calc"
     ],
-    "foreground_tree_read": "Measured3.428s by reusing official traversal, not yet integrated",
-    "linux_accessibility_limit": "Whole-desktop4s limit unavailable in loaded Calc scene"
+    "foreground_tree_read": "Integrated official foreground traversal; three real Calc captures succeeded within4s, generalization unproven",
+    "linux_accessibility_limit": "Whole-desktop4s limit unavailable in loaded Calc scene",
+    "recovery_counter": "Same-device safe evidence refresh does not consume malformed-call allowance; original error counts and cumulative budget remain",
+    "control_target_guard": "Verified click_control refreshes even young observations; same unique control identity and target image crop required before one dispatch"
   },
-  "updated_at": 1791057399.91765
+  "updated_at": 1791060071.962569
 }

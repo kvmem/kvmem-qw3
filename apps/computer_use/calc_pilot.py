@@ -61,8 +61,8 @@ def grade_bytes(data, initial):
 
 def initialize(linux_execute, directory):
     from pathlib import Path
-    from browser_pilot import identity
-    guest_file = '/home/user/Desktop/qw3-pilot-budget-' + identity(Path(directory).name) + '.xlsx'
+    from platform_pilots import fixture_identity
+    guest_file = '/home/user/Desktop/qw3-pilot-budget-' + fixture_identity(Path(directory)) + '.xlsx'
     initial = initial_workbook()
     linux_execute('from pathlib import Path;import base64,subprocess;'
                   f'p=Path({guest_file!r});data=base64.b64decode({base64.b64encode(initial).decode()!r});'

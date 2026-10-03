@@ -43,6 +43,7 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.mode = "normal"
         self.controls = None
         self.accessibility_status = "ok"
+        self.accessibility_extra = {}
         self.receipts = {}
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
@@ -89,7 +90,7 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
                 "image": base64.b64encode(self.png).decode(), "sha256": hashlib.sha256(self.png).hexdigest(),
                 "width": 8, "height": 8, "paused": self.paused}
         if self.controls is not None:
-            result['accessibility'] = {'status': self.accessibility_status, 'controls': self.controls}
+            result['accessibility'] = {'status': self.accessibility_status, 'controls': self.controls} | self.accessibility_extra
         return result
 
     async def observed_controls(self):
@@ -158,6 +159,50 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(DesktopRejected) as caught:
             await self.desktop.act(action)
         self.assertEqual(caught.exception.observation['observation_id'],self.desktop.latest['observation_id'])
+        self.assertTrue(caught.exception.evidence_refreshed)
+        self.assertEqual(self.effects,0)
+        self.assertEqual(self.desktop.unresolved(),[])
+        self.execution.close()
+
+    async def test_capture_timing_metadata_does_not_invalidate_identical_ui_evidence(self):
+        self.accessibility_extra={'read_seconds':.5,'scope':'foreground_window'}
+        await self.observed_controls()
+        step=await self.enable_expired_step()
+        action=self.action(step=step)
+        self.accessibility_extra['read_seconds']=1.25
+        result=await self.desktop.act(action)
+        self.assertTrue(result['observation_revalidation']['same_view'])
+        self.assertEqual(self.effects,1)
+        self.execution.close()
+
+    async def test_control_target_is_rechecked_before_one_input_when_source_is_young(self):
+        from qw3_computer.execution import Execution
+        controls=await self.observed_controls()
+        self.execution=Execution(self.desktop,Path(self.temp.name))
+        self.desktop.execution=self.execution
+        action=self.action(step={'goal':'Click Save','conditions':[{'kind':'screen_changed'}]},
+                           action={'kind':'click_control','control_id':controls[0]['control_id']})
+        source=action['observation_id']
+        result=await self.desktop.act(action)
+        self.assertNotEqual(self.last_dispatched['observation_id'],source)
+        self.assertTrue(result['observation_revalidation']['target_control_valid'])
+        await self.desktop.act(action)
+        self.assertEqual(self.effects,1)
+        self.execution.close()
+
+    async def test_keyboard_covering_unchanged_control_bounds_rejects_without_input(self):
+        from qw3_computer.execution import Execution
+        controls=await self.observed_controls()
+        self.execution=Execution(self.desktop,Path(self.temp.name))
+        self.desktop.execution=self.execution
+        action=self.action(step={'goal':'Click the intended field','conditions':[{'kind':'screen_changed'}]},
+                           action={'kind':'click_control','control_id':controls[0]['control_id']})
+        pixels=io.BytesIO()
+        Image.new('RGB',(8,8),'red').save(pixels,format='PNG')
+        self.png=pixels.getvalue()  # The tree still exposes the covered field.
+        with self.assertRaises(DesktopRejected) as caught:
+            await self.desktop.act(action)
+        self.assertTrue(caught.exception.evidence_refreshed)
         self.assertEqual(self.effects,0)
         self.assertEqual(self.desktop.unresolved(),[])
         self.execution.close()

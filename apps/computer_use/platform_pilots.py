@@ -50,9 +50,19 @@ def linux_execute(code):
     return result
 
 
+def fixture_identity(directory):
+    from browser_pilot import identity
+    # Scheduler interludes all use a nested "pilot" evidence directory. Its
+    # parent is the attempt identity; using only "pilot" creates ambiguous
+    # contacts and colliding browser fixture folders in later repetitions.
+    value=directory.parent.name+'-'+directory.name if directory.name=='pilot' else directory.name
+    return identity(value)
+
+
 def run(args):
     directory = args.output.resolve()
     directory.mkdir(parents=True, exist_ok=False)
+    identity_value=fixture_identity(directory)
     state = request(args.app, "/api/state")
     if state["status"] not in {"idle", "completed", "failed", "stopped"} or state["uncertain_actions"]:
         raise ValueError("Finish the existing task and reconcile uncertain input before a pilot")
@@ -96,7 +106,7 @@ def run(args):
                 save(directory / "initial-system-settings.json", before_settings)
             elif args.case=='android_contacts':
                 from android_contacts_pilot import initialize
-                fixture,prompt=initialize(android_command,directory.name)
+                fixture,prompt=initialize(android_command,identity_value)
                 save(directory/'contacts-fixture.json',fixture)
                 manifest['prompt']=prompt
                 save(directory/'pilot-manifest.json',manifest)
@@ -105,7 +115,7 @@ def run(args):
                                  '-c','android.intent.category.LAUNCHER','-p','com.google.android.contacts'],capture_output=True)
             else:
                 from browser_pilot import initialize
-                browser_fixture,prompt=initialize('android',directory.name,directory)
+                browser_fixture,prompt=initialize('android',identity_value,directory)
                 manifest['prompt']=prompt
                 save(directory/'pilot-manifest.json',manifest)
                 android_command(['shell','am','start','-a','android.intent.action.VIEW',
@@ -120,7 +130,7 @@ def run(args):
         else:
             if args.case=='linux_browser':
                 from browser_pilot import initialize
-                browser_fixture,prompt=initialize('linux',directory.name,directory,linux_execute)
+                browser_fixture,prompt=initialize('linux',identity_value,directory,linux_execute)
                 manifest['prompt']=prompt
                 save(directory/'pilot-manifest.json',manifest)
                 linux_execute('import subprocess;subprocess.Popen('+repr(['google-chrome','--new-window',browser_fixture['url']])+
