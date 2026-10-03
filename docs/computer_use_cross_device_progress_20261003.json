@@ -57,6 +57,7 @@
       "task": "013",
       "arm": "legacy",
       "repetition": 1,
+      "status": "scored",
       "score": 0.0,
       "agent_status": "paused",
       "seconds": 694.603716163896,
@@ -68,6 +69,7 @@
       "task": "013",
       "arm": "verified",
       "repetition": 1,
+      "status": "scored",
       "score": 0.0,
       "agent_status": "failed",
       "seconds": 122.45599528495222,
@@ -79,6 +81,7 @@
       "task": "004",
       "arm": "verified",
       "repetition": 1,
+      "status": "scored",
       "score": 0.0,
       "agent_status": "paused",
       "seconds": 95.71614843606949,
@@ -90,6 +93,7 @@
       "task": "004",
       "arm": "legacy",
       "repetition": 1,
+      "status": "scored",
       "score": 0.0,
       "agent_status": "paused",
       "seconds": 907.1707902657799,
@@ -101,12 +105,49 @@
       "task": "006",
       "arm": "legacy",
       "repetition": 1,
+      "status": "infrastructure-failed",
       "score": null,
       "agent_status": "paused",
       "seconds": 860.3544154330157,
       "tool_calls": 32,
       "model_score_valid": false,
       "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/006-legacy-r1/result.json"
+    },
+    {
+      "task": "006",
+      "arm": "verified",
+      "repetition": 1,
+      "status": "infrastructure-failed",
+      "score": null,
+      "agent_status": "paused",
+      "seconds": 1323.4019553260878,
+      "tool_calls": 41,
+      "model_score_valid": false,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/006-verified-r1/result.json"
+    },
+    {
+      "task": "010",
+      "arm": "verified",
+      "repetition": 1,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 17.63029193179682,
+      "tool_calls": 0,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/010-verified-r1/result.json"
+    },
+    {
+      "task": "010",
+      "arm": "legacy",
+      "repetition": 1,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 1723.8820119709708,
+      "tool_calls": 47,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/010-legacy-r1/result.json"
     }
   ],
   "warnings": [
@@ -215,6 +256,34 @@
     "real_browser_new_candidate": {
       "passed": true,
       "path": "apps/computer_use/.runtime/cross-device-ui-browser-04/result.json"
+    },
+    "neutral_browser_linux": {
+      "passed": true,
+      "model_used": false,
+      "actual_guest_gui": true,
+      "path": "apps/computer_use/.runtime/linux/browser-fixture-qualification-03/result.json"
+    },
+    "neutral_browser_android": {
+      "passed": true,
+      "model_used": false,
+      "scope": "Saved form storage0/1 and actual initial form render, not full Android GUI completion",
+      "path": "apps/computer_use/.runtime/android/browser-fixture-qualification-04/result.json"
+    },
+    "calc_saved_workbook": {
+      "passed": true,
+      "model_used": false,
+      "cached_totals": [
+        500,
+        500
+      ],
+      "path": "apps/computer_use/.runtime/linux/calc-fixture-qualification-01/result.json"
+    },
+    "platform_saved_data_and_gateway": {
+      "run": 21,
+      "passed": 21,
+      "model_used": false,
+      "log": "/tmp/qw3-platform-fixtures-qualified-tests.log",
+      "scope": "Browser submissions, Calc saved data, media failure preservation, replacement-container cleanup guard and device gateway regression"
     }
   },
   "integration_pilots": [
@@ -456,10 +525,10 @@
   "frozen_campaign": {
     "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/plan.json",
     "commit": "9fe52d3ee254786012652ec9fc85f340b71e9dc9",
-    "finished": 5,
+    "finished": 8,
     "total": 40,
     "current": [
-      "006-verified-r1"
+      "038-legacy-r1"
     ]
   },
   "post_freeze_optimizations": {
@@ -469,5 +538,27 @@
     "expired_observations": "Recapture; exact unchanged view or explicit allowed app intent can dispatch once; other changes return current view without input",
     "real_model_retest": "pending",
     "control_id_copy_hint": "Complete20-character observed IDs; the server currently does not enforce identifier enums during decoding, no constrained-decoding benefit claimed"
-  }
+  },
+  "formal_summary": {
+    "ended_attempts": 8,
+    "valid_original_scores": 6,
+    "infrastructure_failures": 2,
+    "successes": 0,
+    "improvement_demonstrated": false
+  },
+  "candidate_changes_after_freeze": {
+    "same_title_windows": "Unique AT-SPI active frame, real Linux browser qualification passed",
+    "media_failure": "Preserve business grade separately; acceptance still requires collected video",
+    "platform_pilot_cases": [
+      "android_settings",
+      "android_contacts",
+      "android_browser",
+      "linux_text",
+      "linux_browser",
+      "linux_calc"
+    ],
+    "foreground_tree_read": "Measured3.428s by reusing official traversal, not yet integrated",
+    "linux_accessibility_limit": "Whole-desktop4s limit unavailable in loaded Calc scene"
+  },
+  "updated_at": 1791057399.91765
 }

@@ -55,6 +55,11 @@ def controls_from_xml(xml, foreground, width, height):
     root=ET.fromstring(xml)
     # Only the current foreground frame. Do not click hidden/background trees.
     frames=[node for node in root.iter() if node.tag.rsplit('}',1)[-1] in {'frame','dialog'} and attrs(node).get('name')==foreground['title']]
+    if len(frames)>1:
+        # Different browser/document windows can have identical titles. Only
+        # AT-SPI's unique active frame can disambiguate them; never pick the
+        # first frame or choose by coincidentally matching screen coordinates.
+        frames=[node for node in frames if attrs(node).get('active')=='true']
     if len(frames)!=1:
         return {"status":"foreground_unmatched","controls":[],"truncated":False}
     controls=[]

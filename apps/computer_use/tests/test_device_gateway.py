@@ -119,6 +119,18 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         result = android_controls(xml,32,32)
         self.assertEqual([c['name'] for c in result['controls']], ['Save'])
 
+    def test_linux_same_title_uses_only_unique_active_frame(self):
+        xml='''<desktop xmlns:s="state" xmlns:c="component"><frame name="Same title"><button name="Background button" s:visible="true" s:showing="true" s:enabled="true" c:screencoord="(2, 4)" c:size="(10, 8)"/></frame><frame name="Same title" s:active="true"><button name="Foreground button" s:visible="true" s:showing="true" s:enabled="true" c:screencoord="(2, 4)" c:size="(10, 8)"/></frame></desktop>'''
+        result=linux_controls(xml,{'title':'Same title'},32,32)
+        self.assertEqual([c['name'] for c in result['controls']],['Foreground button'])
+
+    def test_linux_same_title_without_unique_active_marker_stays_unmatched(self):
+        for markers in [('', ''), (' active="true"',' active="true"')]:
+            xml=f'<desktop><frame name="Same title"{markers[0]}/><frame name="Same title"{markers[1]}/></desktop>'
+            result=linux_controls(xml,{'title':'Same title'},32,32)
+            self.assertEqual(result['status'],'foreground_unmatched')
+            self.assertEqual(result['controls'],[])
+
     def test_android_keeps_unlabeled_inputs_but_not_passive_container_ids(self):
         xml='''<hierarchy><node resource-id="layout" enabled="true" clickable="false" bounds="[0,0][30,30]"/><node resource-id="search" enabled="true" focusable="true" bounds="[0,0][20,10]"/><node text="5 minutes" enabled="true" checkable="true" checked="true" bounds="[0,10][20,20]"/></hierarchy>'''
         controls=android_controls(xml,32,32)['controls']

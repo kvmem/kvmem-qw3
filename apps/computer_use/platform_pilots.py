@@ -61,7 +61,12 @@ def run(args):
                            "qw3.goal", "cross-device-20261003")
     desired = "android-emulator" if android else "linux-vm"
     state = request(args.app, "/api/device", {"device_id": desired})
-    seconds = 180 if args.case=='android_settings' else 360
+    defaults={'android_settings':180,'android_contacts':600,'linux_text':360,
+              'android_browser':900,'linux_browser':900,'linux_calc':900}
+    requested_seconds=getattr(args,'seconds',None)
+    seconds=requested_seconds if requested_seconds is not None else defaults[args.case]
+    if type(seconds) is not int or not 60<=seconds<=1800:
+        raise ValueError('Pilot deadline must be60..1800seconds')
     prompt = ANDROID_PROMPT if android else LINUX_PROMPT
     manifest = {"kind": "integration-pilot-not-formal", "case": args.case, "prompt": prompt,
                 "deadline_seconds": seconds, "container_id": info["Id"], "app_runtime": str(args.runtime.resolve()),
@@ -69,8 +74,12 @@ def run(args):
                 'video_mode':args.video_mode if android else 'official-osworld-recorder',
                 'model_output_tokens':state.get('model_output_tokens',4096),
                 "no_model_access_to_initializer_or_grader": True}
+    manifest['fixture_sources']={name:hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                                for name in ['browser_pilot.py','browser_pilot_server.js','calc_pilot.py','android_contacts_pilot.py']}
     save(directory / "pilot-manifest.json", manifest)
     video = None
+    fixture = None
+    browser_fixture = None
     task_id = None
     recording = False
     try:
@@ -85,7 +94,7 @@ def run(args):
                 time.sleep(2)
                 before_settings = android_system_settings()
                 save(directory / "initial-system-settings.json", before_settings)
-            else:
+            elif args.case=='android_contacts':
                 from android_contacts_pilot import initialize
                 fixture,prompt=initialize(android_command,directory.name)
                 save(directory/'contacts-fixture.json',fixture)
@@ -94,6 +103,13 @@ def run(args):
                 android_command(['shell','am','force-stop','com.google.android.contacts'],capture_output=True)
                 android_command(['shell','am','start','-a','android.intent.action.MAIN',
                                  '-c','android.intent.category.LAUNCHER','-p','com.google.android.contacts'],capture_output=True)
+            else:
+                from browser_pilot import initialize
+                browser_fixture,prompt=initialize('android',directory.name,directory)
+                manifest['prompt']=prompt
+                save(directory/'pilot-manifest.json',manifest)
+                android_command(['shell','am','start','-a','android.intent.action.VIEW',
+                                 '-d',browser_fixture['url'],'-p','com.android.chrome'],capture_output=True)
             if args.video_mode=='live':
                 from live_android_recording import LiveAndroidRecording as Recorder
             else:
@@ -102,20 +118,21 @@ def run(args):
                 str(ROOT/'apps/computer_use/.runtime/android/sdk/platform-tools/adb'),'-s','emulator-5556'],directory)
             video.start()
         else:
-            # Preserve the previous task artifact before removing that exact file.
-            code = ("from pathlib import Path; import json,base64; p=Path('/home/user/Desktop/qw3-pilot-note.txt'); "
-                    "print(json.dumps({'exists':p.exists(),'data':base64.b64encode(p.read_bytes()).decode() if p.exists() else None}))")
-            previous = json.loads(linux_execute(code)["output"])
-            save(directory / "previous-artifact.json", previous)
-            if previous["exists"]:
-                import base64
-                digest = hashlib.sha256(base64.b64decode(previous["data"])).hexdigest()
-                code = ("from pathlib import Path; import hashlib; p=Path('/home/user/Desktop/qw3-pilot-note.txt'); "
-                        "assert hashlib.sha256(p.read_bytes()).hexdigest()==" + repr(digest) + "; p.unlink()")
-                linux_execute(code)
-            # A fresh test document, without an old modified buffer.
-            linux_execute("import subprocess,time; subprocess.run(['pkill','-TERM','-x','gedit'],check=False); time.sleep(1); "
-                          "subprocess.Popen(['gedit'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)")
+            if args.case=='linux_browser':
+                from browser_pilot import initialize
+                browser_fixture,prompt=initialize('linux',directory.name,directory,linux_execute)
+                manifest['prompt']=prompt
+                save(directory/'pilot-manifest.json',manifest)
+                linux_execute('import subprocess;subprocess.Popen('+repr(['google-chrome','--new-window',browser_fixture['url']])+
+                              ',stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)')
+            elif args.case=='linux_calc':
+                from calc_pilot import initialize
+                fixture,prompt=initialize(linux_execute,directory)
+                save(directory/'calc-fixture.json',fixture)
+                manifest['prompt']=prompt
+                save(directory/'pilot-manifest.json',manifest)
+            else:
+                initialize_linux_text(directory)
             request("http://127.0.0.1:18126", "/start_recording", {}, timeout=30)
             recording = True
         started = time.monotonic()
@@ -143,23 +160,31 @@ def run(args):
         result = {"kind": "integration-pilot-not-formal", "app_status": state["status"],
                   "seconds": time.monotonic() - started, "tool_calls": state["tool_calls_used"],
                   "turn_error": state.get("turn_error"), "uncertain_actions": len(state["uncertain_actions"])}
-        if android:
-            if args.case=='android_settings':
-                value = android_command(["shell", "settings", "get", "system", "screen_off_timeout"],
-                                        capture_output=True, text=True).stdout.strip()
-                result.update(independent_setting_value=value, artifact_passed=value == "300000")
-                after_settings = android_system_settings()
-                save(directory / "final-system-settings.json", after_settings)
-                others = {key: {"before": before_settings.get(key), "after": after_settings.get(key)}
-                          for key in set(before_settings) | set(after_settings)
-                          if key != "screen_off_timeout" and before_settings.get(key) != after_settings.get(key)}
-                result.update(other_system_setting_changes=others, artifact_passed=value == "300000" and not others)
-            else:
-                from android_contacts_pilot import grade
-                independent=grade(android_command,fixture)
-                save(directory/'independent-contacts.json',independent)
-                result['artifact_passed']=independent['passed']
-            result['video_collection_passed']=video.finish()['passed']
+        if android and args.case=='android_settings':
+            value = android_command(["shell", "settings", "get", "system", "screen_off_timeout"],
+                                    capture_output=True, text=True).stdout.strip()
+            result.update(independent_setting_value=value, artifact_passed=value == "300000")
+            after_settings = android_system_settings()
+            save(directory / "final-system-settings.json", after_settings)
+            others = {key: {"before": before_settings.get(key), "after": after_settings.get(key)}
+                      for key in set(before_settings) | set(after_settings)
+                      if key != "screen_off_timeout" and before_settings.get(key) != after_settings.get(key)}
+            result.update(other_system_setting_changes=others, artifact_passed=value == "300000" and not others)
+        elif args.case=='android_contacts':
+            from android_contacts_pilot import grade
+            independent=grade(android_command,fixture)
+            save(directory/'independent-contacts.json',independent)
+            result['artifact_passed']=independent['passed']
+        elif browser_fixture:
+            from browser_pilot import grade
+            independent=grade(browser_fixture,linux_execute)
+            save(directory/'independent-browser.json',independent)
+            result['artifact_passed']=independent['passed']
+        elif args.case=='linux_calc':
+            from calc_pilot import grade
+            independent=grade(linux_execute,fixture,directory)
+            save(directory/'independent-workbook.json',independent)
+            result['artifact_passed']=independent['passed']
         else:
             import base64
             artifact = json.loads(linux_execute(
@@ -169,15 +194,22 @@ def run(args):
             save(directory / "independent-artifact.json", artifact)
             result.update(artifact_passed=data == LINUX_EXPECTED,
                           artifact_bytes=len(data) if data is not None else None)
-            import urllib.request
-            req = urllib.request.Request("http://127.0.0.1:18126/end_recording", data=b"{}",
-                                         headers={"Content-Type": "application/json"})
-            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=45) as r:
-                (directory / "continuous.mp4").write_bytes(r.read())
-            recording = False
-            result["video_collection_passed"] = True
+        # Preserve the independent task result if media collection fails. A
+        # missing video is incomplete acceptance evidence, not a fabricated
+        # zero score or loss of the saved application data.
+        try:
+            if android:
+                result['video_collection_passed']=video.finish()['passed']
+            else:
+                collect_linux_recording(directory/'continuous.mp4')
+                recording=False
+                result['video_collection_passed']=True
+        except Exception as exc:
+            result.update(video_collection_passed=False,video_collection_error=type(exc).__name__+': '+str(exc))
         result["unassisted_passed"] = result["artifact_passed"] and state["status"] == "completed" and not result["uncertain_actions"]
-        result["video_bytes"] = (directory / "continuous.mp4").stat().st_size
+        result['accepted']=result['unassisted_passed'] and result['video_collection_passed']
+        if (directory/'continuous.mp4').exists():
+            result["video_bytes"] = (directory / "continuous.mp4").stat().st_size
         save(directory / "task.json", state)
         for name in ["codex-events.jsonl"]:
             source = args.runtime / name
@@ -205,24 +237,52 @@ def run(args):
             except Exception as exc:
                 save(directory/'recording-error.json',{'error':type(exc).__name__+': '+str(exc)})
         if recording:
-            # The native recorder stops on the bounded VM endpoint. Preserve
-            # failure details; a partial recording is not a passed task.
             try:
-                import urllib.request
-                req = urllib.request.Request("http://127.0.0.1:18126/end_recording", data=b"{}",
-                                             headers={"Content-Type": "application/json"})
-                with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=45) as r:
-                    (directory / "interrupted.mp4").write_bytes(r.read())
+                collect_linux_recording(directory/'interrupted.mp4')
             except Exception as exc:
                 save(directory / "recording-error.json", {"error": type(exc).__name__})
+        if browser_fixture:
+            try:
+                from browser_pilot import stop
+                save(directory/'browser-service-stop.json',stop(browser_fixture,linux_execute))
+            except Exception as exc:
+                save(directory/'browser-service-stop.json',{'stopped':False,'error':type(exc).__name__+': '+str(exc)})
+
+
+def collect_linux_recording(path):
+    import urllib.request
+    req=urllib.request.Request('http://127.0.0.1:18126/end_recording',data=b'{}',headers={'Content-Type':'application/json'})
+    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req,timeout=45) as response:
+        data=response.read()
+    if len(data)<32 or data[4:8]!=b'ftyp':
+        raise ValueError('The recorder did not return an MP4 container')
+    path.write_bytes(data)
+
+
+def initialize_linux_text(directory):
+    # Preserve the previous task artifact before removing that exact file.
+    code = ("from pathlib import Path; import json,base64; p=Path('/home/user/Desktop/qw3-pilot-note.txt'); "
+            "print(json.dumps({'exists':p.exists(),'data':base64.b64encode(p.read_bytes()).decode() if p.exists() else None}))")
+    previous = json.loads(linux_execute(code)["output"])
+    save(directory / "previous-artifact.json", previous)
+    if previous["exists"]:
+        import base64
+        digest = hashlib.sha256(base64.b64decode(previous["data"])).hexdigest()
+        code = ("from pathlib import Path; import hashlib; p=Path('/home/user/Desktop/qw3-pilot-note.txt'); "
+                "assert hashlib.sha256(p.read_bytes()).hexdigest()==" + repr(digest) + "; p.unlink()")
+        linux_execute(code)
+    # A fresh test document, without an old modified buffer.
+    linux_execute("import subprocess,time; subprocess.run(['pkill','-TERM','-x','gedit'],check=False); time.sleep(1); "
+                  "subprocess.Popen(['gedit'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)")
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--case", choices=["android_settings", "android_contacts", "linux_text"], required=True)
+    p.add_argument("--case", choices=["android_settings", "android_contacts", "android_browser", "linux_text", "linux_browser", "linux_calc"], required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--runtime", type=Path, required=True)
     p.add_argument("--app", default="http://127.0.0.1:18205")
+    p.add_argument('--seconds',type=int,help='Explicit60..1800s task deadline; record longer probes separately from prior pilots')
     p.add_argument('--video-mode',choices=['live','native'],default='live',
                    help='Live1Hz measured captures preserve static waits; native video may omit a stationary tail')
     args = p.parse_args()
