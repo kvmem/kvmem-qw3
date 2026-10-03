@@ -366,6 +366,20 @@
       "credentials_exported": false,
       "path": "apps/computer_use/.runtime/cross-device-replay-20261004-03/browser-check.json",
       "contains_success_and_failure_contacts": true
+    },
+    "short_action_id": {
+      "run": 97,
+      "passed": 97,
+      "real_model": false,
+      "log": "/tmp/qw3-short-action-id-tests.log",
+      "scope": "Short semantic IDs are hashed; empty/unsafe IDs and duplicate delivery remain guarded"
+    },
+    "native_windows_client40": {
+      "run": 191,
+      "passed": 191,
+      "real_model": false,
+      "bundle_sha256": "2fb3ce0480a6a28f4bdccf87c09308f11a8591c80bc1189a3dbef28ce5f2cf05",
+      "source_commit": "83219c1fedc3b3ba217314403fa3bed692309453"
     }
   },
   "integration_pilots": [
@@ -658,14 +672,15 @@
     "total": 40,
     "current": [
       "043-legacy-r1"
-    ]
+    ],
+    "separate_pilot_queued": "candidate-interlude-linux-browser-02"
   },
   "post_freeze_optimizations": {
-    "candidate": "cross-device-ui-11",
+    "candidate": "cross-device-ui-12",
     "formal_campaign_changes": false,
     "output_tokens": 16384,
     "expired_observations": "Recapture; exact unchanged view or explicit allowed app intent can dispatch once; other changes return current view without input",
-    "real_model_retest": "Contacts02 accepted unassisted,1 successful development retest; first failed attempt retained; repeat pending",
+    "real_model_retest": "Contacts02 accepted unassisted; Linux browser01 failed on ID length, browser02 queued under same900s budget",
     "control_id_copy_hint": "Complete20-character observed IDs; the server currently does not enforce identifier enums during decoding, no constrained-decoding benefit claimed"
   },
   "formal_summary": {
@@ -693,7 +708,9 @@
     "control_target_guard": "Verified click_control refreshes even young observations; same unique control identity and target image crop required before one dispatch",
     "pending_step_diagnosis": "022 verified remained paused after3 rejections, including incompatible pending-step replacement; semantics retained, further diagnosis pending",
     "pending_step_checkpoint": "Future candidate returns concrete pending goal/conditions and permits continuing same result without copying goal;14 execution checks passed, UI11 and client38 keep their frozen source inventories",
-    "linux_video": "Future platform pilots default to timestamped read-only VNC recorder; official frozen campaign unchanged"
+    "linux_video": "Future platform pilots default to timestamped read-only VNC recorder; official frozen campaign unchanged",
+    "short_action_ids": "Model GUI action identifiers now1..80; downstream receipt identities remain task-scoped q3_SHA256",
+    "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction"
   },
-  "updated_at": 1791063223.3339345
+  "updated_at": 1791063779.0236924
 }
