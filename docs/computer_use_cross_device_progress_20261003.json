@@ -1274,5 +1274,16 @@
     "original_task_setup_and_evaluator_reused": true,
     "declared_framework_and_dependencies_required": true,
     "video_failure_does_not_remove_score": true
+  },
+  "failure_evidence": {
+    "path": "apps/computer_use/.runtime/linux/failure-evidence-26-v2-20261004.json",
+    "sha256": "f49f487463717ee1e5172201401d43f82e077674b53ba28d994f626edc8a5a34",
+    "terminal_attempts": 26,
+    "expired_observation_rejections": 29,
+    "missing_normalized_coordinate_declarations": 12,
+    "attempts_with_output_budget_errors": 6,
+    "preflight_refusal_misreported_as_uncertainty": 2,
+    "vision_vs_reasoning_root_cause_proven": false,
+    "earlier_diagnostic_correction": "apps/computer_use/.runtime/linux/failure-evidence-26-correction-20261004.json"
   }
 }
