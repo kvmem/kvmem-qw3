@@ -69,6 +69,17 @@ def compare(baseline, candidate):
         'baseline': aggregate(baseline), 'candidate': aggregate(candidate), 'pairs': pairs,
         'matched_baseline': aggregate([left[key] for key in sorted(left.keys() & right.keys())]),
         'matched_candidate': aggregate([right[key] for key in sorted(left.keys() & right.keys())]),
+        'both_successful_pairs': {
+            'count': sum(p['baseline_grade']['unassisted_success'] and p['candidate_grade']['unassisted_success'] for p in pairs),
+            'baseline_task_seconds_median': statistics.median(
+                p['baseline_grade']['elapsed_seconds'] for p in pairs
+                if p['baseline_grade']['unassisted_success'] and p['candidate_grade']['unassisted_success'])
+                if any(p['baseline_grade']['unassisted_success'] and p['candidate_grade']['unassisted_success'] for p in pairs) else None,
+            'candidate_task_seconds_median': statistics.median(
+                p['candidate_grade']['elapsed_seconds'] for p in pairs
+                if p['baseline_grade']['unassisted_success'] and p['candidate_grade']['unassisted_success'])
+                if any(p['baseline_grade']['unassisted_success'] and p['candidate_grade']['unassisted_success'] for p in pairs) else None,
+        },
         'limits': ['Eight short neutral conditions repeated twice, not sixteen independent applications.',
             'Retained Windows disk and executor ledger; fresh task/browser/client/model per attempt.',
             'Latency medians include failed tasks and handoffs; no stable speedup ratio is claimed.',

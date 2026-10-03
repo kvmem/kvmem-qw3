@@ -5,7 +5,7 @@
   "status": "active",
   "local_plan": "docs/computer_use_local_diagnostic_plan_20261002.json",
   "combined_goal": "docs/computer_use_local_advisor_goal_20261002.md",
-  "current_stage": "p3_candidate_running_targeting_followup_queued",
+  "current_stage": "p3_initial_and_refined_followup_complete_audited",
   "source_baseline": "56896791b41b6aa5c022c99dac4996f719bd4ba0",
   "stages": {
     "P0": {
@@ -99,13 +99,13 @@
       "native_report": "docs/computer_use_native_thinking_20261003.md"
     },
     "P3": {
-      "status": "candidate_running_baseline_audited_with_infrastructure_replacement",
-      "trials_completed": 19,
+      "status": "complete_with_16_refined_followup_trials",
+      "trials_completed": 32,
       "planned_trials": 32,
       "report": "docs/computer_use_recovery_diagnostic_p3_20261003.md",
       "baseline_bundle": "windows-native-client-30",
       "condition_count": 8,
-      "model_trials_completed": 19,
+      "model_trials_completed": 32,
       "scripted_conditions_qualified": [
         "normal",
         "wrong_focus",
@@ -135,18 +135,18 @@
       "model_preflight_completed": 1,
       "model_preflight_passed": 1,
       "model_preflight_evidence": "apps/computer_use/.runtime/p3-native-preflight-01/summary.json",
-      "formal_baseline_completed": 13,
-      "formal_baseline_passed": 10,
+      "formal_baseline_completed": 16,
+      "formal_baseline_passed": 13,
       "baseline_frozen": true,
       "baseline_acceptance": "apps/computer_use/.runtime/p3-baseline-20261003/acceptance.json",
       "baseline_campaign": "apps/computer_use/.runtime/p3-baseline-20261003/campaign.json",
-      "active_trial": "p3-candidate-r1-04",
+      "active_trial": null,
       "candidate_changes_implemented": 2,
       "observed_baseline_issue": {
         "kind": "cross_task_gui_action_id_collision",
         "first_evidence": "apps/computer_use/.runtime/p3-baseline-r1-01/fixture/state.json",
         "impact": "First completed baseline normal trial required 7 tools and 46.46 seconds; executor rejected a semantic action ID already used by the preceding preflight; model recovered with a new ID. Fresh native clients share the retained VM executor ledger.",
-        "candidate": "Implemented task-scoped GUI identities in client31; actual matched native comparison running."
+        "candidate": "Implemented in client31; both matched frozen comparisons complete and independently audited."
       },
       "baseline_runtime_handles": "apps/computer_use/.runtime/p3-baseline-20261003/run-handles.json",
       "second_observed_issue": {
@@ -174,7 +174,7 @@
         "run": 138,
         "passed": 134,
         "skipped": 4,
-        "scope": "The same selected contract modules shipped by pack_windows_client; Windows/native Codex checks still pending."
+        "scope": "Selected packed host contracts; Windows/native Codex qualification separately passed 138/138."
       },
       "candidate_changes": [
         "Task-scoped GUI wire/ledger IDs with legacy receipt lookup and strict received-action/desktop identity checks.",
@@ -197,23 +197,74 @@
       "baseline_replacement_audit": "apps/computer_use/.runtime/p3-baseline-replacement-20261003/audit.json",
       "candidate_native_contract_tests_passed": 138,
       "candidate_campaign": "apps/computer_use/.runtime/p3-candidate-20261003/campaign.json",
-      "candidate_trials_completed": 3,
+      "candidate_trials_completed": 16,
       "continuation_handle": "apps/computer_use/.runtime/p3-recovery-continuation-handle.json",
       "targeting_followup": {
-        "status": "host_checked_frozen_bundle_native_qualification_queued",
-        "bundle": "apps/computer_use/.runtime/windows-native-client-32",
-        "sha256": "f4d0f4b05b22b7cd0597edc1f2b87a568540b233397599461e8b2177a29ea062",
-        "source_commit": "cef7f2b",
+        "status": "complete_audited",
+        "bundle": "apps/computer_use/.runtime/windows-native-client-33",
+        "sha256": "255c5c081c08ce630ca945e731c56f917eb6b158f2e16b72ada33d24211d67f6",
+        "source_commit": "54d0670",
         "host_contracts": {
-          "run": 143,
-          "passed": 139,
+          "run": 144,
+          "passed": 140,
           "skipped": 4
         },
-        "planned_real_model_smoke_trials": 3,
+        "planned_real_model_smoke_trials": 0,
         "report": "docs/computer_use_targeting_and_recovery_20261003.md",
         "handle": "apps/computer_use/.runtime/targeting-qualification-handle.json",
-        "not_part_of_client31_recovery_comparison": true
-      }
+        "not_part_of_client31_recovery_comparison": true,
+        "planned_matched_followup_trials": 16,
+        "client32_waiter_superseded_before_vm_action": true,
+        "client32_archive_retained": true,
+        "native_contracts_passed": 144,
+        "real_model_trials_completed": 16,
+        "campaign": "apps/computer_use/.runtime/p3-final-20261003/campaign.json",
+        "control_target_audits": true,
+        "unassisted_success": 14,
+        "artifact_correct": 16,
+        "uncertain_handoff": 2,
+        "business_failure": 0,
+        "tool_errors": 2,
+        "executor_rejections": 0,
+        "task_seconds_median": 50.30316225000024,
+        "tool_calls_median": 6.0,
+        "actual_control_target_clicks": 55,
+        "completed_control_target_clicks": 53,
+        "uncertain_control_target_clicks": 2,
+        "actual_executor_mapping_matches": 55,
+        "wrong_window_text_inputs": 0,
+        "duplicate_dispatches": 0,
+        "audit": "apps/computer_use/.runtime/p3-final-20261003/audit.json",
+        "comparison": "apps/computer_use/.runtime/p3-final-20261003/comparison.json",
+        "control_target_aggregate_audit": "apps/computer_use/.runtime/p3-final-20261003/control-target-aggregate-audit.json",
+        "qualification": "apps/computer_use/.runtime/windows-client-33-qualification-01/result.json",
+        "replay": "apps/computer_use/.runtime/recovery-targeting-complete-replay-20261003/index.html",
+        "replay_browser_check": "apps/computer_use/.runtime/recovery-targeting-complete-replay-20261003/browser-check.json",
+        "replay_local_url": "http://127.0.0.1:18124/index.html",
+        "comparison_scope": "Eight short neutral conditions repeated twice; combined interface/guidance changes, not isolated localization accuracy or general desktop reliability."
+      },
+      "candidate_regression_observed": {
+        "attempt": "p3-candidate-r1-04",
+        "condition": "outside_scope",
+        "outcome": "paused",
+        "task_seconds": 20.1734593,
+        "artifact_correct": false,
+        "cause": "Three out-of-scope foreground actions rejected; bounded guard paused before model tried permitted open_app recovery.",
+        "refinement": "Explicit allowed focus-recovery guidance in client33; original rejection limit and permissions retained."
+      },
+      "candidate_unassisted_success": 12,
+      "candidate_artifact_correct": 14,
+      "candidate_uncertain_handoff": 2,
+      "candidate_tool_errors": 8,
+      "candidate_task_seconds_median": 46.39899845,
+      "candidate_audit": "apps/computer_use/.runtime/p3-candidate-20261003/audit.json",
+      "comparison": "apps/computer_use/.runtime/p3-candidate-20261003/comparison.json",
+      "formal_baseline_count_scope": "Valid attempts; one retained infrastructure interruption is additional.",
+      "initial_comparison_valid_trials": 32,
+      "total_valid_model_trials": 48,
+      "total_formal_attempts": 49,
+      "candidate_executor_rejections": 6,
+      "candidate_comparison_v2": "apps/computer_use/.runtime/p3-candidate-20261003/comparison-v2.json"
     },
     "P4": {
       "status": "planned",
@@ -329,16 +380,26 @@
     "apps/computer_use/.runtime/latex-repair-formal-02/result.json",
     "apps/computer_use/.runtime/latex-repair-formal-03/result.json",
     "apps/computer_use/.runtime/latex-repair-formal-20261003/audit.json",
-    "apps/computer_use/.runtime/latex-repair-complete-replay-20261003/browser-check.json"
+    "apps/computer_use/.runtime/latex-repair-complete-replay-20261003/browser-check.json",
+    "apps/computer_use/.runtime/p3-candidate-20261003/audit.json",
+    "apps/computer_use/.runtime/p3-candidate-20261003/comparison-v2.json",
+    "apps/computer_use/.runtime/p3-final-20261003/acceptance.json",
+    "apps/computer_use/.runtime/p3-final-20261003/audit.json",
+    "apps/computer_use/.runtime/p3-final-20261003/comparison.json",
+    "apps/computer_use/.runtime/p3-final-20261003/control-target-aggregate-audit.json",
+    "apps/computer_use/.runtime/p3-final-20261003/post-run-resource-check.json",
+    "apps/computer_use/.runtime/windows-client-33-qualification-01/result.json",
+    "apps/computer_use/.runtime/recovery-targeting-complete-replay-20261003/browser-check.json"
   ],
   "latest_checks": {
     "gpu_idle": true,
-    "root_available_approx_gib": 224,
-    "previous_queue_status": "all_latex_formal_queues_terminal_owned_engines_stopped",
     "gpu_compute_processes": 0,
-    "checked_at": 1790982486.6385703
+    "desktop_paused": true,
+    "root_available_approx_gib": 205.5,
+    "owned_queue_status": "both_complete_and_exited",
+    "checked_at": 1790996047.586366
   },
-  "next_action": "Finish the frozen client31 native comparison, audit and replay; then qualify client32 and run three separate real-model control-target smoke trials.",
+  "next_action": "Freeze an unseen native UI/scale/canvas follow-up for control-ID versus normalized visual targeting, and separately qualify read-only uncertain-receipt recovery; then continue long-task/KVMem baselines before advisor business trials.",
   "advisor_provider": {
     "provider": "deepseek",
     "model": "deepseek-flash",
@@ -451,7 +512,7 @@
     }
   },
   "scheduling": "Iterate diagnosis, product changes and matched retests. Freeze local baselines before advisor business trials; original OSWorld missing assets do not block independent work.",
-  "last_updated": "2026-10-03T09:12:53.327958+08:00",
+  "last_updated": "2026-10-03T10:54:52.538470+08:00",
   "latex_preparation": "docs/computer_use_latex_preparation_20261003.md",
   "latex_qualification": {
     "status": "scripted_install_and_pdf_passed_agent_integration_pending",

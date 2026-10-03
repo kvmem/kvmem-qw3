@@ -2,13 +2,18 @@
 
 The current product goal is tracked in the
 [delivery plan](../../docs/computer_use_product_delivery_20261002.md).
-The latest [Windows focus repair](../../docs/computer_use_focus_improvement_20261003.md)
-passed three fixed switching trials (baseline: zero of three). Native client
-21 passed 104 runtime contracts and includes an opt-in controlled Python setup
-workflow. These runtime checks are separate from product acceptance; the
-[software trial report](../../docs/computer_use_python_workflow_20261003.md)
-records three development attempts, including the first successful cold install.
-LaTeX and optional advisor integration remain open.
+The four managed Windows workflows—Python setup/repair and LaTeX setup/repair—
+passed twelve frozen product trials, including independent deliverable and
+application-reopen checks. They cover reviewed project profiles, not arbitrary
+software installations. The latest
+[targeting and recovery work](../../docs/computer_use_targeting_and_recovery_20261003.md)
+adds task-scoped action receipts, precise error feedback, bounded recovery and
+observation-bound control IDs. Three frozen clients completed 48 audited recovery
+trials; the final client produced correct artifacts in 16/16 and finished without
+intervention in 14/16. Two lost-reply trials paused without duplicate saves.
+These are eight short conditions repeated twice per client, not general desktop
+acceptance. Optional advisor integration and physical-machine/macOS qualification
+remain open.
 
 Work in progress: the local UI, Codex provider bridge, Computer MCP and Windows
 VM executor work end to end. A frozen native Windows client passed 18 core-task
@@ -42,8 +47,14 @@ controls. The program resolves the pixel center and saves the original target
 and dispatched action. When no matching control is exposed, use explicit
 `normalized_1000` visual coordinates. Verify the resulting screen before typing.
 Old control IDs are rejected; lost replies are reconciled through the original
-receipt without resolving or clicking a new target. This interface is undergoing
-separate native qualification; its model-level improvement is not yet established.
+receipt without resolving or clicking a new target. The final client passed 144
+Windows/native Codex contract checks and a separate 16-trial local-model recovery
+follow-up. All 55 control-target clicks matched the observed controls and actual
+executor pixel actions, including the two saves whose replies were withheld.
+When an unrelated application is outside the task's allowed foreground scope,
+use the permitted `open_app` route to activate the intended task application,
+then verify the new foreground. The recovery improvement combines tool and
+guidance changes; it does not isolate a general localization accuracy benefit.
 
 The intended application uses the pinned **Codex CLI/app-server 0.159.2** as its
 agent harness. `qw3_computer.codex` starts it over JSONL stdio, in an app-owned

@@ -14,7 +14,7 @@ HTML = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="vi
 <p class="note">两侧按任务开始对齐。完成情况由真实保存文件和操作回执判定；正确产物但不确定暂停单独标注。录像为连续 VNC 采集，未经截图重建。</p>
 <button id="play">从任务开始同时播放</button><button id="pause">暂停两侧</button><span id="error" role="status"></span>
 <div class="grid"><section><select id="left" aria-label="左侧试次"></select><pre id="leftFacts"></pre><video id="leftVideo" muted controls preload="metadata"></video><small id="leftIdentity"></small></section><section><select id="right" aria-label="右侧试次"></select><pre id="rightFacts"></pre><video id="rightVideo" muted controls preload="metadata"></video><small id="rightIdentity"></small></section></div>
-<p class="note">八类短任务各重复两次，不能代表通用软件可靠性。client31 测恢复改动；client32 测新增控件定位。耗时包含任务失败和暂停，不把单次差异视为稳定加速比例。一次基线基础设施中断保留在原始记录，不将其残缺录像当作完整回放。</p>
+<p class="note">八类短任务各重复两次，不能代表通用软件可靠性。candidate 试次使用 client31；final 试次使用包含控件定位与焦点恢复提示的 client33。耗时包含任务失败和暂停，不把单次差异视为稳定加速比例。一次基线基础设施中断保留在原始记录，不将其残缺录像当作完整回放。</p>
 <script>
 const el=id=>document.getElementById(id);let trials=[],generation=0;
 function chosen(s){return trials[Number(el(s).value)]}
@@ -24,7 +24,7 @@ el(s+'Facts').textContent=t.attempt+'\\n'+t.condition+' · '+t.cohort+' · '+g.o
 el(s+'Identity').textContent='客户端 SHA-256：'+t.bundle_sha256+' · 视频 SHA-256：'+t.video_sha256}
 async function seek(v,time){if(v.readyState<1)await new Promise((ok,fail)=>{v.addEventListener('loadedmetadata',ok,{once:true});v.addEventListener('error',fail,{once:true})});let x=Math.min(time,Math.max(0,v.duration-.1));if(Math.abs(v.currentTime-x)<.02)return;await new Promise(ok=>{v.addEventListener('seeked',ok,{once:true});v.currentTime=x})}
 el('pause').onclick=pause;el('play').onclick=async()=>{pause();let turn=generation;el('error').textContent='';try{await Promise.all(['left','right'].map(s=>seek(el(s+'Video'),chosen(s).task_start_video_seconds)));if(turn!==generation)return;await Promise.all(['left','right'].map(s=>el(s+'Video').play()))}catch(e){if(turn===generation&&e.name!=='AbortError')el('error').textContent=e.message}};
-fetch('trials.json').then(r=>{if(!r.ok)throw Error('无法读取试次');return r.json()}).then(data=>{trials=data;if(!trials.length)throw Error('没有完整录像');for(const s of ['left','right']){trials.forEach((t,i)=>{let o=document.createElement('option');o.value=i;o.textContent=t.attempt+' · '+(t.grade.unassisted_success?'通过':t.grade.explicit_uncertainty_handoff?'不确定暂停':'未通过');el(s).append(o)});el(s).value=s==='left'?0:Math.max(0,trials.findIndex(t=>t.cohort==='candidate'));el(s).onchange=()=>{pause();render(s)};render(s)}}).catch(e=>el('error').textContent=e.message);
+fetch('trials.json').then(r=>{if(!r.ok)throw Error('无法读取试次');return r.json()}).then(data=>{trials=data;if(!trials.length)throw Error('没有完整录像');let final=trials.findIndex(t=>t.attempt.startsWith('p3-final-'));let right=final>=0?final:Math.max(0,trials.findIndex(t=>t.cohort==='candidate'));for(const s of ['left','right']){trials.forEach((t,i)=>{let o=document.createElement('option');o.value=i;o.textContent=t.attempt+' · '+(t.grade.unassisted_success?'通过':t.grade.explicit_uncertainty_handoff?'不确定暂停':'未通过');el(s).append(o)});el(s).value=s==='left'?0:right;el(s).onchange=()=>{pause();render(s)};render(s)}}).catch(e=>el('error').textContent=e.message);
 </script></html>'''
 
 
