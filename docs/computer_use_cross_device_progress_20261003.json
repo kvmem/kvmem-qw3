@@ -172,6 +172,78 @@
       "tool_calls": 20,
       "model_score_valid": true,
       "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/038-verified-r1/result.json"
+    },
+    {
+      "task": "022",
+      "arm": "verified",
+      "repetition": 1,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 1094.4499867330305,
+      "tool_calls": 29,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/022-verified-r1/result.json"
+    },
+    {
+      "task": "022",
+      "arm": "legacy",
+      "repetition": 1,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 1332.0016600945964,
+      "tool_calls": 34,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/022-legacy-r1/result.json"
+    },
+    {
+      "task": "035",
+      "arm": "legacy",
+      "repetition": 1,
+      "status": "evaluator-unavailable",
+      "score": null,
+      "agent_status": "failed",
+      "seconds": 206.45753482589498,
+      "tool_calls": 7,
+      "model_score_valid": false,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/035-legacy-r1/result.json"
+    },
+    {
+      "task": "035",
+      "arm": "verified",
+      "repetition": 1,
+      "status": "evaluator-unavailable",
+      "score": null,
+      "agent_status": "failed",
+      "seconds": 403.1083910749294,
+      "tool_calls": 12,
+      "model_score_valid": false,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/035-verified-r1/result.json"
+    },
+    {
+      "task": "043",
+      "arm": "verified",
+      "repetition": 1,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 298.65793131198734,
+      "tool_calls": 13,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/043-verified-r1/result.json"
+    },
+    {
+      "task": "043",
+      "arm": "legacy",
+      "repetition": 1,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 1237.230811062269,
+      "tool_calls": 32,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/043-legacy-r1/result.json"
     }
   ],
   "warnings": [
@@ -380,6 +452,11 @@
       "real_model": false,
       "bundle_sha256": "2fb3ce0480a6a28f4bdccf87c09308f11a8591c80bc1189a3dbef28ce5f2cf05",
       "source_commit": "83219c1fedc3b3ba217314403fa3bed692309453"
+    },
+    "interlude_workload_admission": {
+      "passed": 6,
+      "model_used": false,
+      "scope": "Separate formal/pilot results, required stop acknowledgement, watchdog isolation and Windows fixture admission"
     }
   },
   "integration_pilots": [
@@ -668,12 +745,11 @@
   "frozen_campaign": {
     "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/plan.json",
     "commit": "9fe52d3ee254786012652ec9fc85f340b71e9dc9",
-    "finished": 14,
+    "finished": 16,
     "total": 40,
-    "current": [
-      "043-legacy-r1"
-    ],
-    "separate_pilot_queued": "candidate-interlude-linux-browser-02"
+    "current": [],
+    "separate_pilot_queued": "candidate-interlude-linux-browser-02",
+    "separate_pilot_status": "running"
   },
   "post_freeze_optimizations": {
     "candidate": "cross-device-ui-12",
@@ -684,8 +760,8 @@
     "control_id_copy_hint": "Complete20-character observed IDs; the server currently does not enforce identifier enums during decoding, no constrained-decoding benefit claimed"
   },
   "formal_summary": {
-    "ended_attempts": 14,
-    "valid_original_scores": 10,
+    "ended_attempts": 16,
+    "valid_original_scores": 12,
     "infrastructure_failures": 2,
     "successes": 0,
     "improvement_demonstrated": false,
@@ -712,5 +788,17 @@
     "short_action_ids": "Model GUI action identifiers now1..80; downstream receipt identities remain task-scoped q3_SHA256",
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction"
   },
-  "updated_at": 1791063779.0236924
+  "updated_at": 1791064695.7718856,
+  "windows_product_protocol": {
+    "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
+    "predeclared_trials": 8,
+    "started": 0,
+    "bundle": "windows-native-client-40",
+    "thinking": true,
+    "workflow_mode": "verified",
+    "model_output_tokens": 16384,
+    "timeout_seconds": 900,
+    "shared_engine": true,
+    "pure_gui": false
+  }
 }

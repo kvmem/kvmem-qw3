@@ -17,6 +17,55 @@ from osworld_linux.campaign import verify_frozen
 from osworld_windows.source import ROOT
 
 
+WINDOWS_CASES={'windows_python_new':('python',False),'windows_python_repair':('python',True),
+               'windows_latex_new':('latex',False),'windows_latex_repair':('latex',True)}
+
+
+def pilot_spec(args):
+    """Reuse the existing owned-VM product runner; do not restart the engine."""
+    python=str(ROOT/'third_party/OSWorld-V2/.venv/bin/python')
+    if args.case not in WINDOWS_CASES:
+        return ([python,'-m','platform_pilots','--case',args.case,'--seconds',str(args.seconds),
+            '--app',args.app,'--runtime',str(args.app_runtime.resolve()),'--output',str(args.output/'pilot')],
+            args.output/'pilot/integration-result.json')
+    scenario,repair=WINDOWS_CASES[args.case]
+    if not args.bundle or not args.engine or not args.ffmpeg or repair!=bool(args.repair_fixture):
+        raise ValueError('Windows case requires qualified bundle, live engine, ffmpeg and the correct fixture kind')
+    # Product runner identities are 8..40 characters. Avoid the shared basename
+    # "pilot", which would collide in the Windows SMB share across attempts.
+    trial=args.output/(args.output.name+'-trial')
+    import re
+    if not re.fullmatch(r'[a-zA-Z0-9_-]{8,40}',trial.name):
+        raise ValueError('Windows interlude identity is too long or unsafe')
+    command=[python,'-m','software_product_run','--scenario',scenario,'--output',str(trial),
+             '--bundle',str(args.bundle.resolve()),'--engine',str(args.engine.resolve()),
+             '--ffmpeg',str(args.ffmpeg.resolve()),'--timeout',str(args.seconds),'--thinking',
+             '--execution-mode','verified','--model-output-tokens','16384']
+    if repair:command+=['--repair-fixture',str(args.repair_fixture.resolve())]
+    if args.acceptance_manifest:
+        command+=['--acceptance-manifest',str(args.acceptance_manifest.resolve())]
+    return command,trial/'result.json'
+
+
+def terminal_pilot(args, outcome):
+    if args.case not in WINDOWS_CASES:
+        current=request(args.app,'/api/state')
+        return (not outcome.get('owned_task_stop_unconfirmed')
+                and current['status'] not in {'starting','running','verifying'}
+                and not current.get('uncertain_actions'))
+    # A Windows runner exception can leave a native worker alive. Only its
+    # durable terminal task/desktop receipt authorizes the next model workload.
+    guest=outcome.get('guest_result',{})
+    return outcome.get('status')=='complete' and guest.get('desktop_stopped') is True and not guest.get('needs_reconciliation')
+
+
+def pilot_watchdog(args):
+    # Windows budget starts after the clean VM restore and bundle installation.
+    # Leave time for setup, independent grading, process cleanup and video flush.
+    # Expiration never kills a worker or authorizes another model request.
+    return args.seconds + (1200 if args.case in WINDOWS_CASES else 240)
+
+
 def command(pid):
     source=Path(f'/proc/{pid}')
     if source.stat().st_uid!=os.getuid():
@@ -51,6 +100,13 @@ def run(args):
     initial=request(args.app,'/api/state')
     if initial['status']!='idle' or initial['uncertain_actions']:
         raise ValueError('Interlude requires an idle independent candidate app')
+    pilot_command,pilot_result_path=pilot_spec(args)
+    if args.case in WINDOWS_CASES:
+        # Freeze already qualified bytes before holding the formal scheduler.
+        from osworld_windows.bundle import verify_bundle
+        verify_bundle(args.bundle)
+        if args.engine.resolve()!=Path(plan['engine_runtime']).resolve():
+            raise ValueError('Windows pilot must use the exact formal shared engine')
     args.output.mkdir(parents=True,exist_ok=False)
     pid,cmd=scheduler(directory)
     if suspended(pid):
@@ -79,7 +135,7 @@ def run(args):
         save(args.output/'interlude.json',receipt)
         if active:
             job=active[0]
-            result=directory/job['id']/'result.json'
+            formal_result_path=directory/job['id']/'result.json'
             child=job['runner_pid']
             deadline=time.monotonic()+3900
             while Path(f'/proc/{child}').exists() and time.monotonic()<deadline:
@@ -88,8 +144,8 @@ def run(args):
                 time.sleep(2)
             if Path(f'/proc/{child}').exists() and '\nState:\tZ' not in Path(f'/proc/{child}/status').read_text():
                 raise TimeoutError('Current runner did not finish; no pilot started')
-            if not result.exists():raise RuntimeError('Current runner has no terminal result')
-            receipt['preceding_formal_result']=json.loads(result.read_text())
+            if not formal_result_path.exists():raise RuntimeError('Current runner has no terminal result')
+            receipt['preceding_formal_result']=json.loads(formal_result_path.read_text())
         verify_frozen(plan)
         if not suspended(pid):raise RuntimeError('Scheduler resumed elsewhere; no pilot started')
         # No formal app may still be serving an agent, including after a
@@ -105,26 +161,21 @@ def run(args):
         save(args.output/'interlude.json',receipt)
         environment=dict(os.environ,PYTHONPATH=str(ROOT/'apps/computer_use')+':'+str(ROOT/'apps/computer_use/.runtime/media-qualification'))
         safe_to_resume=False
-        pilot_command=[str(ROOT/'third_party/OSWorld-V2/.venv/bin/python'),'-m','platform_pilots',
-                                '--case',args.case,'--seconds',str(args.seconds),'--app',args.app,
-                                '--runtime',str(args.app_runtime.resolve()),'--output',str(args.output/'pilot')]
         pilot=subprocess.Popen(pilot_command,
                                cwd=ROOT,env=environment,stdout=(args.output/'pilot-launch.log').open('wb'),stderr=subprocess.STDOUT)
         receipt.update(pilot_pid=pilot.pid,pilot_command=pilot_command)
         save(args.output/'interlude.json',receipt)
-        try:code=pilot.wait(timeout=args.seconds+240)
+        try:code=pilot.wait(timeout=pilot_watchdog(args))
         except subprocess.TimeoutExpired:
             safe_to_resume=False
             receipt.update(status='needs-reconciliation',error='Pilot watchdog expired; do not resume model queue automatically')
             save(args.output/'interlude.json',receipt)
             raise
-        result=args.output/'pilot/integration-result.json'
-        if not result.exists():
+        if not pilot_result_path.exists():
             safe_to_resume=False
             raise RuntimeError('Pilot ended without durable result; reconcile candidate app before resuming queue')
-        outcome=json.loads(result.read_text())
-        current=request(args.app,'/api/state')
-        if outcome.get('owned_task_stop_unconfirmed') or current['status'] in {'starting','running','verifying'}:
+        outcome=json.loads(pilot_result_path.read_text())
+        if not terminal_pilot(args,outcome):
             safe_to_resume=False
             raise RuntimeError('Candidate model task termination unconfirmed')
         safe_to_resume=True
@@ -152,7 +203,12 @@ if __name__=='__main__':
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--app-runtime',type=Path,required=True)
     parser.add_argument('--app',default='http://127.0.0.1:18205')
-    parser.add_argument('--case',choices=['android_contacts','android_settings','android_browser','linux_browser','linux_calc','linux_text'],required=True)
+    parser.add_argument('--case',choices=['android_contacts','android_settings','android_browser','linux_browser','linux_calc','linux_text',*WINDOWS_CASES],required=True)
+    parser.add_argument('--bundle',type=Path)
+    parser.add_argument('--engine',type=Path)
+    parser.add_argument('--ffmpeg',type=Path)
+    parser.add_argument('--repair-fixture',type=Path)
+    parser.add_argument('--acceptance-manifest',type=Path)
     parser.add_argument('--seconds',type=int,default=600)
     args=parser.parse_args()
     if not 60<=args.seconds<=900:parser.error('Interlude budget must be60..900seconds')
