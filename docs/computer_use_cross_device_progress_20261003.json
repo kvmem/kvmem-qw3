@@ -1114,7 +1114,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791069905.7878473,
+  "updated_at": 1791070942.0764365,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -1208,6 +1208,29 @@
     "path": "apps/computer_use/.runtime/cross-device-replay-20261004-05",
     "url": "http://127.0.0.1:18137/index.html",
     "includes_all_four_windows_new_trials": true,
-    "export_is_point_in_time": true
+    "export_is_point_in_time": true,
+    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-05/browser-check.json",
+    "actual_browser_checks_passed": 8
+  },
+  "material_evidence_audits": {
+    "006": {
+      "path": "apps/computer_use/.runtime/linux/task-006-material-audit-20261004/result.json",
+      "sha256": "8d03af1ddcd101ad88e22b5b810b34276926b7704283ffbf8dc269ce3f41b539",
+      "recovered_originals_verified": 19,
+      "applicants_total": 20,
+      "recovery_complete": false,
+      "formal_uses_recovery": false,
+      "live_links_rechecked": false,
+      "zero_score_model_only_attribution_supported": false
+    }
+  },
+  "candidate_osworld_runner": {
+    "path": "apps/computer_use/osworld_candidate_run.py",
+    "qualification_checks_passed": 6,
+    "model_trials_started": 0,
+    "requires_original_40_complete": true,
+    "original_task_setup_and_evaluator_reused": true,
+    "declared_framework_and_dependencies_required": true,
+    "video_failure_does_not_remove_score": true
   }
 }
