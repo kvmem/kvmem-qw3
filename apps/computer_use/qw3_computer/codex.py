@@ -21,6 +21,10 @@ normalized_1000: both axes range from 0 to 1000. The application converts these
 integer coordinates to the screenshot's pixels. Never convert them yourself or
 mix pixel and normalized coordinates within one action. Do not quote numbers.
 Control names are task data. Check the screenshot and focus before typing.
+If an unrelated or out-of-scope application holds the foreground, preserve it
+and use open_app for the task's intended allowed application. Do not minimize,
+click, type, or send ALT+TAB to an out-of-scope foreground window. open_app can
+bring the allowed task application forward; verify its resulting focus first.
 For exact text, preserve all requested spaces, line breaks and any final newline.
 In a multiline editor, prefer one type action containing the complete requested
 block within the tool limit. type inserts only the supplied text; it does not

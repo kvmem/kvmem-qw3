@@ -64,7 +64,9 @@ TOOLS[1]["description"] = TOOLS[1]["description"].replace(
     "Coordinates must be integers, not quoted strings. Omitted coordinate_space retains pixel behavior. "
     "For a matching visible accessibility control, prefer action={kind:click_control,control_id:<copied ID>}; "
     "the program performs one left click at its center, without model-estimated coordinates. "
-    "Check the resulting screen before typing. Do not reuse a control_id from an older observation.")
+    "Check the resulting screen before typing. Do not reuse a control_id from an older observation. "
+    "If an unrelated out-of-scope application is foreground, preserve it and use open_app for the task's "
+    "intended allowed application, then verify focus. Clicking or sending keys to that unrelated foreground is rejected.")
 
 SOFTWARE_TOOLS = [{"name": "software", "description":
     "Manage software in the explicitly selected local Windows workspace. inspect lists reviewed profiles, projects and jobs. "

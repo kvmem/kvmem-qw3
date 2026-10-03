@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 from aiohttp import web
 
 from .bridge import create_app as bridge_app
+from .action_validation import executor_rejection_problem
 from .codex import CodexClient, write_config
 from .desktop import Desktop, DesktopError, DesktopRejected, DesktopValidationError, mcp_observation
 from .software import Software
@@ -448,10 +449,11 @@ class Controller:
                 observation = await self.desktop.observe()
             except DesktopError:
                 raise exc
-            recovery = await self.note_gui_rejection({"code": "executor_rejected", "path": "$.action",
-                "message": str(exc), "hint": "No input was dispatched. Use the fresh observation to correct the action."}, task_id)
+            problem = executor_rejection_problem(str(exc))
+            recovery = await self.note_gui_rejection(problem, task_id)
             return mcp_observation(observation, {"action_id": arguments.get("action_id"),
-                "status": "rejected", "dispatched": False, "error": str(exc), "recovery": recovery}) | {"isError": True}
+                "status": "rejected", "dispatched": False, "error": str(exc), "problem": problem,
+                "recovery": recovery}) | {"isError": True}
         except BaseException:
             if self.desktop.paused:
                 self.state["status"] = "paused"

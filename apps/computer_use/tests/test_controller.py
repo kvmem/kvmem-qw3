@@ -187,6 +187,21 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.desktop.paused)
         self.assertEqual(self.controller.state["status"], "running")
 
+    async def test_outside_scope_rejection_explains_allowed_focus_recovery_without_dispatching_it(self):
+        self.controller.state.update(status='running', id='task')
+        self.desktop.paused = False
+        self.desktop.act = AsyncMock(side_effect=DesktopRejected('Foreground application is outside the allowed scope'))
+        result = await self.controller.tool('act', {'action_id': 'bring-edge-forward', 'action': {'kind': 'key', 'key': 'ALT+TAB'}})
+        text = json.loads(result['content'][0]['text'])
+        self.assertEqual(text['problem']['code'], 'foreground_outside_scope')
+        self.assertIn('open_app', text['problem']['hint'])
+        self.assertIn('Preserve unrelated', text['problem']['hint'])
+        self.assertFalse(text['dispatched'])
+        self.assertEqual(text['recovery']['rejected_calls'], 1)
+        self.assertEqual(self.controller.state['status'], 'running')
+        self.desktop.act.assert_awaited_once()
+        self.assertFalse(self.desktop.paused)
+
     async def test_rejected_action_with_failed_refresh_stays_rejected(self):
         self.controller.state["status"] = "running"
         self.desktop.paused = False

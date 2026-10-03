@@ -5,7 +5,7 @@
   "status": "active",
   "local_plan": "docs/computer_use_local_diagnostic_plan_20261002.json",
   "combined_goal": "docs/computer_use_local_advisor_goal_20261002.md",
-  "current_stage": "p3_baseline_running_candidate_host_contracts_passed",
+  "current_stage": "p3_candidate_running_targeting_followup_queued",
   "source_baseline": "56896791b41b6aa5c022c99dac4996f719bd4ba0",
   "stages": {
     "P0": {
@@ -99,13 +99,13 @@
       "native_report": "docs/computer_use_native_thinking_20261003.md"
     },
     "P3": {
-      "status": "baseline_running_candidate_implemented_host_checked",
-      "trials_completed": 13,
+      "status": "candidate_running_baseline_audited_with_infrastructure_replacement",
+      "trials_completed": 19,
       "planned_trials": 32,
       "report": "docs/computer_use_recovery_diagnostic_p3_20261003.md",
       "baseline_bundle": "windows-native-client-30",
       "condition_count": 8,
-      "model_trials_completed": 13,
+      "model_trials_completed": 19,
       "scripted_conditions_qualified": [
         "normal",
         "wrong_focus",
@@ -140,13 +140,13 @@
       "baseline_frozen": true,
       "baseline_acceptance": "apps/computer_use/.runtime/p3-baseline-20261003/acceptance.json",
       "baseline_campaign": "apps/computer_use/.runtime/p3-baseline-20261003/campaign.json",
-      "active_trial": "p3-baseline-r2-03",
+      "active_trial": "p3-candidate-r1-04",
       "candidate_changes_implemented": 2,
       "observed_baseline_issue": {
         "kind": "cross_task_gui_action_id_collision",
         "first_evidence": "apps/computer_use/.runtime/p3-baseline-r1-01/fixture/state.json",
         "impact": "First completed baseline normal trial required 7 tools and 46.46 seconds; executor rejected a semantic action ID already used by the preceding preflight; model recovered with a new ID. Fresh native clients share the retained VM executor ledger.",
-        "candidate": "Namespace both local GUI action ledger and executor wire IDs by task while preserving legacy receipt reconciliation; implement only after baseline evidence is complete."
+        "candidate": "Implemented task-scoped GUI identities in client31; actual matched native comparison running."
       },
       "baseline_runtime_handles": "apps/computer_use/.runtime/p3-baseline-20261003/run-handles.json",
       "second_observed_issue": {
@@ -167,9 +167,9 @@
         ],
         "visual_localization_claim": "No action reached the executor, so this attempt cannot establish click accuracy.",
         "proposed_generic_candidate": "Report the exact missing/invalid field path and bounded repeated-error recovery, keeping strict validation and no automatic reinterpretation of actions.",
-        "candidate_implemented": false
+        "candidate_implemented": true
       },
-      "candidate_native_qualified": false,
+      "candidate_native_qualified": true,
       "candidate_host_contracts": {
         "run": 138,
         "passed": 134,
@@ -185,10 +185,35 @@
         "path": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-native-client-31.zip",
         "sha256": "23be842ab569dd86d98a9dfc524e46a7efb269cebd82a26b7adfbae3550bfc3a",
         "bytes": 175796498,
-        "native_qualified": false
+        "native_qualified": true
       },
-      "candidate_qualification_handle": "apps/computer_use/.runtime/p3-baseline-20261003/candidate-qualification-handle.json",
-      "baseline_partial_audit": "apps/computer_use/.runtime/p3-baseline-20261003/audit-partial-latest-check.json"
+      "candidate_qualification_handle": "apps/computer_use/.runtime/windows-client-31-qualification-01/result.json",
+      "baseline_partial_audit": "apps/computer_use/.runtime/p3-baseline-20261003/audit-partial-15.json",
+      "baseline_valid_trials_completed": 16,
+      "baseline_unassisted_success": 13,
+      "baseline_artifact_correct": 14,
+      "baseline_uncertain_handoff": 1,
+      "baseline_infrastructure_interruptions_retained": 1,
+      "baseline_replacement_audit": "apps/computer_use/.runtime/p3-baseline-replacement-20261003/audit.json",
+      "candidate_native_contract_tests_passed": 138,
+      "candidate_campaign": "apps/computer_use/.runtime/p3-candidate-20261003/campaign.json",
+      "candidate_trials_completed": 3,
+      "continuation_handle": "apps/computer_use/.runtime/p3-recovery-continuation-handle.json",
+      "targeting_followup": {
+        "status": "host_checked_frozen_bundle_native_qualification_queued",
+        "bundle": "apps/computer_use/.runtime/windows-native-client-32",
+        "sha256": "f4d0f4b05b22b7cd0597edc1f2b87a568540b233397599461e8b2177a29ea062",
+        "source_commit": "cef7f2b",
+        "host_contracts": {
+          "run": 143,
+          "passed": 139,
+          "skipped": 4
+        },
+        "planned_real_model_smoke_trials": 3,
+        "report": "docs/computer_use_targeting_and_recovery_20261003.md",
+        "handle": "apps/computer_use/.runtime/targeting-qualification-handle.json",
+        "not_part_of_client31_recovery_comparison": true
+      }
     },
     "P4": {
       "status": "planned",
@@ -313,7 +338,7 @@
     "gpu_compute_processes": 0,
     "checked_at": 1790982486.6385703
   },
-  "next_action": "Complete the frozen client30 P3 baseline while preparing client31 from the isolated candidate source. Baseline hashes and zip remain unchanged. After VM queue ends, qualify all client31 contracts in Windows, freeze candidate 16-trial acceptance, run paired conditions, and audit real improvements and false pauses. Preserve remaining P4/P5, original ten V0/V1, advisor and resource deliverables.",
+  "next_action": "Finish the frozen client31 native comparison, audit and replay; then qualify client32 and run three separate real-model control-target smoke trials.",
   "advisor_provider": {
     "provider": "deepseek",
     "model": "deepseek-flash",
@@ -426,7 +451,7 @@
     }
   },
   "scheduling": "Iterate diagnosis, product changes and matched retests. Freeze local baselines before advisor business trials; original OSWorld missing assets do not block independent work.",
-  "last_updated": "2026-10-03",
+  "last_updated": "2026-10-03T09:12:53.327958+08:00",
   "latex_preparation": "docs/computer_use_latex_preparation_20261003.md",
   "latex_qualification": {
     "status": "scripted_install_and_pdf_passed_agent_integration_pending",

@@ -13,6 +13,17 @@ def fail(code, path, message, hint='Correct the field and submit a new tool call
     raise ActionValidationError(code, path, message, hint)
 
 
+def executor_rejection_problem(message):
+    problem = {'code': 'executor_rejected', 'path': '$.action', 'message': message,
+        'hint': 'No input was dispatched. Use the fresh observation to correct the action.'}
+    if message == 'Foreground application is outside the allowed scope':
+        problem.update(code='foreground_outside_scope',
+            hint='No input was dispatched. Do not click, type, minimize, or send keys to this unrelated foreground window. '
+                 'Use open_app for the task\'s intended allowed application to bring it to the foreground, '
+                 'then verify the resulting screen before typing. Preserve unrelated windows.')
+    return problem
+
+
 def validate_action(arguments):
     """Validate the public act schema before acquiring a delivery identity.
 
