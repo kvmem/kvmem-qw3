@@ -808,3 +808,29 @@ arbitrary package sets, physical machines and ordinary-memory deployment remain
 unqualified. The current 1M-context GPU profile used about 67 GiB in the LaTeX
 trials. Full local recovery/capability/KVMem diagnostics and optional advisor
 integration remain active work; the advisor is still disabled and unimplemented.
+
+The cross-device development framework now also uses the owned Linux OSWorld VM
+and Android emulator. Its current goal and evidence are in
+`docs/computer_use_cross_device_goal_20261003.md` and the accompanying progress
+JSON. GUI tasks, controlled software tools, native contracts and original
+OSWorld scores are reported separately. The shared current engine uses a 512K
+context; the older Windows qualification above used a different engine profile.
+
+Start new Linux/Android gateways through `device_gateway_entry`, with the same
+platform, endpoint, device ID, runtime, port and Android serial arguments. Use
+`PYTHONPATH=apps/computer_use .venv/bin/python -m device_gateway_entry --help`
+to inspect its options. This entry imports the gateway canonically so driver
+and gateway share the same rejection exception. Executing the old gateway
+module directly creates a second exception class under `__main__`; a confirmed
+foreground preflight refusal can then be misreported as ambiguous delivery.
+The real development Linux qualification reproduced HTTP503 without input and
+verified HTTP409 `delivery=rejected` after the entry correction. Existing frozen
+formal attempts retain their original launcher for comparison.
+
+`receipt_fault_proxy` and `device_receipt_qualification` test lost completed
+receipts without resending input. Each qualification has a unique task
+namespace that survives a client restart. `cross_device_progress` refreshes
+terminal evidence without converting missing evaluators or interrupted trials
+into model failures. `cross_device_replay` exports only public summaries and
+collected videos, with separate software-product rows and explicit incomplete
+time coverage; it does not export bearer credentials or private inference data.

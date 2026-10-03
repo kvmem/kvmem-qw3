@@ -62,8 +62,13 @@
       "agent_status": "paused",
       "seconds": 694.603716163896,
       "tool_calls": 17,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
       "model_score_valid": true,
-      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/013-legacy-r1/result.json"
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/013-legacy-r1/result.json",
+      "finished_at": 1791051464.342846
     },
     {
       "task": "013",
@@ -74,8 +79,18 @@
       "agent_status": "failed",
       "seconds": 122.45599528495222,
       "tool_calls": 6,
+      "uncertain_actions": 0,
+      "turn_error": {
+        "message": "stream disconnected before completion: Incomplete response returned, reason: max_output_tokens",
+        "codexErrorInfo": "other",
+        "additionalDetails": null,
+        "misalignment": null
+      },
+      "unassisted_passed": false,
+      "infrastructure_error": null,
       "model_score_valid": true,
-      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/013-verified-r1/result.json"
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/013-verified-r1/result.json",
+      "finished_at": 1791051626.195478
     },
     {
       "task": "004",
@@ -86,8 +101,13 @@
       "agent_status": "paused",
       "seconds": 95.71614843606949,
       "tool_calls": 7,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
       "model_score_valid": true,
-      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/004-verified-r1/result.json"
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/004-verified-r1/result.json",
+      "finished_at": 1791051790.656256
     },
     {
       "task": "004",
@@ -98,8 +118,13 @@
       "agent_status": "paused",
       "seconds": 907.1707902657799,
       "tool_calls": 22,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
       "model_score_valid": true,
-      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/004-legacy-r1/result.json"
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/004-legacy-r1/result.json",
+      "finished_at": 1791052766.5803847
     },
     {
       "task": "006",
@@ -110,8 +135,13 @@
       "agent_status": "paused",
       "seconds": 860.3544154330157,
       "tool_calls": 32,
+      "uncertain_actions": 1,
+      "turn_error": null,
+      "unassisted_passed": null,
+      "infrastructure_error": "HTTPError: 500 Server Error: Internal Server Error for url: http://127.0.0.1:18300/end_recording",
       "model_score_valid": false,
-      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/006-legacy-r1/result.json"
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/006-legacy-r1/result.json",
+      "finished_at": 1791053802.8683856
     },
     {
       "task": "006",
@@ -122,8 +152,13 @@
       "agent_status": "paused",
       "seconds": 1323.4019553260878,
       "tool_calls": 41,
+      "uncertain_actions": 1,
+      "turn_error": null,
+      "unassisted_passed": null,
+      "infrastructure_error": "HTTPError: 500 Server Error: Internal Server Error for url: http://127.0.0.1:18300/end_recording",
       "model_score_valid": false,
-      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/006-verified-r1/result.json"
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/006-verified-r1/result.json",
+      "finished_at": 1791055304.5098448
     },
     {
       "task": "010",
@@ -134,8 +169,13 @@
       "agent_status": "paused",
       "seconds": 17.63029193179682,
       "tool_calls": 0,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
       "model_score_valid": true,
-      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/010-verified-r1/result.json"
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/010-verified-r1/result.json",
+      "finished_at": 1791055368.1357026
     },
     {
       "task": "010",
@@ -146,8 +186,13 @@
       "agent_status": "paused",
       "seconds": 1723.8820119709708,
       "tool_calls": 47,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
       "model_score_valid": true,
-      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/010-legacy-r1/result.json"
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/010-legacy-r1/result.json",
+      "finished_at": 1791057139.4283202
     },
     {
       "task": "038",
@@ -158,8 +203,13 @@
       "agent_status": "paused",
       "seconds": 898.4291156781837,
       "tool_calls": 22,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
       "model_score_valid": true,
-      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/038-legacy-r1/result.json"
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/038-legacy-r1/result.json",
+      "finished_at": 1791058077.3108957
     },
     {
       "task": "038",
@@ -170,8 +220,13 @@
       "agent_status": "paused",
       "seconds": 667.8779564290307,
       "tool_calls": 20,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
       "model_score_valid": true,
-      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/038-verified-r1/result.json"
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/038-verified-r1/result.json",
+      "finished_at": 1791059008.6448295
     },
     {
       "task": "022",
@@ -182,8 +237,13 @@
       "agent_status": "paused",
       "seconds": 1094.4499867330305,
       "tool_calls": 29,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
       "model_score_valid": true,
-      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/022-verified-r1/result.json"
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/022-verified-r1/result.json",
+      "finished_at": 1791060162.83845
     },
     {
       "task": "022",
@@ -194,8 +254,13 @@
       "agent_status": "paused",
       "seconds": 1332.0016600945964,
       "tool_calls": 34,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
       "model_score_valid": true,
-      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/022-legacy-r1/result.json"
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/022-legacy-r1/result.json",
+      "finished_at": 1791061555.683286
     },
     {
       "task": "035",
@@ -206,8 +271,18 @@
       "agent_status": "failed",
       "seconds": 206.45753482589498,
       "tool_calls": 7,
+      "uncertain_actions": 0,
+      "turn_error": {
+        "message": "stream disconnected before completion: Incomplete response returned, reason: max_output_tokens",
+        "codexErrorInfo": "other",
+        "additionalDetails": null,
+        "misalignment": null
+      },
+      "unassisted_passed": false,
+      "infrastructure_error": null,
       "model_score_valid": false,
-      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/035-legacy-r1/result.json"
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/035-legacy-r1/result.json",
+      "finished_at": 1791062388.2296302
     },
     {
       "task": "035",
@@ -218,8 +293,18 @@
       "agent_status": "failed",
       "seconds": 403.1083910749294,
       "tool_calls": 12,
+      "uncertain_actions": 0,
+      "turn_error": {
+        "message": "stream disconnected before completion: Incomplete response returned, reason: max_output_tokens",
+        "codexErrorInfo": "other",
+        "additionalDetails": null,
+        "misalignment": null
+      },
+      "unassisted_passed": false,
+      "infrastructure_error": null,
       "model_score_valid": false,
-      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/035-verified-r1/result.json"
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/035-verified-r1/result.json",
+      "finished_at": 1791062863.8236635
     },
     {
       "task": "043",
@@ -230,8 +315,13 @@
       "agent_status": "paused",
       "seconds": 298.65793131198734,
       "tool_calls": 13,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
       "model_score_valid": true,
-      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/043-verified-r1/result.json"
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/043-verified-r1/result.json",
+      "finished_at": 1791063231.0276196
     },
     {
       "task": "043",
@@ -242,8 +332,130 @@
       "agent_status": "paused",
       "seconds": 1237.230811062269,
       "tool_calls": 32,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
       "model_score_valid": true,
-      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/043-legacy-r1/result.json"
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/043-legacy-r1/result.json",
+      "finished_at": 1791064506.5213912
+    },
+    {
+      "task": "080",
+      "arm": "legacy",
+      "repetition": 1,
+      "status": "infrastructure-failed",
+      "score": null,
+      "agent_status": null,
+      "seconds": null,
+      "tool_calls": null,
+      "uncertain_actions": null,
+      "turn_error": null,
+      "unassisted_passed": null,
+      "infrastructure_error": "HTTPError: HTTP Error 409: Conflict",
+      "model_score_valid": false,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/080-legacy-r1/result.json",
+      "finished_at": 1791064887.96665
+    },
+    {
+      "task": "080",
+      "arm": "verified",
+      "repetition": 1,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 16.941381433047354,
+      "tool_calls": 2,
+      "uncertain_actions": 1,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/080-verified-r1/result.json",
+      "finished_at": 1791064947.9023597
+    },
+    {
+      "task": "051",
+      "arm": "verified",
+      "repetition": 1,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "failed",
+      "seconds": 210.09781272383407,
+      "tool_calls": 13,
+      "uncertain_actions": 0,
+      "turn_error": {
+        "message": "stream disconnected before completion: Incomplete response returned, reason: max_output_tokens",
+        "codexErrorInfo": "other",
+        "additionalDetails": null,
+        "misalignment": null
+      },
+      "unassisted_passed": false,
+      "infrastructure_error": null,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/051-verified-r1/result.json",
+      "finished_at": 1791065492.6396842
+    },
+    {
+      "task": "051",
+      "arm": "legacy",
+      "repetition": 1,
+      "status": "infrastructure-failed",
+      "score": null,
+      "agent_status": "paused",
+      "seconds": 21.518643178977072,
+      "tool_calls": 2,
+      "uncertain_actions": 1,
+      "turn_error": null,
+      "unassisted_passed": null,
+      "infrastructure_error": "HTTPError: 400 Client Error: Bad Request for url: http://127.0.0.1:18300/end_recording",
+      "model_score_valid": false,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/051-legacy-r1/result.json",
+      "finished_at": 1791065802.1021023
+    },
+    {
+      "task": "013",
+      "arm": "verified",
+      "repetition": 2,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "failed",
+      "seconds": 572.2029523388483,
+      "tool_calls": 21,
+      "uncertain_actions": 0,
+      "turn_error": {
+        "message": "stream disconnected before completion: Incomplete response returned, reason: max_output_tokens",
+        "codexErrorInfo": "other",
+        "additionalDetails": null,
+        "misalignment": null
+      },
+      "unassisted_passed": false,
+      "infrastructure_error": null,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/013-verified-r2/result.json",
+      "finished_at": 1791066419.359973
+    },
+    {
+      "task": "013",
+      "arm": "legacy",
+      "repetition": 2,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "failed",
+      "seconds": 116.72057607769966,
+      "tool_calls": 6,
+      "uncertain_actions": 0,
+      "turn_error": {
+        "message": "stream disconnected before completion: Incomplete response returned, reason: max_output_tokens",
+        "codexErrorInfo": "other",
+        "additionalDetails": null,
+        "misalignment": null
+      },
+      "unassisted_passed": false,
+      "infrastructure_error": null,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/013-legacy-r2/result.json",
+      "finished_at": 1791066966.6316082
     }
   ],
   "warnings": [
@@ -255,7 +467,8 @@
     "Client37 native181 and independent grader/recording qualification are not real-model task successes.",
     "Android live video is sampled at1Hz and can miss subsecond UI changes.",
     "The frozen campaign has not yet demonstrated a successful task or success-rate improvement.",
-    "Default official Linux recording can block on undrained stderr: isolated real VM diagnostic at305/320s saw pipe_write and64519 queued bytes, a322.70s run produced283.73s video. Existing formal scores retained; video timeline coverage is not accepted."
+    "Default official Linux recording can block on undrained stderr: isolated real VM diagnostic at305/320s saw pipe_write and64519 queued bytes, a322.70s run produced283.73s video. Existing formal scores retained; video timeline coverage is not accepted.",
+    "080 verified and051 legacy stopped with a false ambiguous-delivery classification after confirmed driver preflight rejection. Canonical entry fix is independently qualified; no complex-task improvement is yet established."
   ],
   "contract_checks": {
     "core_regression": {
@@ -436,8 +649,9 @@
       "passed": true,
       "actual_browser": true,
       "credentials_exported": false,
-      "path": "apps/computer_use/.runtime/cross-device-replay-20261004-03/browser-check.json",
-      "contains_success_and_failure_contacts": true
+      "path": "apps/computer_use/.runtime/cross-device-replay-20261004-04/browser-check.json",
+      "contains_success_and_failure_contacts": true,
+      "contains_linux_form_and_windows_product": true
     },
     "short_action_id": {
       "run": 97,
@@ -457,6 +671,39 @@
       "passed": 6,
       "model_used": false,
       "scope": "Separate formal/pilot results, required stop acknowledgement, watchdog isolation and Windows fixture admission"
+    },
+    "gateway_canonical_namespace": {
+      "passed": 2,
+      "model_used": false,
+      "scope": "Reproduced503 false ambiguity before any driver input; canonical entry returns409 non-delivery"
+    },
+    "canonical_foreground_real_linux": {
+      "passed": true,
+      "model_used": false,
+      "baseline_http_status": 503,
+      "candidate_http_status": 409,
+      "input_sent": false,
+      "path": "apps/computer_use/.runtime/linux/preflight-qualification-canonical-01/result.json"
+    },
+    "receipt_fault_proxy": {
+      "passed": 5,
+      "model_used": false,
+      "includes_independent_repeat_namespaces": true
+    },
+    "receipt_recovery_real_linux": {
+      "passed": true,
+      "model_used": false,
+      "path": "apps/computer_use/.runtime/linux/receipt-fault-qualification-01/result.json"
+    },
+    "receipt_recovery_real_android": {
+      "passed": true,
+      "model_used": false,
+      "path": "apps/computer_use/.runtime/android/receipt-fault-qualification-04/result.json"
+    },
+    "progress_summary": {
+      "passed": 3,
+      "model_used": false,
+      "scope": "Unavailable graders, partial/running reports, zero scores and incomplete video separated"
     }
   },
   "integration_pilots": [
@@ -604,7 +851,7 @@
     {
       "id": "candidate-interlude-contacts-01",
       "formal": false,
-      "status": "failed",
+      "status": "paused",
       "seconds": 210.33237604191527,
       "tool_calls": 14,
       "uncertain_actions": 0,
@@ -615,12 +862,16 @@
         "pixel-values-relabeled-normalized",
         "evidence-refresh-counted-as-third-rejection"
       ],
-      "path": "apps/computer_use/.runtime/candidate-interlude-contacts-01/pilot/integration-result.json"
+      "path": "apps/computer_use/.runtime/candidate-interlude-contacts-01/pilot/integration-result.json",
+      "artifact_passed": false,
+      "accepted": false,
+      "unassisted_passed": false,
+      "video_collection_passed": true
     },
     {
       "id": "candidate-interlude-contacts-02",
       "formal": false,
-      "status": "passed",
+      "status": "completed",
       "seconds": 539.4699720763601,
       "tool_calls": 24,
       "uncertain_actions": 0,
@@ -630,12 +881,13 @@
       "video_bytes": 3277202,
       "fresh_target_checks": 10,
       "changed_target_rejections": 4,
-      "path": "apps/computer_use/.runtime/candidate-interlude-contacts-02/pilot/integration-result.json"
+      "path": "apps/computer_use/.runtime/candidate-interlude-contacts-02/pilot/integration-result.json",
+      "video_collection_passed": true
     },
     {
       "id": "candidate-interlude-linux-browser-01",
       "formal": false,
-      "status": "failed",
+      "status": "paused",
       "app_status": "paused",
       "seconds": 15.484068754129112,
       "tool_calls": 3,
@@ -646,7 +898,22 @@
       "categories": [
         "action-id-arbitrary-minimum-length"
       ],
-      "path": "apps/computer_use/.runtime/candidate-interlude-linux-browser-01/pilot/integration-result.json"
+      "path": "apps/computer_use/.runtime/candidate-interlude-linux-browser-01/pilot/integration-result.json",
+      "unassisted_passed": false,
+      "video_collection_passed": true
+    },
+    {
+      "id": "candidate-interlude-linux-browser-02",
+      "formal": false,
+      "path": "apps/computer_use/.runtime/candidate-interlude-linux-browser-02/pilot/integration-result.json",
+      "status": "completed",
+      "seconds": 332.5453197588213,
+      "tool_calls": 15,
+      "artifact_passed": true,
+      "accepted": true,
+      "unassisted_passed": true,
+      "video_collection_passed": true,
+      "uncertain_actions": 0
     }
   ],
   "app_entry": "http://127.0.0.1:18205/",
@@ -745,27 +1012,29 @@
   "frozen_campaign": {
     "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/plan.json",
     "commit": "9fe52d3ee254786012652ec9fc85f340b71e9dc9",
-    "finished": 16,
+    "finished": 22,
     "total": 40,
-    "current": [],
-    "separate_pilot_queued": "candidate-interlude-linux-browser-02",
-    "separate_pilot_status": "running"
+    "current": [
+      "004-legacy-r2"
+    ],
+    "separate_pilot_queued": "xdev-latex-new-02",
+    "separate_pilot_status": "waiting-for-current-formal-attempt"
   },
   "post_freeze_optimizations": {
     "candidate": "cross-device-ui-12",
     "formal_campaign_changes": false,
     "output_tokens": 16384,
     "expired_observations": "Recapture; exact unchanged view or explicit allowed app intent can dispatch once; other changes return current view without input",
-    "real_model_retest": "Contacts02 accepted unassisted; Linux browser01 failed on ID length, browser02 queued under same900s budget",
+    "real_model_retest": "Contacts02 and Linux browser02 accepted; Windows Python new2/2 and LaTeX new1/2 accepted under separate controlled-software-tool protocol",
     "control_id_copy_hint": "Complete20-character observed IDs; the server currently does not enforce identifier enums during decoding, no constrained-decoding benefit claimed"
   },
   "formal_summary": {
-    "ended_attempts": 16,
-    "valid_original_scores": 12,
-    "infrastructure_failures": 2,
+    "ended_attempts": 22,
+    "valid_original_scores": 16,
+    "infrastructure_failures": 4,
+    "unavailable_original_evaluators": 2,
     "successes": 0,
-    "improvement_demonstrated": false,
-    "unavailable_original_evaluators": 2
+    "improvement_demonstrated": false
   },
   "candidate_changes_after_freeze": {
     "same_title_windows": "Unique AT-SPI active frame, real Linux browser qualification passed",
@@ -786,19 +1055,63 @@
     "pending_step_checkpoint": "Future candidate returns concrete pending goal/conditions and permits continuing same result without copying goal;14 execution checks passed, UI11 and client38 keep their frozen source inventories",
     "linux_video": "Future platform pilots default to timestamped read-only VNC recorder; official frozen campaign unchanged",
     "short_action_ids": "Model GUI action identifiers now1..80; downstream receipt identities remain task-scoped q3_SHA256",
-    "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction"
+    "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
+    "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791064695.7718856,
+  "updated_at": 1791067273.9799984,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
-    "started": 0,
+    "started": 3,
     "bundle": "windows-native-client-40",
     "thinking": true,
     "workflow_mode": "verified",
     "model_output_tokens": 16384,
     "timeout_seconds": 900,
     "shared_engine": true,
-    "pure_gui": false
-  }
+    "pure_gui": false,
+    "ended": 3,
+    "accepted": 3
+  },
+  "windows_product_attempts": [
+    {
+      "id": "xdev-latex-new-01-trial",
+      "task": "product-latex-new",
+      "status": "complete",
+      "passed": true,
+      "accepted": true,
+      "model_used": true,
+      "pure_gui": false,
+      "seconds": 218.7118222,
+      "tool_calls": 17,
+      "workflow_mode": "verified",
+      "path": "apps/computer_use/.runtime/xdev-latex-new-01/xdev-latex-new-01-trial/result.json"
+    },
+    {
+      "id": "xdev-python-new-01-trial",
+      "task": "product-python-new",
+      "status": "complete",
+      "passed": true,
+      "accepted": true,
+      "model_used": true,
+      "pure_gui": false,
+      "seconds": 85.8319225,
+      "tool_calls": 7,
+      "workflow_mode": "verified",
+      "path": "apps/computer_use/.runtime/xdev-python-new-01/xdev-python-new-01-trial/result.json"
+    },
+    {
+      "id": "xdev-python-new-02-trial",
+      "task": "product-python-new",
+      "status": "complete",
+      "passed": true,
+      "accepted": true,
+      "model_used": true,
+      "pure_gui": false,
+      "seconds": 96.4502671,
+      "tool_calls": 9,
+      "workflow_mode": "verified",
+      "path": "apps/computer_use/.runtime/xdev-python-new-02/xdev-python-new-02-trial/result.json"
+    }
+  ]
 }
