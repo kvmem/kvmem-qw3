@@ -456,6 +456,57 @@
       "model_score_valid": true,
       "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/013-legacy-r2/result.json",
       "finished_at": 1791066966.6316082
+    },
+    {
+      "task": "004",
+      "arm": "legacy",
+      "repetition": 2,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 701.0808197157457,
+      "tool_calls": 18,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/004-legacy-r2/result.json",
+      "finished_at": 1791067738.5793207
+    },
+    {
+      "task": "004",
+      "arm": "verified",
+      "repetition": 2,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 567.2826624396257,
+      "tool_calls": 17,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/004-verified-r2/result.json",
+      "finished_at": 1791068767.2867765
+    },
+    {
+      "task": "006",
+      "arm": "verified",
+      "repetition": 2,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 41.04253107402474,
+      "tool_calls": 4,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/006-verified-r2/result.json",
+      "finished_at": 1791068960.4847353
     }
   ],
   "warnings": [
@@ -704,6 +755,11 @@
       "passed": 3,
       "model_used": false,
       "scope": "Unavailable graders, partial/running reports, zero scores and incomplete video separated"
+    },
+    "repair_preflight": {
+      "passed": 4,
+      "model_used": false,
+      "scope": "Original broken fixture bytes, validated post-success reset provenance and rejection before scheduler/VM mutation"
     }
   },
   "integration_pilots": [
@@ -1012,12 +1068,12 @@
   "frozen_campaign": {
     "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/plan.json",
     "commit": "9fe52d3ee254786012652ec9fc85f340b71e9dc9",
-    "finished": 22,
+    "finished": 25,
     "total": 40,
     "current": [
-      "004-legacy-r2"
+      "006-legacy-r2"
     ],
-    "separate_pilot_queued": "xdev-latex-new-02",
+    "separate_pilot_queued": "xdev-python-repair-02",
     "separate_pilot_status": "waiting-for-current-formal-attempt"
   },
   "post_freeze_optimizations": {
@@ -1025,12 +1081,12 @@
     "formal_campaign_changes": false,
     "output_tokens": 16384,
     "expired_observations": "Recapture; exact unchanged view or explicit allowed app intent can dispatch once; other changes return current view without input",
-    "real_model_retest": "Contacts02 and Linux browser02 accepted; Windows Python new2/2 and LaTeX new1/2 accepted under separate controlled-software-tool protocol",
+    "real_model_retest": "Contacts02 and Linux browser02 accepted; Windows Python new2/2 and LaTeX new2/2 accepted under separate controlled-software-tool protocol; Python repair initial trial queued",
     "control_id_copy_hint": "Complete20-character observed IDs; the server currently does not enforce identifier enums during decoding, no constrained-decoding benefit claimed"
   },
   "formal_summary": {
-    "ended_attempts": 22,
-    "valid_original_scores": 16,
+    "ended_attempts": 25,
+    "valid_original_scores": 19,
     "infrastructure_failures": 4,
     "unavailable_original_evaluators": 2,
     "successes": 0,
@@ -1058,11 +1114,11 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791067273.9799984,
+  "updated_at": 1791069905.7878473,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
-    "started": 3,
+    "started": 4,
     "bundle": "windows-native-client-40",
     "thinking": true,
     "workflow_mode": "verified",
@@ -1070,8 +1126,8 @@
     "timeout_seconds": 900,
     "shared_engine": true,
     "pure_gui": false,
-    "ended": 3,
-    "accepted": 3
+    "ended": 5,
+    "accepted": 4
   },
   "windows_product_attempts": [
     {
@@ -1086,6 +1142,19 @@
       "tool_calls": 17,
       "workflow_mode": "verified",
       "path": "apps/computer_use/.runtime/xdev-latex-new-01/xdev-latex-new-01-trial/result.json"
+    },
+    {
+      "id": "xdev-latex-new-02-trial",
+      "task": "product-latex-new",
+      "status": "complete",
+      "passed": true,
+      "accepted": true,
+      "model_used": true,
+      "pure_gui": false,
+      "seconds": 210.35221339999998,
+      "tool_calls": 16,
+      "workflow_mode": "verified",
+      "path": "apps/computer_use/.runtime/xdev-latex-new-02/xdev-latex-new-02-trial/result.json"
     },
     {
       "id": "xdev-python-new-01-trial",
@@ -1112,6 +1181,33 @@
       "tool_calls": 9,
       "workflow_mode": "verified",
       "path": "apps/computer_use/.runtime/xdev-python-new-02/xdev-python-new-02-trial/result.json"
+    },
+    {
+      "id": "xdev-python-repair-01-trial",
+      "task": "product-python-repair",
+      "status": "halted",
+      "passed": false,
+      "accepted": false,
+      "model_used": false,
+      "pure_gui": false,
+      "seconds": null,
+      "tool_calls": null,
+      "workflow_mode": "verified",
+      "path": "apps/computer_use/.runtime/xdev-python-repair-01/xdev-python-repair-01-trial/result.json"
     }
-  ]
+  ],
+  "repair_preparation": {
+    "first_fixture": "apps/computer_use/.runtime/xdev-python-fixture-01/result.json",
+    "preserved_failed_reset": "apps/computer_use/.runtime/xdev-python-fixture-reset-01/result.json",
+    "preserved_pre_model_attempt": "apps/computer_use/.runtime/xdev-python-repair-01/reconciliation.json",
+    "corrected_initial_protocol": "apps/computer_use/.runtime/windows-cross-products-20261004/python-repair-initial-acceptance-v2.json",
+    "corrected_repeat_protocol": "apps/computer_use/.runtime/windows-cross-products-20261004/python-repair-repeat-acceptance-v2.json",
+    "real_model_candidate_queued": "xdev-python-repair-02"
+  },
+  "public_replay_snapshot": {
+    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-05",
+    "url": "http://127.0.0.1:18137/index.html",
+    "includes_all_four_windows_new_trials": true,
+    "export_is_point_in_time": true
+  }
 }
