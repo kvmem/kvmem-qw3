@@ -125,9 +125,18 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_inline_step_cannot_silently_replace_pending_plan(self):
         await self.begin()
         request={'step':{'goal':'Another plan','conditions':[{'kind':'screen_changed'}]}}
-        with self.assertRaises(DesktopValidationError):
+        with self.assertRaises(DesktopValidationError) as caught:
             self.execution.before_dispatch(request,{'action':{'kind':'key','key':'ESC'}},'q3_other')
         self.assertEqual(self.execution.steps()[0]['status'],'pending')
+        checkpoint=caught.exception.problem['checkpoint']
+        self.assertEqual(checkpoint['pending_step']['step_id'],'save')
+        self.assertEqual(checkpoint['pending_step']['conditions'],self.execution.steps()[0]['conditions'])
+        self.assertFalse(checkpoint['input_dispatched'])
+        self.assertEqual(checkpoint['uncertain_action_ids'],[])
+        # A correction pursuing the existing save conditions needs no copied
+        # goal text and does not abandon or invent another step.
+        self.execution.before_dispatch({}, {'action':{'kind':'key','key':'TAB'}}, 'q3_continue')
+        self.assertEqual(len(self.execution.steps()),1)
         request['step']['recovery_reason']='Close the blocking dialog before trying another save'
         self.execution.before_dispatch(request,{'action':{'kind':'key','key':'ESC'}},'q3_recovery')
         self.assertEqual(self.execution.steps()[0]['status'],'abandoned')

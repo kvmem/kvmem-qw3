@@ -24,7 +24,7 @@ def frames_before(elapsed_seconds, fps):
     return max(0, math.ceil(elapsed_seconds * fps))
 
 
-def record(output, ffmpeg, duration=None, fps=10, port=15900, stop=None):
+def record(output, ffmpeg, duration=None, fps=10, port=15900, stop=None, host="127.0.0.1"):
     if not 1 <= fps <= 30 or (duration is not None and duration <= 0):
         raise ValueError("Use 1–30 fps and a positive duration")
     output = Path(output).resolve()
@@ -41,7 +41,7 @@ def record(output, ffmpeg, duration=None, fps=10, port=15900, stop=None):
                 "clock": "host_monotonic_ns", "status": "starting",
                 "executor_observe_calls": 0, "input_events": 0,
                 "capture_gap_policy": "repeat_last_available_frame; initial frame is black",
-                "video": "screen.mkv", "complete": False}
+                "video": "screen.mkv", "complete": False, "console_host":host,"console_port":port}
     with Path(ffmpeg).open("rb") as stream:
         metadata["ffmpeg_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
     manifest = output / "recording.json"
@@ -53,7 +53,7 @@ def record(output, ffmpeg, duration=None, fps=10, port=15900, stop=None):
 
     save()
     try:
-        console = Console(port)
+        console = Console(port,host)
         # A failed capture must terminate promptly instead of producing a
         # seemingly valid movie with an unreported frozen desktop.
         console.socket.settimeout(3)
@@ -158,11 +158,12 @@ def main():
     parser.add_argument("--duration", type=float)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--port", type=int, default=15900)
+    parser.add_argument("--host", default="127.0.0.1", help="Private IP of an already verified task-owned VM console")
     args = parser.parse_args()
     stop = threading.Event()
     for name in (signal.SIGINT, signal.SIGTERM):
         signal.signal(name, lambda *_: stop.set())
-    result = record(args.output, args.ffmpeg, args.duration, args.fps, args.port, stop)
+    result = record(args.output, args.ffmpeg, args.duration, args.fps, args.port, stop, args.host)
     print(json.dumps({k: result[k] for k in ("status", "captures", "video_frames", "elapsed_seconds")}))
 
 

@@ -8,8 +8,12 @@ from PIL import Image
 
 
 class Console:
-    def __init__(self, port=15900):
-        self.socket = socket.create_connection(("127.0.0.1", port), 10)
+    def __init__(self, port=15900, host="127.0.0.1"):
+        # Administrative local VM consoles only; never exposed to Computer MCP.
+        import ipaddress
+        if not ipaddress.ip_address(host).is_private:
+            raise ValueError("Console host must be a private or loopback IP")
+        self.socket = socket.create_connection((host, port), 10)
         self.socket.settimeout(20)
         self.read(12)
         self.socket.sendall(b"RFB 003.008\n")

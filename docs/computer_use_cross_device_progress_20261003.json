@@ -182,7 +182,8 @@
     "Task013 verified reached4096 combined output tokens during reasoning; later budget and freshness changes are a separate candidate.",
     "Client37 native181 and independent grader/recording qualification are not real-model task successes.",
     "Android live video is sampled at1Hz and can miss subsecond UI changes.",
-    "The frozen campaign has not yet demonstrated a successful task or success-rate improvement."
+    "The frozen campaign has not yet demonstrated a successful task or success-rate improvement.",
+    "Default official Linux recording can block on undrained stderr: isolated real VM diagnostic at305/320s saw pipe_write and64519 queued bytes, a322.70s run produced283.73s video. Existing formal scores retained; video timeline coverage is not accepted."
   ],
   "contract_checks": {
     "core_regression": {
@@ -337,6 +338,34 @@
       "real_model": false,
       "log": "/tmp/qw3-control-target-refresh-tests.log",
       "scope": "Fresh control identity and target-image region, recovery accounting, execution and controller regression"
+    },
+    "native_windows_client38": {
+      "run": 191,
+      "passed": 191,
+      "real_model": false,
+      "bundle_sha256": "e63c15c319c0e7fdcd1115e7ba6b750a30dcb56db232d5d97c6ae2fb1695ebd4",
+      "source_commit": "46eb4d3a2182aa2ad13afb29172e7c59723038b4"
+    },
+    "linux_vnc_time_coverage": {
+      "passed": true,
+      "model_used": false,
+      "wall_elapsed_seconds": 360.95379405,
+      "video_seconds": 361.0,
+      "last_decoded_frame_seconds": 360.5,
+      "input_events": 0,
+      "path": "apps/computer_use/.runtime/linux/vnc-recording-qualification-02/time-coverage-qualification.json"
+    },
+    "linux_vnc_wrapper": {
+      "passed": true,
+      "model_used": false,
+      "path": "apps/computer_use/.runtime/linux/vnc-wrapper-qualification-01/result.json"
+    },
+    "cross_device_public_replay": {
+      "passed": true,
+      "actual_browser": true,
+      "credentials_exported": false,
+      "path": "apps/computer_use/.runtime/cross-device-replay-20261004-03/browser-check.json",
+      "contains_success_and_failure_contacts": true
     }
   },
   "integration_pilots": [
@@ -496,6 +525,21 @@
         "evidence-refresh-counted-as-third-rejection"
       ],
       "path": "apps/computer_use/.runtime/candidate-interlude-contacts-01/pilot/integration-result.json"
+    },
+    {
+      "id": "candidate-interlude-contacts-02",
+      "formal": false,
+      "status": "passed",
+      "seconds": 539.4699720763601,
+      "tool_calls": 24,
+      "uncertain_actions": 0,
+      "artifact_passed": true,
+      "accepted": true,
+      "unassisted_passed": true,
+      "video_bytes": 3277202,
+      "fresh_target_checks": 10,
+      "changed_target_rejections": 4,
+      "path": "apps/computer_use/.runtime/candidate-interlude-contacts-02/pilot/integration-result.json"
     }
   ],
   "app_entry": "http://127.0.0.1:18205/",
@@ -594,26 +638,28 @@
   "frozen_campaign": {
     "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/plan.json",
     "commit": "9fe52d3ee254786012652ec9fc85f340b71e9dc9",
-    "finished": 10,
+    "finished": 13,
     "total": 40,
     "current": [
-      "022-verified-r1"
-    ]
+      "035-verified-r1"
+    ],
+    "separate_pilot_queued": "candidate-interlude-linux-browser-01"
   },
   "post_freeze_optimizations": {
-    "candidate": "cross-device-ui-10",
+    "candidate": "cross-device-ui-11",
     "formal_campaign_changes": false,
     "output_tokens": 16384,
     "expired_observations": "Recapture; exact unchanged view or explicit allowed app intent can dispatch once; other changes return current view without input",
-    "real_model_retest": "contacts01 failed with saved video; corrected candidate retest pending",
+    "real_model_retest": "Contacts02 accepted unassisted,1 successful development retest; first failed attempt retained; repeat pending",
     "control_id_copy_hint": "Complete20-character observed IDs; the server currently does not enforce identifier enums during decoding, no constrained-decoding benefit claimed"
   },
   "formal_summary": {
-    "ended_attempts": 10,
-    "valid_original_scores": 8,
+    "ended_attempts": 13,
+    "valid_original_scores": 10,
     "infrastructure_failures": 2,
     "successes": 0,
-    "improvement_demonstrated": false
+    "improvement_demonstrated": false,
+    "unavailable_original_evaluators": 1
   },
   "candidate_changes_after_freeze": {
     "same_title_windows": "Unique AT-SPI active frame, real Linux browser qualification passed",
@@ -629,7 +675,10 @@
     "foreground_tree_read": "Integrated official foreground traversal; three real Calc captures succeeded within4s, generalization unproven",
     "linux_accessibility_limit": "Whole-desktop4s limit unavailable in loaded Calc scene",
     "recovery_counter": "Same-device safe evidence refresh does not consume malformed-call allowance; original error counts and cumulative budget remain",
-    "control_target_guard": "Verified click_control refreshes even young observations; same unique control identity and target image crop required before one dispatch"
+    "control_target_guard": "Verified click_control refreshes even young observations; same unique control identity and target image crop required before one dispatch",
+    "pending_step_diagnosis": "022 verified remained paused after3 rejections, including incompatible pending-step replacement; semantics retained, further diagnosis pending",
+    "pending_step_checkpoint": "Future candidate returns concrete pending goal/conditions and permits continuing same result without copying goal;14 execution checks passed, UI11 and client38 keep their frozen source inventories",
+    "linux_video": "Future platform pilots default to timestamped read-only VNC recorder; official frozen campaign unchanged"
   },
-  "updated_at": 1791060071.962569
+  "updated_at": 1791062891.5985713
 }

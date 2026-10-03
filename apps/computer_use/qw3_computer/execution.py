@@ -129,7 +129,11 @@ class Execution:
                 if not isinstance(reason, str) or not 1 <= len(reason.strip()) <= 1024 or self.desktop.unresolved():
                     raise DesktopValidationError({"code":"pending_step","path":"$.step.recovery_reason",
                         "message":"The previous step is still pending; it cannot be silently replaced.",
-                        "hint":"Wait for its conditions, reuse its goal/conditions, or provide a concrete recovery_reason when changing approach. Never supersede an uncertain input."})
+                        "hint":"Use workflow wait for this pending step. To continue toward the same result, omit step in the next act call. To replace it, declare the new step with a concrete recovery_reason. Never supersede an uncertain input.",
+                        "checkpoint":{"pending_step":{k:pending[0].get(k) for k in
+                            ("step_id","goal","conditions","status","last_observation_id")},
+                            "uncertain_action_ids":[a["action_id"] for a in self.desktop.unresolved()],
+                            "input_dispatched":False}})
                 pending[0].update(status="abandoned",reason=reason,abandoned_at=time.time())
                 self.save_step(pending[0]);pending=[]
             if not pending:

@@ -81,11 +81,13 @@ def run(args):
     manifest = {"kind": "integration-pilot-not-formal", "case": args.case, "prompt": prompt,
                 "deadline_seconds": seconds, "container_id": info["Id"], "app_runtime": str(args.runtime.resolve()),
                 "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                'video_mode':args.video_mode if android else 'official-osworld-recorder',
+                'video_mode':args.video_mode if android else getattr(args,'linux_video_mode','official'),
                 'model_output_tokens':state.get('model_output_tokens',4096),
                 "no_model_access_to_initializer_or_grader": True}
     manifest['fixture_sources']={name:hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
                                 for name in ['browser_pilot.py','browser_pilot_server.js','calc_pilot.py','android_contacts_pilot.py']}
+    manifest['recording_sources']={name:hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest()
+                                 for name in ['linux_recording.py','vm/record_console.py','vm/vnc_admin.py','live_android_recording.py']}
     save(directory / "pilot-manifest.json", manifest)
     video = None
     fixture = None
@@ -143,8 +145,13 @@ def run(args):
                 save(directory/'pilot-manifest.json',manifest)
             else:
                 initialize_linux_text(directory)
-            request("http://127.0.0.1:18126", "/start_recording", {}, timeout=30)
-            recording = True
+            if getattr(args,'linux_video_mode','official')=='vnc':
+                from linux_recording import LinuxRecording
+                video=LinuxRecording(directory,info['Id'])
+                video.start()
+            else:
+                request("http://127.0.0.1:18126", "/start_recording", {}, timeout=30)
+                recording = True
         started = time.monotonic()
         state = request(args.app, "/api/task", {"prompt": prompt})
         task_id = state["id"]
@@ -210,6 +217,8 @@ def run(args):
         try:
             if android:
                 result['video_collection_passed']=video.finish()['passed']
+            elif video is not None:
+                result['video_collection_passed']=video.finish()['complete']
             else:
                 collect_linux_recording(directory/'continuous.mp4')
                 recording=False
@@ -295,6 +304,8 @@ def main():
     p.add_argument('--seconds',type=int,help='Explicit60..1800s task deadline; record longer probes separately from prior pilots')
     p.add_argument('--video-mode',choices=['live','native'],default='live',
                    help='Live1Hz measured captures preserve static waits; native video may omit a stationary tail')
+    p.add_argument('--linux-video-mode',choices=['vnc','official'],default='vnc',
+                   help='Timestamped read-only VNC sampling; official server recordings can omit long waits')
     args = p.parse_args()
     print(json.dumps(run(args), ensure_ascii=False), flush=True)
 
