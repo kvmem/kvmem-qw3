@@ -45,14 +45,30 @@ def qualify_cpu(path):
     for name in HELPERS: image.pinned(ROOT / "apps/computer_use" / name, q["source_sha256"][name])
 
 
+def image_registration_proof(parent_protocol, registration):
+    registered = read(registration)
+    if registered.get("protocol_sha256") != owned.digest(parent_protocol):
+        raise SafetyHalt("Original image-policy predecessor protocol changed")
+    if registered.get("kind") == "actual_visual_context_retest_waiter_identity":
+        if (not image.successors.command_path(registered["identity"], "--protocol", parent_protocol)
+                or "visual_context_retest_queue" not in registered["identity"]["command"]):
+            raise SafetyHalt("Original image-policy controller identity is unproven")
+        return None
+    if registered.get("kind") != "actual_retired_051_successor_identity" or registered.get("stage") != "image":
+        raise SafetyHalt("Actual image-policy predecessor controller is unproven")
+    import retired_051_successors as successor
+    followup = Path(registered["followup"])
+    d, _, _, _ = successor.validate_followup(followup)
+    successor.registration(registration, "image", followup, d)
+    if Path(d["image_protocol"]).resolve() != Path(parent_protocol).resolve():
+        raise SafetyHalt("Continued image controller uses a different original protocol")
+    return dict(followup=str(followup), followup_sha256=owned.digest(followup), wrapper_sha256=registered["wrapper_sha256"])
+
+
 def prepare(parent_protocol, registration, directory, qualification):
     p = image.validate(parent_protocol)
     registered = read(registration)
-    if (registered.get("kind") != "actual_visual_context_retest_waiter_identity"
-            or registered.get("protocol_sha256") != owned.digest(parent_protocol)
-            or not image.successors.command_path(registered["identity"], "--protocol", parent_protocol)
-            or "visual_context_retest_queue" not in registered["identity"]["command"]):
-        raise SafetyHalt("Actual image-policy predecessor controller is unproven")
+    continuation = image_registration_proof(parent_protocol, registration)
     base.require_identity(registered["identity"])
     qualify_cpu(qualification)
     data = source_input(SOURCE)
@@ -63,6 +79,7 @@ def prepare(parent_protocol, registration, directory, qualification):
              declared_at=time.time(), parent_protocol=str(parent_protocol), parent_protocol_sha256=owned.digest(parent_protocol),
              parent_registration=str(registration), parent_registration_sha256=owned.digest(registration),
              parent_queue=registered["queue"], parent_controller=registered["identity"],
+             parent_continuation=continuation,
              qualification=str(qualification), qualification_sha256=owned.digest(qualification),
              source_trace=str(SOURCE), source_request=str(source), source_request_sha256=image.archive.digest(data),
              source_metrics_sha256=owned.digest(SOURCE / "metrics.json"), source_backend_sha256=owned.digest(SOURCE / "backend.jsonl"),
@@ -95,6 +112,8 @@ def validate(path):
     if (registered["identity"] != p["parent_controller"] or registered["queue"] != p["parent_queue"]
             or registered["protocol_sha256"] != p["parent_protocol_sha256"]):
         raise SafetyHalt("Image predecessor registration changed")
+    if image_registration_proof(Path(p["parent_protocol"]), Path(p["parent_registration"])) != p.get("parent_continuation"):
+        raise SafetyHalt("Scoped image predecessor continuation changed")
     image.pinned(SOURCE / "metrics.json", p["source_metrics_sha256"])
     image.pinned(SOURCE / "backend.jsonl", p["source_backend_sha256"])
     image.pinned(SOURCE.parents[2] / "result.json", p["original_result_sha256"])
@@ -105,6 +124,14 @@ def validate(path):
 
 def predecessor_ready(p):
     q = read(p["parent_queue"])
+    continuation = p.get("parent_continuation")
+    if continuation is not None:
+        import retired_051_successors as successor
+        image.pinned(continuation["followup"], continuation["followup_sha256"])
+        successor.guard_queue(q, p["parent_controller"], continuation["followup_sha256"],
+                              "continued_successor_declaration_sha256")
+        if q.get("continued_successor_wrapper_sha256") != continuation["wrapper_sha256"]:
+            raise SafetyHalt("Image predecessor wrapper changed")
     if (q.get("pid") != p["parent_controller"]["pid"]
             or q.get("protocol_sha256") != p["parent_protocol_sha256"]
             or str(q.get("status", "")).startswith("halted")):

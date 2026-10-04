@@ -131,6 +131,72 @@ class ContractTests(unittest.TestCase):
                 patch.object(queue.base, "process_retired", return_value=False):
             self.assertIsNone(queue.predecessor_ready(p))
 
+    def continued_registration(self, directory, stage="image"):
+        import retired_051_successors as successor
+        protocol, followup, registration = (directory / n for n in ("protocol.json", "followup.json", "registration.json"))
+        queue.save(protocol, {}); queue.save(followup, {})
+        identity = dict(pid=123, cwd=str(directory), command=["python", "-m", successor.MODULE, "--stage", stage,
+                                                            "--followup", str(followup)])
+        r = dict(kind="actual_retired_051_successor_identity", stage=stage, identity=identity,
+                 protocol_sha256=queue.owned.digest(protocol), followup=str(followup), followup_sha256=queue.owned.digest(followup),
+                 wrapper_sha256=queue.owned.digest(Path(successor.__file__)), queue=str(directory / "state/queue.json"))
+        queue.save(registration, r)
+        d = dict(image_protocol=str(protocol), image_state_dir=str(directory / "state"))
+        return successor, protocol, followup, registration, r, d
+
+    def test_actual_continued_image_registration_keeps_original_protocol(self):
+        with tempfile.TemporaryDirectory() as folder:
+            successor, protocol, followup, registration, r, d = self.continued_registration(Path(folder))
+            with patch.object(successor, "validate_followup", return_value=(d, None, None, None)):
+                proof = queue.image_registration_proof(protocol, registration)
+            self.assertEqual(proof, dict(followup=str(followup), followup_sha256=queue.owned.digest(followup),
+                                         wrapper_sha256=r["wrapper_sha256"]))
+
+    def test_sdk_registration_cannot_authorize_image_replay(self):
+        with tempfile.TemporaryDirectory() as folder:
+            successor, protocol, _, registration, _, _ = self.continued_registration(Path(folder), "sdk")
+            with patch.object(successor, "validate_followup") as validation:
+                with self.assertRaises(queue.SafetyHalt): queue.image_registration_proof(protocol, registration)
+                validation.assert_not_called()
+
+    def test_changed_original_image_protocol_cannot_authorize_replay(self):
+        with tempfile.TemporaryDirectory() as folder:
+            successor, protocol, _, registration, _, _ = self.continued_registration(Path(folder))
+            queue.save(protocol, dict(changed=True))
+            with patch.object(successor, "validate_followup") as validation:
+                with self.assertRaises(queue.SafetyHalt): queue.image_registration_proof(protocol, registration)
+                validation.assert_not_called()
+
+    def test_command_stage_and_registration_stage_must_agree(self):
+        with tempfile.TemporaryDirectory() as folder:
+            successor, protocol, _, registration, r, d = self.continued_registration(Path(folder))
+            r["identity"]["command"][r["identity"]["command"].index("--stage")+1] = "memory"
+            queue.save(registration, r)
+            with patch.object(successor, "validate_followup", return_value=(d, None, None, None)):
+                with self.assertRaises(queue.SafetyHalt): queue.image_registration_proof(protocol, registration)
+
+    def test_continued_image_pid_reuse_blocks_replay_while_waiting(self):
+        import retired_051_successors as successor
+        identity = dict(pid=123, uid=1001, start_ticks=7, cwd="/owned", command=["python", "owned"], state="S")
+        p = dict(parent_queue="q", parent_controller=identity, parent_protocol_sha256="sha",
+                 parent_continuation=dict(followup="f", followup_sha256="followup-sha", wrapper_sha256="wrapper-sha"))
+        state = dict(pid=123, protocol_sha256="sha", status="waiting-for-forty-eight-and-ten",
+                     continued_successor_declaration_sha256="followup-sha", continued_successor_wrapper_sha256="wrapper-sha")
+        with patch.object(queue, "read", return_value=state), patch.object(queue.image, "pinned"), \
+                patch.object(successor.owned, "process_identity", return_value=dict(identity, start_ticks=8)):
+            with self.assertRaises(queue.SafetyHalt): queue.predecessor_ready(p)
+
+    def test_changed_continued_image_wrapper_blocks_replay(self):
+        import retired_051_successors as successor
+        identity = dict(pid=123, uid=1001, start_ticks=7, cwd="/owned", command=["python", "owned"], state="S")
+        p = dict(parent_queue="q", parent_controller=identity, parent_protocol_sha256="sha",
+                 parent_continuation=dict(followup="f", followup_sha256="followup-sha", wrapper_sha256="wrapper-sha"))
+        state = dict(pid=123, protocol_sha256="sha", status="waiting-for-forty-eight-and-ten",
+                     continued_successor_declaration_sha256="followup-sha", continued_successor_wrapper_sha256="changed")
+        with patch.object(queue, "read", return_value=state), patch.object(queue.image, "pinned"), \
+                patch.object(successor.owned, "process_identity", return_value=identity):
+            with self.assertRaises(queue.SafetyHalt): queue.predecessor_ready(p)
+
     def test_four_replays_are_interleaved_with_fixed_original_input_and_output_budget(self):
         rows = queue.trials()
         self.assertEqual([r["thinking_budget"] for r in rows], [0, 8192, 8192, 0])

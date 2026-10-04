@@ -2357,7 +2357,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791130819.026595,
+  "updated_at": 1791132799.461114,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -4163,7 +4163,7 @@
       "on"
     ],
     "repetitions": 2,
-    "status": "halted-before-eight-after-new-051-unknown",
+    "status": "waiting-for-parent-forty",
     "after_candidate49b_all40_and_durable_model_retirement": true,
     "source_framework": "qualified49",
     "experimental_visual_context_included": false,
@@ -4182,8 +4182,8 @@
     "controller_sha256": "2e9a1b1e881f5c1705e7be1bca55be9fe5589d78b35b2e60e406b6b8d4ad339f",
     "controller_checks_passed": 14,
     "controller_qualification": "apps/computer_use/.runtime/linux/kvmem-matched-49-20261004/controller-qualification-01.json",
-    "queue": "apps/computer_use/.runtime/linux/kvmem-matched-49-20261004/queue-runtime-02/queue.json",
-    "controller_pid": 2643545,
+    "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-matched-49-20261004/queue-runtime-03/queue.json",
+    "controller_pid": 2722773,
     "model_trials_started": 0,
     "all_parent_results_required": true,
     "all_parent_vms_retired_required": true,
@@ -4191,12 +4191,18 @@
     "preserved_halted_controller_pid": 2542065,
     "preserved_halted_queue": "apps/computer_use/.runtime/linux/kvmem-matched-49-20261004/queue-runtime-01/queue.json",
     "status_at_snapshot": "waiting-for-parent-forty",
-    "continued_wrapper": "apps/computer_use/resumed_kvmem_queue.py",
-    "continued_followup_declaration": "apps/computer_use/.runtime/retired-022-frozen-successors-01.json",
+    "continued_wrapper": "apps/computer_use/retired_051_successors.py",
+    "continued_followup_declaration": "/home/chaidi/qw3/apps/computer_use/.runtime/retired-051-frozen-successors-01.json",
     "original_trials_profiles_and_source_inventories_unchanged": true,
     "known_retired_022_unknown_preserved_without_replay": true,
     "new_unknown_still_blocks_dispatch": true,
-    "actual_model_trials_at_snapshot": 0
+    "actual_model_trials_at_snapshot": 0,
+    "previous_halted_controller_pid": 2643545,
+    "previous_halted_queue": "apps/computer_use/.runtime/linux/kvmem-matched-49-20261004/queue-runtime-02/queue.json",
+    "controller_currently_live": true,
+    "continued_wrapper_sha256": "f7dd09b93f6fd1672ede705686611a5295b14f6dbd3a4eade8d3aa8bf26f738a",
+    "continued_controller_registration": "apps/computer_use/.runtime/retired-051-actual-memory-controller-01.json",
+    "new_successor_cpu_checks_passed": 28
   },
   "interruption_persistence_experiment": {
     "build": "apps/computer_use/.runtime/durable-interruption-candidate-01/build.json",
@@ -4263,11 +4269,11 @@
     "protocol_sha256": "b8c09c4465ffd06165bf9c4fce4811c75669bec7c41ab3d4f00a5d96b4bbe220",
     "controller": "apps/computer_use/execution_retest_queue_v2.py",
     "controller_sha256": "5074f4e3e427d47431911f8137f353967caed226810b7a4186773f25bcdc9677",
-    "controller_pid": 2643576,
+    "controller_pid": 2723604,
     "controller_checks_passed": 24,
     "controller_qualification": "apps/computer_use/.runtime/candidate51b-retest-20261004/controller-qualification-01.json",
-    "queue": "apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-02/queue.json",
-    "status_at_snapshot": "halted-no-further-dispatch",
+    "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-03/queue.json",
+    "status_at_snapshot": "waiting-for-forty-and-eight",
     "planned_trials": 10,
     "model_trials_completed": 0,
     "current49_and_kvmem_sources_unchanged": true,
@@ -4290,14 +4296,19 @@
     "quarantine_admission": "apps/computer_use/.runtime/candidate51b-retest-20261004/quarantine-admission.json",
     "preserved_halted_controller_pid": 2578011,
     "preserved_halted_queue": "apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-01/queue.json",
-    "status": "halted-no-further-dispatch",
-    "continued_wrapper": "apps/computer_use/resumed_execution_retest_queue.py",
-    "continued_followup_declaration": "apps/computer_use/.runtime/retired-022-frozen-successors-01.json",
+    "status": "waiting-for-forty-and-eight",
+    "continued_wrapper": "apps/computer_use/retired_051_successors.py",
+    "continued_followup_declaration": "/home/chaidi/qw3/apps/computer_use/.runtime/retired-051-frozen-successors-01.json",
     "original_trials_profiles_and_source_inventories_unchanged": true,
     "known_retired_022_unknown_preserved_without_replay": true,
     "new_unknown_still_blocks_dispatch": true,
     "actual_model_trials_at_snapshot": 0,
-    "controller_currently_live": false
+    "controller_currently_live": true,
+    "previous_halted_controller_pid": 2643576,
+    "previous_halted_queue": "apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-02/queue.json",
+    "continued_wrapper_sha256": "f7dd09b93f6fd1672ede705686611a5295b14f6dbd3a4eade8d3aa8bf26f738a",
+    "continued_controller_registration": "apps/computer_use/.runtime/retired-051-actual-sdk-controller-01.json",
+    "new_successor_cpu_checks_passed": 28
   },
   "terminal_model_cost_diagnostic": {
     "path": "apps/computer_use/.runtime/candidate49b-terminal-model-cost-03.json",
@@ -4642,22 +4653,35 @@
     "deployed": false,
     "planned_retest": "docs/computer_use_visual_context_retest_plan_20261004.json",
     "planned_trials": 12,
-    "plan_status": "halted-before-dispatch-after-new-051-unknown",
+    "plan_status": "waiting-for-forty-eight-and-ten",
     "no_new_controller_pid_claimed": false,
     "actual_queue_and_source_audit": "apps/computer_use/.runtime/visual-context-retest-20261004/admission-and-progress-01.json",
-    "actual_controller_pid": 2692907,
+    "actual_controller_pid": 2724534,
     "controller": "apps/computer_use/visual_context_retest_queue.py",
     "cpu_boundary_checks_passed": 23,
     "cpu_qualification": "apps/computer_use/.runtime/visual-context-controller-qualification-01/result.json",
     "frozen_protocol": "apps/computer_use/.runtime/visual-context-retest-20261004/protocol.json",
     "frozen_protocol_sha256": "ac297f6d8a062fb9e27465beedd89fbadb85c566899d23373ad5e7902cbd49c2",
-    "actual_queue": "apps/computer_use/.runtime/visual-context-retest-20261004/queue-runtime-01/queue.json",
-    "actual_controller_registration": "apps/computer_use/.runtime/visual-context-retest-20261004/actual-controller-01.json",
+    "actual_queue": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/queue-runtime-02/queue.json",
+    "actual_controller_registration": "apps/computer_use/.runtime/retired-051-actual-image-controller-01.json",
     "temporary_clients_only": true,
     "fresh_engine_per_trial": true,
     "original_grades_unchanged": true,
-    "actual_controller_currently_live": false,
-    "successor_waiter_not_yet_created": true
+    "actual_controller_currently_live": true,
+    "successor_waiter_not_yet_created": false,
+    "previous_halted_controller_pid": 2692907,
+    "previous_halted_queue": "apps/computer_use/.runtime/visual-context-retest-20261004/queue-runtime-01/queue.json",
+    "status": "waiting-for-forty-eight-and-ten",
+    "status_at_snapshot": "waiting-for-forty-eight-and-ten",
+    "controller_pid": 2724534,
+    "controller_currently_live": true,
+    "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/queue-runtime-02/queue.json",
+    "continued_wrapper": "apps/computer_use/retired_051_successors.py",
+    "continued_followup_declaration": "/home/chaidi/qw3/apps/computer_use/.runtime/retired-051-frozen-successors-01.json",
+    "continued_wrapper_sha256": "f7dd09b93f6fd1672ede705686611a5295b14f6dbd3a4eade8d3aa8bf26f738a",
+    "continued_controller_registration": "apps/computer_use/.runtime/retired-051-actual-image-controller-01.json",
+    "new_successor_cpu_checks_passed": 28,
+    "actual_model_trials_at_snapshot": 0
   },
   "terminal_inference_stage_readonly_diagnostic": {
     "recipe": "apps/computer_use/terminal_inference_diagnostic.py",
@@ -4684,33 +4708,34 @@
     "preserved_previous_snapshot": "apps/computer_use/.runtime/terminal-inference-stage-20261004-03.json"
   },
   "current_matched_osworld_snapshot": {
-    "at": 1791130819.026595,
+    "at": 1791132799.461114,
     "queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue_02.json",
     "status": "running",
-    "terminal_trials": 19,
+    "terminal_trials": 20,
     "planned_trials": 40,
-    "current_trial": "051-legacy-r1",
-    "available_original_scores": 17,
+    "current_trial": "013-verified-r2",
+    "available_original_scores": 18,
     "positive_original_scores": 0,
     "original_unknowns_preserved": 2,
     "current_continuation_new_unknowns": 0,
     "last_trial": {
-      "id": "051-verified-r1",
+      "id": "051-legacy-r1",
       "exit_code": 0,
       "result": {
         "status": "scored",
         "score": 0.0,
         "passed": false,
-        "agent_status": "paused",
-        "seconds": 726.1993969781324,
-        "tool_calls": 27,
-        "uncertain_actions": 1,
+        "stop_reason": "deadline",
+        "agent_status": "stopped",
+        "seconds": 1805.1491762436926,
+        "tool_calls": 34,
+        "uncertain_actions": 0,
         "turn_error": null,
-        "notice": "操作结果需要核对，请检查桌面后继续。",
-        "video_bytes": 4690269,
+        "notice": null,
+        "video_bytes": 3991519,
         "original_evaluation": 0.0,
         "unassisted_passed": false,
-        "finished_at": 1791129398.8307924,
+        "finished_at": 1791132172.5872393,
         "candidate_harness": true,
         "video_collection_passed": true,
         "video_collection_errors": [],
@@ -4731,7 +4756,7 @@
     "invalid_kind_parser_snapshot_preserved": true
   },
   "improvement_evidence_snapshot": {
-    "at": 1791130819.026595,
+    "at": 1791132799.461114,
     "coordinate_diagnostic": {
       "pixel_contract_passed": 0,
       "normalized_contract_passed": 11,
@@ -4756,8 +4781,8 @@
     "complex_osworld_success_improvement_proven": false,
     "image_policy_real_qw3_trials_started": 0,
     "latency_improvement_proven": false,
-    "complex_osworld_terminal_trials": 19,
-    "complex_osworld_available_scores": 17,
+    "complex_osworld_terminal_trials": 20,
+    "complex_osworld_available_scores": 18,
     "complex_osworld_positive_scores": 0
   },
   "retired_051_trial_and_actual_continuation": {
@@ -4768,7 +4793,7 @@
     "controller_start_ticks": 368606859,
     "queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue_02.json",
     "status_at_snapshot": "running",
-    "current_trial_at_snapshot": "051-legacy-r1",
+    "current_trial_at_snapshot": "013-verified-r2",
     "original_terminal_rows_preserved": 19,
     "original_unknowns_preserved": 2,
     "old_unknowns_replayed": false,
@@ -4779,14 +4804,16 @@
     "cpu_checks_passed": 15,
     "cpu_qualification": "apps/computer_use/.runtime/retired-051-continuation-qualification-02/result.json",
     "first_cpu_failure_preserved": "apps/computer_use/.runtime/retired-051-continuation-qualification-01/result.json",
-    "eight_ten_twelve_successor_waiters_still_halted": true
+    "eight_ten_twelve_successor_waiters_still_halted": false,
+    "original_eight_ten_twelve_waiters_preserved_halted": true,
+    "new_successor_audit": "apps/computer_use/.runtime/retired-051-successor-live-audit-01.json"
   },
   "readonly_thinking_budget_replay": {
-    "status": "implemented-and-qualified-not-queued",
+    "status": "waiting-for-image-twelve",
     "implementation": "apps/computer_use/thinking_budget_replay.py",
     "controller": "apps/computer_use/thinking_budget_replay_queue.py",
-    "cpu_http_checks_passed": 25,
-    "cpu_http_qualification": "apps/computer_use/.runtime/thinking-budget-replay-qualification-01/result.json",
+    "cpu_http_checks_passed": 31,
+    "cpu_http_qualification": "apps/computer_use/.runtime/thinking-budget-replay-qualification-02/result.json",
     "original_input_trace": "035-legacy-r1/6ecce7c76e284947b8d07aeb1e96526d",
     "original_request_sha256": "f29e1854e05f8be0cac8f80881838c6b40dbd949b793f6baaaa622b4ab3c97b3",
     "original_input_tokens": 107482,
@@ -4807,6 +4834,164 @@
     "original_body_except_thinking_budget_preserved": true,
     "own_model_request_retirement_acknowledgement_required": true,
     "requires_all_image_policy_trials_terminal_and_controller_retired": true,
-    "latency_or_business_improvement_proven": false
+    "latency_or_business_improvement_proven": false,
+    "preserved_original_cpu_http_qualification": "apps/computer_use/.runtime/thinking-budget-replay-qualification-01/result.json",
+    "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/protocol.json",
+    "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/queue-runtime-01/queue.json",
+    "actual_controller_registration": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/actual-controller-01.json",
+    "controller_pid": 2725730,
+    "controller_currently_live": true,
+    "parent_actual_registration": "apps/computer_use/.runtime/retired-051-actual-image-controller-01.json"
+  },
+  "retired_051_frozen_successor_continuation": {
+    "audit": {
+      "kind": "actual_continued_serial_successor_live_audit",
+      "at": 1791132475.950531,
+      "followup": "/home/chaidi/qw3/apps/computer_use/.runtime/retired-051-frozen-successors-01.json",
+      "followup_sha256": "b4b3feefd7c3c530187750c7a001885f1b113cf37eaaa1e356c8ca649a24bf37",
+      "source_sha256": "f7dd09b93f6fd1672ede705686611a5295b14f6dbd3a4eade8d3aa8bf26f738a",
+      "parent": {
+        "identity": {
+          "pid": 2706506,
+          "uid": 1001,
+          "start_ticks": 368606859,
+          "command": [
+            "third_party/OSWorld-V2/.venv/bin/python",
+            "-m",
+            "retired_051_continuation",
+            "--declaration",
+            "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/retired-051-continuation.json"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        },
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue_02.json",
+        "status": "running",
+        "terminal_trials": 20,
+        "current_trial": "013-verified-r2"
+      },
+      "stages": [
+        {
+          "stage": "memory",
+          "registration": "apps/computer_use/.runtime/retired-051-actual-memory-controller-01.json",
+          "registration_sha256": "b5f7a77e17f213f97c3488a817200d1f35ee7aef127fe0d76ed7727e52361fcf",
+          "identity": {
+            "pid": 2722773,
+            "uid": 1001,
+            "start_ticks": 368790245,
+            "command": [
+              ".venv/bin/python",
+              "-m",
+              "retired_051_successors",
+              "--stage",
+              "memory",
+              "--followup",
+              "apps/computer_use/.runtime/retired-051-frozen-successors-01.json"
+            ],
+            "cwd": "/home/chaidi/qw3",
+            "state": "S"
+          },
+          "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-matched-49-20261004/queue-runtime-03/queue.json",
+          "status": "waiting-for-parent-forty",
+          "model_trials_completed": 0
+        },
+        {
+          "stage": "sdk",
+          "registration": "apps/computer_use/.runtime/retired-051-actual-sdk-controller-01.json",
+          "registration_sha256": "68d9ccc9a4dd25253302a01212bb68579ee8676deffa55fa091dc3ee74cda065",
+          "identity": {
+            "pid": 2723604,
+            "uid": 1001,
+            "start_ticks": 368793422,
+            "command": [
+              ".venv/bin/python",
+              "-m",
+              "retired_051_successors",
+              "--stage",
+              "sdk",
+              "--followup",
+              "apps/computer_use/.runtime/retired-051-frozen-successors-01.json",
+              "--memory-controller",
+              "apps/computer_use/.runtime/retired-051-actual-memory-controller-01.json"
+            ],
+            "cwd": "/home/chaidi/qw3",
+            "state": "S"
+          },
+          "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-03/queue.json",
+          "status": "waiting-for-forty-and-eight",
+          "model_trials_completed": 0
+        },
+        {
+          "stage": "image",
+          "registration": "apps/computer_use/.runtime/retired-051-actual-image-controller-01.json",
+          "registration_sha256": "59326d9c8420c47a3fa2cb28c14aa5c9a19208e1f479983e6375154cbf190d9b",
+          "identity": {
+            "pid": 2724534,
+            "uid": 1001,
+            "start_ticks": 368796896,
+            "command": [
+              ".venv/bin/python",
+              "-m",
+              "retired_051_successors",
+              "--stage",
+              "image",
+              "--followup",
+              "apps/computer_use/.runtime/retired-051-frozen-successors-01.json",
+              "--memory-controller",
+              "apps/computer_use/.runtime/retired-051-actual-memory-controller-01.json",
+              "--sdk-controller",
+              "apps/computer_use/.runtime/retired-051-actual-sdk-controller-01.json"
+            ],
+            "cwd": "/home/chaidi/qw3",
+            "state": "S"
+          },
+          "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/queue-runtime-02/queue.json",
+          "status": "waiting-for-forty-eight-and-ten",
+          "model_trials_completed": 0
+        }
+      ],
+      "readonly_replay": {
+        "identity": {
+          "pid": 2725730,
+          "uid": 1001,
+          "start_ticks": 368817386,
+          "command": [
+            ".venv/bin/python",
+            "-m",
+            "thinking_budget_replay_queue",
+            "run",
+            "--protocol",
+            "apps/computer_use/.runtime/thinking-budget-replay-20261005/protocol.json",
+            "--state-dir",
+            "apps/computer_use/.runtime/thinking-budget-replay-20261005/queue-runtime-01"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        },
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/actual-controller-01.json",
+        "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/protocol.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/queue-runtime-01/queue.json",
+        "status": "waiting-for-image-twelve",
+        "completed": 0,
+        "tool_calls_executed": 0
+      },
+      "cpu_checks": 28,
+      "readonly_cpu_http_checks": 31,
+      "old_8_10_12_halted_queues_unchanged": true,
+      "original_model_profiles_tasks_graders_unchanged": true
+    },
+    "qualification": "apps/computer_use/.runtime/retired-051-frozen-successors-qualification-02/result.json",
+    "cpu_checks_passed": 28,
+    "first_fixture_failure_preserved": "apps/computer_use/.runtime/retired-051-frozen-successors-qualification-01/result.json",
+    "controller": "apps/computer_use/retired_051_successors.py",
+    "actual_dispatch_order": [
+      "remaining-original-forty",
+      "kvmem-eight",
+      "sdk51b-ten",
+      "image-policy-twelve",
+      "readonly-thinking-four"
+    ],
+    "original_profiles_sources_grades_unchanged": true,
+    "new_unknown_blocks_all_successors": true
   }
 }
