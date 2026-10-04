@@ -174,14 +174,17 @@ def create_app(gateway, token):
     return app
 
 
-async def run(args):
+async def run(args, driver=None):
     runtime = args.runtime.resolve()
     runtime.mkdir(parents=True,exist_ok=True)
     token_path = runtime / "token.txt"
     if not token_path.exists():
         token_path.write_text(secrets.token_hex(32))
         token_path.chmod(0o600)
-    if args.platform == "linux":
+    if driver is not None:
+        if driver.device_id != args.device_id or driver.endpoint.rstrip('/') != args.driver_endpoint.rstrip('/'):
+            raise ValueError('Injected driver identity differs from the declared device')
+    elif args.platform == "linux":
         from .linux_driver import LinuxDriver
         driver = LinuxDriver(args.driver_endpoint, args.device_id)
     else:

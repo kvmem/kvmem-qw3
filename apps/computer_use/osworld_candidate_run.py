@@ -214,7 +214,7 @@ def main():
     def interrupted(*_):raise TimeoutError('Candidate watchdog requested shutdown')
     signal.signal(signal.SIGTERM,interrupted)
     import fcntl
-    with open('/tmp/qw3-cross-device-candidate-model.lock','a') as lock:
+    with open('/tmp/qw3-cross-device-model-queue.lock','a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         result=run(args)
     print(json.dumps(result,ensure_ascii=False),flush=True)
