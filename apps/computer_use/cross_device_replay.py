@@ -4,12 +4,17 @@ The export is a point-in-time snapshot. Missing videos and unavailable official
 scores remain explicit rows; development pilots never become OSWorld scores.
 """
 import argparse
+import errno
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import time
+
+from replay_recording_evidence import recording_evidence, retained_mkv
 
 
 HTML = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8">
@@ -21,6 +26,7 @@ h1{font-size:26px}p{line-height:1.7}.note,small{color:#59677b}.grid{display:grid
 section{background:white;border:1px solid #d8dfe8;border-radius:12px;padding:18px;min-width:0}
 select,button{font:inherit;padding:9px;margin:6px 8px 6px 0;border:1px solid #bcc7d4;border-radius:6px;background:white;max-width:100%}
 video{width:100%;height:480px;object-fit:contain;background:#172436}pre{font:inherit;white-space:pre-wrap;line-height:1.65}
+.videoFrame{position:relative}.gapOverlay{position:absolute;top:12px;left:12px;right:12px;padding:12px;background:#fff0c8;color:#593d08;border:1px solid #bf8b27;border-radius:6px;pointer-events:none}.gapOverlay[hidden]{display:none}.gapStatus{color:#835917;line-height:1.6}
 small{word-break:break-all}#error{color:#982a26}@media(max-width:850px){.grid{grid-template-columns:1fr}video{height:380px}}
 </style>
 <h1>跨设备 Computer Use：实测录像对照</h1>
@@ -29,8 +35,8 @@ small{word-break:break-all}#error{color:#982a26}@media(max-width:850px){.grid{gr
 <select id="task" aria-label="测试场景"></select>
 <button id="play">从录像开始同时播放</button><button id="pause">暂停两侧</button><span id="error" role="status"></span>
 <div class="grid">
-<section><select id="left" aria-label="左侧尝试"></select><pre id="leftFacts"></pre><video id="leftVideo" muted controls preload="metadata"></video><p id="leftMissing"></p><small id="leftIdentity"></small></section>
-<section><select id="right" aria-label="右侧尝试"></select><pre id="rightFacts"></pre><video id="rightVideo" muted controls preload="metadata"></video><p id="rightMissing"></p><small id="rightIdentity"></small></section>
+<section><select id="left" aria-label="左侧尝试"></select><pre id="leftFacts"></pre><div class="videoFrame"><video id="leftVideo" muted controls preload="metadata"></video><div id="leftGapOverlay" class="gapOverlay" hidden>缺少新画面 · 当前显示旧帧</div></div><p id="leftGapStatus" class="gapStatus" role="status"></p><p id="leftMissing"></p><small id="leftIdentity"></small></section>
+<section><select id="right" aria-label="右侧尝试"></select><pre id="rightFacts"></pre><div class="videoFrame"><video id="rightVideo" muted controls preload="metadata"></video><div id="rightGapOverlay" class="gapOverlay" hidden>缺少新画面 · 当前显示旧帧</div></div><p id="rightGapStatus" class="gapStatus" role="status"></p><p id="rightMissing"></p><small id="rightIdentity"></small></section>
 </div>
 <p class="note">Linux 录像分别标记来源，时长不足的官方录像只能查看保留片段。Android 是实时 1Hz 采样录像，可能遗漏亚秒变化。两侧从录像起点播放，准备时间和操作轨迹可能不同；不能把进度条当成单次推理加速比。任务耗时、调用数与独立核验结果分别列出。</p>
 <script>
@@ -39,13 +45,23 @@ const chosen=side=>rows[Number(el(side).value)];
 const yn=x=>x===true?'通过':x===false?'未通过':'不可用';
 const sec=x=>typeof x==='number'?x.toFixed(2)+' 秒':'未取得';
 function pause(){generation++;for(const side of ['left','right'])el(side+'Video').pause()}
+function updateGap(side){const t=chosen(side);if(!t)return;const current=el(side+'Video').currentTime;
+ const gaps=t.video_observation_gaps||[],active=gaps.some(g=>current>=g.start_seconds&&current<g.end_seconds);
+ el(side+'GapOverlay').hidden=!active;
+ el(side+'GapStatus').textContent=active?'缺少新画面，正在显示上一次采集；恢复后的新画面会在标记结束后出现。':
+ t.partial_video?'这是保留片段，录制未覆盖完整任务；原任务结果保持不变。':
+ t.recording_evidence_status==='invalid'?'采集时间线无法核验，此录像不能作为完整操作轨迹。':
+ gaps.length?'此片有 '+gaps.length+' 段采集缺口，旧帧不算新观察。':'';
+}
 function render(side){const t=chosen(side),v=el(side+'Video');v.pause();
  if(t.video){v.src=t.video;v.hidden=false;el(side+'Missing').textContent=''}else{v.removeAttribute('src');v.load();v.hidden=true;el(side+'Missing').textContent='未取得可用录像：'+t.media_status}
- const result=['formal-osworld','development-osworld'].includes(t.kind)?'官方评分：'+(t.original_score??'不可用')+' · 无接管通过：'+yn(t.unassisted_passed)+(t.secondary_local_score!=null?'\\n单列本地工作簿指标：'+t.secondary_local_score+'（不是官方分数）':''):'独立产物核验：'+yn(t.artifact_passed)+' · 完整验收：'+yn(t.accepted);
- el(side+'Facts').textContent=t.attempt+'\\n'+(t.kind==='formal-osworld'?'正式 OSWorld · Linux':t.kind==='development-osworld'?'OSWorld 开发复测 · Linux · '+t.cohort:t.kind==='software-product'?'软件配置验收 · Windows · 受控软件工具':'平台开发任务 · '+t.platform)+' · '+t.arm+'\\n'+result+'\\n任务状态：'+t.agent_status+' · 记录状态：'+t.outcome+'\\n任务耗时：'+sec(t.seconds)+' · 工具调用：'+t.tool_calls+' · 未知动作：'+t.uncertain_actions+'\\n输出预算：'+(t.model_output_tokens??'未记录')+' token · KVMem：'+t.kvmem+' · 视频：'+t.media_kind+'\\n录像时长：'+sec(t.video_duration_seconds)+' · '+t.time_coverage;
+ const result=t.kind==='recording-qualification'?'录制组件核验：'+yn(t.component_passed)+' · 模型调用：0 · 设备输入：0 · 不是模型任务成绩':
+ ['formal-osworld','development-osworld'].includes(t.kind)?'官方评分：'+(t.original_score??'不可用')+' · 无接管通过：'+yn(t.unassisted_passed)+(t.secondary_local_score!=null?'\\n单列本地工作簿指标：'+t.secondary_local_score+'（不是官方分数）':''):'独立产物核验：'+yn(t.artifact_passed)+' · 完整验收：'+yn(t.accepted);
+ el(side+'Facts').textContent=t.attempt+'\\n'+(t.kind==='formal-osworld'?'正式 OSWorld · Linux':t.kind==='development-osworld'?'OSWorld 开发复测 · Linux · '+t.cohort:t.kind==='software-product'?'软件配置验收 · Windows · 受控软件工具':t.kind==='recording-qualification'?'录制组件验收 · Linux':'平台开发任务 · '+t.platform)+' · '+t.arm+'\\n'+result+'\\n任务状态：'+t.agent_status+' · 记录状态：'+t.outcome+'\\n任务耗时：'+sec(t.seconds)+' · 工具调用：'+t.tool_calls+' · 未知动作：'+t.uncertain_actions+'\\n输出预算：'+(t.model_output_tokens??'未记录')+' token · KVMem：'+t.kvmem+' · 视频：'+t.media_kind+'\\n录像时长：'+sec(t.video_duration_seconds)+' · '+t.time_coverage;
  if(t.fault_condition)el(side+'Facts').textContent+='\\n故障：'+t.fault_condition+' · 故障处理验收：'+yn(t.fault_accepted)+(t.fault_condition==='no_progress'?'（考核及时安全暂停；业务完成另计）':'');
  if(t.administrative_recovery===true)el(side+'Facts').textContent+='\\n回执恢复由测试人员流程完成；模型独立恢复：'+(t.unassisted_recovery_claimed===true?'已声明':'未声明')+' · 恢复耗时：'+sec(t.recovery_seconds)+' · 含恢复总耗时：'+sec(t.total_seconds);
  el(side+'Identity').textContent='原结果 SHA256：'+t.result_sha256+(t.video_sha256?' · 导出视频 SHA256：'+t.video_sha256:'');
+ updateGap(side);
 }
 function selectTask(){pause();rows=all.filter(t=>t.task===el('task').value);
  for(const side of ['left','right']){el(side).replaceChildren();rows.forEach((t,i)=>{const o=document.createElement('option');o.value=i;o.textContent=t.attempt;el(side).append(o)});
@@ -57,11 +73,12 @@ el('pause').onclick=pause;el('play').onclick=async()=>{pause();const turn=genera
  if(!sides.length){el('error').textContent='当前尝试没有可播放录像';return}
  try{await Promise.all(sides.map(side=>rewind(el(side+'Video'))));if(turn!==generation)return;
  await Promise.all(sides.map(side=>el(side+'Video').play()))}catch(e){if(turn===generation&&e.name!=='AbortError')el('error').textContent='播放失败：'+e.message}};
-for(const side of ['left','right'])el(side).onchange=()=>{pause();render(side)};
+for(const side of ['left','right']){el(side).onchange=()=>{pause();render(side)};
+ for(const event of ['timeupdate','seeked','loadedmetadata','ended'])el(side+'Video').addEventListener(event,()=>updateGap(side))}
 el('task').onchange=selectTask;
 fetch('summary.json').then(r=>{if(!r.ok)throw Error('无法读取导出记录');return r.json()}).then(data=>{
  all=data.attempts;const s=data.formal_summary;
- el('summary').textContent='本地 QW3 · 顾问关闭 · 正式尝试 '+s.terminal_attempts+' 次，其中有效官方评分 '+s.available_original_scores+' 次、评分通过 '+s.original_passes+' 次 · OSWorld 开发复测 '+(data.development_osworld_attempts||0)+' 次 · 平台开发尝试 '+data.development_attempts+' 次 · 软件配置验收 '+(data.software_product_attempts||0)+' 次';
+ el('summary').textContent='本地 QW3 · 顾问关闭 · 正式尝试 '+s.terminal_attempts+' 次，其中有效官方评分 '+s.available_original_scores+' 次、评分通过 '+s.original_passes+' 次 · OSWorld 开发复测 '+(data.development_osworld_attempts||0)+' 次 · 平台开发尝试 '+data.development_attempts+' 次 · 软件配置验收 '+(data.software_product_attempts||0)+' 次 · 单列录制组件验收 '+(data.recording_qualification_attempts||0)+' 次';
  for(const task of [...new Set(all.map(t=>t.task))]){const o=document.createElement('option');o.value=task;o.textContent=task;el('task').append(o)}
  if(all.length)selectTask();else el('error').textContent='没有终止记录';
 }).catch(e=>el('error').textContent=e.message);
@@ -73,7 +90,7 @@ def read(path):
 
 
 def digest(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    with path.open('rb') as stream:return hashlib.file_digest(stream,'sha256').hexdigest()
 
 
 def media_details(path, seconds):
@@ -85,7 +102,7 @@ def media_details(path, seconds):
         return result
     try:
         with av.open(str(path)) as source:
-            next(source.decode(video=0))
+            frame=next(source.decode(video=0));result['video_dimensions']=[frame.width,frame.height]
             duration=float(source.duration)/av.time_base if source.duration is not None else None
         result['video_duration_seconds']=duration
         if duration is not None and seconds is not None:
@@ -186,10 +203,33 @@ def matched_rows(campaign):
             result_sha256=digest(root/'result.json'),video_bytes=result.get('video_bytes',0))
 
 
-def export(campaign, pilots, output, port, products=(), matched_campaigns=()):
+def recording_probe_row(root):
+    r=read(root/'state.json');receipt=read(root/'recording/recoverable-recording.json')
+    if (not r.get('finished_at') or r.get('native_device_task_or_qw3_retest') is not False
+            or r.get('model_calls')!=0 or r.get('native_device_inputs')!=0):
+        raise ValueError('Only terminal zero-input/model recording qualifications belong here')
+    return root,dict(attempt=root.name,task='录制恢复检查 · Linux',kind='recording-qualification',
+        platform='linux',arm='有界恢复候选',outcome=r['status'],agent_status='已终止',
+        component_passed=r.get('passed'),accepted=None,artifact_passed=None,
+        started_at=r.get('started_at'),seconds=r['finished_at']-r['started_at'],
+        tool_calls=0,uncertain_actions=0,model_output_tokens=None,kvmem='未调用模型',
+        media_kind='只读录制恢复短片',result_sha256=digest(root/'state.json'),
+        video_bytes=receipt.get('artifacts',{}).get('screen.mp4',{}).get('bytes',0))
+
+
+def terminal_media(source,target):
+    try:os.link(source,target)
+    except OSError as exc:
+        if exc.errno!=errno.EXDEV:raise
+        shutil.copyfile(source,target)
+
+
+def export(campaign, pilots, output, port, products=(), matched_campaigns=(),
+           recording_probes=(), known_recording_limits=()):
     rows=list(formal_rows(campaign)) if campaign else []
     rows.extend(pilot_row(root) for root in pilots)
     rows.extend(product_row(root) for root in products)
+    rows.extend(recording_probe_row(root) for root in recording_probes)
     for matched in matched_campaigns:rows.extend(matched_rows(matched))
     # Filesystem glob order is not trial order: the default left/right views
     # must select the first and latest attempt of each scene consistently.
@@ -197,7 +237,7 @@ def export(campaign, pilots, output, port, products=(), matched_campaigns=()):
     output.mkdir(parents=True,exist_ok=False)
     exported=[]
     for index,(root,row) in enumerate(rows):
-        source=root/'video/screen.mp4' if row['kind']=='software-product' else root/'continuous.mp4'
+        source=root/'recording/screen.mp4' if row['kind']=='recording-qualification' else root/'video/screen.mp4' if row['kind']=='software-product' else root/'continuous.mp4'
         row.update(video=None,video_sha256=None,media_status='未收集或收集失败',video_duration_seconds=None,time_coverage='未取得录像')
         if row['video_bytes'] and source.is_file():
             with source.open('rb') as file:
@@ -207,10 +247,31 @@ def export(campaign, pilots, output, port, products=(), matched_campaigns=()):
             elif row.get('expected_video_sha256') and digest(source)!=row['expected_video_sha256']:
                 row['media_status']='录像哈希与原始录制回执不匹配'
             else:
-                name=f'trial-{index}.mp4';shutil.copyfile(source,output/name)
+                name=f'trial-{index}.mp4';terminal_media(source,output/name)
                 row.update(video=name,video_sha256=digest(output/name),media_status='已收集')
                 row.update(media_details(output/name,row['seconds']))
+                row.update(recording_evidence(root,source,row.get('video_duration_seconds')))
+        if row['video'] is None:
+            retained=retained_mkv(root)
+            if retained is not None:
+                import imageio_ffmpeg
+                partial,evidence=retained;name=f'trial-{index}-partial.mp4'
+                subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(),'-nostdin','-hide_banner','-loglevel','error','-n',
+                    '-i',str(partial),'-map','0:v:0','-c:v','copy','-an','-movflags','+faststart',str(output/name)],
+                    check=True,timeout=60,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+                row.update(evidence,video=name,video_sha256=digest(output/name),
+                    media_status='原始失败录制的保留片段，独立转封装，原成绩不改',
+                    partial_video=True,original_recording_video_sha256=digest(partial))
+                row.update(media_details(output/name,row['seconds']))
+        if row.get('video_duration_seconds') is not None and row.get('seconds') is not None and row['video_duration_seconds']+10<row['seconds']:
+            row['partial_video']=True
+        if row.get('partial_video'):row['time_coverage']='保留片段，未覆盖完整任务，禁止录像延迟比较'
         exported.append(row)
+    for limit in known_recording_limits:
+        matches=[r for r in exported if r['attempt']==limit['attempt'] and r.get('cohort')==limit['cohort']]
+        if len(matches)!=1 or matches[0]['result_sha256']!=limit['result_sha256'] or matches[0]['video_sha256']!=limit['video_sha256']:
+            raise ValueError('Known geometry warning does not match original result and media')
+        matches[0].update(full_screen_coverage=False,video_usable_for_full_task_trace=False,time_coverage=limit['notice'])
     official=[r for r in exported if r['kind']=='formal-osworld']
     summary={'kind':'public-terminal-attempts-snapshot','exported_at':time.time(),
              'contains_private_requests':False,'contains_credentials':False,
@@ -221,7 +282,10 @@ def export(campaign, pilots, output, port, products=(), matched_campaigns=()):
                  'unavailable_original_evaluators':sum(r['outcome']=='evaluator-unavailable' for r in official)},
              'development_attempts':sum(row['kind']=='development-pilot' for row in exported),
              'development_osworld_attempts':sum(row['kind']=='development-osworld' for row in exported),
-             'software_product_attempts':sum(row['kind']=='software-product' for row in exported),'attempts':exported}
+             'software_product_attempts':sum(row['kind']=='software-product' for row in exported),
+             'recording_qualification_attempts':sum(row['kind']=='recording-qualification' for row in exported),
+             'terminal_media_storage':'hardlink on same filesystem; copy only across filesystems',
+             'attempts':exported}
     (output/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n')
     (output/'index.html').write_text(HTML)
     # The local server exposes only copied public replay assets.
@@ -237,10 +301,11 @@ if __name__=='__main__':
     p.add_argument('--pilots',type=Path,nargs='*',default=[])
     p.add_argument('--products',type=Path,nargs='*',default=[])
     p.add_argument('--matched-campaigns',type=Path,nargs='*',default=[])
+    p.add_argument('--recording-probes',type=Path,nargs='*',default=[])
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--port',type=int,default=18134)
     a=p.parse_args()
-    if not a.campaign and not a.pilots and not a.products and not a.matched_campaigns:p.error('Supply at least one campaign, pilot or product trial')
+    if not a.campaign and not a.pilots and not a.products and not a.matched_campaigns and not a.recording_probes:p.error('Supply at least one terminal trial or component qualification')
     if not 1024<=a.port<=65535:p.error('Invalid unprivileged local port')
-    x=export(a.campaign,a.pilots,a.output,a.port,a.products,a.matched_campaigns)
+    x=export(a.campaign,a.pilots,a.output,a.port,a.products,a.matched_campaigns,a.recording_probes)
     print({'formal':x['formal_summary'],'development_attempts':x['development_attempts'],'index':str(a.output/'index.html')})
