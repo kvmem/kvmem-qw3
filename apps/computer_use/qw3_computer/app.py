@@ -466,10 +466,10 @@ class Controller:
         guard["last_error"] = problem
         self.save()
         if guard["rejected_calls"] >= 3:
-            await self.control("pause")
             guard["paused_reason"] = "repeated_rejection"
             self.state["notice"] = "任务连续三次未能发出有效操作，已暂停等待检查或接管。"
             self.save()
+            await self.control("pause")
         return {"rejected_calls": guard["rejected_calls"], "limit": 3,
                 "paused": self.state["status"] == "paused"}
 
@@ -493,10 +493,13 @@ class Controller:
         # A single slow inference is not an observe-only loop. Real changing
         # foreground content resets this window; taskbar clocks do not.
         if guard["unchanged_observations"] >= 3 and now - guard["unchanged_since_monotonic"] >= minimum_unchanged_seconds:
-            await self.control("pause")
             guard["paused_reason"] = "unchanged_observation_loop"
             self.state["notice"] = "反复查看的窗口持续没有变化，已暂停。请确认是否仍需等待或接管。"
             self.save()
+            # Interrupting this model tool can cancel its HTTP request. Persist
+            # the cause before pause/interrupt, while running remains running.
+            # Acceptance still requires the actual paused device/retired task.
+            await self.control("pause")
             return {"status": "paused", "reason": guard["paused_reason"],
                     "unchanged_seconds": now - guard["unchanged_since_monotonic"],
                     "hint": "No desktop input was sent. Repeated unchanged observations were paused for user review."}
@@ -537,10 +540,10 @@ class Controller:
             if result.get("status") == "takeover_requested":
                 # Keep pending steps and uncertain receipts intact. A pause is
                 # acknowledged by the device before it is reported as safe.
-                await self.control("pause")
                 self.state["takeover"] = {"reason": result["reason"], "requested_at": time.time()}
                 self.state["notice"] = "任务需要接管，已暂停并保留进度。"
                 self.save()
+                await self.control("pause")
                 result.update(status="paused", task_completed=False, desktop_paused=self.desktop.paused)
             if arguments.get("operation") == "finish" and result.get("verified"):
                 result["task_completed"] = await self.complete_checked_workflow(task_id, result)

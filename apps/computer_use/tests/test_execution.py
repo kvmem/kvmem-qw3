@@ -202,6 +202,21 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class VerifiedControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_takeover_reason_survives_interrupt_cancelling_its_own_tool_request(self):
+        with tempfile.TemporaryDirectory() as path:
+            controller, checks = await self.make_checked_controller(path)
+            try:
+                controller.state.update(status='running',thread_id='test-thread',turn_id='test-turn')
+                controller.client.interrupt.side_effect=asyncio.CancelledError
+                with self.assertRaises(asyncio.CancelledError):
+                    await controller.tool('workflow',{'operation':'request_takeover','reason':'Save is stuck'})
+                stored=json.loads(controller.state_path.read_text())
+                self.assertEqual(stored['takeover']['reason'],'Save is stuck')
+                self.assertEqual(stored['status'],'paused')
+                self.assertTrue(controller.desktop.paused)
+                self.assertIsNone(controller.workflow.completion())
+            finally:await controller.close()
+
     async def test_requested_takeover_pauses_device_and_preserves_checkpoint(self):
         with tempfile.TemporaryDirectory() as path:
             controller, checks = await self.make_checked_controller(path)

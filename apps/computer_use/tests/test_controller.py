@@ -593,6 +593,19 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.controller.state['status'], 'paused')
         self.assertEqual(self.controller.state['gui_recovery']['paused_reason'], 'unchanged_observation_loop')
 
+    async def test_stall_pause_cause_is_durable_before_interrupt_cancels_observation_tool(self):
+        await self.controller.start_task('Observe a stuck application')
+        for clock in (100,120):
+            with patch.object(self.controller,'recovery_clock',return_value=clock):
+                await self.controller.tool('observe',{})
+        self.controller.client.interrupt.side_effect=asyncio.CancelledError
+        with patch.object(self.controller,'recovery_clock',return_value=140):
+            with self.assertRaises(asyncio.CancelledError):await self.controller.tool('observe',{})
+        stored=json.loads(self.controller.state_path.read_text())
+        self.assertEqual(stored['gui_recovery']['paused_reason'],'unchanged_observation_loop')
+        self.assertEqual(stored['status'],'paused')
+        self.assertTrue(self.desktop.paused)
+
     async def test_active_software_job_is_not_a_static_desktop_stall(self):
         from types import SimpleNamespace
         await self.controller.start_task('Wait for a real background installation')
