@@ -59,6 +59,21 @@ def tool_problem(item):
     return {'category':'other_tool_error','path':None}
 
 
+def action_kind(item):
+    """Count an event's declared kind without inferring validity or delivery."""
+    arguments=item.get('arguments')
+    if isinstance(arguments,str):
+        try:arguments=json.loads(arguments)
+        except ValueError:return 'unknown'
+    if not isinstance(arguments,dict):return 'unknown'
+    action=arguments.get('action')
+    if isinstance(action,str):
+        try:action=json.loads(action)
+        except ValueError:return 'unknown'
+    if not isinstance(action,dict) or not isinstance(action.get('kind'),str):return 'unknown'
+    return action['kind']
+
+
 def inspect_attempt(directory):
     result_path=directory/'result.json'
     result=json.loads(result_path.read_text())
@@ -66,8 +81,7 @@ def inspect_attempt(directory):
     items=completed_tools(directory/'app/codex-events.jsonl')
     problems=[value for item in items if (value:=tool_problem(item))]
     timings=[item['durationMs']/1000 for item in items if numeric(item.get('durationMs'))]
-    inputs=Counter((item.get('arguments',{}).get('action') or {}).get('kind','unknown')
-                   for item in items if item.get('tool')=='act')
+    inputs=Counter(action_kind(item) for item in items if item.get('tool')=='act')
     inference=[]
     for path in sorted(directory.joinpath('app/inference').glob('*/metrics.json')):
         inference.append(json.loads(path.read_text()))

@@ -42,5 +42,20 @@ class FailureEvidenceTests(unittest.TestCase):
             self.assertEqual(result['attempts'][0]['tool_duration']['count'],0)
             self.assertNotIn('reasoning_failed',result['attempts'][0])
 
+    def test_string_and_malformed_actions_do_not_hide_terminal_failure_evidence(self):
+        with tempfile.TemporaryDirectory() as name:
+            attempt=Path(name);(attempt/'app').mkdir()
+            (attempt/'result.json').write_text(json.dumps({'status':'scored','score':0,'finished_at':1}))
+            arguments=[{'action':{'kind':'click'}},{'action':json.dumps({'kind':'type_text'})},
+                       {'action':'not a JSON object'},None,json.dumps({'action':{'kind':'key'}})]
+            events=[{'method':'item/completed','params':{'item':{'type':'mcpToolCall','tool':'act',
+                     'arguments':value,'status':'failed','error':'Rejected before input'}}} for value in arguments]
+            (attempt/'app/codex-events.jsonl').write_text(''.join(json.dumps(e)+'\n' for e in events))
+            row=analysis.inspect_attempt(attempt)
+            self.assertEqual(row['act_call_kinds'],{'click':1,'type_text':1,'unknown':2,'key':1})
+            self.assertEqual(row['tool_errors_observed'],5)
+            self.assertEqual(row['original_score'],0)
+            self.assertNotIn('inputs_delivered',row)
+
 
 if __name__=='__main__':unittest.main()

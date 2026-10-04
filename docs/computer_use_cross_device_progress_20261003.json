@@ -2584,7 +2584,7 @@
     "video_full_screen_coverage_not_proven_trials": [
       "051-legacy-r1"
     ],
-    "current_queue_terminal_trials_at_audit": 32,
+    "current_queue_terminal_trials_at_audit": 33,
     "actual_server_identity": {
       "pid": 2838863,
       "uid": 1001,
@@ -2599,7 +2599,7 @@
     "total_rows": 138,
     "recording_qualification_attempts": 1,
     "recording_component_rows_excluded_from_model_denominators": true,
-    "later_terminal_trials_not_yet_exported": 3,
+    "later_terminal_trials_not_yet_exported": 4,
     "duplicated_full_video_bytes_allocated": 0,
     "new_partial_remux_bytes_allocated": 3159973,
     "all128_previous_terminal_rows_retained": true,
@@ -2624,7 +2624,7 @@
       "apps/computer_use/.runtime/replay26-server-registration-01.json",
       "apps/computer_use/.runtime/replay26-server-registration-02.json"
     ],
-    "actual_latest_queue_audit": "apps/computer_use/.runtime/literal-feedback-native-and-parent-progress-20261005-01.json"
+    "actual_latest_queue_audit": "apps/computer_use/.runtime/feedback-retest-queue-and-parent-progress-20261005-01.json"
   },
   "material_evidence_audits": {
     "006": {
@@ -4758,31 +4758,33 @@
   "current_matched_osworld_snapshot": {
     "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue_02.json",
     "status": "running",
-    "terminal_trials": 32,
+    "terminal_trials": 33,
     "planned_trials": 40,
-    "current_trial": "035-verified-r2",
+    "current_trial": "035-legacy-r2",
     "available_original_scores": 30,
     "positive_original_scores": 0,
     "original_unknowns_preserved": 2,
     "current_continuation_new_unknowns": 0,
     "last_trial": {
-      "id": "022-verified-r2",
+      "id": "035-verified-r2",
       "exit_code": 0,
       "result": {
-        "status": "scored",
-        "score": 0.0,
+        "status": "evaluator-unavailable",
+        "score": null,
         "passed": false,
         "stop_reason": "deadline",
         "agent_status": "stopped",
-        "seconds": 1803.2714512730017,
-        "tool_calls": 24,
+        "seconds": 1802.4925068761222,
+        "tool_calls": 20,
         "uncertain_actions": 0,
         "turn_error": null,
         "notice": null,
-        "video_bytes": 6411063,
-        "original_evaluation": 0.0,
+        "video_bytes": 4431871,
+        "evaluator_error": "RuntimeError: Task035 evaluator failed during the LLM whole-table judgment.",
+        "secondary_local_score": 0,
+        "secondary_local_passed": false,
         "unassisted_passed": false,
-        "finished_at": 1791147196.899099,
+        "finished_at": 1791149070.3855076,
         "candidate_harness": true,
         "video_collection_passed": true,
         "video_collection_errors": [],
@@ -4790,8 +4792,8 @@
         "accepted": false
       }
     },
-    "at": 1791148444.1663554,
-    "actual_live_audit": "apps/computer_use/.runtime/literal-feedback-native-and-parent-progress-20261005-01.json"
+    "at": 1791149590.8771453,
+    "actual_live_audit": "apps/computer_use/.runtime/feedback-retest-queue-and-parent-progress-20261005-01.json"
   },
   "080_legacy_execution_cost_diagnostic": {
     "report": "apps/computer_use/.runtime/080-legacy-execution-cost-20261004-02.json",
@@ -4805,7 +4807,7 @@
     "invalid_kind_parser_snapshot_preserved": true
   },
   "improvement_evidence_snapshot": {
-    "at": 1791148444.1663554,
+    "at": 1791149590.8771453,
     "coordinate_diagnostic": {
       "pixel_contract_passed": 0,
       "normalized_contract_passed": 11,
@@ -4830,7 +4832,7 @@
     "complex_osworld_success_improvement_proven": false,
     "image_policy_real_qw3_trials_started": 0,
     "latency_improvement_proven": false,
-    "complex_osworld_terminal_trials": 32,
+    "complex_osworld_terminal_trials": 33,
     "complex_osworld_available_scores": 30,
     "complex_osworld_positive_scores": 0,
     "short_rule_thinking_diagnostic": {
@@ -5214,12 +5216,12 @@
     ]
   },
   "current_40_8_10_12_4_live_status": {
-    "at": 1791148444.1663554,
-    "audit": "apps/computer_use/.runtime/literal-feedback-native-and-parent-progress-20261005-01.json",
+    "at": 1791149590.8771453,
+    "audit": "apps/computer_use/.runtime/feedback-retest-queue-and-parent-progress-20261005-01.json",
     "parent": {
       "status": "running",
-      "terminal_trials": 32,
-      "current_trial": "035-verified-r2",
+      "terminal_trials": 33,
+      "current_trial": "035-legacy-r2",
       "available_original_scores": 30,
       "positive_original_scores": 0
     },
@@ -5318,7 +5320,33 @@
       "status": "waiting-for-image-twelve",
       "completed": 0
     },
-    "all_original_protocols_unchanged": true
+    "all_original_protocols_unchanged": true,
+    "literal_feedback_followup": {
+      "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/actual-controller-01.json",
+      "identity": {
+        "pid": 3050244,
+        "uid": 1001,
+        "start_ticks": 370503040,
+        "command": [
+          "/home/chaidi/qw3/.venv/bin/python",
+          "-m",
+          "feedback_retest_queue",
+          "run",
+          "--protocol",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/protocol.json",
+          "--state-dir",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/queue-runtime-01"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "S"
+      },
+      "status": "waiting-for-forty-eight-ten-twelve-four",
+      "completed_trials": 0,
+      "planned_trials": 8,
+      "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/protocol.json",
+      "protocol_sha256": "2b412349570ef4e1ddf4679a947e3d4ee16e95ffee28a92b4deb744e25379c01",
+      "original_frozen_queues_changed": false
+    }
   },
   "second_repetition_readonly_execution_and_cost_diagnostic": {
     "at": 1791137848.0977476,
@@ -5465,7 +5493,9 @@
     "original_native_executor_unchanged": true,
     "administrative_console_launch": true,
     "fixture_device_inputs": 0,
-    "native_device_business_task_qualified": false
+    "native_device_business_task_qualified": false,
+    "real_qw3_retest_controller_queued": true,
+    "real_qw3_retest_registration": "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/actual-controller-01.json"
   },
   "second_repetition_recording_timeout_diagnostic": {
     "at": 1791140321.6080546,
@@ -5685,5 +5715,202 @@
       "encoder_and_remux_cpu_seconds": 395.316428,
       "process_peak_rss_kib": 246992
     }
+  },
+  "literal_completion_feedback_matched_retest": {
+    "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/actual-controller-01.json",
+    "identity": {
+      "pid": 3050244,
+      "uid": 1001,
+      "start_ticks": 370503040,
+      "command": [
+        "/home/chaidi/qw3/.venv/bin/python",
+        "-m",
+        "feedback_retest_queue",
+        "run",
+        "--protocol",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/protocol.json",
+        "--state-dir",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/queue-runtime-01"
+      ],
+      "cwd": "/home/chaidi/qw3",
+      "state": "S"
+    },
+    "status": "waiting-for-forty-eight-ten-twelve-four",
+    "completed_trials": 0,
+    "planned_trials": 8,
+    "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/protocol.json",
+    "protocol_sha256": "2b412349570ef4e1ddf4679a947e3d4ee16e95ffee28a92b4deb744e25379c01",
+    "original_frozen_queues_changed": false,
+    "at": 1791149590.8771453,
+    "controller": "apps/computer_use/feedback_retest_queue.py",
+    "cpu_qualification": "apps/computer_use/.runtime/feedback-retest-controller-qualification-02/result.json",
+    "cpu_tests_passed": 16,
+    "first_fixture_failure_retained": "apps/computer_use/.runtime/feedback-retest-controller-qualification-01/result.json",
+    "tasks": [
+      "013",
+      "004"
+    ],
+    "trials": [
+      {
+        "id": "013-literal-feedback-off-r1",
+        "kind": "original-osworld",
+        "task": "013",
+        "feedback": "off",
+        "arm": "verified",
+        "repetition": 1,
+        "seconds": 1800,
+        "tools": 250
+      },
+      {
+        "id": "013-literal-feedback-on-r1",
+        "kind": "original-osworld",
+        "task": "013",
+        "feedback": "on",
+        "arm": "verified",
+        "repetition": 1,
+        "seconds": 1800,
+        "tools": 250
+      },
+      {
+        "id": "004-literal-feedback-on-r1",
+        "kind": "original-osworld",
+        "task": "004",
+        "feedback": "on",
+        "arm": "verified",
+        "repetition": 1,
+        "seconds": 1800,
+        "tools": 250
+      },
+      {
+        "id": "004-literal-feedback-off-r1",
+        "kind": "original-osworld",
+        "task": "004",
+        "feedback": "off",
+        "arm": "verified",
+        "repetition": 1,
+        "seconds": 1800,
+        "tools": 250
+      },
+      {
+        "id": "013-literal-feedback-on-r2",
+        "kind": "original-osworld",
+        "task": "013",
+        "feedback": "on",
+        "arm": "verified",
+        "repetition": 2,
+        "seconds": 1800,
+        "tools": 250
+      },
+      {
+        "id": "013-literal-feedback-off-r2",
+        "kind": "original-osworld",
+        "task": "013",
+        "feedback": "off",
+        "arm": "verified",
+        "repetition": 2,
+        "seconds": 1800,
+        "tools": 250
+      },
+      {
+        "id": "004-literal-feedback-off-r2",
+        "kind": "original-osworld",
+        "task": "004",
+        "feedback": "off",
+        "arm": "verified",
+        "repetition": 2,
+        "seconds": 1800,
+        "tools": 250
+      },
+      {
+        "id": "004-literal-feedback-on-r2",
+        "kind": "original-osworld",
+        "task": "004",
+        "feedback": "on",
+        "arm": "verified",
+        "repetition": 2,
+        "seconds": 1800,
+        "tools": 250
+      }
+    ],
+    "model": {
+      "weights": "Qwen3.8-27B-Q8_0.gguf",
+      "vision": "Qwen3.8-27B-BF16",
+      "thinking": true,
+      "thinking_budget": 0,
+      "max_output_tokens": 16384,
+      "context_tokens": 524288,
+      "kv_dtype": "fp8",
+      "dflash": "dflash2",
+      "dflash_max_tokens": 7,
+      "kvmem": "off",
+      "prefix_reuse": "off",
+      "visual_history": "pin-all",
+      "guided_refresh": "off",
+      "advisor": false
+    },
+    "actual_waiter_live": true,
+    "real_qw3_trials_started": 0,
+    "task_success_improvement_proven": false,
+    "repeat_interleaving_balanced": true,
+    "unchanged_original_recording_policy": true,
+    "primary_metric": "Original independent business grade; qualification and feedback exposure do not count as success.",
+    "secondary_metrics": [
+      "task seconds",
+      "actual request/first model delta timings",
+      "completed tool events and refusal categories",
+      "pending conditions and wait calls",
+      "feedback exposure and repeated intent refusals"
+    ],
+    "limitations": "Known development tasks, two repetitions per arm. No claim of statistical significance, blind generalization, active GUI recording improvement or actual model benefit yet."
+  },
+  "latest_terminal_tool_and_model_cost_audit": {
+    "path": "apps/computer_use/.runtime/terminal-tool-and-inference-cost-20261005-01.json",
+    "terminal_trials": 33,
+    "arm_summaries": {
+      "legacy": {
+        "terminal_trials": 16,
+        "positive_original_scores": 0,
+        "completed_mcp_events": 355,
+        "tool_problem_categories": {
+          "executor_rejected": 35,
+          "invalid_length": 6,
+          "other_tool_error": 2,
+          "invalid_action_kind": 2,
+          "out_of_range": 1,
+          "observation_expired": 8,
+          "unexpected_field": 2
+        },
+        "captured_model_time_fraction_median": 0.9106820484944367,
+        "attempts_with_output_budget_errors": 2
+      },
+      "verified": {
+        "terminal_trials": 17,
+        "positive_original_scores": 0,
+        "completed_mcp_events": 468,
+        "tool_problem_categories": {
+          "out_of_range": 4,
+          "step_required": 34,
+          "evidence_refreshed": 76,
+          "pending_step": 20,
+          "stale_observation": 4,
+          "other_tool_error": 11,
+          "missing_field": 2,
+          "normalized_coordinates_required": 6,
+          "invalid_control_id": 1,
+          "invalid_coordinates": 8,
+          "invalid_action_kind": 2,
+          "wrong_type": 3,
+          "invalid_value": 2
+        },
+        "captured_model_time_fraction_median": 0.9573747923588146,
+        "attempts_with_output_budget_errors": 0
+      }
+    },
+    "model_calls": 0,
+    "device_inputs": 0,
+    "is_pure_inference_or_visual_capability_attribution": false,
+    "reporter_string_action_bug_fixed": true,
+    "reporter_regression_checks_passed": 5,
+    "first_failed_read_only_audit_retained": "apps/computer_use/.runtime/terminal-cost-audit-preparation-failed-01/result.json"
   }
 }
