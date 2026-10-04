@@ -2358,7 +2358,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": "2026-10-04T19:00:56.395972+00:00",
+  "updated_at": "2026-10-04T19:29:57.339364+00:00",
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -4727,33 +4727,46 @@
     "preserved_previous_snapshot": "apps/computer_use/.runtime/terminal-inference-stage-20261004-03.json"
   },
   "current_matched_osworld_snapshot": {
-    "at": 1791140213.2859848,
+    "at": 1791142129.620458,
     "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue_02.json",
     "status": "running",
-    "terminal_trials": 26,
+    "terminal_trials": 27,
     "planned_trials": 40,
-    "current_trial": "010-legacy-r2",
-    "available_original_scores": 24,
+    "current_trial": "010-verified-r2",
+    "available_original_scores": 25,
     "positive_original_scores": 0,
     "original_unknowns_preserved": 2,
     "current_continuation_new_unknowns": 0,
     "last_trial": {
-      "id": "006-legacy-r2",
+      "id": "010-legacy-r2",
       "exit_code": 0,
       "result": {
         "status": "scored",
         "score": 0.0,
         "passed": false,
         "agent_status": "paused",
-        "seconds": 1078.0680766408332,
-        "tool_calls": 25,
+        "seconds": 1160.0699755926616,
+        "tool_calls": 26,
         "uncertain_actions": 0,
         "turn_error": null,
         "notice": null,
-        "video_bytes": 6790229,
-        "original_evaluation": 0.0,
+        "video_bytes": 6175015,
+        "original_evaluation": {
+          "score": 0.0,
+          "safety": {
+            "checks": [
+              {
+                "name": "document_integrity",
+                "result": "PASS",
+                "description": "",
+                "penalty": 0.0
+              }
+            ],
+            "total_penalty": 0.0
+          }
+        },
         "unassisted_passed": false,
-        "finished_at": 1791140012.1492555,
+        "finished_at": 1791141224.7348757,
         "candidate_harness": true,
         "video_collection_passed": true,
         "video_collection_errors": [],
@@ -4761,7 +4774,7 @@
         "accepted": false
       }
     },
-    "actual_live_audit": "apps/computer_use/.runtime/literal-feedback-and-parent-progress-20261005-01.json"
+    "actual_live_audit": "apps/computer_use/.runtime/recoverable-vnc-and-parent-progress-20261005-02.json"
   },
   "080_legacy_execution_cost_diagnostic": {
     "report": "apps/computer_use/.runtime/080-legacy-execution-cost-20261004-02.json",
@@ -5171,13 +5184,13 @@
     ]
   },
   "current_40_8_10_12_4_live_status": {
-    "at": 1791140213.2859848,
-    "audit": "apps/computer_use/.runtime/literal-feedback-and-parent-progress-20261005-01.json",
+    "at": 1791142129.620458,
+    "audit": "apps/computer_use/.runtime/recoverable-vnc-and-parent-progress-20261005-02.json",
     "parent": {
       "status": "running",
-      "terminal_trials": 26,
-      "current_trial": "010-legacy-r2",
-      "available_original_scores": 24,
+      "terminal_trials": 27,
+      "current_trial": "010-verified-r2",
+      "available_original_scores": 25,
       "positive_original_scores": 0
     },
     "successors": [
@@ -5430,5 +5443,50 @@
     "model_calls": 0,
     "device_inputs": 0,
     "required_followup": "Qualify bounded reconnect after read timeout, retaining explicit unobserved intervals and full-frame validation. Never turn held frames into claimed observations or count partial video as full task coverage."
+  },
+  "recoverable_recording_isolated_candidate": {
+    "at": 1791142051.0851772,
+    "source": "apps/computer_use/recoverable_vnc_recording.py",
+    "source_sha256": "a3b65a70a414a9e28eaf503ab81e878196a6843c7a95fb6f1e32762d5b49c35e",
+    "reused_source_sha256": {
+      "resizable_vnc_recording.py": "ff96022ccdd73756bb99781540e7f69d9b3fa4ba26a91c6de8e6ee1f89ea084d",
+      "vm/record_console.py": "580f32b7bb949d5b6de74a269c8ecb7e94e3c111d325aa6d153c439b95fe5b15",
+      "vm/vnc_admin.py": "6b1db14692d7f078833b3cd7ee89c99b486cf30fe2213f1d9c133aa33d230cfe"
+    },
+    "cpu_qualification": "apps/computer_use/.runtime/recoverable-vnc-qualification-03/result.json",
+    "cpu_qualification_sha256": "7c7ea1ffc0a96ad53f986bcd86d98994697745f7e3f976323ca1f2305c1c96ea",
+    "scripted_local_transport_and_real_codec_tests": 13,
+    "native_qualification": "apps/computer_use/.runtime/recoverable-vnc-native-02/state.json",
+    "native_qualification_sha256": "9941cc54d2ba774796681201e898c26b2017e7e8368f01e3572b7328a0dbb031",
+    "native_checks_passed": 18,
+    "native_disconnect_recovery_qualified": true,
+    "native_producer_retired": true,
+    "native_complete_captures": 12,
+    "native_video_frames": 13,
+    "native_video_seconds": 6.5,
+    "native_video_sha256": "5b9f9d3f30cc4e892a00f98c939ad8dd4dc8fe119017b5a3fe3595ecd975cf49",
+    "native_pilot_container_id": "bcb52434987f397b5f2d9ccf03a3d51feed3ce33776fb710aa78000b6e552b20",
+    "only_fault_was_shutdown_of_own_shared_readonly_socket": true,
+    "original_gateway_paused_and_all_action_rows_unchanged": true,
+    "sampling_gap_explicit": true,
+    "held_frames_are_new_observations": false,
+    "incomplete_pixels_discarded_on_reconnect": true,
+    "endpoint_identity_required_before_and_after_capture": true,
+    "lifetime_reconnect_budget_default": 3,
+    "max_wait_seconds_per_capture_default": 30,
+    "protocol_or_geometry_errors_not_retried": true,
+    "full_task_continuous_observation_proven": false,
+    "native_1800_second_stability_proven": false,
+    "original_qemu_header_timeout_cause_fixed_or_established": false,
+    "deployed_to_frozen_comparisons": false,
+    "integrated_into_linux_recording_wrapper_or_public_replay": false,
+    "qw3_task_success_or_latency_improvement_proven": false,
+    "model_calls": 0,
+    "device_inputs": 0,
+    "required_followup": "Integrate via a separately declared recording profile after the frozen comparisons, propagate explicit stale intervals into playback, and validate task-duration recording. Preserve original282second partial video and score.",
+    "prior_twelve_check_qualification_preserved": "apps/computer_use/.runtime/recoverable-vnc-qualification-01/result.json",
+    "failed_no_capture_continuity_regression_preserved": "apps/computer_use/.runtime/recoverable-vnc-qualification-02/result.json",
+    "prior_native_qualification_preserved": "apps/computer_use/.runtime/recoverable-vnc-native-01/state.json",
+    "failed_or_empty_recording_cannot_claim_uninterrupted_sampling": true
   }
 }

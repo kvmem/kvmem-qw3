@@ -224,3 +224,21 @@ SDK51的观察适配器支持GTK文件选择器，但Desktop的完整窗口保�
 本地复现CPU检查：`PYTHONPATH=apps/computer_use .venv/bin/python -m unittest discover -s apps/computer_use/tests -p test_literal_completion_feedback_candidate.py -v`。隔离构建入口的`--help`列出来源framework/manifest/acceptance及各哈希，实际`build.json`保存所使用来源。实际通路的冻结`run.py`与九份合成请求也保留；重新执行须复制到新的同级目录，不能覆盖原资格。后续须在新任务目录及相同材料/预算下做真实QW3复测，现阶段反馈合约通过不计为业务收益。
 
 另独立核验006新版第二次的录制失败：原任务1801.29秒/22调用、未知输入0、原官方0；冻结VNC录制器在等候下一条RFB消息首字节时触发3秒socket timeout。217次采集、564帧/282秒MKV全部可解码，尺寸1920×1080；最后真实采集时间281.9557秒，不能代表完整任务。九项只读检查通过，全部媒体、原成绩与失败日志哈希不变。证据`.runtime/retained-006-r2-recording-timeout-diagnostic-20261005-01.json`。首次诊断因未加载已有媒体组件而缺少PyAV，准备失败保留；使用现有media-qualification模块路径完成解码，没有新安装。尚未证明服务器/网络延迟的根因，也未证明任务早期的补充只读录制导致超时。之后应独立资格验证有界重连、完整新帧与明确未观察间隔；保持上一帧不能被描述为新观察，片段不能标作完整录像。原冻结录制器与当前试次不修改。
+
+
+## 2026-10-05 有界只读录像恢复的实现与原生资格
+
+新独立录制入口`recoverable_vnc_recording.py`复用原已固定尺寸解析、帧覆盖检查与编码器，三个原源码SHA不变。每个采集的绝对期限默认30秒；整段最多3次重连，失败或成功都不会刷新该次数预算。所有连接/握手/分片读取共享该次期限，防止不断送少量数据拖延。仅超时、EOF或连接类故障允许新连接；完整帧缺失、越界、未支持协议、设备端点身份检查失败和停止直接结束。读取前后及重连前均核验所有者；同一Docker ID的重启、镜像或桥接地址变化同样拒绝。原连接收到的部分像素和部分协议消息不带入新连接；新连接的完整原生帧验证成功后才发布。
+
+12项实际本地RFB故障和真实编解码测试首次全部通过：消息首字节超时后新尺寸、半帧断连丢弃、恢复后再次失败不重置整段次数、零次数、重连前或读完后身份变化、协议/尺寸错误不重试、慢速字节总期限、停止期间无新帧、损坏来源/配置连接前拒绝、同ID容器重启/外来标签拒绝、实际视频中的新尺寸和未观察区间。未生成模型请求或连接客机，资格`.runtime/recoverable-vnc-qualification-01/result.json`。
+
+随后在已有Linux试验机`qw3-computer-linux`执行独立原生资格，严格核验该机不是当前OSWorld的客机；输入网关已有进程、设备/会话和暂停状态不变。探针在首次完整采集后仅shutdown本进程自己的共享只读VNC连接一次，再由候选捕获真实连接错误并重新握手、完整读取。18项资格全部通过，12次完整原生采集、13帧/6.5秒视频、一次重连，原生尺寸1920×1080，整片可解码并有实际桌面像素。全部原动作行哈希不变，输入与模型调用为零；进程已实际核验退役。证据`.runtime/recoverable-vnc-native-01/{run.py,state.json,recording/recoverable-recording.json}`及`.runtime/recoverable-vnc-and-parent-progress-20261005-01.json`。这是受控断连接恢复，原服务器3秒不回消息的原因尚未建立，不能宣称其已修复。
+
+`transport-recovery.jsonl`与最终`recoverable-recording.json`区分编码完成、完整新帧、恢复后的未观察区间；重复旧帧不算新观察，断连后不会重建缺失像素。编码时间线可以完成但`fresh_sampling_uninterrupted=false`，不自动授予任务耗时比较或连续观察资格。它没有替换当前原LinuxRecording包装器或任何冻结模型/评分/记录，不补写旧282秒录像。下一步需独立声明新录制配置、将区间标记带到公共播放器并做任务时长验收；6.5秒资格不是半小时稳定性证明。
+
+本地故障复现：`PYTHONPATH=apps/computer_use:apps/computer_use/.runtime/media-qualification third_party/OSWorld-V2/.venv/bin/python -m unittest discover -s apps/computer_use/tests -p test_recoverable_vnc_recording.py -v`。新入口`--help`列出完整自有容器ID、名称、私有地址、编码器和时间/次数预算；未经身份核验不进入连接。原生注入脚本保存为不可覆盖的首次资格，重新执行必须新建独立输出目录。
+
+最新实际主对照27/40已终止、25份可用原评分均0，当前010-verified-r2；8/10/12/4实际等待器继续存活、模型试次仍为零。此次独立原生录像的主机CPU/网络成本单独保留，不能计成模型任务速度收益。
+
+
+录制失败状态又补充了一项实质回归：第一版在协议失败、零完整采集时仍可能报告fresh_sampling_uninterrupted=true。新增用例对第一版确实失败，`.runtime/recoverable-vnc-qualification-02`原失败保留；改成必须编码完成、至少一份完整帧且无传输缺口后，全部13项资格在03通过。没有删检查或将原失败改为通过。最终源码再次对同一独立暂停Linux客机执行全新只读断连接资格，native02的18项通过；原native01保留，不能将两次资格相加充当36个独立场景。两次均12次采集、13帧/6.5秒、动作账本不变且零输入/模型调用；两个生产者均已退役。最终证据`.runtime/recoverable-vnc-qualification-03/result.json`、`.runtime/recoverable-vnc-native-02/state.json`及`.runtime/recoverable-vnc-and-parent-progress-20261005-02.json`。最新主测试仍27/40、25份评分0、当前010-verified-r2，所有原冻结队列不改。
