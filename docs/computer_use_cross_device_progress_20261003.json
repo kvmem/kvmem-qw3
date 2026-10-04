@@ -1556,7 +1556,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": "2026-10-04T04:16:17.768722+00:00",
+  "updated_at": "2026-10-04T05:32:05.211814+00:00",
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -1718,22 +1718,23 @@
     "latex_repeat_tool_calls": 23
   },
   "public_replay_snapshot": {
-    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-11",
-    "url": "http://127.0.0.1:18143/index.html",
+    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-13",
+    "url": "http://127.0.0.1:18145/index.html",
     "formal_attempts_at_export": 40,
     "windows_model_trials_at_export": 8,
-    "platform_pilots_at_export": 16,
+    "platform_pilots_at_export": 32,
     "includes_python_repair_pair": true,
     "includes_latex_repair_pair": true,
     "export_is_point_in_time": true,
-    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-11/browser-check-01.json",
-    "actual_browser_checks_passed": 18,
+    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-13/browser-check-03.json",
+    "actual_browser_checks_passed": 29,
     "retained_failed_snapshot_checks": [
       "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check.json",
       "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check-02.json"
     ],
     "partial_formal_videos_not_for_latency_comparison": true,
-    "matched_development_osworld_at_export": 2
+    "matched_development_osworld_at_export": 4,
+    "includes_wire_regression_failures": true
   },
   "material_evidence_audits": {
     "006": {
@@ -1750,20 +1751,29 @@
   "candidate_osworld_runner": {
     "path": "apps/computer_use/osworld_candidate_run.py",
     "qualification_checks_passed": 6,
-    "model_trials_started": 2,
+    "model_trials_started": 4,
     "requires_original_40_complete": true,
     "original_task_setup_and_evaluator_reused": true,
     "declared_framework_and_dependencies_required": true,
     "video_failure_does_not_remove_score": true,
-    "model_trials_completed": 2,
+    "model_trials_completed": 4,
     "matched_first_pair": "apps/computer_use/.runtime/linux/candidate-matched-16k-20261004/first-pair-queue.json",
     "matched_first_pair_scores": [
       0.0,
       0.0
     ],
-    "current_cohort_protocol": "apps/computer_use/.runtime/linux/candidate45-matched-16k-20261004/protocol.json",
+    "current_cohort_protocol": "apps/computer_use/.runtime/linux/candidate48-matched-16k-20261004/protocol.json",
     "current_cohort_model_trials_started": 0,
-    "improvement_demonstrated": false
+    "improvement_demonstrated": false,
+    "current_cohort_declared_trials": 40,
+    "current_cohort_queue": "apps/computer_use/.runtime/linux/candidate48-matched-16k-20261004/queue.json",
+    "previous_candidate45_first_pair": "apps/computer_use/.runtime/linux/candidate45-matched-16k-20261004/first-pair-queue.json",
+    "candidate45_first_pair_scores": [
+      0.0,
+      0.0
+    ],
+    "candidate45_remaining38_not_executed": true,
+    "auxiliary_source_checks": 8
   },
   "failure_evidence": {
     "path": "apps/computer_use/.runtime/linux/failure-evidence-26-v2-20261004.json",
@@ -1884,7 +1894,7 @@
     "frozen_runtime": "apps/computer_use/.runtime/cross-device-ui-13",
     "commit": "06044fb",
     "retest_protocol": "apps/computer_use/.runtime/linux-fault-batch-20261004-protocol-02.json",
-    "retest_state": "running",
+    "retest_state": "historical; superseded by separately frozen candidates, not active",
     "first_trial": "xdev-linux-slow-loading-02",
     "windows_fixture_qualification": "apps/computer_use/.runtime/win-fault-qual03",
     "windows_fixture_qualification_state": "pending"
@@ -1954,10 +1964,10 @@
     "deployed_runtime": "apps/computer_use/.runtime/cross-device-ui-15"
   },
   "current_candidate": {
-    "runtime": "apps/computer_use/.runtime/cross-device-ui-15",
-    "source_commit": "b02bbbd96bc0b7ecd69f7c6788043e03e6ee2ea0",
-    "app": "http://127.0.0.1:18208",
-    "deployment": "apps/computer_use/.runtime/cross-device-ui-15/deployment.json",
+    "runtime": "apps/computer_use/.runtime/cross-device-ui-17",
+    "source_commit": "910d17b2619cdfd81e25c6a52eb46d8a599b1b21",
+    "app": "http://127.0.0.1:18210",
+    "deployment": "apps/computer_use/.runtime/cross-device-ui-17/deployment.json",
     "model_output_tokens": 16384,
     "thinking": true,
     "advisor": false,
@@ -1978,16 +1988,17 @@
     "bundle_sha256": "cbd166262f516712320bbd1d9a84abf649b091f9d24834c7c9eca5e26bf563d1"
   },
   "native_client46": {
-    "qualified": false,
-    "assembled": true,
-    "source_commit": "79b2137",
-    "pending_controller": "apps/computer_use/.runtime/native46-qualified-followup-01.json",
-    "model_retested": false
+    "qualified": true,
+    "source_commit": "79b21374e24654019609ac75853080b0200b5333",
+    "tests_passed": 211,
+    "bundle_sha256": "1099793289ee269c1a196d4846e50849711a609c4450d36bd97bad0eaf6100fc",
+    "qualification": "apps/computer_use/.runtime/windows-native-client-46/qualification.json",
+    "model_task_success_claimed": false
   },
   "current_linux_normal_batch": {
     "protocol": "apps/computer_use/.runtime/current-linux-normal-20261004-protocol-01.json",
     "result": "apps/computer_use/.runtime/xdev-current-linux-normal-01/batch/result.json",
-    "status_at_snapshot": "running",
+    "status_at_snapshot": "completed",
     "trials_at_snapshot": [
       {
         "id": "xdev-linux-text-05",
@@ -2044,8 +2055,27 @@
           "video_bytes": 635852,
           "owned_task_retired": true
         }
+      },
+      {
+        "id": "xdev-linux-calc-02",
+        "exit_code": 0,
+        "result": {
+          "kind": "integration-pilot-not-formal",
+          "app_status": "stopped",
+          "seconds": 906.5233569522388,
+          "tool_calls": 31,
+          "turn_error": null,
+          "uncertain_actions": 0,
+          "artifact_passed": false,
+          "video_collection_passed": true,
+          "unassisted_passed": false,
+          "accepted": false,
+          "video_bytes": 2147063,
+          "owned_task_retired": true
+        }
       }
-    ]
+    ],
+    "accepted": 2
   },
   "control_context_revalidation": {
     "commit": "b02bbbd",
@@ -2069,6 +2099,157 @@
     "model_used": false,
     "passed": true,
     "reason": "Appium3600second idle session expired; owner paused/no unsettled input; only owned gateway restarted, no replay",
-    "long_idle_resilience_implemented": false
+    "long_idle_resilience_implemented": false,
+    "latest_idle_recreation": "apps/computer_use/.runtime/candidate16-deployment-controller-01.json",
+    "automatic_long_idle_recovery_implemented": false
+  },
+  "native_client47": {
+    "qualified": true,
+    "source_commit": "8a228adaebefef8afad87373a47b0c38cf66741e",
+    "tests_passed": 216,
+    "bundle_sha256": "e9aba9600799abdae4c95666f94949753dccc086a870d9a69c44d66b509e79f3",
+    "qualification": "apps/computer_use/.runtime/windows-native-client-47/qualification.json",
+    "model_task_success_claimed": false
+  },
+  "native_client48": {
+    "qualified": true,
+    "source_commit": "910d17b2619cdfd81e25c6a52eb46d8a599b1b21",
+    "tests_passed": 218,
+    "bundle_sha256": "3ad16f38fc64b0914cbdc6dd596b5d0b4b4f5d3e74d3f7113ba52875abedcc70",
+    "qualification": "apps/computer_use/.runtime/windows-native-client-48/qualification.json",
+    "model_task_success_claimed": false
+  },
+  "windows_model_recovery_current": {
+    "protocol": "apps/computer_use/.runtime/windows-fault-candidate15-protocol-01.json",
+    "fault_conditions_passed": 3,
+    "business_tasks_passed": 2,
+    "attempts": [
+      {
+        "result": "apps/computer_use/.runtime/xdev-win-focus-dialog-01/xdev-win-focus-dialog-01-pilot/integration-result.json",
+        "kind": "integration-pilot-not-formal",
+        "platform": "windows",
+        "formal": false,
+        "model_used": true,
+        "accepted": true,
+        "fault_accepted": true,
+        "started_at": 1791087774.8696544,
+        "model_dispatch_attempted": true,
+        "app_status": "completed",
+        "seconds": 213.17379836179316,
+        "tool_calls": 16,
+        "turn_error": null,
+        "uncertain_actions": 0,
+        "artifact_passed": true,
+        "fault_condition": "focus_dialog",
+        "fault_exercised": true,
+        "fault_response_passed": true,
+        "unassisted_passed": true,
+        "video_collection_passed": true,
+        "video_bytes": 777825,
+        "owned_task_retired": true,
+        "finished_at": 1791088062.4869657
+      },
+      {
+        "result": "apps/computer_use/.runtime/xdev-win-slow-loading-01/xdev-win-slow-loading-01-pilot/integration-result.json",
+        "kind": "integration-pilot-not-formal",
+        "platform": "windows",
+        "formal": false,
+        "model_used": true,
+        "accepted": true,
+        "fault_accepted": true,
+        "started_at": 1791088063.0112722,
+        "model_dispatch_attempted": true,
+        "app_status": "completed",
+        "seconds": 205.24694969458506,
+        "tool_calls": 16,
+        "turn_error": null,
+        "uncertain_actions": 0,
+        "artifact_passed": true,
+        "fault_condition": "slow_loading",
+        "fault_exercised": true,
+        "fault_response_passed": true,
+        "unassisted_passed": true,
+        "video_collection_passed": true,
+        "video_bytes": 682179,
+        "owned_task_retired": true,
+        "finished_at": 1791088342.589093
+      },
+      {
+        "result": "apps/computer_use/.runtime/xdev-win-no-progress-01/xdev-win-no-progress-01-pilot/integration-result.json",
+        "kind": "integration-pilot-not-formal",
+        "platform": "windows",
+        "formal": false,
+        "model_used": true,
+        "accepted": false,
+        "fault_accepted": true,
+        "started_at": 1791088343.0746868,
+        "model_dispatch_attempted": true,
+        "app_status": "paused",
+        "seconds": 189.16782865813002,
+        "tool_calls": 13,
+        "turn_error": null,
+        "uncertain_actions": 0,
+        "artifact_passed": false,
+        "fault_condition": "no_progress",
+        "fault_exercised": true,
+        "fault_response_passed": true,
+        "unassisted_passed": false,
+        "video_collection_passed": true,
+        "video_bytes": 688938,
+        "owned_task_retired": true,
+        "finished_at": 1791088607.3137863
+      }
+    ],
+    "receipt_loss_model_test_pending": true
+  },
+  "bounded_office_observation": {
+    "source": "apps/computer_use/bounded_linux_observation.py",
+    "qualified_actual_driver": "apps/computer_use/.runtime/linux/bounded-office-driver-qualification-01/result.json",
+    "actual_read_seconds": [
+      2.345362462103367,
+      2.269583025947213
+    ],
+    "always_partial": true,
+    "no_input_or_official_server_patch": true,
+    "negative_or_workbook_evidence_allowed": false,
+    "deployment": "apps/computer_use/.runtime/cross-device-ui-16/deployment.json"
+  },
+  "visual_context_revalidation": {
+    "source_commit": "755ce41",
+    "desktop_checks": 44,
+    "actual_qualification": "apps/computer_use/.runtime/linux-visual-context-live-qualification-02/result.json",
+    "passed": true,
+    "age_floor_simulated": true,
+    "earlier_no_input_failed_qualification": "apps/computer_use/.runtime/linux-visual-context-live-qualification-01/result.json",
+    "input_modules_unchanged_in48": true,
+    "model_or_latency_success_claimed": false
+  },
+  "schema_wire_regression": {
+    "diagnostic": "apps/computer_use/.runtime/schema-wire-regression-20261004-01.json",
+    "candidate47_completed_trials": 12,
+    "candidate47_business_accepted": 0,
+    "candidate47_actual_requests_with_empty_act_definition": 49,
+    "candidate47_all_retired": true,
+    "not_model_or_vision_ability_evaluation": true,
+    "repair_commit": "910d17b",
+    "host_checks": 155,
+    "native48_checks": 218,
+    "actual_codex_platform_schema_checks": [
+      "windows",
+      "linux",
+      "android"
+    ],
+    "actual_qw3_repaired_request_schema_present": true,
+    "model_business_improvement_demonstrated": false
+  },
+  "current_normal_retest": {
+    "protocol": "apps/computer_use/.runtime/candidate17-normal-protocol-01.json",
+    "controller": "apps/computer_use/.runtime/candidate17-wire-repair-followup-01.json",
+    "result": "apps/computer_use/.runtime/xdev-candidate17-normal-01/batch/result.json",
+    "status_at_snapshot": "running",
+    "planned_trials": 12,
+    "original_templates_initializers_graders_budgets_unchanged": true,
+    "formal_osworld": false,
+    "model_concurrency": 1
   }
 }
