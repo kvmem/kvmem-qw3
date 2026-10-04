@@ -1804,7 +1804,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": "2026-10-04T07:28:05.677091+00:00",
+  "updated_at": 1791100310.9439182,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -2849,9 +2849,81 @@
     "controller": "apps/computer_use/.runtime/candidate19-followup-01.json",
     "result": "apps/computer_use/.runtime/xdev-candidate19-remaining-window-and-fault-01/batch/result.json",
     "planned_remaining_trials": 8,
-    "finished_at_snapshot": 1,
+    "finished_at_snapshot": 3,
     "status_at_snapshot": "running",
     "failed_prior_trial_not_overwritten": true,
-    "device_core_bytes_unchanged": true
+    "device_core_bytes_unchanged": true,
+    "complete_acceptances_at_snapshot": 2,
+    "fault_acceptances_at_snapshot": 2,
+    "finished_trials_at_snapshot": [
+      "xdev-android-focus-c49-01",
+      "xdev-linux-calc-08",
+      "xdev-android-slow-c49-01"
+    ],
+    "current_trial_at_snapshot": "xdev-linux-browser-07",
+    "android_focus_result": {
+      "accepted": true,
+      "fault_accepted": true,
+      "seconds": 362.7047844277695,
+      "tool_calls": 18
+    },
+    "android_slow_result": {
+      "accepted": true,
+      "fault_accepted": true,
+      "seconds": 313.17760542500764,
+      "tool_calls": 14
+    },
+    "linux_calc08_result": {
+      "accepted": false,
+      "artifact_passed": false,
+      "seconds": 889.6444349759258,
+      "tool_calls": 18,
+      "unknown_actions": 0,
+      "owned_task_retired": true,
+      "observed_work_total": 500,
+      "saved_workbook_unmodified": true
+    }
+  },
+  "isolated_visual_foreground_experiment": {
+    "recipe": "apps/computer_use/foreground_visual_candidate.py",
+    "build": "apps/computer_use/.runtime/foreground-visual-candidate-02/build.json",
+    "qualification": "apps/computer_use/.runtime/foreground-visual-candidate-02/qualification.json",
+    "window_and_age_diagnostic": "apps/computer_use/.runtime/candidate49-calc-window-and-age-diagnostic-01.json",
+    "latency_diagnostic": "apps/computer_use/.runtime/candidate49-calc08-latency-diagnostic-01.json",
+    "host_boundary_checks_passed": 14,
+    "recorded_cases": 5,
+    "recorded_clock_only_visual_contexts_accepted": 4,
+    "real_window_change_still_rejected": 1,
+    "new_device_inputs_in_qualification": 0,
+    "real_model_retest": false,
+    "native_windows_qualified": false,
+    "production_qualified": false,
+    "current_framework_updated": false,
+    "osworld49b_cohort_updated": false,
+    "calc08_original_business_result_preserved": true,
+    "calc07_original_unknown_preserved": true,
+    "recorded_latency": {
+      "requests": 18,
+      "completed_requests": 18,
+      "first_input_tokens": 6951,
+      "last_input_tokens": 197585,
+      "input_tokens_sum": 1823361,
+      "first_request_images": 1,
+      "last_request_images": 17,
+      "first_delta_median_seconds": 32.969842329388484,
+      "elapsed_total_seconds": 852.032074093353,
+      "last_four_first_delta_seconds": [
+        63.473495153244585,
+        68.61280984990299,
+        73.95440445421264,
+        80.60359576717019
+      ],
+      "last_four_elapsed_seconds": [
+        68.45235709426925,
+        75.34106536302716,
+        113.10711535392329,
+        151.2618486220017
+      ]
+    }
   }
 }
