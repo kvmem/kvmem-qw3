@@ -237,7 +237,7 @@
   "business_success_improvement_proven": false,
   "no_new_queue_pid_claimed": false,
   "source_validation_work_equalized_in_both_arms": true,
-  "updated_at": 1791132799.461114,
+  "updated_at": 1791135408.1567693,
   "actual_controller_pid": 2724534,
   "actual_controller_registration": "apps/computer_use/.runtime/retired-051-actual-image-controller-01.json",
   "frozen_execution_protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/protocol.json",
@@ -255,5 +255,24 @@
   "continued_controller": "apps/computer_use/retired_051_successors.py",
   "continued_followup_declaration": "/home/chaidi/qw3/apps/computer_use/.runtime/retired-051-frozen-successors-01.json",
   "continued_cpu_qualification": "apps/computer_use/.runtime/retired-051-frozen-successors-qualification-02/result.json",
-  "continued_cpu_checks_passed": 28
+  "continued_cpu_checks_passed": 28,
+  "current_forty_snapshot": {
+    "audit": "apps/computer_use/.runtime/recording-and-replay-progress-20261005-01.json",
+    "at": 1791135408.1567693,
+    "terminal_trials": 23,
+    "planned_trials": 40,
+    "current_trial": "004-verified-r2",
+    "positive_original_scores": 0,
+    "actual_controller_live": true
+  },
+  "recording_geometry_limits": {
+    "source": "apps/computer_use/.runtime/terminal-recording-geometry-20261005-01.json",
+    "prior_051_legacy_video_cropped": true,
+    "051_first_model_images_equal": true,
+    "new_recorder_not_deployed_to_frozen_comparison": true,
+    "native_candidate_qualification": "halted-no-input: VNC not yet listening; preserve original failed attempt",
+    "native_resize_qualified": false,
+    "scripted_rfb_real_codec_checks_passed": 17
+  },
+  "last_actual_live_audit": "apps/computer_use/.runtime/recording-and-replay-progress-20261005-01.json"
 }

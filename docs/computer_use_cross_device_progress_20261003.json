@@ -2357,7 +2357,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791132799.461114,
+  "updated_at": 1791135408.1567693,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -2519,41 +2519,39 @@
     "latex_repeat_tool_calls": 23
   },
   "public_replay_snapshot": {
-    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-22",
-    "url": "http://127.0.0.1:18154/index.html",
+    "path": "apps/computer_use/.runtime/cross-device-replay-20261005-23",
+    "url": "http://127.0.0.1:18155/index.html",
     "formal_attempts_at_export": 40,
     "windows_model_trials_at_export": 8,
     "platform_pilots_at_export": 56,
     "includes_python_repair_pair": true,
     "includes_latex_repair_pair": true,
     "export_is_point_in_time": true,
-    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-22/browser-check-01.json",
-    "actual_browser_checks_passed": 109,
+    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261005-23/browser-check-03.json",
+    "actual_browser_checks_passed": 133,
     "retained_failed_snapshot_checks": [
-      "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check.json",
-      "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check-02.json",
-      "apps/computer_use/.runtime/cross-device-replay-20261004-17/browser-check-01.json",
-      "apps/computer_use/.runtime/cross-device-replay-20261004-20/browser-check-01.json"
+      "apps/computer_use/.runtime/cross-device-replay-20261005-23/browser-check-01.json",
+      "apps/computer_use/.runtime/cross-device-replay-23-browser-preparation-failed-02.json"
     ],
     "partial_formal_videos_not_for_latency_comparison": true,
-    "matched_development_osworld_at_export": 19,
+    "matched_development_osworld_at_export": 24,
     "includes_wire_regression_failures": true,
     "development_attempts": 56,
-    "development_osworld_attempts": 19,
+    "development_osworld_attempts": 24,
     "software_product_attempts": 8,
-    "browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-22/browser-check-01.json",
-    "browser_checks_passed": 109,
+    "browser_check": "apps/computer_use/.runtime/cross-device-replay-20261005-23/browser-check-03.json",
+    "browser_checks_passed": 133,
     "snapshot_excludes_later_candidate19_trials": false,
     "new_candidate19_terminal_trials_at_export": 8,
     "public_video_storage": "hardlinks of terminal immutable videos; no duplicate video bytes allocated",
-    "previous_snapshot": "apps/computer_use/.runtime/cross-device-replay-20261004-21",
-    "directory": "apps/computer_use/.runtime/cross-device-replay-20261004-22",
+    "previous_snapshot": "apps/computer_use/.runtime/cross-device-replay-20261004-22",
+    "directory": "apps/computer_use/.runtime/cross-device-replay-20261005-23",
     "platform_development_attempts": 56,
     "actual_browser_passed": true,
     "includes_terminal_receipt_trials": true,
     "all_four_candidate49b_terminal_pairs_included": true,
     "snapshot_excludes_later_candidate49b_006_pair": false,
-    "current49b_terminal_trials_at_export": 15,
+    "current49b_terminal_trials_at_export": 20,
     "current49b_matched_pairs_included": [
       "004",
       "013",
@@ -2561,7 +2559,10 @@
       "010",
       "038",
       "022",
-      "035"
+      "035",
+      "043",
+      "080",
+      "051"
     ],
     "current49b_038_legacy_r1_included": true,
     "original_failure_rows_retained": true,
@@ -2570,13 +2571,29 @@
     "retained_browser_startup_failure_log": "/tmp/qw3-replay19-browser-check01.log",
     "browser_startup_failure_explained": "Host CPython3.13 environment lacks playwright; browser qualification uses the existing CPython3.12 environment. No dependency was installed.",
     "new_022_unknown_preserved_and_visible": true,
-    "actual_browser_qualification": "apps/computer_use/.runtime/cross-device-replay-20261004-22/browser-check-01.json",
-    "current_candidate49b_terminal_trials": 15,
-    "shared_hardlinked_videos": 117,
+    "actual_browser_qualification": "apps/computer_use/.runtime/cross-device-replay-20261005-23/browser-check-03.json",
+    "current_candidate49b_terminal_trials": 20,
+    "shared_hardlinked_videos": 122,
     "duplicate_media_bytes": 0,
-    "unpaired_043_clearly_marked": true,
     "task035_official_unavailable_separate_local_score": true,
-    "unpaired_task043_terminal_arm": "verified"
+    "task043_two_distinct_terminal_videos_included": true,
+    "task051_legacy_video_cropped_warning_visible": true,
+    "video_full_screen_coverage_not_proven_trials": [
+      "051-legacy-r1"
+    ],
+    "current_queue_terminal_trials_at_audit": 23,
+    "snapshot_excludes_current_later_three_trials": true,
+    "actual_server_identity": {
+      "pid": 2733770,
+      "uid": 1001,
+      "start_ticks": 368893260,
+      "command": [
+        ".venv/bin/python",
+        "apps/computer_use/.runtime/cross-device-replay-20261005-23/serve.py"
+      ],
+      "cwd": "/home/chaidi/qw3",
+      "state": "S"
+    }
   },
   "material_evidence_audits": {
     "006": {
@@ -4708,41 +4725,41 @@
     "preserved_previous_snapshot": "apps/computer_use/.runtime/terminal-inference-stage-20261004-03.json"
   },
   "current_matched_osworld_snapshot": {
-    "at": 1791132799.461114,
-    "queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue_02.json",
+    "at": 1791135408.1567693,
+    "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue_02.json",
     "status": "running",
-    "terminal_trials": 20,
+    "terminal_trials": 23,
     "planned_trials": 40,
-    "current_trial": "013-verified-r2",
-    "available_original_scores": 18,
+    "current_trial": "004-verified-r2",
+    "available_original_scores": 21,
     "positive_original_scores": 0,
     "original_unknowns_preserved": 2,
     "current_continuation_new_unknowns": 0,
     "last_trial": {
-      "id": "051-legacy-r1",
+      "id": "004-legacy-r2",
       "exit_code": 0,
       "result": {
         "status": "scored",
         "score": 0.0,
         "passed": false,
-        "stop_reason": "deadline",
-        "agent_status": "stopped",
-        "seconds": 1805.1491762436926,
-        "tool_calls": 34,
+        "agent_status": "paused",
+        "seconds": 457.4133103075437,
+        "tool_calls": 10,
         "uncertain_actions": 0,
         "turn_error": null,
         "notice": null,
-        "video_bytes": 3991519,
+        "video_bytes": 1112566,
         "original_evaluation": 0.0,
         "unassisted_passed": false,
-        "finished_at": 1791132172.5872393,
+        "finished_at": 1791134954.7353463,
         "candidate_harness": true,
         "video_collection_passed": true,
         "video_collection_errors": [],
         "unassisted_business_passed": false,
         "accepted": false
       }
-    }
+    },
+    "actual_live_audit": "apps/computer_use/.runtime/recording-and-replay-progress-20261005-01.json"
   },
   "080_legacy_execution_cost_diagnostic": {
     "report": "apps/computer_use/.runtime/080-legacy-execution-cost-20261004-02.json",
@@ -4756,7 +4773,7 @@
     "invalid_kind_parser_snapshot_preserved": true
   },
   "improvement_evidence_snapshot": {
-    "at": 1791132799.461114,
+    "at": 1791135408.1567693,
     "coordinate_diagnostic": {
       "pixel_contract_passed": 0,
       "normalized_contract_passed": 11,
@@ -4781,9 +4798,36 @@
     "complex_osworld_success_improvement_proven": false,
     "image_policy_real_qw3_trials_started": 0,
     "latency_improvement_proven": false,
-    "complex_osworld_terminal_trials": 20,
-    "complex_osworld_available_scores": 18,
-    "complex_osworld_positive_scores": 0
+    "complex_osworld_terminal_trials": 23,
+    "complex_osworld_available_scores": 21,
+    "complex_osworld_positive_scores": 0,
+    "short_rule_thinking_diagnostic": {
+      "screenshot_thinking_off_passed": 14,
+      "screenshot_thinking_on_passed": 24,
+      "text_thinking_off_passed": 16,
+      "text_thinking_on_passed": 24,
+      "requests_per_condition": 24,
+      "unique_questions": 12,
+      "is_long_gui_task_success": false,
+      "screenshot_median_seconds_off": 0.575,
+      "screenshot_median_seconds_on": 4.479,
+      "source": "docs/computer_use_reasoning_diagnostic_p2_20261003.md"
+    },
+    "controlled_software_tool_route": {
+      "full_business_passed": 8,
+      "trials": 8,
+      "tasks": [
+        "python-install",
+        "python-repair",
+        "latex-install",
+        "latex-repair"
+      ],
+      "is_pure_gui": false,
+      "matched_speed_improvement_proven": false
+    },
+    "readonly_thinking_budget_qw3_replays_started": 0,
+    "kvmem_matched_trials_started": 0,
+    "sdk51b_real_model_retests_started": 0
   },
   "retired_051_trial_and_actual_continuation": {
     "declaration": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/retired-051-continuation.json",
@@ -4993,5 +5037,174 @@
     ],
     "original_profiles_sources_grades_unchanged": true,
     "new_unknown_blocks_all_successors": true
+  },
+  "recording_geometry_readonly_diagnostic": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/terminal-recording-geometry-20261005-01.json",
+    "sha256": "4a476b76134c3d80ce0761d5eb859de751f6afed6579cb2b2b6c4ab932548067",
+    "051_legacy_video_whole_screen_cropped": true,
+    "051_first_model_images_exactly_equal": true,
+    "original_grades_and_recording_results_changed": false,
+    "terminated_trials_at_capture": 21,
+    "video_crop_not_model_initial_image_difference": true
+  },
+  "resizable_recording_isolated_candidate": {
+    "qualification": "/home/chaidi/qw3/apps/computer_use/.runtime/resizable-vnc-qualification-03/result.json",
+    "qualification_sha256": "77e63712479cb2d15936c581a745b67212ebbf613c90e8cf07620895613c02a4",
+    "source_sha256": {
+      "resizable_vnc_recording.py": "ff96022ccdd73756bb99781540e7f69d9b3fa4ba26a91c6de8e6ee1f89ea084d",
+      "tests/test_resizable_vnc_recording.py": "2441329ef26f3d8bc1739d01be1a93805517ed0c017865b75ca57b7faa16e183"
+    },
+    "cpu_scripted_rfb_and_real_codec_checks": 17,
+    "passed": true,
+    "not_deployed_to_frozen_queues": true,
+    "native_watcher_registration": "/home/chaidi/qw3/apps/computer_use/.runtime/resizable-vnc-native-watch-01/actual-controller-01.json",
+    "native_watcher_state": {
+      "kind": "supplemental_readonly_fresh_owned_vm_recording_qualification",
+      "started_at": 1791134802.1383462,
+      "pid": 2750588,
+      "status": "halted-no-input",
+      "model_calls": 0,
+      "device_inputs": 0,
+      "frozen_queues_and_recorders_unchanged": true,
+      "original_grades_changed": false,
+      "candidate_sha256": "ff96022ccdd73756bb99781540e7f69d9b3fa4ba26a91c6de8e6ee1f89ea084d",
+      "qualification_sha256": "77e63712479cb2d15936c581a745b67212ebbf613c90e8cf07620895613c02a4",
+      "trial": "004-verified-r2",
+      "vm": {
+        "container_id": "82b0274943f5407c67edab8b23774abfa15b87d8943995b79b2a8f9f54099d8f",
+        "name": "qw3-linux-004-verified-r2",
+        "image": "sha256:0e6497a9295647cf05bf2b2af522fdd79bdeba2737595259cab310a3bcf6baa9",
+        "disk": "/home/chaidi/qw3/third_party/OSWorld-V2/docker_vm_data/osworld-v2-ubuntu-x86.qcow2",
+        "disk_read_only": true,
+        "ports": {
+          "server": 18500,
+          "chromium": 18501,
+          "vnc": 18502,
+          "vlc": 18503
+        },
+        "bind": "127.0.0.1"
+      },
+      "vm_manifest_sha256": "1c80f53488f0637318d458555c9ff5b158780361a476a9feba0ba48794347ab3",
+      "host": "172.17.0.5",
+      "duration_seconds": 45,
+      "fps": 2,
+      "declared_canvas": [
+        1920,
+        1080
+      ],
+      "finished_at": 1791134961.4676359,
+      "error": "ConnectionRefusedError: [Errno 111] Connection refused",
+      "live_model_and_trial_children_preserved": true
+    },
+    "actual_watcher_identity": null,
+    "native_resize_qualified": false
+  },
+  "current_40_8_10_12_4_live_status": {
+    "at": 1791135408.1567693,
+    "audit": "apps/computer_use/.runtime/recording-and-replay-progress-20261005-01.json",
+    "parent": {
+      "status": "running",
+      "terminal_trials": 23,
+      "current_trial": "004-verified-r2",
+      "available_original_scores": 21,
+      "positive_original_scores": 0
+    },
+    "successors": [
+      {
+        "stage": "memory",
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/retired-051-actual-memory-controller-01.json",
+        "identity": {
+          "pid": 2722773,
+          "uid": 1001,
+          "start_ticks": 368790245,
+          "command": [
+            ".venv/bin/python",
+            "-m",
+            "retired_051_successors",
+            "--stage",
+            "memory",
+            "--followup",
+            "apps/computer_use/.runtime/retired-051-frozen-successors-01.json"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        },
+        "status": "waiting-for-parent-forty",
+        "completed_trials": 0
+      },
+      {
+        "stage": "sdk",
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/retired-051-actual-sdk-controller-01.json",
+        "identity": {
+          "pid": 2723604,
+          "uid": 1001,
+          "start_ticks": 368793422,
+          "command": [
+            ".venv/bin/python",
+            "-m",
+            "retired_051_successors",
+            "--stage",
+            "sdk",
+            "--followup",
+            "apps/computer_use/.runtime/retired-051-frozen-successors-01.json",
+            "--memory-controller",
+            "apps/computer_use/.runtime/retired-051-actual-memory-controller-01.json"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        },
+        "status": "waiting-for-forty-and-eight",
+        "completed_trials": 0
+      },
+      {
+        "stage": "image",
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/retired-051-actual-image-controller-01.json",
+        "identity": {
+          "pid": 2724534,
+          "uid": 1001,
+          "start_ticks": 368796896,
+          "command": [
+            ".venv/bin/python",
+            "-m",
+            "retired_051_successors",
+            "--stage",
+            "image",
+            "--followup",
+            "apps/computer_use/.runtime/retired-051-frozen-successors-01.json",
+            "--memory-controller",
+            "apps/computer_use/.runtime/retired-051-actual-memory-controller-01.json",
+            "--sdk-controller",
+            "apps/computer_use/.runtime/retired-051-actual-sdk-controller-01.json"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        },
+        "status": "waiting-for-forty-eight-and-ten",
+        "completed_trials": 0
+      }
+    ],
+    "readonly_replay": {
+      "identity": {
+        "pid": 2725730,
+        "uid": 1001,
+        "start_ticks": 368817386,
+        "command": [
+          ".venv/bin/python",
+          "-m",
+          "thinking_budget_replay_queue",
+          "run",
+          "--protocol",
+          "apps/computer_use/.runtime/thinking-budget-replay-20261005/protocol.json",
+          "--state-dir",
+          "apps/computer_use/.runtime/thinking-budget-replay-20261005/queue-runtime-01"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "S"
+      },
+      "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/queue-runtime-01/queue.json",
+      "status": "waiting-for-image-twelve",
+      "completed": 0
+    },
+    "all_original_protocols_unchanged": true
   }
 }
