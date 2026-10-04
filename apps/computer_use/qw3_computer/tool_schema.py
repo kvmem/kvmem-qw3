@@ -208,4 +208,28 @@ def tools_for_platform(platform, workflow=False):
         kind = branch["properties"]["kind"]["const"]
         if kind == "open_app": branch["properties"]["app"]["enum"] = apps
         if kind == "key": branch["properties"]["key"]["enum"] = keys
+    if workflow:
+        schema=tools[1]['inputSchema']
+        # Keep root field types for Qwen's XML decoder, while advertising
+        # which actions actually require coordinates. A unit attached to a
+        # key/type/open_app caused known pre-input rejections in real runs.
+        schema['oneOf']=[]
+        for action in schema['properties']['action']['oneOf']:
+            kind=action['properties']['kind']['const']
+            fields=copy.deepcopy(schema['properties'])
+            fields['action']=action
+            required=list(schema['required'])
+            if kind in {'click','drag','scroll'}:
+                required.append('coordinate_space')
+            elif kind!='click_control':
+                fields.pop('coordinate_space')
+            schema['oneOf'].append({'type':'object','properties':fields,
+                'required':required,'additionalProperties':False})
+        legacy_coordinates=(
+            'Declare coordinate_space: normalized_1000 for positions estimated from the screenshot (both axes 0..1000), '
+            'or pixels for accessibility control centers. The host converts normalized coordinates using the exact latest screenshot dimensions. '
+            'Coordinates must be integers, not quoted strings. Omitted coordinate_space retains pixel behavior. ')
+        tools[1]['description']=tools[1]['description'].replace(legacy_coordinates,
+            'Use integers0..1000 and coordinate_space=normalized_1000 for click/drag/scroll. '
+            'The host converts them using the current screenshot dimensions. Omit coordinate_space for key/type/open_app. ')
     return tools

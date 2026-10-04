@@ -134,6 +134,22 @@ class LinuxDriver:
         result=await self.execute(FOREGROUND_SCRIPT)
         return json.loads(result['output'].strip())
 
+    async def read_accessibility(self, foreground, width, height):
+        """Read-only extension point; default retains the official full reader."""
+        accessibility={'status':'unavailable','controls':[],'truncated':False,'scope':'foreground_window'}
+        began=time.monotonic()
+        try:
+            result=await self.execute(foreground_tree_script(foreground['title']),read_timeout=4)
+            tree=json.loads(result['output'])
+            if tree['status']=='ok':
+                accessibility=controls_from_xml(tree['AT'],foreground,width,height)
+            else:
+                accessibility={'status':'foreground_unmatched','controls':[],'truncated':False}
+        except (aiohttp.ClientError,TimeoutError,RuntimeError,ET.ParseError,KeyError,ValueError) as exc:
+            accessibility['error_kind']=type(exc).__name__
+        return accessibility | {'scope':'foreground_window','read_seconds':time.monotonic()-began,
+            'provider':'official-osworld-create_atspi_node','read_deadline_seconds':4}
+
     async def observe(self):
         before=await self.foreground()
         async with self.session.get(self.endpoint+'/screenshot') as r:
@@ -144,19 +160,7 @@ class LinuxDriver:
             bounds=(min(75,width-1),min(30,height-1),width,max(min(31,height),height-45))
             region=image.crop(bounds).convert('RGB')
             progress=hashlib.sha256(region.tobytes()).hexdigest()
-        accessibility={'status':'unavailable','controls':[],'truncated':False,'scope':'foreground_window'}
-        began=time.monotonic()
-        try:
-            result=await self.execute(foreground_tree_script(before['title']),read_timeout=4)
-            tree=json.loads(result['output'])
-            if tree['status']=='ok':
-                accessibility=controls_from_xml(tree['AT'],before,width,height)
-            else:
-                accessibility={'status':'foreground_unmatched','controls':[],'truncated':False}
-        except (aiohttp.ClientError,TimeoutError,RuntimeError,ET.ParseError,KeyError,ValueError) as exc:
-            accessibility['error_kind']=type(exc).__name__
-        accessibility.update(scope='foreground_window',read_seconds=time.monotonic()-began,
-                             provider='official-osworld-create_atspi_node',read_deadline_seconds=4)
+        accessibility=await self.read_accessibility(before,width,height)
         after=await self.foreground()
         if before!=after:accessibility={'status':'foreground_changed','controls':[],'truncated':False}
         return {'png':png,'foreground':after,'accessibility':accessibility,'progress_sha256':progress,
