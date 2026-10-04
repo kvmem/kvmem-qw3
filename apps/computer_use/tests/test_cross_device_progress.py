@@ -46,5 +46,24 @@ class EvidenceSummaryTests(unittest.TestCase):
                 path.write_text(json.dumps(base|{'recording':{'complete':True},'guest_result':{'desktop_stopped':False}}))
                 self.assertFalse(progress.product_row(path)['accepted'])
 
+    def test_batch_recovery_is_not_counted_as_formal_or_business_success(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name);runtime=root/'runtime';campaign=runtime/'campaign';campaign.mkdir(parents=True)
+            (campaign/'plan.json').write_text(json.dumps({'jobs':[]}))
+            path=root/'progress.json';path.write_text(json.dumps({'formal_attempts':[],'integration_pilots':[],
+                                                               'frozen_campaign':{}}))
+            attempt=runtime/'xdev-recovery/batch/xdev-probe-01';attempt.mkdir(parents=True)
+            (attempt/'integration-result.json').write_text(json.dumps({'accepted':False,'artifact_passed':False,
+                'app_status':'paused','fault_condition':'no_progress','fault_accepted':True,
+                'fault_response_passed':True,'owned_task_retired':True}))
+            with patch.object(progress,'ROOT',root),patch.object(progress,'RUNTIME',runtime):
+                value=progress.refresh(path,campaign)
+            self.assertEqual(value['formal_summary']['ended_attempts'],0)
+            row=value['integration_pilots'][0]
+            self.assertEqual(row['id'],'xdev-probe-01')
+            self.assertTrue(row['fault_accepted'])
+            self.assertFalse(row['accepted'])
+            self.assertFalse(row['formal'])
+
 
 if __name__=='__main__':unittest.main()

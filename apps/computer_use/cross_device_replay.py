@@ -42,6 +42,7 @@ function render(side){const t=chosen(side),v=el(side+'Video');v.pause();
  if(t.video){v.src=t.video;v.hidden=false;el(side+'Missing').textContent=''}else{v.removeAttribute('src');v.load();v.hidden=true;el(side+'Missing').textContent='未取得可用录像：'+t.media_status}
  const result=t.kind==='formal-osworld'?'官方评分：'+(t.original_score??'不可用')+' · 无接管通过：'+yn(t.unassisted_passed)+(t.secondary_local_score!=null?'\\n单列本地工作簿指标：'+t.secondary_local_score+'（不是官方分数）':''):'独立产物核验：'+yn(t.artifact_passed)+' · 完整验收：'+yn(t.accepted);
  el(side+'Facts').textContent=t.attempt+'\\n'+(t.kind==='formal-osworld'?'正式 OSWorld · Linux':t.kind==='software-product'?'软件配置验收 · Windows · 受控软件工具':'平台开发任务 · '+t.platform)+' · '+t.arm+'\\n'+result+'\\n任务状态：'+t.agent_status+' · 记录状态：'+t.outcome+'\\n任务耗时：'+sec(t.seconds)+' · 工具调用：'+t.tool_calls+' · 未知动作：'+t.uncertain_actions+'\\n输出预算：'+(t.model_output_tokens??'未记录')+' token · KVMem：'+t.kvmem+' · 视频：'+t.media_kind+'\\n录像时长：'+sec(t.video_duration_seconds)+' · '+t.time_coverage;
+ if(t.fault_condition)el(side+'Facts').textContent+='\\n故障：'+t.fault_condition+' · 故障处理验收：'+yn(t.fault_accepted)+(t.fault_condition==='no_progress'?'（安全暂停；业务完成另计）':'');
  el(side+'Identity').textContent='原结果 SHA256：'+t.result_sha256+(t.video_sha256?' · 导出视频 SHA256：'+t.video_sha256:'');
 }
 function selectTask(){pause();rows=all.filter(t=>t.task===el('task').value);
@@ -117,14 +118,16 @@ def formal_rows(campaign):
 def pilot_row(root):
     r=read(root/'integration-result.json');m=read(root/'pilot-manifest.json')
     identity=root.parent.name if root.name=='pilot' else root.name
-    return root,dict(attempt=identity,task=m['case'],kind='development-pilot',
+    fault=r.get('fault_condition')
+    return root,dict(attempt=identity,task=m['case']+('__'+fault if fault else ''),kind='development-pilot',
         platform='android' if m['case'].startswith('android') else 'linux',arm='verified候选',
         outcome='accepted' if r.get('accepted') else 'not-accepted',agent_status=r.get('app_status'),
         artifact_passed=r.get('artifact_passed'),accepted=r.get('accepted'),
         seconds=r.get('seconds'),tool_calls=r.get('tool_calls'),uncertain_actions=r.get('uncertain_actions'),
         model_output_tokens=m.get('model_output_tokens'),kvmem=m.get('kvmem','未记录'),
         media_kind={'live':'实时1Hz采样','vnc':'真实时间戳VNC采样','official':'官方录像'}.get(m.get('video_mode'),m.get('video_mode')),
-        result_sha256=digest(root/'integration-result.json'),video_bytes=r.get('video_bytes',0))
+        result_sha256=digest(root/'integration-result.json'),video_bytes=r.get('video_bytes',0),
+        fault_condition=fault,fault_response_passed=r.get('fault_response_passed'),fault_accepted=r.get('fault_accepted'))
 
 
 def product_row(root):

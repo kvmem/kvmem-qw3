@@ -62,13 +62,17 @@ def refresh(progress, campaign):
     result['frozen_campaign']['current']=[job['id'] for job in read(campaign/'plan.json')['jobs']
                                         if job['status']=='running' and not (campaign/job['id']/'result.json').exists()]
     by_id={row['id']:row for row in result['integration_pilots']}
-    for path in RUNTIME.glob('candidate-interlude-*/pilot/integration-result.json'):
-        value=read(path);identity=path.parent.parent.name
+    pilot_paths=[*RUNTIME.glob('candidate-interlude-*/pilot/integration-result.json'),
+                 *RUNTIME.glob('xdev-*/batch/*/integration-result.json')]
+    for path in pilot_paths:
+        value=read(path);identity=path.parent.parent.name if path.parent.name=='pilot' else path.parent.name
         by_id[identity]=by_id.get(identity,{}) | dict(id=identity,formal=False,path=str(path.relative_to(ROOT)),
             status=value.get('app_status',value.get('status')),seconds=value.get('seconds'),
             tool_calls=value.get('tool_calls'),artifact_passed=value.get('artifact_passed'),
             accepted=value.get('accepted',False),unassisted_passed=value.get('unassisted_passed',False),
-            video_collection_passed=value.get('video_collection_passed'),uncertain_actions=value.get('uncertain_actions'))
+            video_collection_passed=value.get('video_collection_passed'),uncertain_actions=value.get('uncertain_actions'),
+            fault_condition=value.get('fault_condition'),fault_response_passed=value.get('fault_response_passed'),
+            fault_accepted=value.get('fault_accepted'),owned_task_retired=value.get('owned_task_retired'))
     result['integration_pilots']=list(by_id.values())
     products=[row for path in RUNTIME.glob('xdev-*/*-trial/result.json') if (row:=product_row(path))]
     result['windows_product_attempts']=sorted(products,key=lambda row:row['id'])
