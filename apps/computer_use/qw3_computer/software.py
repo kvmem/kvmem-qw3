@@ -79,6 +79,18 @@ def job_receipt(job, *, compact=False):
     receipt["job_id"] = job["id"]
     if job["status"] in ACTIVE:
         receipt["next_poll"] = {"operation": "job_status", "job_id": job["id"], "wait_seconds": 10}
+    verification=job.get('verification',{})
+    if (job['status']=='completed' and job.get('needs_reconciliation') is False
+            and isinstance(verification,dict) and verification.get('passed') is True):
+        receipt['verified_job_result']={
+            'next':'report_verified_outputs',
+            'project':job.get('project'),'operation':job.get('operation'),
+            'outputs':{name:verification[name] for name in ('project','pdf','interpreter','source_file')
+                       if isinstance(verification.get(name),str)},
+            'verification_scope':'The fresh-process checks recorded in this job verification; not independent acceptance of an arbitrary task.',
+            'additional_gui_checks_required_for_job':False,
+            'task_completion_claimed':False,
+            'guidance':'Report the verified result and its output paths. Continue desktop work only for additional requested steps; do not browse files to repeat these completed job checks.'}
     return receipt
 
 

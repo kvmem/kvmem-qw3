@@ -13,6 +13,24 @@ from qw3_computer.software import Software, atomic_json, process_environment, jo
 
 
 class SoftwareTests(unittest.IsolatedAsyncioTestCase):
+    def test_completed_receipt_reports_verified_outputs_without_claiming_the_whole_task(self):
+        job={'id':'job-test','status':'completed','project':'latex-demo','operation':'repair_latex',
+             'needs_reconciliation':False,'verification':{'passed':True,'pdf':'C:/project/main.pdf'},
+             'task_id':'private-owner','action_id':'private-action'}
+        receipt=job_receipt(job,compact=True)
+        result=receipt['verified_job_result']
+        self.assertEqual(result['outputs']['pdf'],'C:/project/main.pdf')
+        self.assertFalse(result['task_completion_claimed'])
+        self.assertNotIn('private-owner',json.dumps(receipt))
+        self.assertNotIn('next_poll',receipt)
+
+    def test_failed_active_or_uncertain_job_never_recommends_reporting_success(self):
+        base={'id':'job-test','status':'completed','needs_reconciliation':False,
+              'verification':{'passed':True},'steps':[],'downloads':[]}
+        for changes in [{'status':'running'},{'status':'failed'},{'needs_reconciliation':True},
+                        {'verification':{'passed':False}},{'verification':{'passed':1}}]:
+            self.assertNotIn('verified_job_result',job_receipt(base|changes,compact=True))
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.software = Software(Path(self.temp.name) / "workspace")
