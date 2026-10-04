@@ -2357,7 +2357,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791104838.614274,
+  "updated_at": 1791105863.5851243,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -2577,7 +2577,7 @@
       0.0
     ],
     "current_cohort_protocol": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/protocol.json",
-    "current_cohort_model_trials_started": 2,
+    "current_cohort_model_trials_started": 3,
     "improvement_demonstrated": false,
     "current_cohort_declared_trials": 40,
     "current_cohort_queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/queue.json",
@@ -2596,8 +2596,8 @@
     "waits_for_remaining_eight_followups_and_three_receipt_tests": true,
     "previous_unexecuted_candidate49_retirement": "apps/computer_use/.runtime/linux/candidate49-matched-16k-20261004/retirement-after-quarantine-01.json",
     "current_cohort_status": "running",
-    "current_cohort_model_trials_completed": 1,
-    "current_cohort_current_trial": "004-legacy-r1",
+    "current_cohort_model_trials_completed": 2,
+    "current_cohort_current_trial": "013-legacy-r1",
     "current_cohort_terminal_trials": [
       {
         "id": "004-verified-r1",
@@ -2617,6 +2617,30 @@
           "original_evaluation": 0.0,
           "unassisted_passed": false,
           "finished_at": 1791104182.7357087,
+          "candidate_harness": true,
+          "video_collection_passed": true,
+          "video_collection_errors": [],
+          "unassisted_business_passed": false,
+          "accepted": false
+        }
+      },
+      {
+        "id": "004-legacy-r1",
+        "exit_code": 0,
+        "result": {
+          "status": "scored",
+          "score": 0.0,
+          "passed": false,
+          "agent_status": "paused",
+          "seconds": 854.7951554879546,
+          "tool_calls": 19,
+          "uncertain_actions": 0,
+          "turn_error": null,
+          "notice": null,
+          "video_bytes": 2234379,
+          "original_evaluation": 0.0,
+          "unassisted_passed": false,
+          "finished_at": 1791105104.7891474,
           "candidate_harness": true,
           "video_collection_passed": true,
           "video_collection_errors": [],
@@ -3744,5 +3768,32 @@
     "active_frozen_packages_unchanged": true,
     "observed_file_chooser_supported": true,
     "window_title_and_unique_active_matching_unchanged": true
+  },
+  "native_client50_combination": {
+    "qualified": false,
+    "qualification": "apps/computer_use/.runtime/windows-native-client-50/qualification.json",
+    "tests_run": 233,
+    "test_failure_retained": true,
+    "cause": "Original region-only visual test conflicts with declared whole-window proof; its failed assertion also skips SQLite cleanup.",
+    "real_model_trials": 0
+  },
+  "native_client51_combination": {
+    "qualified": true,
+    "qualification": "apps/computer_use/.runtime/windows-native-client-51/qualification.json",
+    "bundle_sha256": "f09e29aa277d7b4b58aed5126206d0a9d94f9510bfd7f653cb52155b1f4cf097",
+    "tests_passed": 245,
+    "actual_codex_and_windows_runtime": true,
+    "core_changes": [
+      "durable_model_turn_status",
+      "gtk_file_chooser_observation",
+      "positive_linux_visual_window_context"
+    ],
+    "test_policy_changes": "Replace obsolete region-only assertion with positive whole-window proof; add twelve unchanged-window boundary tests. Preserve SDK50 failure.",
+    "builder_commit": "867a1d4",
+    "model_trials": 0,
+    "active_frozen49_packages_changed": false,
+    "retest_protocol": "apps/computer_use/.runtime/candidate51-retest-20261004/protocol.json",
+    "retest_prepared_trials": 10,
+    "retest_dispatched_trials": 0
   }
 }
