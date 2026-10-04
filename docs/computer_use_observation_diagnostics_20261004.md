@@ -272,3 +272,32 @@ CPU资格03为17项通过（新增10项＋原回放7项）；第一次资格01�
 30分钟空闲原生稳定性测试实际控制器PID2862766、录制器PID2862834均存活，登记为`.runtime/recoverable-linux-wrapper-stability-controller-01.json`，状态为`.runtime/recoverable-linux-wrapper-stability-01/state.json`。冻结1800秒/2fps/30秒捕获上限/3次总重连，目标为独立暂停的Linux试验机，和当前OSWorldVM不同；第一次审计约175秒录制中，不能计为完成。后续应只读核验同一完整句柄和终止结果，不因观察超时重启。即使完成，也只覆盖空闲桌面采样，不是活动GUI半小时稳定性或业务成功/速度证明。当前冻结任务runner与原LinuxRecording不替换。
 
 复现本地包装器检查：`PYTHONPATH=apps/computer_use:apps/computer_use/.runtime/media-qualification third_party/OSWorld-V2/.venv/bin/python -m unittest discover -s apps/computer_use/tests -p test_recoverable_linux_recording.py -v`；非停止异常负例使用同命令替换pattern为test_graceful_recoverable_recording.py。原生入口`qualify_recoverable_linux_recording.py --help`提供lifecycle/stability两种明确范围，要求已完成CPU资格、原SDK协议及实际冻结后继声明；输出目录必须全新，端点认证只由既有助手内部读取，不保存或显示密钥。
+
+
+## 2026-10-05 已证实的改善与未验证候选
+
+最新只读审计为`.runtime/literal-feedback-native-and-parent-progress-20261005-01.json`：主同条件队列终止32/40，30份可用原评分均0，当前035-verified-r2。原035第一轮两侧评分器不可用，不计入30份可用评分；旧未知动作保留两条。8/10/12/4后继实际存活等待，真实模型试次仍零。公开快照26保留当前29条，与本次审计相差三条；不改原评分或中途配置。
+
+| 尝试 | 已观察效果 | 可得结论与范围 |
+| --- | --- | --- |
+| 显式归一化坐标，由工具换算像素 | 同图12个目标，命中0/12→11/12 | 修复坐标约定有实效；不是复杂任务成功率，不能推断所有视觉定位都可靠 |
+| 修复工具参数在Codex/MCP传递时丢失 | 同模板开发集完整通过0/12→8/12，产物正确11/12 | 工具契约影响端到端效果；不是陌生任务泛化 |
+| 开启thinking的短规则诊断 | 截图14/24→24/24，文字16/24→24/24 | 12题各两次，短约束推理改善；截图中位耗时0.575→4.479秒，存在延迟代价 |
+| Windows原生Calc的单次thinking探索 | 两侧33/33文件检查；456.51秒/38调用→125.30秒/15调用 | 单对已知任务、未预注册重复；不能作为一般速度收益 |
+| Python/LaTeX安装与修复使用混合工具 | 8/8完整通过 | 支持受控软件操作路线可用；没有同条件旧路线对照，也不是纯GUI |
+| 故障等待、焦点恢复与明确接管 | Windows三类响应通过，两项业务完成，永久停滞安全接管 | 避免错误完成；永久停滞未变成业务成功 |
+| 完整窗口保护、file-chooser角色与中断落盘 | 原生/只读合约资格通过 | 具体缺陷有证据；SDK51b十次真实模型复测尚未执行 |
+| 文字完成条件反馈 | 原生Windows运行时36项合成通路检查通过 | 仅证明反馈传递与条件保持，不证明模型决策或业务提升 |
+| 可恢复录制与正常停止收尾 | 独立空闲Linux原生30分钟、16项核验通过 | 证据采集稳定性改善；不是任务成功率、活动GUI稳定性或模型速度收益 |
+
+最直接支持的判断是：坐标/参数/完成条件表达是已定位的框架问题，thinking能改善短约束题；长任务还存在历史图像成本、思考耗尽但没有工具输出、目标页和保存条件表达不足等记录。当前证据不能把全部复杂失败归因于视觉或逻辑中的某一种。截图历史精简、KVMem、thinking预算限制仍待真实模型对照；未执行的资格不能记为成功率提升。
+
+### Windows原生反馈资格与独立证据
+
+可移植配方`literal_completion_feedback_qualification.py`由已验证单次配方派生，原候选build SHA c4aad9c1872020ad5a0ec5e1c806194283624d8d1b12c7b773b26bc8670373e4；仍只修改SDK51的execution.py与completion_feedback.py，不改变六种原谓词、输入schema或业务评分。主机36项通过后，由`windows_literal_feedback_bundle.py`打包进唯一资格目录，在已安装客户端中核验466份运行时/源码，再用真实Windows CPython3.13.13/Codex0.159.2执行同配方，九次合成请求、36项检查通过。实际原生进程5260退出0，原执行器11428及暂停状态保持，客户端未替换。行政控制台启动有键盘输入，与零夹具输入分开；桌面及后端仍为合成，无QW3推理。
+
+导出ZIP SHA ebdf375790ca7e5cfced0079e2a5cd270e0a3060e63f43c7a4c8805afffbf476经独立校验，316份成员/12990633字节，禁止越界、重复、符号链接及过量解压。九份实际请求工具定义与相同源码主机资格相同；三份第三次请求保留`control_text: Prize Items`失败、无输入送达或业务正确性推断；三个实际SQLite步骤pending，零completion。原打包配方SHA及payload、guest脚本、原始ZIP保留，当前新增导出验证逻辑不覆盖原产物。证据`.runtime/literal-feedback-windows-native-01/{qualification,verified-export}.json`、`.runtime/literal-feedback-portable-host-01/result.json`。
+
+### 30分钟原生空闲录制终止结果
+
+同一已登记稳定性控制器2862766及工作进程2862834实际退役，16项终止资格通过：3600次完整新帧采集，3601帧/1800.5秒全部解码、1920×1080、零重连/传输缺口；原设备/会话/暂停与动作行及源码哈希相同。最后媒体与任务发布视频为同一inode，SHA deced2fe60d606975f7feb95f4bbafc591525f9e4d54f28e2754635ceac40feb。采集进程CPU163.75秒、编码/封装CPU395.32秒、峰值RSS246992KiB分别记录，不能忽略其资源成本或算作模型提速。证据`.runtime/recoverable-linux-wrapper-stability-01/state.json`与最新实际审计。范围为空闲且暂停的独立Linux试验机，零模型/输入，不代表活动GUI30分钟稳定性；冻结模型队列和原LinuxRecording仍未替换。
