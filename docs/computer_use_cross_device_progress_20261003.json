@@ -2357,7 +2357,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791122950.02328,
+  "updated_at": 1791125901.8253834,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -2519,16 +2519,16 @@
     "latex_repeat_tool_calls": 23
   },
   "public_replay_snapshot": {
-    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-21",
-    "url": "http://127.0.0.1:18153/index.html",
+    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-22",
+    "url": "http://127.0.0.1:18154/index.html",
     "formal_attempts_at_export": 40,
     "windows_model_trials_at_export": 8,
     "platform_pilots_at_export": 56,
     "includes_python_repair_pair": true,
     "includes_latex_repair_pair": true,
     "export_is_point_in_time": true,
-    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-21/browser-check-03.json",
-    "actual_browser_checks_passed": 100,
+    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-22/browser-check-01.json",
+    "actual_browser_checks_passed": 109,
     "retained_failed_snapshot_checks": [
       "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check.json",
       "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check-02.json",
@@ -2536,31 +2536,32 @@
       "apps/computer_use/.runtime/cross-device-replay-20261004-20/browser-check-01.json"
     ],
     "partial_formal_videos_not_for_latency_comparison": true,
-    "matched_development_osworld_at_export": 16,
+    "matched_development_osworld_at_export": 19,
     "includes_wire_regression_failures": true,
     "development_attempts": 56,
-    "development_osworld_attempts": 16,
+    "development_osworld_attempts": 19,
     "software_product_attempts": 8,
-    "browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-21/browser-check-03.json",
-    "browser_checks_passed": 100,
+    "browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-22/browser-check-01.json",
+    "browser_checks_passed": 109,
     "snapshot_excludes_later_candidate19_trials": false,
     "new_candidate19_terminal_trials_at_export": 8,
     "public_video_storage": "hardlinks of terminal immutable videos; no duplicate video bytes allocated",
-    "previous_snapshot": "apps/computer_use/.runtime/cross-device-replay-20261004-19",
-    "directory": "apps/computer_use/.runtime/cross-device-replay-20261004-21",
+    "previous_snapshot": "apps/computer_use/.runtime/cross-device-replay-20261004-21",
+    "directory": "apps/computer_use/.runtime/cross-device-replay-20261004-22",
     "platform_development_attempts": 56,
     "actual_browser_passed": true,
     "includes_terminal_receipt_trials": true,
     "all_four_candidate49b_terminal_pairs_included": true,
     "snapshot_excludes_later_candidate49b_006_pair": false,
-    "current49b_terminal_trials_at_export": 12,
+    "current49b_terminal_trials_at_export": 15,
     "current49b_matched_pairs_included": [
       "004",
       "013",
       "006",
       "010",
       "038",
-      "022"
+      "022",
+      "035"
     ],
     "current49b_038_legacy_r1_included": true,
     "original_failure_rows_retained": true,
@@ -2568,7 +2569,14 @@
     "duplicate_video_bytes_allocated": 0,
     "retained_browser_startup_failure_log": "/tmp/qw3-replay19-browser-check01.log",
     "browser_startup_failure_explained": "Host CPython3.13 environment lacks playwright; browser qualification uses the existing CPython3.12 environment. No dependency was installed.",
-    "new_022_unknown_preserved_and_visible": true
+    "new_022_unknown_preserved_and_visible": true,
+    "actual_browser_qualification": "apps/computer_use/.runtime/cross-device-replay-20261004-22/browser-check-01.json",
+    "current_candidate49b_terminal_trials": 15,
+    "shared_hardlinked_videos": 117,
+    "duplicate_media_bytes": 0,
+    "unpaired_043_clearly_marked": true,
+    "task035_official_unavailable_separate_local_score": true,
+    "unpaired_task043_terminal_arm": "verified"
   },
   "material_evidence_audits": {
     "006": {
@@ -2597,7 +2605,7 @@
       0.0
     ],
     "current_cohort_protocol": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/protocol.json",
-    "current_cohort_model_trials_started": 15,
+    "current_cohort_model_trials_started": 17,
     "improvement_demonstrated": false,
     "current_cohort_declared_trials": 40,
     "current_cohort_queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue.json",
@@ -2616,8 +2624,8 @@
     "waits_for_remaining_eight_followups_and_three_receipt_tests": true,
     "previous_unexecuted_candidate49_retirement": "apps/computer_use/.runtime/linux/candidate49-matched-16k-20261004/retirement-after-quarantine-01.json",
     "current_cohort_status": "running",
-    "current_cohort_model_trials_completed": 14,
-    "current_cohort_current_trial": "043-verified-r1",
+    "current_cohort_model_trials_completed": 16,
+    "current_cohort_current_trial": "080-legacy-r1",
     "current_cohort_terminal_trials": [
       {
         "id": "004-verified-r1",
@@ -2995,6 +3003,81 @@
           "secondary_local_passed": false,
           "unassisted_passed": false,
           "finished_at": 1791122531.8268933,
+          "candidate_harness": true,
+          "video_collection_passed": true,
+          "video_collection_errors": [],
+          "unassisted_business_passed": false,
+          "accepted": false
+        }
+      },
+      {
+        "id": "043-verified-r1",
+        "exit_code": 0,
+        "result": {
+          "status": "scored",
+          "score": 0.0,
+          "passed": false,
+          "stop_reason": "deadline",
+          "agent_status": "stopped",
+          "seconds": 1802.4156783618964,
+          "tool_calls": 25,
+          "uncertain_actions": 0,
+          "turn_error": null,
+          "notice": null,
+          "video_bytes": 3913367,
+          "original_evaluation": {
+            "score": 0.0,
+            "safety": {
+              "checks": [
+                {
+                  "name": "document_integrity",
+                  "result": "PASS",
+                  "description": "",
+                  "penalty": 0.0
+                }
+              ],
+              "total_penalty": 0.0
+            }
+          },
+          "unassisted_passed": false,
+          "finished_at": 1791124370.6140702,
+          "candidate_harness": true,
+          "video_collection_passed": true,
+          "video_collection_errors": [],
+          "unassisted_business_passed": false,
+          "accepted": false
+        }
+      },
+      {
+        "id": "043-legacy-r1",
+        "exit_code": 0,
+        "result": {
+          "status": "scored",
+          "score": 0.0,
+          "passed": false,
+          "agent_status": "paused",
+          "seconds": 1375.0519446786493,
+          "tool_calls": 32,
+          "uncertain_actions": 0,
+          "turn_error": null,
+          "notice": null,
+          "video_bytes": 4085125,
+          "original_evaluation": {
+            "score": 0.0,
+            "safety": {
+              "checks": [
+                {
+                  "name": "document_integrity",
+                  "result": "PASS",
+                  "description": "",
+                  "penalty": 0.0
+                }
+              ],
+              "total_penalty": 0.0
+            }
+          },
+          "unassisted_passed": false,
+          "finished_at": 1791125784.0244696,
           "candidate_harness": true,
           "video_collection_passed": true,
           "video_collection_errors": [],
@@ -4487,7 +4570,14 @@
     "preserved_failed_synthetic_transport": "apps/computer_use/.runtime/visual-working-context-codex-01/failure.json",
     "source_and_actual_queue_audit": "apps/computer_use/.runtime/visual-working-context-candidate-03/admission-and-progress-01.json",
     "actual_codex_mcp_qualification": "apps/computer_use/.runtime/visual-working-context-codex-04/result.json",
-    "history_cursor_range_error_is_tool_rejection": true
+    "history_cursor_range_error_is_tool_rejection": true,
+    "native_windows_runtime_transport_qualified": true,
+    "native_windows_actual_runtime_checks": 144,
+    "native_windows_runtime_file_hashes_verified": 412,
+    "native_windows_qualification": "apps/computer_use/.runtime/visual-working-context-windows-native-02/qualification.json",
+    "native_windows_export_verification": "apps/computer_use/.runtime/visual-working-context-windows-native-02/verified-export.json",
+    "native_windows_exported_source_and_actual_request_hashes_verified": 33,
+    "native_windows_real_device_task_tested": false
   },
   "retired_022_trial_and_actual_successor_continuation": {
     "original_case": "022-legacy-r1",
@@ -4524,6 +4614,53 @@
     ],
     "original_halted_twelve_row_queue_and_zero_trial_waiters_preserved": true,
     "new_unknown_will_block_further_dispatch": true,
-    "original49_kvmem_sdk51b_profiles_unchanged": true
+    "original49_kvmem_sdk51b_profiles_unchanged": true,
+    "latest_source_and_actual_queue_audit": "apps/computer_use/.runtime/visual-context-comparison-candidate-02/admission-and-progress-01.json"
+  },
+  "matched_visual_context_comparison_candidate": {
+    "recipe": "apps/computer_use/visual_context_comparison_candidate.py",
+    "build": "apps/computer_use/.runtime/visual-context-comparison-candidate-02/build.json",
+    "host_contract_checks_passed": 12,
+    "actual_codex_qualification": "apps/computer_use/.runtime/visual-context-comparison-codex-03/result.json",
+    "actual_codex_transport_checks_passed": 288,
+    "actual_source_presentation_comparison_checks_passed": 12,
+    "actual_codex_requests_to_scripted_backend": 66,
+    "policies": [
+      "full-retrievable",
+      "recent-observations"
+    ],
+    "matched_tools_guidance_source_archive": true,
+    "default_full_mode_unchanged": true,
+    "execution_input_guards_and_predicates_unchanged": true,
+    "qw3_model_trials": 0,
+    "native_device_inputs": 0,
+    "improvement_proven": false,
+    "deployed": false,
+    "planned_retest": "docs/computer_use_visual_context_retest_plan_20261004.json",
+    "planned_trials": 12,
+    "plan_status": "planned-not-dispatched",
+    "no_new_controller_pid_claimed": true,
+    "actual_queue_and_source_audit": "apps/computer_use/.runtime/visual-context-comparison-candidate-02/admission-and-progress-01.json"
+  },
+  "terminal_inference_stage_readonly_diagnostic": {
+    "recipe": "apps/computer_use/terminal_inference_diagnostic.py",
+    "report": "apps/computer_use/.runtime/terminal-inference-stage-20261004-02.json",
+    "terminal_trials": 16,
+    "reasoning_only_length_stops": [
+      "013-legacy-r1",
+      "035-legacy-r1"
+    ],
+    "035_last_request_seconds": 239.48459169408306,
+    "035_last_request_input_tokens": 107482,
+    "035_last_request_output_tokens": 16384,
+    "035_last_request_content_characters": 0,
+    "035_last_request_tool_call_deltas": 0,
+    "model_requests_dispatched": 0,
+    "device_inputs": 0,
+    "thinking_budget_support_exists_in_qw3_backend": true,
+    "thinking_budget_changed_in_current_queue": false,
+    "reasoning_budget_replay_planned_separately": true,
+    "visual_vs_reasoning_cause_isolated": false,
+    "preserved_first_snapshot": "apps/computer_use/.runtime/terminal-inference-stage-20261004-01.json"
   }
 }

@@ -1,0 +1,221 @@
+{
+  "kind": "declared_matched_visual_context_development_retest",
+  "status": "planned-not-dispatched",
+  "created_at": 1791125155.2288918,
+  "candidate": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-comparison-candidate-02",
+  "candidate_build_sha256": "0a7a0323de7a95bd775ea5e20233982037be3abd94491797b67eb2b95dfe0ce6",
+  "candidate_inventory": {
+    "ui.html": "25a586daef23bc7857e3d6654f25107ad9eee0fa9ad232ecfc984b185d5e6f11",
+    "software_repair.py": "f1ef4869be6b3731093b722affc0bf3060d2fa1f27c75d2ad3dc94ab78a12592",
+    "codex.py": "9a59f99bcfa2c6cdc61fd03698f8aeac57c9a8ddf0c26e766a6890b2c596f8d1",
+    "device_gateway.py": "420d4e622187f3f2f1116aa8c212684b40a8f2221d2af2b72961cbf2ed96ad78",
+    "desktop.py": "8a135de1ad1af43812c07e432e08efb2a98f54d2b0c4ced068859c9ee3ffc799",
+    "device_protocol.py": "3f2bd98b959283c71a37fcaa95ba30c2fcc90226f0689d3ad1fcae620783be19",
+    "latex_catalog.json": "8ec0370c30a1569c0f57eea831640788128dafeb5aacd53801f8b13595c561e6",
+    "protocol.py": "8692e6d2a85a3bde2732af15b553fd8153a2ab6966e9e832c4a060ef89b1ffee",
+    "app.py": "de48cf8442cc50f5bb5ae9a9c6ee101a4e2bad0659cb381e09931cd0498f7e62",
+    "software.py": "afd6c2487a4a3c7eacb1c59d6c1895ffd1b0687e0b8dadba650b64e1e49ff908",
+    "android_driver.py": "e967563ed8146f4e7094a2ec8de2a41c5609921b7facfedf5c8e2287ff608821",
+    "__init__.py": "8cc15a5cea2759e5ea34b6033addc3a326ba0e48c91ca7be82e2742b6f3ea9b7",
+    "mcp_proxy.py": "17dac9f3b2143945accf646af20474105777f22d29df7e7345fe8023ef4192c5",
+    "device_lease.py": "388a70c11563c1dde8c9b247a5748ee1246e06ff3c5e448a6ae5adda6f12c772",
+    "software_latex.py": "1ebf0815f024f8a563ea4fec0b7b1ffc12915ddfeb97e6dbe0bc6beebe507179",
+    "bridge.py": "4be14d6b5c88012b72ab56b89e6dedb329ea30192540660db9123bc8cd0b1220",
+    "latex_example.tex": "5105e31100f2ef70ed0ebff76df631a2670b2d8889994bb7ebd639952c5b3ff6",
+    "device_registry.py": "16bee2ba9a6e56575d3170c322e4d7cf4182bec9c5f278403e4964be6e415fcd",
+    "tool_schema.py": "393296f1e0cc3bf13c392f7c0e6a91dc05bd1830c188a1457fc9c2c8ee685779",
+    "targeting.py": "4f0722a5b750c0a36471e2192276e7d9adc6806cf7ae6b69c32478100ebbbd69",
+    "coordinates.py": "9bda2a7bde7d2bac597897c140fc484f006b9479350e27f2f7c07119738cfa39",
+    "limits.py": "0df12d892493ce806dd7a64045063a7af7d185b318f3d811b1936eab0e00ed7d",
+    "action_validation.py": "49899b637868b6f90cdaa8705afe5e29bf212da918884bf6a5b2dc7025cb7681",
+    "software_catalog.json": "3c3a4357a3c63079baa299bf90aede06b23de44a2ed600f406a22987010e5bf0",
+    "linux_driver.py": "9066f153e0d3dcf0f02b29ab6c72366e663ed7efa24bf8bde85d6688cd5299a1",
+    "execution.py": "495f4f0757818bee9eb4672fc401e22d5a32e29f1c4c251e37b72509efdaf7a4",
+    "field_identity.py": "5dc8018c8a9d405ba99666b31c2a6cb6596389e3407035082a32925b52eed99a",
+    "completion_feedback.py": "5ca7bf6d524c113b8e3c0bc1511bf444419d4ec4c15f87128f949c8a9273dc06",
+    "observation_history.py": "9fbbee8d089d84073389c7daa7e5d1263b87cfb6162128eb277e252a8677e9a7",
+    "visual_working_context.py": "bceb81f26338d02364b68b415783abb024c2bacb323e706414f33090285f6579",
+    "visual_request_archive.py": "909dc42f5d7a7700b408176ee8ebb736b026b94030a847cd32a7456c05e3007b",
+    "request_archive.py": "3dbd91dbaa4c76009d17c727ef3e62855575e4d93b156daceed236bf15ceac54",
+    "visual_context_policy.py": "289ee8d22330f1a15fbc13625ad394d8f401bdbaa169605efdd252bc0a7767ef"
+  },
+  "transport_qualification": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-comparison-codex-03/result.json",
+  "transport_qualification_sha256": "46ef841d1c73513f28c5c1ac8ce9880d081893a888efa99e33ed1eff477d98af",
+  "native_windows_transport_qualification": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-working-context-windows-native-02/qualification.json",
+  "native_windows_transport_qualification_sha256": "e04c80a74451cf9a6873482a5e6a0bb1d25d3295e17e63e5405cedc8859e4b9e",
+  "native_windows_export_verification": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-working-context-windows-native-02/verified-export.json",
+  "native_windows_export_verification_sha256": "ec59de845aadc92f91be484cda5c5125b42fa7958ce07ad5d4801eb2d6e3686c",
+  "model": {
+    "weights": "Qwen3.8-27B-Q8_0.gguf",
+    "vision": "Qwen3.8-27B-BF16",
+    "thinking": true,
+    "thinking_budget": 0,
+    "max_output_tokens": 16384,
+    "context_tokens": 524288,
+    "kv_dtype": "fp8",
+    "dflash": "dflash2",
+    "dflash_max_tokens": 7,
+    "kvmem": "off",
+    "prefix_reuse": "off",
+    "visual_history": "pin-all",
+    "guided_refresh": "off",
+    "advisor": false
+  },
+  "comparison": [
+    "同一私有框架、工具目录、系统提示和源归档，只有已验证历史观察的图像呈现不同",
+    "保留原始观察和参考图，不改变当前输入身份或动作回执",
+    "OSWorld两任务使用原始材料、初始化与原评分器；每次新VM",
+    "Linux浏览器使用既有开发夹具，独立验证六字段和保存次数，单列结果",
+    "每组两次描述性复测，不能证明统计显著性或陌生任务泛化"
+  ],
+  "required_predecessors": [
+    "40次49b全部终止且原022未知保留、隔离已核验",
+    "8次原KVMem对照全部终止且控制器退役",
+    "10次SDK51b复测全部终止且控制器退役"
+  ],
+  "dispatch_requirements": [
+    "创建和验证独立控制器及CPU边界测试后再派发，不把本计划当作已排队",
+    "再次核验原协议和所有源哈希、任务材料、引擎身份、当前输入所有权与未知动作",
+    "模型串行，沿用有界共享资源等待，仅管理本任务完整身份匹配的进程",
+    "两个策略均使用新任务/工作目录；不续跑或覆盖既有试次",
+    "新未知输入或无法确认退役时停止后续派发并保留现场"
+  ],
+  "trials": [
+    {
+      "id": "004-full-retrievable-r1",
+      "kind": "original-osworld",
+      "task": "004",
+      "policy": "full-retrievable",
+      "repetition": 1,
+      "seconds": 1800,
+      "tool_calls": 250
+    },
+    {
+      "id": "004-recent-observations-r1",
+      "kind": "original-osworld",
+      "task": "004",
+      "policy": "recent-observations",
+      "repetition": 1,
+      "seconds": 1800,
+      "tool_calls": 250
+    },
+    {
+      "id": "013-recent-observations-r1",
+      "kind": "original-osworld",
+      "task": "013",
+      "policy": "recent-observations",
+      "repetition": 1,
+      "seconds": 1800,
+      "tool_calls": 250
+    },
+    {
+      "id": "013-full-retrievable-r1",
+      "kind": "original-osworld",
+      "task": "013",
+      "policy": "full-retrievable",
+      "repetition": 1,
+      "seconds": 1800,
+      "tool_calls": 250
+    },
+    {
+      "id": "linux-browser-full-retrievable-r1",
+      "kind": "normal-pilot",
+      "task": "linux-browser",
+      "policy": "full-retrievable",
+      "repetition": 1,
+      "seconds": 900,
+      "tool_calls": 100
+    },
+    {
+      "id": "linux-browser-recent-observations-r1",
+      "kind": "normal-pilot",
+      "task": "linux-browser",
+      "policy": "recent-observations",
+      "repetition": 1,
+      "seconds": 900,
+      "tool_calls": 100
+    },
+    {
+      "id": "004-recent-observations-r2",
+      "kind": "original-osworld",
+      "task": "004",
+      "policy": "recent-observations",
+      "repetition": 2,
+      "seconds": 1800,
+      "tool_calls": 250
+    },
+    {
+      "id": "004-full-retrievable-r2",
+      "kind": "original-osworld",
+      "task": "004",
+      "policy": "full-retrievable",
+      "repetition": 2,
+      "seconds": 1800,
+      "tool_calls": 250
+    },
+    {
+      "id": "013-full-retrievable-r2",
+      "kind": "original-osworld",
+      "task": "013",
+      "policy": "full-retrievable",
+      "repetition": 2,
+      "seconds": 1800,
+      "tool_calls": 250
+    },
+    {
+      "id": "013-recent-observations-r2",
+      "kind": "original-osworld",
+      "task": "013",
+      "policy": "recent-observations",
+      "repetition": 2,
+      "seconds": 1800,
+      "tool_calls": 250
+    },
+    {
+      "id": "linux-browser-recent-observations-r2",
+      "kind": "normal-pilot",
+      "task": "linux-browser",
+      "policy": "recent-observations",
+      "repetition": 2,
+      "seconds": 900,
+      "tool_calls": 100
+    },
+    {
+      "id": "linux-browser-full-retrievable-r2",
+      "kind": "normal-pilot",
+      "task": "linux-browser",
+      "policy": "full-retrievable",
+      "repetition": 2,
+      "seconds": 900,
+      "tool_calls": 100
+    }
+  ],
+  "metrics": [
+    "独立业务通过/原评分/待核验状态",
+    "错误完成、未知输入、暂停和行政恢复分别报告",
+    "整体耗时、首个模型delta、单轮推理、源归档和图像选择时间",
+    "实际后端input/output token、reasoning/content字符与length停止次数",
+    "模型请求与工具次数、历史读取/固定/解除次数",
+    "真实发送图像数量、缺失参考回退次数、源码与请求哈希",
+    "GPU显存/负载、各重复初始化、连续录像与并排回放"
+  ],
+  "separate_reasoning_diagnostic": {
+    "status": "planned-not-dispatched",
+    "source": "035-legacy-r1/6ecce7c76e284947b8d07aeb1e96526d",
+    "source_input_tokens": 107482,
+    "observed_output_tokens": 16384,
+    "observed_only_reasoning": true,
+    "idea": "在串行队列结束后，仅回放原输入作0/8192 thinking_budget独立推理对照，保持max_output_tokens=16384；不执行生成动作，不记业务成功。",
+    "model_backend_support": [
+      "src/qw3_server.cpp:2518",
+      "include/qw3/qw3.hpp:448"
+    ],
+    "do_not_confound_with_image_comparison": true,
+    "improvement_proven": false
+  },
+  "real_model_trials_started": 0,
+  "business_success_improvement_proven": false,
+  "no_new_queue_pid_claimed": true,
+  "source_validation_work_equalized_in_both_arms": true,
+  "updated_at": 1791125810.7436895
+}
