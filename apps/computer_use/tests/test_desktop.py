@@ -250,6 +250,53 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.effects,0)
         self.execution.close()
 
+    async def test_aged_visual_click_inside_unchanged_context_ignores_external_clock_once(self):
+        action=await self.aged_context_control()
+        action.update(coordinate_space='normalized_1000',action={'kind':'click','x':250,'y':250,'button':'left','clicks':1})
+        self.change_pixel((7,7))
+        result=await self.desktop.act(action)
+        self.assertTrue(result['observation_revalidation']['target_context_unchanged'])
+        self.assertFalse(result['observation_revalidation']['same_view'])
+        self.assertEqual((self.last_dispatched['action']['x'],self.last_dispatched['action']['y']),(2,2))
+        await self.desktop.act(action)
+        self.assertEqual(self.effects,1)
+        self.execution.close()
+
+    async def test_visual_context_does_not_ignore_changed_semantics(self):
+        action=await self.aged_context_control()
+        action.update(coordinate_space='normalized_1000',action={'kind':'click','x':250,'y':250,'button':'left','clicks':1})
+        self.change_pixel((7,7))
+        self.controls[0]['states']={'enabled':False}
+        with self.assertRaises(DesktopRejected):await self.desktop.act(action)
+        self.assertEqual(self.effects,0)
+        self.execution.close()
+
+    async def test_visual_context_rejects_changed_dialog_body_away_from_target(self):
+        action=await self.aged_context_control()
+        action.update(coordinate_space='normalized_1000',action={'kind':'click','x':250,'y':250,'button':'left','clicks':1})
+        self.change_pixel((5,3))
+        with self.assertRaises(DesktopRejected):await self.desktop.act(action)
+        self.assertEqual(self.effects,0)
+        self.assertEqual(self.desktop.unresolved(),[])
+        self.execution.close()
+
+    async def test_visual_target_outside_declared_content_keeps_strict_view_check(self):
+        action=await self.aged_context_control()
+        action.update(coordinate_space='normalized_1000',action={'kind':'click','x':250,'y':875,'button':'left','clicks':1})
+        self.change_pixel((7,7))
+        with self.assertRaises(DesktopRejected):await self.desktop.act(action)
+        self.assertEqual(self.effects,0)
+        self.execution.close()
+
+    async def test_drag_end_outside_context_cannot_use_clock_exemption(self):
+        action=await self.aged_context_control()
+        action.update(coordinate_space='normalized_1000',action={'kind':'drag','from_x':250,'from_y':250,
+            'to_x':500,'to_y':875,'duration_ms':500,'modifier':'none'})
+        self.change_pixel((7,7))
+        with self.assertRaises(DesktopRejected):await self.desktop.act(action)
+        self.assertEqual(self.effects,0)
+        self.execution.close()
+
     async def test_control_target_is_rechecked_before_one_input_when_source_is_young(self):
         from qw3_computer.execution import Execution
         controls=await self.observed_controls()

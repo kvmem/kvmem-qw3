@@ -105,11 +105,11 @@ class Desktop:
                 result["step_check"] = self.execution.after_delivery(metadata)
             return result
 
-    def unchanged_control_context(self, old, fresh, target):
+    def unchanged_target_context(self, old, fresh, target):
         """Compare stored pixels, never trust a progress hash as target evidence.
 
         A driver may declare desktop chrome outside the working area. Only a
-        control entirely inside an unchanged working area can use this path;
+        target entirely inside an unchanged working area can use this path;
         a dialog's changed text still invalidates its unchanged button.
         """
         region = old.get('progress_region')
@@ -262,20 +262,28 @@ class Desktop:
                              Image.open(self.runtime/'screenshots'/(fresh['sha256']+'.png')) as second:
                             target_valid=first.crop(bounds).convert('RGBA').tobytes()==second.crop(bounds).convert('RGBA').tobytes()
                 context_valid=(aged and guarded_control and target_valid
-                               and self.unchanged_control_context(old,fresh,mapping['control']))
+                               and self.unchanged_target_context(old,fresh,mapping['control']))
+                visual_context_valid=False
+                if aged and arguments['action']['kind'] in {'click','drag','scroll'} and controls(old)==controls(fresh):
+                    action=dispatched['action']
+                    points=[(action['from_x'],action['from_y']),(action['to_x'],action['to_y'])] if action['kind']=='drag' else [(action['x'],action['y'])]
+                    visual_context_valid=all(self.unchanged_target_context(old,fresh,
+                        {'x':x,'y':y,'width':1,'height':1}) for x,y in points)
+                    context_valid=context_valid or visual_context_valid
                 independent_app_intent=arguments['action']['kind']=='open_app'
                 revalidation={'source_observation_id':old['observation_id'],'fresh_observation_id':fresh['observation_id'],
                     'age_milliseconds':time.time()*1000-captured if type(captured) in (int,float) else None,
                     'same_device':same_device,'same_view':same_view,'target_control_valid':target_valid if guarded_control else None,
                     'target_context_unchanged':bool(context_valid),
                     'scope':('Explicit allowed app intent' if independent_app_intent else
+                             'Exact unchanged content and semantic evidence; visual points inside content region' if visual_context_valid else
                              'Fresh control identity and exact unchanged desktop content region' if context_valid else
                              'Fresh control identity, bounds and target image region' if guarded_control and not aged else
                              'Exact screenshot, foreground and control evidence'),
                     'input_sent':False}
                 self.db.execute('INSERT INTO revalidations VALUES (?,?,?)',(receipt_id,old['observation_id'],json.dumps(revalidation)))
                 self.db.commit()
-                allowed=same_view or independent_app_intent
+                allowed=same_view or independent_app_intent or visual_context_valid
                 if guarded_control:
                     allowed=target_valid and ((same_view or context_valid) if aged else True)
                 if not same_device or not allowed:
