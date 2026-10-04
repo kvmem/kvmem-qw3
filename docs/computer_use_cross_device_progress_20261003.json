@@ -524,6 +524,74 @@
       "model_score_valid": true,
       "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/006-legacy-r2/result.json",
       "finished_at": 1791070972.0624776
+    },
+    {
+      "task": "010",
+      "arm": "legacy",
+      "repetition": 2,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 820.4700811170042,
+      "tool_calls": 19,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/010-legacy-r2/result.json",
+      "finished_at": 1791071996.1435206
+    },
+    {
+      "task": "010",
+      "arm": "verified",
+      "repetition": 2,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 441.4101923443377,
+      "tool_calls": 16,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/010-verified-r2/result.json",
+      "finished_at": 1791072623.3317487
+    },
+    {
+      "task": "038",
+      "arm": "verified",
+      "repetition": 2,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 443.87350475927815,
+      "tool_calls": 11,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/038-verified-r2/result.json",
+      "finished_at": 1791073114.9039342
+    },
+    {
+      "task": "038",
+      "arm": "legacy",
+      "repetition": 2,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 691.2852856600657,
+      "tool_calls": 15,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/038-legacy-r2/result.json",
+      "finished_at": 1791073851.830656
     }
   ],
   "warnings": [
@@ -1085,12 +1153,12 @@
   "frozen_campaign": {
     "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/plan.json",
     "commit": "9fe52d3ee254786012652ec9fc85f340b71e9dc9",
-    "finished": 26,
+    "finished": 30,
     "total": 40,
     "current": [
-      "010-legacy-r2"
+      "022-legacy-r2"
     ],
-    "separate_pilot_queued": "xdev-python-repair-03",
+    "separate_pilot_queued": "xdev-latex-repair-01",
     "separate_pilot_status": "waiting-for-current-formal-attempt"
   },
   "post_freeze_optimizations": {
@@ -1102,8 +1170,8 @@
     "control_id_copy_hint": "Complete20-character observed IDs; the server currently does not enforce identifier enums during decoding, no constrained-decoding benefit claimed"
   },
   "formal_summary": {
-    "ended_attempts": 26,
-    "valid_original_scores": 20,
+    "ended_attempts": 30,
+    "valid_original_scores": 24,
     "infrastructure_failures": 4,
     "unavailable_original_evaluators": 2,
     "successes": 0,
@@ -1131,11 +1199,11 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791071250.9803512,
+  "updated_at": 1791074272.212246,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
-    "started": 5,
+    "started": 6,
     "bundle": "windows-native-client-40",
     "thinking": true,
     "workflow_mode": "verified",
@@ -1143,8 +1211,8 @@
     "timeout_seconds": 900,
     "shared_engine": true,
     "pure_gui": false,
-    "ended": 6,
-    "accepted": 5
+    "ended": 7,
+    "accepted": 6
   },
   "windows_product_attempts": [
     {
@@ -1224,6 +1292,19 @@
       "tool_calls": 4,
       "workflow_mode": "verified",
       "path": "apps/computer_use/.runtime/xdev-python-repair-02/xdev-python-repair-02-trial/result.json"
+    },
+    {
+      "id": "xdev-python-repair-03-trial",
+      "task": "product-python-repair",
+      "status": "complete",
+      "passed": true,
+      "accepted": true,
+      "model_used": true,
+      "pure_gui": false,
+      "seconds": 54.19833440000002,
+      "tool_calls": 4,
+      "workflow_mode": "verified",
+      "path": "apps/computer_use/.runtime/xdev-python-repair-03/xdev-python-repair-03-trial/result.json"
     }
   ],
   "repair_preparation": {
@@ -1232,7 +1313,7 @@
     "preserved_pre_model_attempt": "apps/computer_use/.runtime/xdev-python-repair-01/reconciliation.json",
     "corrected_initial_protocol": "apps/computer_use/.runtime/windows-cross-products-20261004/python-repair-initial-acceptance-v2.json",
     "corrected_repeat_protocol": "apps/computer_use/.runtime/windows-cross-products-20261004/python-repair-repeat-acceptance-v2.json",
-    "real_model_candidate_queued": "xdev-python-repair-03",
+    "real_model_candidate_queued": "xdev-latex-repair-01",
     "reset_after_verified_repair": "apps/computer_use/.runtime/xdev-python-fixture-reset-02/result.json",
     "first_valid_repair": {
       "path": "apps/computer_use/.runtime/xdev-python-repair-02/xdev-python-repair-02-trial/result.json",
@@ -1244,15 +1325,21 @@
       "launcher_passed": true,
       "reopen_passed": true,
       "complete_video": true
-    }
+    },
+    "python_valid_repeats": 2,
+    "latex_initial_fixture": "apps/computer_use/.runtime/xdev-latex-fixture-01/result.json"
   },
   "public_replay_snapshot": {
-    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-05",
-    "url": "http://127.0.0.1:18137/index.html",
-    "includes_all_four_windows_new_trials": true,
+    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-07",
+    "url": "http://127.0.0.1:18139/index.html",
+    "formal_attempts_at_export": 29,
+    "windows_model_trials_at_export": 6,
+    "includes_python_repair_pair": true,
     "export_is_point_in_time": true,
-    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-05/browser-check.json",
-    "actual_browser_checks_passed": 8
+    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-07/browser-check.json",
+    "actual_browser_checks_passed": 8,
+    "retained_failed_snapshot_check": "apps/computer_use/.runtime/cross-device-replay-20261004-06/browser-check.json",
+    "partial_formal_videos_not_for_latency_comparison": true
   },
   "material_evidence_audits": {
     "006": {
@@ -1285,5 +1372,37 @@
     "preflight_refusal_misreported_as_uncertainty": 2,
     "vision_vs_reasoning_root_cause_proven": false,
     "earlier_diagnostic_correction": "apps/computer_use/.runtime/linux/failure-evidence-26-correction-20261004.json"
+  },
+  "recovery_fixture_qualification": {
+    "path": "apps/computer_use/.runtime/fault-browser-qualification-02/result.json",
+    "actual_host_browser": true,
+    "model_used": false,
+    "native_device_qualification": false,
+    "checks_passed": 44,
+    "conditions": [
+      "normal",
+      "slow_loading",
+      "focus_dialog",
+      "no_progress"
+    ],
+    "actual_slow_loading_seconds": [
+      90.446,
+      90.44
+    ],
+    "model_fault_trials_completed": 0,
+    "retained_earlier_failed_checker": "apps/computer_use/.runtime/fault-browser-qualification-01/result.json"
+  },
+  "linux_editor_serialization": {
+    "native_gui_qualification": "apps/computer_use/.runtime/linux/text-serialization-qualification-01/result.json",
+    "readonly_preferences": "apps/computer_use/.runtime/linux/editor-semantics-audit-01/result.json",
+    "model_used": false,
+    "editor_version": "Gedit 41.0",
+    "ensure_trailing_newline": true,
+    "typed_final_lf_saved_bytes": 46,
+    "typed_without_final_lf_saved_bytes": 45,
+    "original_prompt_and_grader_unchanged": true,
+    "preferences_changed": false,
+    "qualified_failure_attribution": "Editor appends a newline; original model literal payload was correct. Does not establish model vision or reasoning sufficiency.",
+    "model_retest_after_optimization": false
   }
 }

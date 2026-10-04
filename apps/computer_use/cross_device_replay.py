@@ -78,6 +78,7 @@ def media_details(path, seconds):
     try:
         import av
     except ImportError:
+        result.update(time_coverage='视频解码依赖不可用，时长未核验，禁止延迟对比',media_decode_error='missing_dependency')
         return result
     try:
         with av.open(str(path)) as source:

@@ -81,6 +81,35 @@ class CalcSavedWorkbookTests(unittest.TestCase):
 
 
 class PilotEvidenceTests(unittest.TestCase):
+    def test_retirement_never_stops_a_replaced_or_uncertain_task(self):
+        from platform_pilots import retire_task
+        for state in [{'id':'other-task','status':'completed','uncertain_actions':[]},
+                      {'id':'owned-task','status':'paused','uncertain_actions':[{'status':'uncertain'}]},
+                      {'id':'owned-task','status':'running','uncertain_actions':[]}]:
+            with patch('platform_pilots.request',return_value=state) as requests:
+                with self.assertRaisesRegex(ValueError,'identified reconciled'):
+                    retire_task('app','owned-task','linux-vm')
+                requests.assert_called_once_with('app','/api/state')
+
+    def test_retirement_requires_an_explicit_stop_receipt_before_device_reset(self):
+        from platform_pilots import retire_task
+        with patch('platform_pilots.request',side_effect=[
+            {'id':'owned-task','status':'completed','uncertain_actions':[]},
+            {'id':'owned-task','status':'stopped'}]) as requests:
+            with self.assertRaisesRegex(ValueError,'stop not acknowledged'):
+                retire_task('app','owned-task','linux-vm')
+            self.assertEqual(requests.call_count,2)
+
+    def test_retirement_retains_known_task_identity_and_acknowledges_idle_entry(self):
+        from platform_pilots import retire_task
+        with patch('platform_pilots.request',side_effect=[
+            {'id':'owned-task','status':'paused','uncertain_actions':[]},
+            {'id':'owned-task','status':'stopped','desktop_paused':True},
+            {'status':'idle','uncertain_actions':[]}]) as requests:
+            result=retire_task('app','owned-task','android-emulator')
+            self.assertTrue(result['stopped'] and result['idle'])
+            self.assertEqual(requests.call_args.args,('app','/api/device',{'device_id':'android-emulator'}))
+
     def test_replaced_container_never_receives_cleanup_signal(self):
         from browser_pilot import stop
         fixture={'platform':'android','container_id':'original-container'}

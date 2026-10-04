@@ -67,6 +67,13 @@ def run(args):
     if state["status"] not in {"idle", "completed", "failed", "stopped"} or state["uncertain_actions"]:
         raise ValueError("Finish the existing task and reconcile uncertain input before a pilot")
     android = args.case.startswith('android_')
+    fault=getattr(args,'fault',None)
+    if fault and args.case not in {'android_browser','linux_browser'}:
+        raise ValueError('Recovery fixture conditions apply only to browser pilots')
+    if fault:
+        import fault_browser_pilot as browser_provider
+    else:
+        import browser_pilot as browser_provider
     info = owned_container("qw3-computer-android" if android else "qw3-computer-linux",
                            "qw3.goal", "cross-device-20261003")
     desired = "android-emulator" if android else "linux-vm"
@@ -88,6 +95,9 @@ def run(args):
                                 for name in ['browser_pilot.py','browser_pilot_server.js','calc_pilot.py','android_contacts_pilot.py']}
     manifest['recording_sources']={name:hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest()
                                  for name in ['linux_recording.py','vm/record_console.py','vm/vnc_admin.py','live_android_recording.py']}
+    if fault:
+        manifest.update(fault_condition=fault,fault_sources={name:hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+            for name in ['fault_browser_pilot.py','fault_browser_server.js']})
     dependencies=args.runtime/'device-dependencies-canonical-20261004.json'
     if dependencies.exists():
         # This is a separate dependency upgrade, not a rewrite of the private
@@ -110,6 +120,8 @@ def run(args):
     browser_fixture = None
     task_id = None
     recording = False
+    result=None
+    deadline_reached=False
     try:
         if android:
             metadata = json.loads((ROOT / "apps/computer_use/.runtime/android/emulator-container-manifest.json").read_text())
@@ -132,8 +144,8 @@ def run(args):
                 android_command(['shell','am','start','-a','android.intent.action.MAIN',
                                  '-c','android.intent.category.LAUNCHER','-p','com.google.android.contacts'],capture_output=True)
             else:
-                from browser_pilot import initialize
-                browser_fixture,prompt=initialize('android',identity_value,directory)
+                options={'condition':fault} if fault else {}
+                browser_fixture,prompt=browser_provider.initialize('android',identity_value,directory,**options)
                 manifest['prompt']=prompt
                 save(directory/'pilot-manifest.json',manifest)
                 android_command(['shell','am','start','-a','android.intent.action.VIEW',
@@ -147,8 +159,8 @@ def run(args):
             video.start()
         else:
             if args.case=='linux_browser':
-                from browser_pilot import initialize
-                browser_fixture,prompt=initialize('linux',identity_value,directory,linux_execute)
+                options={'condition':fault} if fault else {}
+                browser_fixture,prompt=browser_provider.initialize('linux',identity_value,directory,linux_execute,**options)
                 manifest['prompt']=prompt
                 save(directory/'pilot-manifest.json',manifest)
                 linux_execute('import subprocess;subprocess.Popen('+repr(['google-chrome','--new-window',browser_fixture['url']])+
@@ -171,6 +183,9 @@ def run(args):
         event_source=args.runtime/'codex-events.jsonl'
         event_offset=event_source.stat().st_size if event_source.exists() else 0
         manifest['codex_event_offset_bytes']=event_offset
+        if fault:
+            manifest['fault_armed']=browser_provider.arm(browser_fixture,linux_execute)
+            save(directory/'pilot-manifest.json',manifest)
         started = time.monotonic()
         state = request(args.app, "/api/task", {"prompt": prompt})
         task_id = state["id"]
@@ -186,6 +201,7 @@ def run(args):
                 if state["status"] in {"completed", "failed", "paused", "stopped"}:
                     break
                 if time.monotonic() - started >= seconds:
+                    deadline_reached=True
                     state = request(args.app, "/api/control", {"command": "stop"})
                     break
                 gpu = subprocess.run(["nvidia-smi", "--query-gpu=timestamp,memory.used,memory.free,utilization.gpu",
@@ -212,10 +228,14 @@ def run(args):
             save(directory/'independent-contacts.json',independent)
             result['artifact_passed']=independent['passed']
         elif browser_fixture:
-            from browser_pilot import grade
-            independent=grade(browser_fixture,linux_execute)
+            independent=browser_provider.grade(browser_fixture,linux_execute)
             save(directory/'independent-browser.json',independent)
             result['artifact_passed']=independent['passed']
+            if fault:
+                response=browser_provider.response_grade(independent,state,deadline_reached=deadline_reached)
+                save(directory/'independent-fault-response.json',response)
+                result.update(fault_condition=fault,fault_exercised=response['fault_exercised'],
+                              fault_response_passed=response['passed'])
         elif args.case=='linux_calc':
             from calc_pilot import grade
             independent=grade(linux_execute,fixture,directory)
@@ -246,6 +266,7 @@ def run(args):
             result.update(video_collection_passed=False,video_collection_error=type(exc).__name__+': '+str(exc))
         result["unassisted_passed"] = result["artifact_passed"] and state["status"] == "completed" and not result["uncertain_actions"]
         result['accepted']=result['unassisted_passed'] and result['video_collection_passed']
+        if fault:result['fault_accepted']=result['fault_response_passed'] and result['video_collection_passed']
         if (directory/'continuous.mp4').exists():
             result["video_bytes"] = (directory / "continuous.mp4").stat().st_size
         save(directory / "task.json", state)
@@ -262,6 +283,7 @@ def run(args):
     except Exception as exc:
         failed = {"kind": "integration-pilot-not-formal", "status": "infrastructure-failed",
                   "error": type(exc).__name__ + ": " + str(exc), "unassisted_passed": False}
+        result=failed
         if task_id:
             try:
                 current = request(args.app, "/api/state")
@@ -285,10 +307,37 @@ def run(args):
                 save(directory / "recording-error.json", {"error": type(exc).__name__})
         if browser_fixture:
             try:
-                from browser_pilot import stop
-                save(directory/'browser-service-stop.json',stop(browser_fixture,linux_execute))
+                save(directory/'browser-service-stop.json',browser_provider.stop(browser_fixture,linux_execute))
             except Exception as exc:
                 save(directory/'browser-service-stop.json',{'stopped':False,'error':type(exc).__name__+': '+str(exc)})
+        if task_id and getattr(args,'retire_task',False):
+            # Probe-only cleanup: keep the original task.json and durable
+            # archive, stop only our terminal task, then reset the idle device
+            # entry so the next queued model trial has explicit admission.
+            try:
+                retirement=retire_task(args.app,task_id,desired)
+                save(directory/'task-retirement.json',retirement)
+                if result is not None:result['owned_task_retired']=True
+            except Exception as exc:
+                save(directory/'task-retirement.json',{'task_id':task_id,'stopped':False,'error':type(exc).__name__+': '+str(exc)})
+                if result is not None:
+                    result.update(owned_task_stop_unconfirmed=True,accepted=False)
+                    if fault:result['fault_accepted']=False
+            if result is not None:save(directory/'integration-result.json',result)
+
+
+def retire_task(app,task_id,desired):
+    current=request(app,'/api/state')
+    if (current.get('id')!=task_id or current['status'] in {'starting','running','verifying'}
+            or current.get('uncertain_actions')):
+        raise ValueError('Probe task retirement requires its identified reconciled terminal state')
+    stopped=request(app,'/api/control',{'command':'stop'})
+    if stopped.get('id')!=task_id or stopped['status']!='stopped' or stopped.get('desktop_paused') is not True:
+        raise ValueError('Probe task stop not acknowledged')
+    reset=request(app,'/api/device',{'device_id':desired})
+    if reset['status']!='idle' or reset.get('uncertain_actions'):
+        raise ValueError('Probe device reset not acknowledged')
+    return {'task_id':task_id,'stopped':True,'idle':True,'archive_preserved':True}
 
 
 def collect_linux_recording(path):
@@ -329,6 +378,10 @@ def main():
                    help='Live1Hz measured captures preserve static waits; native video may omit a stationary tail')
     p.add_argument('--linux-video-mode',choices=['vnc','official'],default='vnc',
                    help='Timestamped read-only VNC sampling; official server recordings can omit long waits')
+    p.add_argument('--fault',choices=['slow_loading','focus_dialog','no_progress'],
+                   help='Separate declared browser recovery probe, never an OSWorld score')
+    p.add_argument('--retire-task',action='store_true',
+                   help='Archive and stop only this probe task, then restore its idle device entry')
     args = p.parse_args()
     print(json.dumps(run(args), ensure_ascii=False), flush=True)
 
