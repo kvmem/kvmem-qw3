@@ -2357,7 +2357,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791125901.8253834,
+  "updated_at": 1791128235.893821,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -4595,7 +4595,7 @@
         "start_ticks": 367571279,
         "queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue.json",
         "status": "running",
-        "terminal_trials": 13
+        "terminal_trials": 17
       },
       {
         "pid": 2643545,
@@ -4615,7 +4615,7 @@
     "original_halted_twelve_row_queue_and_zero_trial_waiters_preserved": true,
     "new_unknown_will_block_further_dispatch": true,
     "original49_kvmem_sdk51b_profiles_unchanged": true,
-    "latest_source_and_actual_queue_audit": "apps/computer_use/.runtime/visual-context-comparison-candidate-02/admission-and-progress-01.json"
+    "latest_source_and_actual_queue_audit": "apps/computer_use/.runtime/visual-context-retest-20261004/admission-and-progress-01.json"
   },
   "matched_visual_context_comparison_candidate": {
     "recipe": "apps/computer_use/visual_context_comparison_candidate.py",
@@ -4638,14 +4638,25 @@
     "deployed": false,
     "planned_retest": "docs/computer_use_visual_context_retest_plan_20261004.json",
     "planned_trials": 12,
-    "plan_status": "planned-not-dispatched",
-    "no_new_controller_pid_claimed": true,
-    "actual_queue_and_source_audit": "apps/computer_use/.runtime/visual-context-comparison-candidate-02/admission-and-progress-01.json"
+    "plan_status": "queued-waiting-for-forty-eight-and-ten",
+    "no_new_controller_pid_claimed": false,
+    "actual_queue_and_source_audit": "apps/computer_use/.runtime/visual-context-retest-20261004/admission-and-progress-01.json",
+    "actual_controller_pid": 2692907,
+    "controller": "apps/computer_use/visual_context_retest_queue.py",
+    "cpu_boundary_checks_passed": 23,
+    "cpu_qualification": "apps/computer_use/.runtime/visual-context-controller-qualification-01/result.json",
+    "frozen_protocol": "apps/computer_use/.runtime/visual-context-retest-20261004/protocol.json",
+    "frozen_protocol_sha256": "ac297f6d8a062fb9e27465beedd89fbadb85c566899d23373ad5e7902cbd49c2",
+    "actual_queue": "apps/computer_use/.runtime/visual-context-retest-20261004/queue-runtime-01/queue.json",
+    "actual_controller_registration": "apps/computer_use/.runtime/visual-context-retest-20261004/actual-controller-01.json",
+    "temporary_clients_only": true,
+    "fresh_engine_per_trial": true,
+    "original_grades_unchanged": true
   },
   "terminal_inference_stage_readonly_diagnostic": {
     "recipe": "apps/computer_use/terminal_inference_diagnostic.py",
-    "report": "apps/computer_use/.runtime/terminal-inference-stage-20261004-02.json",
-    "terminal_trials": 16,
+    "report": "apps/computer_use/.runtime/terminal-inference-stage-20261004-03.json",
+    "terminal_trials": 17,
     "reasoning_only_length_stops": [
       "013-legacy-r1",
       "035-legacy-r1"
@@ -4661,6 +4672,80 @@
     "thinking_budget_changed_in_current_queue": false,
     "reasoning_budget_replay_planned_separately": true,
     "visual_vs_reasoning_cause_isolated": false,
-    "preserved_first_snapshot": "apps/computer_use/.runtime/terminal-inference-stage-20261004-01.json"
+    "preserved_first_snapshot": "apps/computer_use/.runtime/terminal-inference-stage-20261004-01.json",
+    "preserved_second_snapshot": "apps/computer_use/.runtime/terminal-inference-stage-20261004-02.json"
+  },
+  "current_matched_osworld_snapshot": {
+    "at": 1791128235.893821,
+    "queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue.json",
+    "terminal_trials": 17,
+    "planned_trials": 40,
+    "current_trial": "080-verified-r1",
+    "available_original_scores": 15,
+    "positive_original_scores": 0,
+    "original_unknown_preserved": 1,
+    "new_unknowns": 0,
+    "last_trial": {
+      "id": "080-legacy-r1",
+      "exit_code": 0,
+      "result": {
+        "status": "scored",
+        "score": 0.0,
+        "passed": false,
+        "agent_status": "paused",
+        "seconds": 1689.2413432542235,
+        "tool_calls": 43,
+        "uncertain_actions": 0,
+        "turn_error": null,
+        "notice": null,
+        "video_bytes": 5145125,
+        "original_evaluation": 0.0,
+        "unassisted_passed": false,
+        "finished_at": 1791127514.918704,
+        "candidate_harness": true,
+        "video_collection_passed": true,
+        "video_collection_errors": [],
+        "unassisted_business_passed": false,
+        "accepted": false
+      }
+    }
+  },
+  "080_legacy_execution_cost_diagnostic": {
+    "report": "apps/computer_use/.runtime/080-legacy-execution-cost-20261004-02.json",
+    "model_seconds": 1557.8317222967744,
+    "task_seconds": 1689.2413432542235,
+    "model_processing_fraction": 0.922207906240149,
+    "trace_count": 43,
+    "max_input_tokens": 158791,
+    "reasoning_only_length_stops": 0,
+    "pure_reasoning_or_vision_cause_isolated": false,
+    "invalid_kind_parser_snapshot_preserved": true
+  },
+  "improvement_evidence_snapshot": {
+    "at": 1791128235.893821,
+    "coordinate_diagnostic": {
+      "pixel_contract_passed": 0,
+      "normalized_contract_passed": 11,
+      "targets": 12,
+      "is_full_task_success": false,
+      "source": "docs/computer_use_visual_diagnostic_p1_20261003.md"
+    },
+    "same_template_schema_wire_retest": {
+      "previous_full_business_passed": 0,
+      "current_full_business_passed": 8,
+      "current_artifact_passed": 11,
+      "trials": 12,
+      "is_unseen_task_generalization": false,
+      "source": "apps/computer_use/.runtime/xdev-candidate17-normal-01/batch/result.json"
+    },
+    "windows_fault_development": {
+      "fault_response_passed": 3,
+      "business_passed": 2,
+      "trials": 3,
+      "permanent_stall_business_passed": false
+    },
+    "complex_osworld_success_improvement_proven": false,
+    "image_policy_real_qw3_trials_started": 0,
+    "latency_improvement_proven": false
   }
 }

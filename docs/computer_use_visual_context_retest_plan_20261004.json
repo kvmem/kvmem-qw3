@@ -1,6 +1,6 @@
 {
   "kind": "declared_matched_visual_context_development_retest",
-  "status": "planned-not-dispatched",
+  "status": "queued-waiting-for-forty-eight-and-ten",
   "created_at": 1791125155.2288918,
   "candidate": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-comparison-candidate-02",
   "candidate_build_sha256": "0a7a0323de7a95bd775ea5e20233982037be3abd94491797b67eb2b95dfe0ce6",
@@ -215,7 +215,15 @@
   },
   "real_model_trials_started": 0,
   "business_success_improvement_proven": false,
-  "no_new_queue_pid_claimed": true,
+  "no_new_queue_pid_claimed": false,
   "source_validation_work_equalized_in_both_arms": true,
-  "updated_at": 1791125810.7436895
+  "updated_at": 1791128235.893821,
+  "actual_controller_pid": 2692907,
+  "actual_controller_registration": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/actual-controller-01.json",
+  "frozen_execution_protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/protocol.json",
+  "frozen_execution_protocol_sha256": "ac297f6d8a062fb9e27465beedd89fbadb85c566899d23373ad5e7902cbd49c2",
+  "actual_queue": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/queue-runtime-01/queue.json",
+  "controller_cpu_boundary_checks_passed": 23,
+  "actual_source_admission": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/admission-and-progress-01.json",
+  "private_frozen_original_plan": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/plan.json"
 }
