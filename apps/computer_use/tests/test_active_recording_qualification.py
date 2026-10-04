@@ -41,5 +41,30 @@ class NativeEvidenceTests(unittest.TestCase):
         pixels[180:190,180:190]=(255,0,0)
         with self.assertRaises(ValueError):qualification.locate_marker(pixels,[40,40,240,180],[255,0,0])
 
+    def test_visibility_wait_uses_new_pixels_before_returning_a_target(self):
+        hidden=np.zeros((240,320,3),dtype=np.uint8);visible=hidden.copy();visible[90:150,80:140]=(255,0,0)
+        samples=iter([(hidden,[40,40,240,180],[255,0,0]),(visible,[40,40,240,180],[255,0,0])])
+        with patch.object(qualification.time,'monotonic',side_effect=[0,0,.01,.1,.11]),patch.object(qualification.time,'sleep') as sleep:
+            rectangle,wait=qualification.wait_for_marker(lambda:next(samples))
+        self.assertEqual(rectangle,[90,100,40,40]);self.assertEqual(wait['attempts'],2);sleep.assert_called_once_with(.1)
+
+    def test_visibility_timeout_never_returns_an_input_target(self):
+        hidden=np.zeros((240,320,3),dtype=np.uint8)
+        with patch.object(qualification.time,'monotonic',side_effect=[0,0,16]),patch.object(qualification.time,'sleep') as sleep:
+            with self.assertRaises(TimeoutError):qualification.wait_for_marker(lambda:(hidden,[40,40,240,180],[255,0,0]))
+        sleep.assert_not_called()
+
+    def test_visibility_wait_does_not_retry_invalid_window_bounds(self):
+        hidden=np.zeros((240,320,3),dtype=np.uint8)
+        with patch.object(qualification.time,'sleep') as sleep:
+            with self.assertRaisesRegex(ValueError,'Invalid owned window bounds'):
+                qualification.wait_for_marker(lambda:(hidden,[-1,40,240,180],[255,0,0]))
+        sleep.assert_not_called()
+
+    def test_late_positive_pixels_do_not_extend_the_visibility_deadline(self):
+        visible=np.zeros((240,320,3),dtype=np.uint8);visible[90:150,80:140]=(255,0,0)
+        with patch.object(qualification.time,'monotonic',side_effect=[0,0,16]):
+            with self.assertRaises(TimeoutError):qualification.wait_for_marker(lambda:(visible,[40,40,240,180],[255,0,0]))
+
 
 if __name__=='__main__':unittest.main()

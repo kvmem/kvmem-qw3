@@ -60,6 +60,33 @@ def locate_marker(pixels,bounds,color):
     return rectangle
 
 
+def wait_for_marker(snapshot,timeout_seconds=15,poll_seconds=.1):
+    """Wait for native drawing; never sends or retries a device action."""
+    import time
+    if not (0<timeout_seconds<=15 and 0<poll_seconds<=1):
+        raise ValueError('Native visibility wait must have a bounded budget')
+    started=time.monotonic();deadline=started+timeout_seconds;attempts=0
+    while True:
+        if time.monotonic()>=deadline:
+            raise TimeoutError('Native marker did not become visible within its declared budget')
+        pixels,bounds,color=snapshot();attempts+=1
+        observed=time.monotonic()
+        if observed>=deadline:
+            raise TimeoutError('Native marker did not become visible within its declared budget')
+        try:
+            rectangle=locate_marker(pixels,bounds,color)
+            return rectangle,dict(attempts=attempts,seconds=observed-started)
+        except ValueError as error:
+            # Invalid identity/geometry and unrelated errors remain fatal.
+            if str(error) not in ('Owned native marker is not visible',
+                                  'Native marker is small, occluded or ambiguous',
+                                  'Native marker is not positively established'):
+                raise
+            remaining=deadline-observed
+            if remaining<=0:raise TimeoutError('Native marker did not become visible within its declared budget') from error
+            time.sleep(min(poll_seconds,remaining))
+
+
 def guest(code):
     with requests.Session() as session:
         session.trust_env=False
@@ -84,7 +111,7 @@ def execute_input(directory,identity,nonce,index):
     kind=('key','click','scroll')[index%3]
     # Require the same process generation and a positively visible fixture
     # marker before input. No unresolved operation is retried on a new identity.
-    helpers='\n'.join(inspect.getsource(f) for f in (valid_rectangle,marker_matches,locate_marker))
+    helpers='\n'.join(inspect.getsource(f) for f in (valid_rectangle,marker_matches,locate_marker,wait_for_marker))
     code=helpers+f'''\nimport json,os,subprocess,time
 from pathlib import Path
 import pyautogui
@@ -101,10 +128,24 @@ assert len(ids)==1
 subprocess.run(['xdotool','windowraise',ids[0]],check=True,timeout=5)
 subprocess.run(['xdotool','windowfocus','--sync',ids[0]],check=True,timeout=5)
 assert subprocess.check_output(['xdotool','getwindowfocus'],text=True).strip()==ids[0]
-geometry=dict(line.split('=',1) for line in subprocess.check_output(['xdotool','getwindowgeometry','--shell',ids[0]],text=True).splitlines())
-bounds=[int(geometry[k]) for k in ['X','Y','WIDTH','HEIGHT']]
-image=ImageGrab.grab(xdisplay=os.environ.get('DISPLAY',':0'))
-rectangle=locate_marker(np.asarray(image),bounds,s['color']);x,y,w,h=rectangle
+def snapshot():
+ assert process.stat().st_uid==expected['uid'] and int((process/'stat').read_text().split(') ',1)[1].split()[19])==expected['start_ticks']
+ assert (process/'cmdline').read_bytes().split(b'\\0')[:len(expected['command'])]==[v.encode() for v in expected['command']]
+ assert os.readlink(process/'cwd')==expected['cwd']
+ state=json.loads((p/'state.json').read_text());assert state['nonce']=={nonce!r} and state['phase']=={index}
+ geometry=dict(line.split('=',1) for line in subprocess.check_output(['xdotool','getwindowgeometry','--shell',ids[0]],text=True).splitlines())
+ bounds=[int(geometry[k]) for k in ['X','Y','WIDTH','HEIGHT']]
+ image=ImageGrab.grab(xdisplay=os.environ.get('DISPLAY',':0'));pixels=np.asarray(image)
+ image.save(p/'preflight-{index}.png')
+ mask=np.all(pixels[:,:,:3]==np.asarray(state['color']),axis=2);rows,columns=np.nonzero(mask)
+ native=dict(nonce=state['nonce'],phase=state['phase'],published_at=state['published_at'],captured_at=time.time(),display=os.environ.get('DISPLAY'),
+             window_id=ids[0],window_geometry=geometry,window_bounds=bounds,image_size=list(image.size),tk_reported_rectangle=state['rectangle'],color=state['color'],
+             exact_color_pixels=int(mask.sum()),full_image_color_bounds=[int(columns.min()),int(rows.min()),int(columns.max())+1,int(rows.max())+1] if len(rows) else None,
+             current_focus=subprocess.check_output(['xdotool','getwindowfocus'],text=True).strip(),native_input_events=state['native_input_events'])
+ (p/'preflight-{index}.json').write_text(json.dumps(native))
+ assert native['current_focus']==ids[0]
+ return pixels,bounds,state['color']
+rectangle,visibility=wait_for_marker(snapshot);x,y,w,h=rectangle
 if {kind!r}=='key': pyautogui.press('space')
 elif {kind!r}=='click': pyautogui.click(x+w//2,y+h//2)
 else: pyautogui.moveTo(x+w//2,y+h//2);pyautogui.scroll(1)
@@ -119,9 +160,31 @@ while time.monotonic()<deadline:
   except ValueError:pass
  time.sleep(.05)
 assert matched and s['phase']=={index+1} and s['native_input_events'][-1]['kind']=={kind!r}
-s['tk_reported_rectangle']=s['rectangle'];s['rectangle']=rectangle;s['window_bounds']=bounds
+s['tk_reported_rectangle']=s['rectangle'];s['rectangle']=rectangle;s['window_bounds']=bounds;s['preflight_visibility_wait']=visibility
 print(json.dumps(s))'''
     return guest(code)
+
+
+def collect_preflight(output,guest_directory,identity,nonce,index):
+    """Read only the registered calibration process's own latest snapshot."""
+    code=f'''import base64,json,os
+from pathlib import Path
+p=Path({str(guest_directory)!r});expected={identity!r};process=Path('/proc')/str(expected['pid'])
+assert process.stat().st_uid==expected['uid'] and int((process/'stat').read_text().split(') ',1)[1].split()[19])==expected['start_ticks']
+assert (process/'cmdline').read_bytes().split(b'\\0')[:len(expected['command'])]==[v.encode() for v in expected['command']]
+assert os.readlink(process/'cwd')==expected['cwd']
+state=json.loads((p/'state.json').read_text());assert state['nonce']=={nonce!r}
+files={{}}
+for suffix in ['json','png']:
+ path=p/('preflight-{index}.'+suffix)
+ if path.exists():files[suffix]=base64.b64encode(path.read_bytes()).decode()
+print(json.dumps(files))'''
+    evidence=guest(code)
+    for suffix,data in evidence.items():
+        if suffix not in ('json','png'):raise ValueError('Unexpected calibration evidence file')
+        with (output/f'native-preflight-{index}.{suffix}').open('xb') as stream:
+            stream.write(base64.b64decode(data,validate=True))
+    return dict(files=list(evidence),index=index)
 
 
 def run(args):
@@ -183,10 +246,15 @@ print((Path({state_root!r})/'state.json').read_text())'''
             now=time.monotonic()
             if now>=next_input:
                 checkpoint(input_in_flight=dict(index=index,host_started_monotonic_ns=time.monotonic_ns()))
-                result=execute_input(Path(state_root),identity,nonce,index)
+                try:result=execute_input(Path(state_root),identity,nonce,index)
+                except Exception:
+                    try:checkpoint(failed_preflight_snapshot=collect_preflight(directory,Path(state_root),identity,nonce,index))
+                    except Exception as error:checkpoint(preflight_collection_error=str(error))
+                    raise
+                if index==0:checkpoint(initial_preflight_snapshot=collect_preflight(directory,Path(state_root),identity,nonce,index))
                 event=dict(index=index,phase=result['phase'],kind=result['native_input_events'][-1]['kind'],
                            color=result['color'],rectangle=result['rectangle'],tk_reported_rectangle=result['tk_reported_rectangle'],
-                           window_bounds=result['window_bounds'],host_acknowledged_monotonic_ns=time.monotonic_ns())
+                           window_bounds=result['window_bounds'],preflight_visibility_wait=result['preflight_visibility_wait'],host_acknowledged_monotonic_ns=time.monotonic_ns())
                 record['inputs'].append(event);index+=1;next_input=now+15
                 checkpoint(input_in_flight=None,native_input_events=index)
             checkpoint(observed_active_seconds=time.monotonic()-started)
