@@ -39,6 +39,25 @@ class RecoveryReplayTests(unittest.TestCase):
             self.assertEqual(row['platform'],'windows')
             self.assertEqual(row['task'],'windows_browser__focus_dialog')
 
+    def test_administrative_receipt_recovery_does_not_claim_model_or_business_success(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name);self.row(root,'receipt_loss')
+            result=json.loads((root/'integration-result.json').read_text())
+            result.update(administrative_recovery=True,unassisted_recovery_claimed=False,
+                          recovery_seconds=3.2,total_seconds=46.5)
+            (root/'integration-result.json').write_text(json.dumps(result))
+            (root/'pilot-manifest.json').write_text(json.dumps({'case':'linux_browser'}))
+            (root/'video').mkdir()
+            (root/'video/recording.json').write_text(json.dumps({'kind':'continuous_read_only_vnc_recording'}))
+            row=pilot_row(root)[1]
+            self.assertTrue(row['administrative_recovery'])
+            self.assertFalse(row['unassisted_recovery_claimed'])
+            self.assertFalse(row['accepted'])
+            self.assertTrue(row['fault_accepted'])
+            self.assertEqual(row['task'],'linux_browser__receipt_loss')
+            self.assertEqual(row['media_kind'],'真实时间戳VNC采样')
+            self.assertNotIn('must not be exported',json.dumps(row))
+
     def matched_fixture(self,root):
         trial={'id':'004-verified-r1','task':'004','arm':'verified'}
         (root/'protocol.json').write_text(json.dumps({'trials':[trial]}))

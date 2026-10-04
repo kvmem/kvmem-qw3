@@ -1804,7 +1804,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791101506.442228,
+  "updated_at": 1791104131.7821753,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -1966,16 +1966,16 @@
     "latex_repeat_tool_calls": 23
   },
   "public_replay_snapshot": {
-    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-15",
-    "url": "http://127.0.0.1:18147/index.html",
+    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-16",
+    "url": "http://127.0.0.1:18148/index.html",
     "formal_attempts_at_export": 40,
     "windows_model_trials_at_export": 8,
-    "platform_pilots_at_export": 49,
+    "platform_pilots_at_export": 56,
     "includes_python_repair_pair": true,
     "includes_latex_repair_pair": true,
     "export_is_point_in_time": true,
-    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-15/browser-check-01.json",
-    "actual_browser_checks_passed": 45,
+    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-16/browser-check-01.json",
+    "actual_browser_checks_passed": 57,
     "retained_failed_snapshot_checks": [
       "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check.json",
       "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check-02.json"
@@ -1983,15 +1983,19 @@
     "partial_formal_videos_not_for_latency_comparison": true,
     "matched_development_osworld_at_export": 4,
     "includes_wire_regression_failures": true,
-    "development_attempts": 49,
+    "development_attempts": 56,
     "development_osworld_attempts": 4,
     "software_product_attempts": 8,
-    "browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-15/browser-check-01.json",
-    "browser_checks_passed": 45,
-    "snapshot_excludes_later_candidate19_trials": true,
-    "new_candidate19_terminal_trials_at_export": 4,
+    "browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-16/browser-check-01.json",
+    "browser_checks_passed": 57,
+    "snapshot_excludes_later_candidate19_trials": false,
+    "new_candidate19_terminal_trials_at_export": 8,
     "public_video_storage": "hardlinks of terminal immutable videos; no duplicate video bytes allocated",
-    "previous_snapshot": "apps/computer_use/.runtime/cross-device-replay-20261004-14"
+    "previous_snapshot": "apps/computer_use/.runtime/cross-device-replay-20261004-15",
+    "directory": "apps/computer_use/.runtime/cross-device-replay-20261004-16",
+    "platform_development_attempts": 56,
+    "actual_browser_passed": true,
+    "includes_terminal_receipt_trials": true
   },
   "material_evidence_audits": {
     "006": {
@@ -2020,7 +2024,7 @@
       0.0
     ],
     "current_cohort_protocol": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/protocol.json",
-    "current_cohort_model_trials_started": 0,
+    "current_cohort_model_trials_started": 1,
     "improvement_demonstrated": false,
     "current_cohort_declared_trials": 40,
     "current_cohort_queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/queue.json",
@@ -2037,7 +2041,10 @@
     "current_cohort_protocol_sha256": "2121d296e205217575738b6ec8c076e87b14a2a1f6fa8ea7a5c9aef56ecc0aae",
     "waits_for_nine_device_followups_and_three_receipt_tests": false,
     "waits_for_remaining_eight_followups_and_three_receipt_tests": true,
-    "previous_unexecuted_candidate49_retirement": "apps/computer_use/.runtime/linux/candidate49-matched-16k-20261004/retirement-after-quarantine-01.json"
+    "previous_unexecuted_candidate49_retirement": "apps/computer_use/.runtime/linux/candidate49-matched-16k-20261004/retirement-after-quarantine-01.json",
+    "current_cohort_status": "running",
+    "current_cohort_model_trials_completed": 0,
+    "current_cohort_current_trial": "004-verified-r1"
   },
   "failure_evidence": {
     "path": "apps/computer_use/.runtime/linux/failure-evidence-26-v2-20261004.json",
@@ -2797,11 +2804,115 @@
     "host_qualification_is_not_real_model_or_device_acceptance": true,
     "protocol": "apps/computer_use/.runtime/candidate49b-receipt-model-01/protocol.json",
     "queue": "apps/computer_use/.runtime/candidate49b-receipt-model-01/queue.json",
-    "status_at_snapshot": "waiting-for-candidate19-followup",
+    "status_at_snapshot": "completed",
     "planned_trials": 3,
-    "actual_model_trials_started": 0,
+    "actual_model_trials_started": 3,
     "administrative_recovery_is_separate_from_unassisted_success": true,
-    "previous_unexecuted_protocol_retirement": "apps/computer_use/.runtime/candidate49-receipt-model-01/retirement-after-quarantine-01.json"
+    "previous_unexecuted_protocol_retirement": "apps/computer_use/.runtime/candidate49-receipt-model-01/retirement-after-quarantine-01.json",
+    "actual_model_trials_completed": 3,
+    "fault_acceptances": 2,
+    "business_acceptances": 0,
+    "trials": [
+      {
+        "id": "xdev-android-receipt-c49-01",
+        "exit_code": 0,
+        "result": {
+          "kind": "integration-pilot-not-formal",
+          "formal": false,
+          "platform": "android",
+          "model_used": true,
+          "accepted": false,
+          "fault_accepted": true,
+          "fault_condition": "receipt_loss",
+          "administrative_recovery": true,
+          "unassisted_recovery_claimed": false,
+          "started_at": 1791102089.8567853,
+          "app_status": "paused",
+          "seconds": 42.26066917087883,
+          "total_seconds": 44.57146315323189,
+          "recovery_seconds": 2.3100239890627563,
+          "tool_calls": 3,
+          "uncertain_actions": 0,
+          "uncertain_actions_before_reconciliation": 1,
+          "artifact_passed": false,
+          "fault_exercised": true,
+          "fault_response_passed": true,
+          "unassisted_passed": false,
+          "video_collection_passed": true,
+          "video_bytes": 685589,
+          "main_idle_restored": true,
+          "owned_task_retired": true,
+          "finished_at": 1791102141.5305371
+        }
+      },
+      {
+        "id": "xdev-linux-receipt-c49-01",
+        "exit_code": 1,
+        "result": {
+          "kind": "integration-pilot-not-formal",
+          "formal": false,
+          "platform": "linux",
+          "model_used": true,
+          "accepted": false,
+          "fault_accepted": false,
+          "fault_condition": "receipt_loss",
+          "administrative_recovery": true,
+          "unassisted_recovery_claimed": false,
+          "started_at": 1791102141.9752975,
+          "app_status": "paused",
+          "seconds": 43.28386217728257,
+          "total_seconds": 46.489205583930016,
+          "recovery_seconds": 3.2047543870285153,
+          "tool_calls": 3,
+          "uncertain_actions": 0,
+          "uncertain_actions_before_reconciliation": 1,
+          "artifact_passed": false,
+          "fault_exercised": true,
+          "fault_response_passed": false,
+          "unassisted_passed": false,
+          "video_collection_passed": true,
+          "video_bytes": 161951,
+          "main_idle_restored": true,
+          "owned_task_retired": true,
+          "finished_at": 1791102199.3569689
+        }
+      },
+      {
+        "id": "xdev-win-receipt-c49-01",
+        "exit_code": 0,
+        "result": {
+          "kind": "integration-pilot-not-formal",
+          "formal": false,
+          "platform": "windows",
+          "model_used": true,
+          "accepted": false,
+          "fault_accepted": true,
+          "fault_condition": "receipt_loss",
+          "administrative_recovery": true,
+          "unassisted_recovery_claimed": false,
+          "started_at": 1791102199.8016415,
+          "app_status": "paused",
+          "seconds": 41.193397951778024,
+          "total_seconds": 63.11567552667111,
+          "recovery_seconds": 21.92163737723604,
+          "tool_calls": 4,
+          "uncertain_actions": 0,
+          "uncertain_actions_before_reconciliation": 1,
+          "artifact_passed": false,
+          "fault_exercised": true,
+          "fault_response_passed": true,
+          "unassisted_passed": false,
+          "video_collection_passed": true,
+          "video_bytes": 237300,
+          "main_idle_restored": true,
+          "owned_task_retired": true,
+          "finished_at": 1791102311.8336992
+        }
+      }
+    ],
+    "linux_failure_check": "input_and_model_stay_paused",
+    "linux_after_state": "paused; desktop_paused=true; turn_status missing; no new inference/input; original receipt reconciled",
+    "linux_persistence_diagnostic": "apps/computer_use/.runtime/candidate49-linux-receipt-persistence-diagnostic-01.json"
   },
   "observation_and_completion_diagnostics": {
     "contacts": "apps/computer_use/.runtime/candidate49-contacts-condition-diagnostic-01.json",
@@ -2852,8 +2963,8 @@
     "controller": "apps/computer_use/.runtime/candidate19-followup-01.json",
     "result": "apps/computer_use/.runtime/xdev-candidate19-remaining-window-and-fault-01/batch/result.json",
     "planned_remaining_trials": 8,
-    "finished_at_snapshot": 6,
-    "status_at_snapshot": "running",
+    "finished_at_snapshot": 8,
+    "status_at_snapshot": "completed",
     "failed_prior_trial_not_overwritten": true,
     "device_core_bytes_unchanged": true,
     "complete_acceptances_at_snapshot": 4,
@@ -2864,9 +2975,11 @@
       "xdev-android-slow-c49-01",
       "xdev-linux-browser-07",
       "xdev-android-stall-c49-01",
-      "xdev-linux-browser-08"
+      "xdev-linux-browser-08",
+      "xdev-linux-text-11",
+      "xdev-linux-text-12"
     ],
-    "current_trial_at_snapshot": "xdev-linux-text-11",
+    "current_trial_at_snapshot": null,
     "android_focus_result": {
       "accepted": true,
       "fault_accepted": true,
@@ -2917,7 +3030,39 @@
       "unknown_actions": 0,
       "owned_task_retired": true,
       "video_complete": true
-    }
+    },
+    "termination_confirmed": true,
+    "linux_text11_result": {
+      "kind": "integration-pilot-not-formal",
+      "app_status": "stopped",
+      "seconds": 361.1093991189264,
+      "tool_calls": 15,
+      "turn_error": null,
+      "uncertain_actions": 0,
+      "artifact_passed": false,
+      "artifact_bytes": null,
+      "video_collection_passed": true,
+      "unassisted_passed": false,
+      "accepted": false,
+      "video_bytes": 511965,
+      "owned_task_retired": true
+    },
+    "linux_text12_result": {
+      "kind": "integration-pilot-not-formal",
+      "app_status": "stopped",
+      "seconds": 361.7882147990167,
+      "tool_calls": 12,
+      "turn_error": null,
+      "uncertain_actions": 0,
+      "artifact_passed": false,
+      "artifact_bytes": null,
+      "video_collection_passed": true,
+      "unassisted_passed": false,
+      "accepted": false,
+      "video_bytes": 698045,
+      "owned_task_retired": true
+    },
+    "text_failure_diagnostic": "apps/computer_use/.runtime/candidate49-linux-text11-12-diagnostic-01.json"
   },
   "isolated_visual_foreground_experiment": {
     "recipe": "apps/computer_use/foreground_visual_candidate.py",
@@ -2973,7 +3118,7 @@
       "on"
     ],
     "repetitions": 2,
-    "status": "prepared-not-dispatched",
+    "status": "waiting-for-parent-forty",
     "after_candidate49b_all40_and_durable_model_retirement": true,
     "source_framework": "qualified49",
     "experimental_visual_context_included": false,
@@ -2986,6 +3131,26 @@
     "tools": 250,
     "engine_cpu_capacity_gib": 48,
     "engine_gpu_memory_cap_gib": null,
-    "original035_cloud_evaluator_unavailable_separate_local_score": true
+    "original035_cloud_evaluator_unavailable_separate_local_score": true,
+    "controller": "apps/computer_use/kvmem_osworld_queue.py",
+    "controller_commit": "a059399",
+    "controller_sha256": "2e9a1b1e881f5c1705e7be1bca55be9fe5589d78b35b2e60e406b6b8d4ad339f",
+    "controller_checks_passed": 14,
+    "controller_qualification": "apps/computer_use/.runtime/linux/kvmem-matched-49-20261004/controller-qualification-01.json",
+    "queue": "apps/computer_use/.runtime/linux/kvmem-matched-49-20261004/queue-runtime-01/queue.json",
+    "controller_pid": 2542065,
+    "model_trials_started": 0,
+    "all_parent_results_required": true,
+    "all_parent_vms_retired_required": true,
+    "unknown_input_blocks_dispatch": true
+  },
+  "interruption_persistence_experiment": {
+    "build": "apps/computer_use/.runtime/durable-interruption-candidate-01/build.json",
+    "qualification": "apps/computer_use/.runtime/durable-interruption-candidate-01/qualification.json",
+    "host_checks": 7,
+    "baseline_race_reproduced": true,
+    "real_model_retest": false,
+    "native_windows_qualified": false,
+    "active_frozen_packages_unchanged": true
   }
 }
