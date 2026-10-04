@@ -237,7 +237,7 @@
   "business_success_improvement_proven": false,
   "no_new_queue_pid_claimed": false,
   "source_validation_work_equalized_in_both_arms": true,
-  "updated_at": 1791135408.1567693,
+  "updated_at": 1791137848.0977476,
   "actual_controller_pid": 2724534,
   "actual_controller_registration": "apps/computer_use/.runtime/retired-051-actual-image-controller-01.json",
   "frozen_execution_protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/protocol.json",
@@ -257,11 +257,11 @@
   "continued_cpu_qualification": "apps/computer_use/.runtime/retired-051-frozen-successors-qualification-02/result.json",
   "continued_cpu_checks_passed": 28,
   "current_forty_snapshot": {
-    "audit": "apps/computer_use/.runtime/recording-and-replay-progress-20261005-01.json",
-    "at": 1791135408.1567693,
-    "terminal_trials": 23,
+    "audit": "apps/computer_use/.runtime/second-repetition-and-native-video-progress-20261005-01.json",
+    "at": 1791137848.0977476,
+    "terminal_trials": 24,
     "planned_trials": 40,
-    "current_trial": "004-verified-r2",
+    "current_trial": "006-verified-r2",
     "positive_original_scores": 0,
     "actual_controller_live": true
   },
@@ -270,9 +270,28 @@
     "prior_051_legacy_video_cropped": true,
     "051_first_model_images_equal": true,
     "new_recorder_not_deployed_to_frozen_comparison": true,
-    "native_candidate_qualification": "halted-no-input: VNC not yet listening; preserve original failed attempt",
-    "native_resize_qualified": false,
-    "scripted_rfb_real_codec_checks_passed": 17
+    "native_candidate_qualification": "apps/computer_use/.runtime/resizable-vnc-native-watch-02/independent-video-qualification-03.json",
+    "native_resize_qualified": true,
+    "scripted_rfb_real_codec_checks_passed": 17,
+    "native_independent_video_checks_passed": 20,
+    "native_video_seconds": 122.0,
+    "native_qualification_is_not_whole_task_video": true,
+    "native_candidate_not_deployed_to_frozen_trials": true,
+    "native_qualification_cpu_network_overlap_trial": "006-verified-r2",
+    "native_model_rgb_agreement_not_proven": true
   },
-  "last_actual_live_audit": "apps/computer_use/.runtime/recording-and-replay-progress-20261005-01.json"
+  "last_actual_live_audit": "apps/computer_use/.runtime/second-repetition-and-native-video-progress-20261005-01.json",
+  "additional_terminal_context_evidence": {
+    "cost_diagnostic": "apps/computer_use/.runtime/second-repetition-terminal-model-cost-20261005-02.json",
+    "independent_decodes": 12,
+    "terminal_trials": 4,
+    "none_reached_output_budget": true,
+    "backend_time_fraction_range": [
+      0.9093741084702395,
+      0.9659355577341638
+    ],
+    "is_speed_improvement_evidence": false,
+    "pdf_control_condition_scope_diagnostic": "apps/computer_use/.runtime/retained-pdf-completion-feedback-20261005-01.json",
+    "does_not_change_frozen_image_policy_or_conditions": true
+  }
 }

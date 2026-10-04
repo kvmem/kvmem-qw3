@@ -2357,7 +2357,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791135408.1567693,
+  "updated_at": 1791137848.0977476,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -2581,8 +2581,8 @@
     "video_full_screen_coverage_not_proven_trials": [
       "051-legacy-r1"
     ],
-    "current_queue_terminal_trials_at_audit": 23,
-    "snapshot_excludes_current_later_three_trials": true,
+    "current_queue_terminal_trials_at_audit": 24,
+    "snapshot_excludes_current_later_three_trials": false,
     "actual_server_identity": {
       "pid": 2733770,
       "uid": 1001,
@@ -2593,7 +2593,8 @@
       ],
       "cwd": "/home/chaidi/qw3",
       "state": "S"
-    }
+    },
+    "snapshot_excludes_current_later_four_trials": true
   },
   "material_evidence_audits": {
     "006": {
@@ -4725,33 +4726,34 @@
     "preserved_previous_snapshot": "apps/computer_use/.runtime/terminal-inference-stage-20261004-03.json"
   },
   "current_matched_osworld_snapshot": {
-    "at": 1791135408.1567693,
+    "at": 1791137848.0977476,
     "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue_02.json",
     "status": "running",
-    "terminal_trials": 23,
+    "terminal_trials": 24,
     "planned_trials": 40,
-    "current_trial": "004-verified-r2",
-    "available_original_scores": 21,
+    "current_trial": "006-verified-r2",
+    "available_original_scores": 22,
     "positive_original_scores": 0,
     "original_unknowns_preserved": 2,
     "current_continuation_new_unknowns": 0,
     "last_trial": {
-      "id": "004-legacy-r2",
+      "id": "004-verified-r2",
       "exit_code": 0,
       "result": {
         "status": "scored",
         "score": 0.0,
         "passed": false,
-        "agent_status": "paused",
-        "seconds": 457.4133103075437,
-        "tool_calls": 10,
+        "stop_reason": "deadline",
+        "agent_status": "stopped",
+        "seconds": 1801.7913669869304,
+        "tool_calls": 21,
         "uncertain_actions": 0,
         "turn_error": null,
         "notice": null,
-        "video_bytes": 1112566,
+        "video_bytes": 3551731,
         "original_evaluation": 0.0,
         "unassisted_passed": false,
-        "finished_at": 1791134954.7353463,
+        "finished_at": 1791136827.5071325,
         "candidate_harness": true,
         "video_collection_passed": true,
         "video_collection_errors": [],
@@ -4759,7 +4761,7 @@
         "accepted": false
       }
     },
-    "actual_live_audit": "apps/computer_use/.runtime/recording-and-replay-progress-20261005-01.json"
+    "actual_live_audit": "apps/computer_use/.runtime/second-repetition-and-native-video-progress-20261005-01.json"
   },
   "080_legacy_execution_cost_diagnostic": {
     "report": "apps/computer_use/.runtime/080-legacy-execution-cost-20261004-02.json",
@@ -4773,7 +4775,7 @@
     "invalid_kind_parser_snapshot_preserved": true
   },
   "improvement_evidence_snapshot": {
-    "at": 1791135408.1567693,
+    "at": 1791137848.0977476,
     "coordinate_diagnostic": {
       "pixel_contract_passed": 0,
       "normalized_contract_passed": 11,
@@ -4798,8 +4800,8 @@
     "complex_osworld_success_improvement_proven": false,
     "image_policy_real_qw3_trials_started": 0,
     "latency_improvement_proven": false,
-    "complex_osworld_terminal_trials": 23,
-    "complex_osworld_available_scores": 21,
+    "complex_osworld_terminal_trials": 24,
+    "complex_osworld_available_scores": 22,
     "complex_osworld_positive_scores": 0,
     "short_rule_thinking_diagnostic": {
       "screenshot_thinking_off_passed": 14,
@@ -5057,8 +5059,67 @@
     "cpu_scripted_rfb_and_real_codec_checks": 17,
     "passed": true,
     "not_deployed_to_frozen_queues": true,
-    "native_watcher_registration": "/home/chaidi/qw3/apps/computer_use/.runtime/resizable-vnc-native-watch-01/actual-controller-01.json",
+    "native_watcher_registration": "/home/chaidi/qw3/apps/computer_use/.runtime/resizable-vnc-native-watch-02/actual-controller-01.json",
     "native_watcher_state": {
+      "kind": "supplemental_readonly_fresh_owned_vm_recording_qualification",
+      "started_at": 1791135969.0252168,
+      "pid": 2761001,
+      "status": "qualified-native-resize",
+      "model_calls": 0,
+      "device_inputs": 0,
+      "frozen_queues_and_recorders_unchanged": true,
+      "original_grades_changed": false,
+      "candidate_sha256": "ff96022ccdd73756bb99781540e7f69d9b3fa4ba26a91c6de8e6ee1f89ea084d",
+      "qualification_sha256": "77e63712479cb2d15936c581a745b67212ebbf613c90e8cf07620895613c02a4",
+      "trial": "006-verified-r2",
+      "vm": {
+        "container_id": "2ec8b39f0db55db097285a47fb1922886884c3f24b735a47d15b30a72cd157fa",
+        "name": "qw3-linux-006-verified-r2",
+        "image": "sha256:0e6497a9295647cf05bf2b2af522fdd79bdeba2737595259cab310a3bcf6baa9",
+        "disk": "/home/chaidi/qw3/third_party/OSWorld-V2/docker_vm_data/osworld-v2-ubuntu-x86.qcow2",
+        "disk_read_only": true,
+        "ports": {
+          "server": 18500,
+          "chromium": 18501,
+          "vnc": 18502,
+          "vlc": 18503
+        },
+        "bind": "127.0.0.1"
+      },
+      "vm_manifest_sha256": "0aa9e4938b3179997764cb24d119e77fd427b31841604a72d65a5bf36580dd4b",
+      "host": "172.17.0.5",
+      "readonly_probe_attempts": 2,
+      "readiness_deadline_seconds": 120,
+      "duration_seconds": 120,
+      "fps": 2,
+      "declared_canvas": [
+        1920,
+        1080
+      ],
+      "console_inputs": 0,
+      "readonly_banner_confirmed": true,
+      "capture_started_at": 1791136833.8396163,
+      "prior_native_attempt_retained": true,
+      "inputs_retried": false,
+      "finished_at": 1791136955.6558356,
+      "recording_complete": true,
+      "native_resize_notification_observed": true,
+      "framebuffer_dimensions": [
+        [
+          1280,
+          800
+        ],
+        [
+          1920,
+          1080
+        ]
+      ],
+      "video_sha256": "8c751e3bcefa12290601eb1a107c5a142f2b278f2b012d7ef1dbb48841277091",
+      "limits": "Supplemental early console capture only; no model task success or complete task recording claim."
+    },
+    "actual_watcher_identity": null,
+    "native_resize_qualified": true,
+    "native_first_halted_attempt": {
       "kind": "supplemental_readonly_fresh_owned_vm_recording_qualification",
       "started_at": 1791134802.1383462,
       "pid": 2750588,
@@ -5096,17 +5157,27 @@
       "error": "ConnectionRefusedError: [Errno 111] Connection refused",
       "live_model_and_trial_children_preserved": true
     },
-    "actual_watcher_identity": null,
-    "native_resize_qualified": false
+    "native_first_registration": "/home/chaidi/qw3/apps/computer_use/.runtime/resizable-vnc-native-watch-01/actual-controller-01.json",
+    "native_producer_completed_and_retired": true,
+    "native_video_independent_qualification": "/home/chaidi/qw3/apps/computer_use/.runtime/resizable-vnc-native-watch-02/independent-video-qualification-03.json",
+    "native_video_independent_checks_passed": 20,
+    "native_video_frames": 244,
+    "native_video_seconds": 122.0,
+    "native_model_rgb_matches": 0,
+    "native_video_is_not_whole_task_recording": true,
+    "retained_native_video_failures": [
+      "apps/computer_use/.runtime/resizable-vnc-native-watch-02/independent-video-qualification-01.json",
+      "apps/computer_use/.runtime/resizable-vnc-native-watch-02/independent-video-qualification-02.json"
+    ]
   },
   "current_40_8_10_12_4_live_status": {
-    "at": 1791135408.1567693,
-    "audit": "apps/computer_use/.runtime/recording-and-replay-progress-20261005-01.json",
+    "at": 1791137848.0977476,
+    "audit": "apps/computer_use/.runtime/second-repetition-and-native-video-progress-20261005-01.json",
     "parent": {
       "status": "running",
-      "terminal_trials": 23,
-      "current_trial": "004-verified-r2",
-      "available_original_scores": 21,
+      "terminal_trials": 24,
+      "current_trial": "006-verified-r2",
+      "available_original_scores": 22,
       "positive_original_scores": 0
     },
     "successors": [
@@ -5201,10 +5272,99 @@
         "cwd": "/home/chaidi/qw3",
         "state": "S"
       },
-      "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/queue-runtime-01/queue.json",
       "status": "waiting-for-image-twelve",
       "completed": 0
     },
     "all_original_protocols_unchanged": true
+  },
+  "second_repetition_readonly_execution_and_cost_diagnostic": {
+    "at": 1791137848.0977476,
+    "model_cost": "/home/chaidi/qw3/apps/computer_use/.runtime/second-repetition-terminal-model-cost-20261005-02.json",
+    "model_cost_sha256": "8e0ca6336fdcd97ee1dd4b6b462821cf5d7e48b3d47d877744146e1a327fe2c9",
+    "model_cost_terminal_trials": 4,
+    "independent_restored_request_decodes": 12,
+    "harness": "/home/chaidi/qw3/apps/computer_use/.runtime/second-repetition-harness-diagnostic-20261005-02.json",
+    "harness_sha256": "a59a4800d2a37f8d4fba1cd9ebf6a1138b15e5339bfc3497c095886b98fc43bc",
+    "retained_pdf_feedback": "/home/chaidi/qw3/apps/computer_use/.runtime/retained-pdf-completion-feedback-20261005-01.json",
+    "retained_pdf_feedback_sha256": "c28d687385c2d5dae0321ee0355c0be2f36caf19d2fa0d414c5b7489dd602a24",
+    "pdf_feedback_checks_passed": 12,
+    "business_improvement_proven": false,
+    "attempts": [
+      {
+        "attempt": "013-verified-r2",
+        "task_seconds": 1166.3522925302386,
+        "requests": 25,
+        "request_statuses": {
+          "completed": 25
+        },
+        "backend_elapsed_over_task_duration": 0.9532591906492509,
+        "first_request_images": 1,
+        "last_request_images": 23,
+        "output_budget_hits": 0,
+        "reasoning_only_length_stops": 0,
+        "summed_model_seconds": 1111.8360423892736,
+        "max_input_tokens": 105084
+      },
+      {
+        "attempt": "013-legacy-r2",
+        "task_seconds": 993.2129367957823,
+        "requests": 23,
+        "request_statuses": {
+          "completed": 23
+        },
+        "backend_elapsed_over_task_duration": 0.9093741084702395,
+        "first_request_images": 1,
+        "last_request_images": 23,
+        "output_budget_hits": 0,
+        "reasoning_only_length_stops": 0,
+        "summed_model_seconds": 903.2021289197728,
+        "max_input_tokens": 95409
+      },
+      {
+        "attempt": "004-legacy-r2",
+        "task_seconds": 457.4133103075437,
+        "requests": 10,
+        "request_statuses": {
+          "completed": 10
+        },
+        "backend_elapsed_over_task_duration": 0.9170321791516983,
+        "first_request_images": 1,
+        "last_request_images": 10,
+        "output_budget_hits": 0,
+        "reasoning_only_length_stops": 0,
+        "summed_model_seconds": 419.46272472431883,
+        "max_input_tokens": 95691
+      },
+      {
+        "attempt": "004-verified-r2",
+        "task_seconds": 1801.7913669869304,
+        "requests": 21,
+        "request_statuses": {
+          "completed": 21
+        },
+        "backend_elapsed_over_task_duration": 0.9659355577341638,
+        "first_request_images": 1,
+        "last_request_images": 19,
+        "output_budget_hits": 0,
+        "reasoning_only_length_stops": 0,
+        "summed_model_seconds": 1740.414348991122,
+        "max_input_tokens": 198272
+      }
+    ],
+    "native_pdf_controls_did_not_expose_expected_text": true,
+    "pdf_second_page_was_observed": true,
+    "pdf_final_page_value": "3",
+    "original_condition_and_score_not_relaxed": true,
+    "native_feedback_requalified_on_real_retained_failure": {
+      "path": "apps/computer_use/.runtime/retained-pdf-completion-feedback-20261005-01.json",
+      "passed": true,
+      "checks_passed": 12,
+      "is_real_qw3_retest": false,
+      "business_success_improvement_proven": false
+    },
+    "first_unknown_condition_type_summary_not_usable": "apps/computer_use/.runtime/second-repetition-harness-diagnostic-20261005-01.json",
+    "independent_request_decodes": 12,
+    "model_calls": 0,
+    "device_inputs": 0
   }
 }
