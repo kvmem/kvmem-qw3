@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import time
 
@@ -40,8 +41,8 @@ const sec=x=>typeof x==='number'?x.toFixed(2)+' 秒':'未取得';
 function pause(){generation++;for(const side of ['left','right'])el(side+'Video').pause()}
 function render(side){const t=chosen(side),v=el(side+'Video');v.pause();
  if(t.video){v.src=t.video;v.hidden=false;el(side+'Missing').textContent=''}else{v.removeAttribute('src');v.load();v.hidden=true;el(side+'Missing').textContent='未取得可用录像：'+t.media_status}
- const result=t.kind==='formal-osworld'?'官方评分：'+(t.original_score??'不可用')+' · 无接管通过：'+yn(t.unassisted_passed)+(t.secondary_local_score!=null?'\\n单列本地工作簿指标：'+t.secondary_local_score+'（不是官方分数）':''):'独立产物核验：'+yn(t.artifact_passed)+' · 完整验收：'+yn(t.accepted);
- el(side+'Facts').textContent=t.attempt+'\\n'+(t.kind==='formal-osworld'?'正式 OSWorld · Linux':t.kind==='software-product'?'软件配置验收 · Windows · 受控软件工具':'平台开发任务 · '+t.platform)+' · '+t.arm+'\\n'+result+'\\n任务状态：'+t.agent_status+' · 记录状态：'+t.outcome+'\\n任务耗时：'+sec(t.seconds)+' · 工具调用：'+t.tool_calls+' · 未知动作：'+t.uncertain_actions+'\\n输出预算：'+(t.model_output_tokens??'未记录')+' token · KVMem：'+t.kvmem+' · 视频：'+t.media_kind+'\\n录像时长：'+sec(t.video_duration_seconds)+' · '+t.time_coverage;
+ const result=['formal-osworld','development-osworld'].includes(t.kind)?'官方评分：'+(t.original_score??'不可用')+' · 无接管通过：'+yn(t.unassisted_passed)+(t.secondary_local_score!=null?'\\n单列本地工作簿指标：'+t.secondary_local_score+'（不是官方分数）':''):'独立产物核验：'+yn(t.artifact_passed)+' · 完整验收：'+yn(t.accepted);
+ el(side+'Facts').textContent=t.attempt+'\\n'+(t.kind==='formal-osworld'?'正式 OSWorld · Linux':t.kind==='development-osworld'?'OSWorld 开发复测 · Linux · '+t.cohort:t.kind==='software-product'?'软件配置验收 · Windows · 受控软件工具':'平台开发任务 · '+t.platform)+' · '+t.arm+'\\n'+result+'\\n任务状态：'+t.agent_status+' · 记录状态：'+t.outcome+'\\n任务耗时：'+sec(t.seconds)+' · 工具调用：'+t.tool_calls+' · 未知动作：'+t.uncertain_actions+'\\n输出预算：'+(t.model_output_tokens??'未记录')+' token · KVMem：'+t.kvmem+' · 视频：'+t.media_kind+'\\n录像时长：'+sec(t.video_duration_seconds)+' · '+t.time_coverage;
  if(t.fault_condition)el(side+'Facts').textContent+='\\n故障：'+t.fault_condition+' · 故障处理验收：'+yn(t.fault_accepted)+(t.fault_condition==='no_progress'?'（考核及时安全暂停；业务完成另计）':'');
  el(side+'Identity').textContent='原结果 SHA256：'+t.result_sha256+(t.video_sha256?' · 导出视频 SHA256：'+t.video_sha256:'');
 }
@@ -59,7 +60,7 @@ for(const side of ['left','right'])el(side).onchange=()=>{pause();render(side)};
 el('task').onchange=selectTask;
 fetch('summary.json').then(r=>{if(!r.ok)throw Error('无法读取导出记录');return r.json()}).then(data=>{
  all=data.attempts;const s=data.formal_summary;
- el('summary').textContent='本地 QW3 · 顾问关闭 · 正式尝试 '+s.terminal_attempts+' 次，其中有效官方评分 '+s.available_original_scores+' 次、评分通过 '+s.original_passes+' 次 · 平台开发尝试 '+data.development_attempts+' 次 · 软件配置验收 '+(data.software_product_attempts||0)+' 次';
+ el('summary').textContent='本地 QW3 · 顾问关闭 · 正式尝试 '+s.terminal_attempts+' 次，其中有效官方评分 '+s.available_original_scores+' 次、评分通过 '+s.original_passes+' 次 · OSWorld 开发复测 '+(data.development_osworld_attempts||0)+' 次 · 平台开发尝试 '+data.development_attempts+' 次 · 软件配置验收 '+(data.software_product_attempts||0)+' 次';
  for(const task of [...new Set(all.map(t=>t.task))]){const o=document.createElement('option');o.value=task;o.textContent=task;el('task').append(o)}
  if(all.length)selectTask();else el('error').textContent='没有终止记录';
 }).catch(e=>el('error').textContent=e.message);
@@ -149,10 +150,38 @@ def product_row(root):
         expected_video_sha256=video.get('sha256'))
 
 
-def export(campaign, pilots, output, port, products=()):
+def matched_rows(campaign):
+    """Keep post-diagnosis retests out of the frozen formal denominator."""
+    protocol=read(campaign/'protocol.json')
+    for trial in protocol['trials']:
+        identity=trial['id']
+        if not isinstance(identity,str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,80}',identity):
+            raise ValueError('Unsafe matched attempt identity')
+        root=campaign/'attempts'/identity
+        if not (root/'result.json').exists():continue
+        result=read(root/'result.json')
+        if not result.get('finished_at'):continue
+        manifest=read(root/'manifest.json')
+        if manifest['task_id']!=trial['task'] or manifest['arm']!=trial['arm']:
+            raise ValueError('Matched attempt differs from its declared task or arm')
+        yield root,dict(attempt=identity,task='OSWorld 开发复测 '+trial['task'],
+            kind='development-osworld',cohort=campaign.name,platform='linux',arm=trial['arm'],
+            outcome=result['status'],agent_status=result.get('agent_status'),
+            original_score=result.get('score') if result['status']=='scored' else None,
+            secondary_local_score=result.get('secondary_local_score'),
+            started_at=manifest.get('agent_started_at',manifest.get('started_at')),
+            unassisted_passed=result.get('unassisted_passed'),accepted=result.get('accepted'),
+            artifact_passed=result.get('passed'),seconds=result.get('seconds'),tool_calls=result.get('tool_calls'),
+            uncertain_actions=result.get('uncertain_actions'),model_output_tokens=manifest['model_output_tokens'],
+            kvmem='on' if manifest['kvmem'] else 'off',media_kind='真实时间戳VNC采样',
+            result_sha256=digest(root/'result.json'),video_bytes=result.get('video_bytes',0))
+
+
+def export(campaign, pilots, output, port, products=(), matched_campaigns=()):
     rows=list(formal_rows(campaign)) if campaign else []
     rows.extend(pilot_row(root) for root in pilots)
     rows.extend(product_row(root) for root in products)
+    for matched in matched_campaigns:rows.extend(matched_rows(matched))
     # Filesystem glob order is not trial order: the default left/right views
     # must select the first and latest attempt of each scene consistently.
     rows.sort(key=lambda pair:(pair[1].get('started_at') or 0,pair[1]['attempt']))
@@ -182,6 +211,7 @@ def export(campaign, pilots, output, port, products=()):
                  'infrastructure_failures':sum(r['outcome']=='infrastructure-failed' for r in official),
                  'unavailable_original_evaluators':sum(r['outcome']=='evaluator-unavailable' for r in official)},
              'development_attempts':sum(row['kind']=='development-pilot' for row in exported),
+             'development_osworld_attempts':sum(row['kind']=='development-osworld' for row in exported),
              'software_product_attempts':sum(row['kind']=='software-product' for row in exported),'attempts':exported}
     (output/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n')
     (output/'index.html').write_text(HTML)
@@ -197,10 +227,11 @@ if __name__=='__main__':
     p.add_argument('--campaign',type=Path)
     p.add_argument('--pilots',type=Path,nargs='*',default=[])
     p.add_argument('--products',type=Path,nargs='*',default=[])
+    p.add_argument('--matched-campaigns',type=Path,nargs='*',default=[])
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--port',type=int,default=18134)
     a=p.parse_args()
-    if not a.campaign and not a.pilots and not a.products:p.error('Supply at least one campaign, pilot or product trial')
+    if not a.campaign and not a.pilots and not a.products and not a.matched_campaigns:p.error('Supply at least one campaign, pilot or product trial')
     if not 1024<=a.port<=65535:p.error('Invalid unprivileged local port')
-    x=export(a.campaign,a.pilots,a.output,a.port,a.products)
+    x=export(a.campaign,a.pilots,a.output,a.port,a.products,a.matched_campaigns)
     print({'formal':x['formal_summary'],'development_attempts':x['development_attempts'],'index':str(a.output/'index.html')})
