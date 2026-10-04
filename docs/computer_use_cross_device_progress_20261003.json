@@ -1804,7 +1804,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791101262.058783,
+  "updated_at": 1791101506.442228,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -2852,20 +2852,21 @@
     "controller": "apps/computer_use/.runtime/candidate19-followup-01.json",
     "result": "apps/computer_use/.runtime/xdev-candidate19-remaining-window-and-fault-01/batch/result.json",
     "planned_remaining_trials": 8,
-    "finished_at_snapshot": 5,
+    "finished_at_snapshot": 6,
     "status_at_snapshot": "running",
     "failed_prior_trial_not_overwritten": true,
     "device_core_bytes_unchanged": true,
-    "complete_acceptances_at_snapshot": 3,
+    "complete_acceptances_at_snapshot": 4,
     "fault_acceptances_at_snapshot": 3,
     "finished_trials_at_snapshot": [
       "xdev-android-focus-c49-01",
       "xdev-linux-calc-08",
       "xdev-android-slow-c49-01",
       "xdev-linux-browser-07",
-      "xdev-android-stall-c49-01"
+      "xdev-android-stall-c49-01",
+      "xdev-linux-browser-08"
     ],
-    "current_trial_at_snapshot": "xdev-linux-browser-08",
+    "current_trial_at_snapshot": "xdev-linux-text-11",
     "android_focus_result": {
       "accepted": true,
       "fault_accepted": true,
@@ -2907,6 +2908,15 @@
       "owned_task_retired": true,
       "focus_failure_self_corrected": true,
       "focus_diagnostic": "apps/computer_use/.runtime/candidate49-android-keyboard-focus-diagnostic-01.json"
+    },
+    "linux_browser08_result": {
+      "accepted": true,
+      "artifact_passed": true,
+      "seconds": 509.65593775874004,
+      "tool_calls": 20,
+      "unknown_actions": 0,
+      "owned_task_retired": true,
+      "video_complete": true
     }
   },
   "isolated_visual_foreground_experiment": {
