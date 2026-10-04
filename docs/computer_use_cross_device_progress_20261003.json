@@ -794,7 +794,8 @@
     "Android live video is sampled at1Hz and can miss subsecond UI changes.",
     "The frozen campaign has not yet demonstrated a successful task or success-rate improvement.",
     "Default official Linux recording can block on undrained stderr: isolated real VM diagnostic at305/320s saw pipe_write and64519 queued bytes, a322.70s run produced283.73s video. Existing formal scores retained; video timeline coverage is not accepted.",
-    "080 verified and051 legacy stopped with a false ambiguous-delivery classification after confirmed driver preflight rejection. Canonical entry fix is independently qualified; no complex-task improvement is yet established."
+    "080 verified and051 legacy stopped with a false ambiguous-delivery classification after confirmed driver preflight rejection. Canonical entry fix is independently qualified; no complex-task improvement is yet established.",
+    "006-verified-r2 retained video ends after282seconds of an1801second task because VNC header read timed out. Original MKV is decodable but is partial; do not claim full recording or use it for task latency comparison. Original official0 and no uncertain input remain unchanged."
   ],
   "contract_checks": {
     "core_regression": {
@@ -2357,7 +2358,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791137848.0977476,
+  "updated_at": "2026-10-04T19:00:56.395972+00:00",
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -4726,34 +4727,33 @@
     "preserved_previous_snapshot": "apps/computer_use/.runtime/terminal-inference-stage-20261004-03.json"
   },
   "current_matched_osworld_snapshot": {
-    "at": 1791137848.0977476,
+    "at": 1791140213.2859848,
     "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue_02.json",
     "status": "running",
-    "terminal_trials": 24,
+    "terminal_trials": 26,
     "planned_trials": 40,
-    "current_trial": "006-verified-r2",
-    "available_original_scores": 22,
+    "current_trial": "010-legacy-r2",
+    "available_original_scores": 24,
     "positive_original_scores": 0,
     "original_unknowns_preserved": 2,
     "current_continuation_new_unknowns": 0,
     "last_trial": {
-      "id": "004-verified-r2",
+      "id": "006-legacy-r2",
       "exit_code": 0,
       "result": {
         "status": "scored",
         "score": 0.0,
         "passed": false,
-        "stop_reason": "deadline",
-        "agent_status": "stopped",
-        "seconds": 1801.7913669869304,
-        "tool_calls": 21,
+        "agent_status": "paused",
+        "seconds": 1078.0680766408332,
+        "tool_calls": 25,
         "uncertain_actions": 0,
         "turn_error": null,
         "notice": null,
-        "video_bytes": 3551731,
+        "video_bytes": 6790229,
         "original_evaluation": 0.0,
         "unassisted_passed": false,
-        "finished_at": 1791136827.5071325,
+        "finished_at": 1791140012.1492555,
         "candidate_harness": true,
         "video_collection_passed": true,
         "video_collection_errors": [],
@@ -4761,7 +4761,7 @@
         "accepted": false
       }
     },
-    "actual_live_audit": "apps/computer_use/.runtime/second-repetition-and-native-video-progress-20261005-01.json"
+    "actual_live_audit": "apps/computer_use/.runtime/literal-feedback-and-parent-progress-20261005-01.json"
   },
   "080_legacy_execution_cost_diagnostic": {
     "report": "apps/computer_use/.runtime/080-legacy-execution-cost-20261004-02.json",
@@ -5171,13 +5171,13 @@
     ]
   },
   "current_40_8_10_12_4_live_status": {
-    "at": 1791137848.0977476,
-    "audit": "apps/computer_use/.runtime/second-repetition-and-native-video-progress-20261005-01.json",
+    "at": 1791140213.2859848,
+    "audit": "apps/computer_use/.runtime/literal-feedback-and-parent-progress-20261005-01.json",
     "parent": {
       "status": "running",
-      "terminal_trials": 24,
-      "current_trial": "006-verified-r2",
-      "available_original_scores": 22,
+      "terminal_trials": 26,
+      "current_trial": "010-legacy-r2",
+      "available_original_scores": 24,
       "positive_original_scores": 0
     },
     "successors": [
@@ -5366,5 +5366,69 @@
     "independent_request_decodes": 12,
     "model_calls": 0,
     "device_inputs": 0
+  },
+  "literal_completion_feedback_sdk51_isolated_candidate": {
+    "at": 1791140009.1329925,
+    "builder": "apps/computer_use/literal_completion_feedback_candidate.py",
+    "builder_sha256": "bcd8f6faaba52e9f82fa49802c35b06d1cf4146c6675ce6ad54cfc6273b71dae",
+    "build": "apps/computer_use/.runtime/sdk51-literal-feedback-candidate-01/build.json",
+    "build_sha256": "c4aad9c1872020ad5a0ec5e1c806194283624d8d1b12c7b773b26bc8670373e4",
+    "changed_package_files": [
+      "execution.py",
+      "completion_feedback.py"
+    ],
+    "cpu_qualification": "apps/computer_use/.runtime/literal-completion-feedback-qualification-02/result.json",
+    "cpu_tests_passed": 17,
+    "first_cpu_fixture_expectation_failure_retained": "apps/computer_use/.runtime/literal-completion-feedback-qualification-01/result.json",
+    "retained_condition_qualification": "apps/computer_use/.runtime/sdk51-literal-feedback-candidate-01/retained-condition-qualification-01.json",
+    "retained_condition_qualification_sha256": "ca2ae2314004e33a27e50db12dbba86b6565abb8de58b548a69d0544a065a07a",
+    "actual_retained_conditions_checked": 58,
+    "actual_retained_tasks": 6,
+    "codex_mcp_transport": "apps/computer_use/.runtime/sdk51-literal-feedback-codex-01/result.json",
+    "codex_mcp_transport_sha256": "52682d23a953cc41963fc363d1e9f37692565b27081c59c8f83ba099ef790253",
+    "transport_checks_passed": 36,
+    "synthetic_backend_requests": 9,
+    "platform_tool_catalogues": [
+      "windows",
+      "linux",
+      "android"
+    ],
+    "original_predicates_and_schema_preserved": true,
+    "source_auxiliaries_unchanged": true,
+    "original_result_booleans_and_fields_preserved": true,
+    "task_business_success_improvement_proven": false,
+    "real_qw3_retest_started": false,
+    "native_windows_qualified": false,
+    "deployed_to_frozen_queues": false,
+    "advisor_enabled": false,
+    "model_calls": 0,
+    "device_inputs": 0,
+    "limitations": "Synthetic desktop/backend through actual pinned Codex0.159.2/MCP. No native platform task, real QW3 decision, speed gain or business success claim. Feedback only explains literal evidence; missing control text does not prove failed input, application identity does not prove target-page arrival, and Save/window changes do not prove saved content."
+  },
+  "second_repetition_recording_timeout_diagnostic": {
+    "at": 1791140321.6080546,
+    "path": "apps/computer_use/.runtime/retained-006-r2-recording-timeout-diagnostic-20261005-01.json",
+    "sha256": "c4a91892cc5e6300adbeeb01125fc5f1af8195c8c8820fc183ca5c03875fa628",
+    "checks_passed": 9,
+    "trial": "006-verified-r2",
+    "original_score": 0.0,
+    "original_unknown_inputs": 0,
+    "task_seconds": 1801.2906276527792,
+    "retained_video_duration_seconds": 282.0,
+    "decoded_frames": 564,
+    "decoded_geometry": [
+      [
+        1920,
+        1080
+      ]
+    ],
+    "complete_task_video": false,
+    "timeout_phase": "waiting_for_first_rfb_message_byte",
+    "underlying_delay_cause_established": false,
+    "original_artifacts_and_grades_unchanged": true,
+    "preparation_failure_retained": "apps/computer_use/.runtime/retained-006-r2-recording-timeout-preparation-01.json",
+    "model_calls": 0,
+    "device_inputs": 0,
+    "required_followup": "Qualify bounded reconnect after read timeout, retaining explicit unobserved intervals and full-frame validation. Never turn held frames into claimed observations or count partial video as full task coverage."
   }
 }

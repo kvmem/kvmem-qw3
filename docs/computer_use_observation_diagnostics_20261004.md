@@ -211,3 +211,16 @@ SDK51的观察适配器支持GTK文件选择器，但Desktop的完整窗口保�
 四次均没有输出预算命中或只思考的length停止。12份首、中、尾请求经实际无损恢复独立核对图像计数，未派发模型或输入。后台时间包括视觉编码、prefill、生成和共享GPU影响；不同停止轨迹不能用来声称提速。成本报告`.runtime/second-repetition-terminal-model-cost-20261005-02.json`、执行结构报告`second-repetition-harness-diagnostic-20261005-02.json`、补充三份独立解码`second-repetition-004-independent-decodes-20261005-01.json`均保留原结果哈希。第一份执行结构报告误按type统计条件，实际字段为kind，第一份未知类型统计不能用于结论；第二份纠正而不覆盖。早期探索还误假设旧核心有revalidations表、messages为角色对象，两次只读失败保留在报告中，没有输入或原成绩改变。
 
 013新版步骤`read-page2`的原条件是`control_text: Prize Items`，实际读取ok且不截断，12个原生控件主要为工具栏、页码与Document View，没有正文标题。保留历史证明页码曾为2，最后为3；最后截图大标题实际为`Prize Item Catalogue`。因此既存在证据来源选错，也有预期字面文字与最终画面不一致，不能仅归于缺失控件、读屏失败或算术错误。原条件和官方0分不改，不用模糊匹配或“到了页码”代替阅读/计算成功。现有隔离feedback候选对这份真实失败的12项只读核验通过：保留原布尔值，提示只能证明原生控件文字、缺失文字不能推出输入失败，不返回业务成功。它仍没有真实QW3改善轨迹。下一轮应分开可核验导航条件和模型的阅读理解，再做同预算复测；重复刷新并不会让PDF正文变成原生控件。证据`.runtime/retained-pdf-completion-feedback-20261005-01.json`。
+
+
+## 2026-10-05 SDK51 原条件反馈传递与录像超时
+
+最新主队列实际进程核验存活，26/40终止、24份可用原评分均0，当前010-legacy-r2。后继8/10/12/4仍实际存活等待、零模型试次；所有原协议与源码不变。审计为`.runtime/literal-feedback-and-parent-progress-20261005-01.json`，旧快照保留。
+
+新的`literal_completion_feedback_candidate.py`从已固定SDK51源码与独立acceptance复制候选，只有`execution.py`新增解释调用和`completion_feedback.py`加入包；设备入口、Linux观察辅助及所有其他包文件按哈希保持不变。保留SDK51六种字面完成条件、原hint/布尔值、输入协议、重复保护、持久步骤、预算和原始未知保护。17项CPU检查通过，包括不暴露正文的PDF、控件重复/截断、错误应用别名、保存证据范围、持久化重复意图、最终条件重新检查和损坏来源拒绝；第一次夹具错误将begin_step与wait总观察数当成一次，失败保留，仅修正计数断言后通过。
+
+真实SDK51旧/新代码对六次保留失败的58份条件进行只读重算：foreground_app16、control_text6、screen_changed27、control_value6、foreground_title1、control_absent2。旧代码重算与原记录一致，新代码保留全部原字段与判定，仅增加解释。没有根据原评分改成通过，也没有输入或模型调用。实际Codex0.159.2/MCP三套平台目录共36项检查通过，九次合成请求检查begin_step→wait→下一轮模型输入；反馈到达实际请求，原缺少正文标题的条件保持失败、步骤仍pending、没有完成记录、桌面暂停、原16K/thinking与累计调用保持。桌面和后端是合成夹具，不能称为原生设备或QW3改善。实际冻结源包及资格记录位于`.runtime/sdk51-literal-feedback-candidate-01`、`.runtime/literal-completion-feedback-qualification-02`和`.runtime/sdk51-literal-feedback-codex-01`；CPU失败01保留。
+
+本地复现CPU检查：`PYTHONPATH=apps/computer_use .venv/bin/python -m unittest discover -s apps/computer_use/tests -p test_literal_completion_feedback_candidate.py -v`。隔离构建入口的`--help`列出来源framework/manifest/acceptance及各哈希，实际`build.json`保存所使用来源。实际通路的冻结`run.py`与九份合成请求也保留；重新执行须复制到新的同级目录，不能覆盖原资格。后续须在新任务目录及相同材料/预算下做真实QW3复测，现阶段反馈合约通过不计为业务收益。
+
+另独立核验006新版第二次的录制失败：原任务1801.29秒/22调用、未知输入0、原官方0；冻结VNC录制器在等候下一条RFB消息首字节时触发3秒socket timeout。217次采集、564帧/282秒MKV全部可解码，尺寸1920×1080；最后真实采集时间281.9557秒，不能代表完整任务。九项只读检查通过，全部媒体、原成绩与失败日志哈希不变。证据`.runtime/retained-006-r2-recording-timeout-diagnostic-20261005-01.json`。首次诊断因未加载已有媒体组件而缺少PyAV，准备失败保留；使用现有media-qualification模块路径完成解码，没有新安装。尚未证明服务器/网络延迟的根因，也未证明任务早期的补充只读录制导致超时。之后应独立资格验证有界重连、完整新帧与明确未观察间隔；保持上一帧不能被描述为新观察，片段不能标作完整录像。原冻结录制器与当前试次不修改。
