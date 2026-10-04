@@ -2358,7 +2358,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791146509.176444,
+  "updated_at": 1791151725.25496,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -4758,33 +4758,43 @@
   "current_matched_osworld_snapshot": {
     "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue_02.json",
     "status": "running",
-    "terminal_trials": 33,
+    "terminal_trials": 36,
     "planned_trials": 40,
-    "current_trial": "035-legacy-r2",
-    "available_original_scores": 30,
+    "current_trial": "080-verified-r2",
+    "available_original_scores": 32,
     "positive_original_scores": 0,
     "original_unknowns_preserved": 2,
     "current_continuation_new_unknowns": 0,
     "last_trial": {
-      "id": "035-verified-r2",
+      "id": "043-verified-r2",
       "exit_code": 0,
       "result": {
-        "status": "evaluator-unavailable",
-        "score": null,
+        "status": "scored",
+        "score": 0.0,
         "passed": false,
-        "stop_reason": "deadline",
-        "agent_status": "stopped",
-        "seconds": 1802.4925068761222,
-        "tool_calls": 20,
+        "agent_status": "paused",
+        "seconds": 1187.7657280792482,
+        "tool_calls": 19,
         "uncertain_actions": 0,
         "turn_error": null,
-        "notice": null,
-        "video_bytes": 4431871,
-        "evaluator_error": "RuntimeError: Task035 evaluator failed during the LLM whole-table judgment.",
-        "secondary_local_score": 0,
-        "secondary_local_passed": false,
+        "notice": "多次刷新后仍无法发出操作，已暂停。请核对目标或接管。",
+        "video_bytes": 3681853,
+        "original_evaluation": {
+          "score": 0.0,
+          "safety": {
+            "checks": [
+              {
+                "name": "document_integrity",
+                "result": "PASS",
+                "description": "",
+                "penalty": 0.0
+              }
+            ],
+            "total_penalty": 0.0
+          }
+        },
         "unassisted_passed": false,
-        "finished_at": 1791149070.3855076,
+        "finished_at": 1791151508.4930668,
         "candidate_harness": true,
         "video_collection_passed": true,
         "video_collection_errors": [],
@@ -4792,8 +4802,8 @@
         "accepted": false
       }
     },
-    "at": 1791149590.8771453,
-    "actual_live_audit": "apps/computer_use/.runtime/feedback-retest-queue-and-parent-progress-20261005-01.json"
+    "at": 1791151725.25496,
+    "actual_live_audit": "apps/computer_use/.runtime/active-recording-and-parent-progress-20261005-01.json"
   },
   "080_legacy_execution_cost_diagnostic": {
     "report": "apps/computer_use/.runtime/080-legacy-execution-cost-20261004-02.json",
@@ -4807,7 +4817,7 @@
     "invalid_kind_parser_snapshot_preserved": true
   },
   "improvement_evidence_snapshot": {
-    "at": 1791149590.8771453,
+    "at": 1791151725.25496,
     "coordinate_diagnostic": {
       "pixel_contract_passed": 0,
       "normalized_contract_passed": 11,
@@ -4832,8 +4842,8 @@
     "complex_osworld_success_improvement_proven": false,
     "image_policy_real_qw3_trials_started": 0,
     "latency_improvement_proven": false,
-    "complex_osworld_terminal_trials": 33,
-    "complex_osworld_available_scores": 30,
+    "complex_osworld_terminal_trials": 36,
+    "complex_osworld_available_scores": 32,
     "complex_osworld_positive_scores": 0,
     "short_rule_thinking_diagnostic": {
       "screenshot_thinking_off_passed": 14,
@@ -5216,13 +5226,13 @@
     ]
   },
   "current_40_8_10_12_4_live_status": {
-    "at": 1791149590.8771453,
-    "audit": "apps/computer_use/.runtime/feedback-retest-queue-and-parent-progress-20261005-01.json",
+    "at": 1791151725.25496,
+    "audit": "apps/computer_use/.runtime/active-recording-and-parent-progress-20261005-01.json",
     "parent": {
       "status": "running",
-      "terminal_trials": 33,
-      "current_trial": "035-legacy-r2",
-      "available_original_scores": 30,
+      "terminal_trials": 36,
+      "current_trial": "080-verified-r2",
+      "available_original_scores": 32,
       "positive_original_scores": 0
     },
     "successors": [
@@ -5912,5 +5922,152 @@
     "reporter_string_action_bug_fixed": true,
     "reporter_regression_checks_passed": 5,
     "first_failed_read_only_audit_retained": "apps/computer_use/.runtime/terminal-cost-audit-preparation-failed-01/result.json"
+  },
+  "active_native_recording_calibration": {
+    "at": 1791151725.25496,
+    "audit": "apps/computer_use/.runtime/active-recording-and-parent-progress-20261005-01.json",
+    "sources": [
+      "apps/computer_use/active_recording_fixture.py",
+      "apps/computer_use/qualify_active_linux_recording.py",
+      "apps/computer_use/tests/test_active_recording_qualification.py"
+    ],
+    "cpu_qualification": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-cpu-02/result.json",
+      "tests_run": 6,
+      "passed": true,
+      "source_sha256": {
+        "qualify_active_linux_recording.py": "32c8382e462ff383a3341576f03d1767ce6b88f5f39fe73443147e68899e4c2b",
+        "active_recording_fixture.py": "810ed9be49beb93b004ff0addd4689a4aea48192a157ef967ce5940903e117c5",
+        "tests/test_active_recording_qualification.py": "493b3feaadf469b0acf5668a5b36d14a16aacc2cca5af6d3741fe06d95417609"
+      }
+    },
+    "attempts": [
+      {
+        "state": "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-smoke-01/state.json",
+        "state_sha256": "c873f29b059a31024f76486475d033956d36f9347589fb513995b5eeccde2b37",
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-smoke-launch-01/registration.json",
+        "identity": {
+          "pid": 3063062,
+          "uid": 1001,
+          "start_ticks": 370638073,
+          "command": [
+            "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+            "-m",
+            "qualify_active_linux_recording",
+            "--mode",
+            "smoke",
+            "--output",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-smoke-01",
+            "--qualification",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/recoverable-linux-wrapper-qualification-02/result.json"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "source_sha256": {
+          "qualify_active_linux_recording.py": "13068c9799129bebb71604e763686d23c03f831487d450b41b21bde2d2f58cba",
+          "active_recording_fixture.py": "810ed9be49beb93b004ff0addd4689a4aea48192a157ef967ce5940903e117c5",
+          "tests/test_active_recording_qualification.py": "5c1f38760a01b184d531f044caaf00aaeda8ea7771629a78940fcf9b80c4fbe9"
+        },
+        "status": "failed",
+        "passed": false,
+        "verified_calibration_inputs": 0,
+        "producer_retired": true,
+        "worker_retired": true,
+        "container_id": "04be80d007577a3dcc60f7edfcdc52136dffad43b19580988c0a2b80be3814e0",
+        "dedicated_vm_retired": true,
+        "error": "Dedicated calibration guest operation failed: XGetWindowProperty[_NET_ACTIVE_WINDOW] failed (code=1)\nTraceback (most recent call last):\n  File \"<string>\", line 13, in <module>\nAssertionError\n ",
+        "model_calls": 0,
+        "qw3_task_success_claimed": false
+      },
+      {
+        "state": "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-smoke-02/state.json",
+        "state_sha256": "0951fe22e6a3a754b39ca8b347487f53b85aa18de7b8e81ced489fed366bbb90",
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-smoke-launch-02/registration.json",
+        "identity": {
+          "pid": 3066984,
+          "uid": 1001,
+          "start_ticks": 370673700,
+          "command": [
+            "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+            "-m",
+            "qualify_active_linux_recording",
+            "--mode",
+            "smoke",
+            "--output",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-smoke-02",
+            "--qualification",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/recoverable-linux-wrapper-qualification-02/result.json"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "source_sha256": {
+          "qualify_active_linux_recording.py": "9711b4a6b14f9b757128ab00ab45664905d1712fbecc9b234c2118efcfc2f75a",
+          "active_recording_fixture.py": "810ed9be49beb93b004ff0addd4689a4aea48192a157ef967ce5940903e117c5",
+          "tests/test_active_recording_qualification.py": "5c1f38760a01b184d531f044caaf00aaeda8ea7771629a78940fcf9b80c4fbe9"
+        },
+        "status": "failed",
+        "passed": false,
+        "verified_calibration_inputs": 0,
+        "producer_retired": true,
+        "worker_retired": true,
+        "container_id": "a5f53ca3699f6c63dbc982af1dfee7e605e9c48be63dd17f9849b039a3904f70",
+        "dedicated_vm_retired": true,
+        "error": "Dedicated calibration guest operation failed: Traceback (most recent call last):\n  File \"<string>\", line 17, in <module>\nAssertionError: {'display': ':0', 'image_size': (1920, 1080), 'rectangle': [190, 227, 40, 40], 'actual_pixel': (48, 48, 48), 'expected_pixel': [255, 0, 0]}\n ",
+        "model_calls": 0,
+        "qw3_task_success_claimed": false
+      },
+      {
+        "state": "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-smoke-03/state.json",
+        "state_sha256": "3eb05f5478f6a492d57325f5d8cc2d5d98872e29d6bbd08d9a1704e223f2c9d5",
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-smoke-launch-03/registration.json",
+        "identity": {
+          "pid": 3071082,
+          "uid": 1001,
+          "start_ticks": 370706322,
+          "command": [
+            "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+            "-m",
+            "qualify_active_linux_recording",
+            "--mode",
+            "smoke",
+            "--output",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-smoke-03",
+            "--qualification",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/recoverable-linux-wrapper-qualification-02/result.json"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "source_sha256": {
+          "qualify_active_linux_recording.py": "32c8382e462ff383a3341576f03d1767ce6b88f5f39fe73443147e68899e4c2b",
+          "active_recording_fixture.py": "810ed9be49beb93b004ff0addd4689a4aea48192a157ef967ce5940903e117c5",
+          "tests/test_active_recording_qualification.py": "493b3feaadf469b0acf5668a5b36d14a16aacc2cca5af6d3741fe06d95417609"
+        },
+        "status": "failed",
+        "passed": false,
+        "verified_calibration_inputs": 0,
+        "producer_retired": true,
+        "worker_retired": true,
+        "container_id": "cbeae1b0a247738116551f0f9597479f813313afe7acb8d1b8d2d42e086cc897",
+        "dedicated_vm_retired": true,
+        "error": "Dedicated calibration guest operation failed: Traceback (most recent call last):\n  File \"<string>\", line 46, in <module>\n  File \"<string>\", line 20, in locate_marker\nValueError: Owned native marker is not visible\n ",
+        "model_calls": 0,
+        "qw3_task_success_claimed": false
+      }
+    ],
+    "scope": "Three new original OSWorld Linux VMs, native Tk calibration fixtures, not model business tasks.",
+    "administrative_fixture_creation_and_focus_operations": true,
+    "verified_key_click_scroll_calibration_actions": 0,
+    "model_calls": 0,
+    "existing_device_inputs": 0,
+    "all_owned_producers_recorders_and_vms_retired": true,
+    "native_1800_second_active_calibration_sampling_proven": false,
+    "native_active_gui_business_recording_stability_proven": false,
+    "production_screenshot_or_input_root_cause_isolated": false,
+    "calibration_failure_not_promoted_to_task_success": true,
+    "retained_failures_not_overwritten": true,
+    "next_step": "Isolate X11 window bounds versus native pixel capture in a new owned attempt before sending calibrated input; preserve existing task and recorder contracts."
   }
 }
