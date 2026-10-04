@@ -52,6 +52,14 @@ Calc07是另一种失败：11次已完成输入后，关闭空白窗口的CTRL+W
 
 证据：`.runtime/candidate49-calc-window-and-age-diagnostic-01.json`、`.runtime/candidate49-calc08-latency-diagnostic-01.json`、`.runtime/foreground-visual-candidate-02/{build,qualification}.json`。均保留原观察身份、截图哈希、候选源码及检查日志哈希；原任务分数未改变。
 
+## Android键盘与焦点恢复
+
+UI19无进度故障处理通过（389.35秒/18调用）：模型修复错误字段输入后，保存永久停留Saving…，等待并请求接管，安全暂停；业务保存仍未完成。Reference的视觉点击后，R-204曾追加到Name成为AsterR-204；模型识别后删除五个多余字符，用TAB移动焦点，再正确输入Reference。不能把恢复通过说成定位从未出错。
+
+原三份保留观察显示Reference空输入框没有进入可操作控件列表；解析器丢弃没有文本、描述或资源标识的输入目标，也未保留XML的focused/ enabled状态。原始XML未留档，不能反推某个原生focused属性。参考截图从键盘隐藏变为键盘显示，Name仍有光标；“聚焦Reference”步骤使用screen_changed并获验证，这个条件只证明画面变化，不能证明输入焦点正确。具体是坐标误判、思考期间界面变化、IME行为还是送达时序，尚未确定。后续可独立验证保留真实焦点状态和未命名输入控件、输入前的焦点确认；不虚构字段标签或稳定身份。当前候选49的Android驱动不修改。
+
+证据：`.runtime/candidate49-android-keyboard-focus-diagnostic-01.json`，保留三张原图哈希、字段控件和步骤条件；没有新输入或重新评分。
+
 ## 后续验证顺序
 
 1. 完成相同核心UI19的剩余独立开发试次、49b真实模型回执阶段及冻结OSWorld40次；原Calc07隔离失败不重放、不覆盖。Android弹窗、慢加载已通过，其他结果分别记录。

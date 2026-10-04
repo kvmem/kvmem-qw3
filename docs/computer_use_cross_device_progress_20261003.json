@@ -1804,7 +1804,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791100310.9439182,
+  "updated_at": 1791101262.058783,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -1966,16 +1966,16 @@
     "latex_repeat_tool_calls": 23
   },
   "public_replay_snapshot": {
-    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-14",
-    "url": "http://127.0.0.1:18146/index.html",
+    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-15",
+    "url": "http://127.0.0.1:18147/index.html",
     "formal_attempts_at_export": 40,
     "windows_model_trials_at_export": 8,
-    "platform_pilots_at_export": 45,
+    "platform_pilots_at_export": 49,
     "includes_python_repair_pair": true,
     "includes_latex_repair_pair": true,
     "export_is_point_in_time": true,
-    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-14/browser-check-01.json",
-    "actual_browser_checks_passed": 35,
+    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-15/browser-check-01.json",
+    "actual_browser_checks_passed": 45,
     "retained_failed_snapshot_checks": [
       "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check.json",
       "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check-02.json"
@@ -1983,12 +1983,15 @@
     "partial_formal_videos_not_for_latency_comparison": true,
     "matched_development_osworld_at_export": 4,
     "includes_wire_regression_failures": true,
-    "development_attempts": 45,
+    "development_attempts": 49,
     "development_osworld_attempts": 4,
     "software_product_attempts": 8,
-    "browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-14/browser-check-01.json",
-    "browser_checks_passed": 35,
-    "snapshot_excludes_later_candidate19_trials": true
+    "browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-15/browser-check-01.json",
+    "browser_checks_passed": 45,
+    "snapshot_excludes_later_candidate19_trials": true,
+    "new_candidate19_terminal_trials_at_export": 4,
+    "public_video_storage": "hardlinks of terminal immutable videos; no duplicate video bytes allocated",
+    "previous_snapshot": "apps/computer_use/.runtime/cross-device-replay-20261004-14"
   },
   "material_evidence_audits": {
     "006": {
@@ -2849,18 +2852,20 @@
     "controller": "apps/computer_use/.runtime/candidate19-followup-01.json",
     "result": "apps/computer_use/.runtime/xdev-candidate19-remaining-window-and-fault-01/batch/result.json",
     "planned_remaining_trials": 8,
-    "finished_at_snapshot": 3,
+    "finished_at_snapshot": 5,
     "status_at_snapshot": "running",
     "failed_prior_trial_not_overwritten": true,
     "device_core_bytes_unchanged": true,
-    "complete_acceptances_at_snapshot": 2,
-    "fault_acceptances_at_snapshot": 2,
+    "complete_acceptances_at_snapshot": 3,
+    "fault_acceptances_at_snapshot": 3,
     "finished_trials_at_snapshot": [
       "xdev-android-focus-c49-01",
       "xdev-linux-calc-08",
-      "xdev-android-slow-c49-01"
+      "xdev-android-slow-c49-01",
+      "xdev-linux-browser-07",
+      "xdev-android-stall-c49-01"
     ],
-    "current_trial_at_snapshot": "xdev-linux-browser-07",
+    "current_trial_at_snapshot": "xdev-linux-browser-08",
     "android_focus_result": {
       "accepted": true,
       "fault_accepted": true,
@@ -2882,6 +2887,26 @@
       "owned_task_retired": true,
       "observed_work_total": 500,
       "saved_workbook_unmodified": true
+    },
+    "linux_browser07_result": {
+      "accepted": true,
+      "artifact_passed": true,
+      "seconds": 762.3662483338267,
+      "tool_calls": 24,
+      "unknown_actions": 0,
+      "owned_task_retired": true,
+      "video_complete": true
+    },
+    "android_stall_result": {
+      "fault_accepted": true,
+      "accepted": false,
+      "artifact_passed": false,
+      "seconds": 389.3533979933709,
+      "tool_calls": 18,
+      "unknown_actions": 0,
+      "owned_task_retired": true,
+      "focus_failure_self_corrected": true,
+      "focus_diagnostic": "apps/computer_use/.runtime/candidate49-android-keyboard-focus-diagnostic-01.json"
     }
   },
   "isolated_visual_foreground_experiment": {
@@ -2925,5 +2950,32 @@
         151.2618486220017
       ]
     }
+  },
+  "kvmem_comparison_preparation": {
+    "protocol": "apps/computer_use/.runtime/linux/kvmem-matched-49-20261004/protocol.json",
+    "planned_trials": 8,
+    "tasks": [
+      "035",
+      "080"
+    ],
+    "arms": [
+      "off",
+      "on"
+    ],
+    "repetitions": 2,
+    "status": "prepared-not-dispatched",
+    "after_candidate49b_all40_and_durable_model_retirement": true,
+    "source_framework": "qualified49",
+    "experimental_visual_context_included": false,
+    "require_fresh_owned_engine_per_trial": true,
+    "prefix_reuse_both_arms": false,
+    "visual_history_both_arms": "pin-all",
+    "model_output_tokens": 16384,
+    "thinking": true,
+    "seconds": 1800,
+    "tools": 250,
+    "engine_cpu_capacity_gib": 48,
+    "engine_gpu_memory_cap_gib": null,
+    "original035_cloud_evaluator_unavailable_separate_local_score": true
   }
 }
