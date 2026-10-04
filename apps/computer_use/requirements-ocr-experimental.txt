@@ -1,0 +1,5 @@
+# Isolated CPU observation prototype; not part of the qualified client49 bundle.
+rapidocr==3.9.2
+onnxruntime==1.30.0
+numpy==2.5.3
+opencv-python==5.0.0.93
