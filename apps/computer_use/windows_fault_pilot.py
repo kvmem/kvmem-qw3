@@ -12,6 +12,7 @@ from fault_browser_pilot import FIELDS,prompt,response_grade
 from linux_recording import LinuxRecording
 from osworld_linux.runner import request,save
 from platform_pilots import owned_container,retire_task
+from windows_capture_candidate import health as executor_health
 import windows_fault_fixture as fixture_transport
 
 
@@ -64,6 +65,9 @@ def run(args):
                     or state.get('model_output_tokens')!=16384 or state.get('tool_call_limit')!=100):
                 raise ValueError('Use the idle qualified local thinking candidate')
             vm=owned_container('qw3-computer-windows','com.qw3.computer-use.owner','codex-goal-20260930')
+            native=executor_health()
+            if native.get('paused') is not True:
+                raise ValueError('The native Windows input owner must be paused before setup')
             state=request(args.app,'/api/device',{'device_id':'windows-vm'})
             candidate=json.loads((args.runtime/'candidate-manifest.json').read_text())
             for filename,expected in candidate['files'].items():
@@ -74,6 +78,8 @@ def run(args):
                 'prompt':instruction,'container_id':vm['Id'],'deadline_seconds':args.seconds,
                 'model_output_tokens':16384,'thinking':True,'tool_call_limit':100,'advisor':False,'kvmem':'off',
                 'app_runtime':str(args.runtime.resolve()),'video_mode':'vnc','no_model_access_to_initializer_or_grader':True,
+                'native_executor':{key:native.get(key) for key in ('process_id','desktop_id','version',
+                    'capture_profile','source_sha256','base_source_sha256')},
                 'candidate_manifest_sha256':hashlib.sha256((args.runtime/'candidate-manifest.json').read_bytes()).hexdigest(),
                 'source_sha256':{name:hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
                     for name in ['windows_fault_pilot.py','windows_fault_fixture.py','fault_browser_windows_guest.py','fault_browser_server.js']}}

@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import shutil
 import time
+import qw3_computer
 
 from fault_browser_pilot import FIELDS
 from qw3_computer.desktop import Desktop, DesktopRejected
@@ -34,11 +35,15 @@ async def qualify(args):
         source=Path(__file__).with_name(name);shutil.copyfile(source,sources/name)
         inventory[name]=hashlib.sha256(source.read_bytes()).hexdigest()
     report['host_source_sha256']=inventory
-    framework=Path(__file__).with_name('qw3_computer')
+    framework=Path(qw3_computer.__file__).resolve().parent
     frozen=args.output/'framework/qw3_computer'
     shutil.copytree(framework,frozen,ignore=shutil.ignore_patterns('__pycache__'))
     report['framework_source_sha256']={str(p.relative_to(frozen)):hashlib.sha256(p.read_bytes()).hexdigest()
                                       for p in frozen.rglob('*') if p.is_file()}
+    bundle_manifest=json.loads((args.bundle/'manifest.json').read_text())
+    for filename,digest in report['framework_source_sha256'].items():
+        if bundle_manifest['source_files'].get('qw3_computer/'+filename)!=digest:
+            raise ValueError('Administrative probe core differs from the qualified native bundle: '+filename)
     with Path('/tmp/qw3-osworld-vm.lock').open('a+') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         for condition in ('normal','slow_loading','focus_dialog','no_progress'):
@@ -72,13 +77,18 @@ async def qualify(args):
 
                 async def click(name, kinds=None, step=None):
                     # Retries only proven non-deliveries, with newly observed IDs.
-                    for _ in range(3):
+                    deadline=time.monotonic()+30
+                    rejected=0
+                    while time.monotonic()<deadline and rejected<3:
                         await desktop.observe()
                         controls=[c for c in desktop.latest.get('accessibility',{}).get('controls',[])
                                   if c.get('name')==name and (not kinds or c.get('kind','').lower() in kinds)]
-                        if len(controls)!=1:raise ValueError('No unique visible control: '+name)
+                        if len(controls)>1:raise ValueError('Ambiguous visible control: '+name)
+                        if not controls:
+                            await asyncio.sleep(.2)
+                            continue
                         try:return await act({'kind':'click_control','control_id':controls[0]['control_id']},step)
-                        except DesktopRejected:continue
+                        except DesktopRejected:rejected+=1
                     raise RuntimeError('Target remained unstable without input')
 
                 await act({'kind':'open_app','app':'edge'},
@@ -105,14 +115,25 @@ async def qualify(args):
                                 'value':value,'control_kind':candidates[0]['kind']}]}
                     await click(name,{'edit','entry','text-box','textbox'},definition)
                     if condition=='focus_dialog' and name=='Name':
-                        await click('Continue',{'button','push-button'})
-                        await click(name,{'edit','entry','text-box','textbox'})
+                        await click('Continue form',{'button','push-button'})
+                        focused=[c for c in desktop.latest.get('accessibility',{}).get('controls',[])
+                                 if c.get('name')==name and c.get('kind','').lower() in {'edit','entry','text-box','textbox'}
+                                 and c.get('focused') is True]
+                        # Closing a modal can restore the field's focus. Only
+                        # send another focus click if the fresh receipt does
+                        # not prove this, rather than creating a new transition.
+                        if len(focused)!=1:await click(name,{'edit','entry','text-box','textbox'})
                     typed=await act({'kind':'type','text':value})
-                    if not typed['step_check']['verified']:
+                    value_check=typed['step_check']
+                    if not value_check['verified']:
+                        value_check=await execution.invoke({'operation':'wait','timeout_seconds':20})
+                    if not value_check['verified']:
                         raise ValueError('Actual field value was not verified: '+name)
-                await click('Save request',{'button','push-button'},
+                saved=await click('Save request',{'button','push-button'},
                     {'goal':'Save the request','conditions':[{'kind':'control_text','text':'Saved'}]})
-                checked=await execution.invoke({'operation':'wait','timeout_seconds':2 if condition=='no_progress' else 20})
+                checked=saved['step_check']
+                if not checked['verified']:
+                    checked=await execution.invoke({'operation':'wait','timeout_seconds':2 if condition=='no_progress' else 20})
                 if condition=='no_progress' and checked['verified']:raise ValueError('Permanent saving incorrectly completed')
                 if condition!='no_progress' and not checked['verified']:raise ValueError('No visible save evidence')
                 await desktop.control('pause')
