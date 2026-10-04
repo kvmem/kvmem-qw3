@@ -592,6 +592,23 @@
       "model_score_valid": true,
       "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/038-legacy-r2/result.json",
       "finished_at": 1791073851.830656
+    },
+    {
+      "task": "022",
+      "arm": "legacy",
+      "repetition": 2,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 720.2293773517013,
+      "tool_calls": 17,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/022-legacy-r2/result.json",
+      "finished_at": 1791074641.0093188
     }
   ],
   "warnings": [
@@ -1007,7 +1024,11 @@
       "artifact_passed": false,
       "accepted": false,
       "unassisted_passed": false,
-      "video_collection_passed": true
+      "video_collection_passed": true,
+      "fault_condition": null,
+      "fault_response_passed": null,
+      "fault_accepted": null,
+      "owned_task_retired": null
     },
     {
       "id": "candidate-interlude-contacts-02",
@@ -1023,7 +1044,11 @@
       "fresh_target_checks": 10,
       "changed_target_rejections": 4,
       "path": "apps/computer_use/.runtime/candidate-interlude-contacts-02/pilot/integration-result.json",
-      "video_collection_passed": true
+      "video_collection_passed": true,
+      "fault_condition": null,
+      "fault_response_passed": null,
+      "fault_accepted": null,
+      "owned_task_retired": null
     },
     {
       "id": "candidate-interlude-linux-browser-01",
@@ -1041,7 +1066,11 @@
       ],
       "path": "apps/computer_use/.runtime/candidate-interlude-linux-browser-01/pilot/integration-result.json",
       "unassisted_passed": false,
-      "video_collection_passed": true
+      "video_collection_passed": true,
+      "fault_condition": null,
+      "fault_response_passed": null,
+      "fault_accepted": null,
+      "owned_task_retired": null
     },
     {
       "id": "candidate-interlude-linux-browser-02",
@@ -1054,7 +1083,11 @@
       "accepted": true,
       "unassisted_passed": true,
       "video_collection_passed": true,
-      "uncertain_actions": 0
+      "uncertain_actions": 0,
+      "fault_condition": null,
+      "fault_response_passed": null,
+      "fault_accepted": null,
+      "owned_task_retired": null
     }
   ],
   "app_entry": "http://127.0.0.1:18205/",
@@ -1153,12 +1186,12 @@
   "frozen_campaign": {
     "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/plan.json",
     "commit": "9fe52d3ee254786012652ec9fc85f340b71e9dc9",
-    "finished": 30,
+    "finished": 31,
     "total": 40,
     "current": [
-      "022-legacy-r2"
+      "022-verified-r2"
     ],
-    "separate_pilot_queued": "xdev-latex-repair-01",
+    "separate_pilot_queued": "xdev-latex-repair-02",
     "separate_pilot_status": "waiting-for-current-formal-attempt"
   },
   "post_freeze_optimizations": {
@@ -1170,8 +1203,8 @@
     "control_id_copy_hint": "Complete20-character observed IDs; the server currently does not enforce identifier enums during decoding, no constrained-decoding benefit claimed"
   },
   "formal_summary": {
-    "ended_attempts": 30,
-    "valid_original_scores": 24,
+    "ended_attempts": 31,
+    "valid_original_scores": 25,
     "infrastructure_failures": 4,
     "unavailable_original_evaluators": 2,
     "successes": 0,
@@ -1199,11 +1232,11 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791074272.212246,
+  "updated_at": 1791076260.651477,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
-    "started": 6,
+    "started": 7,
     "bundle": "windows-native-client-40",
     "thinking": true,
     "workflow_mode": "verified",
@@ -1211,8 +1244,8 @@
     "timeout_seconds": 900,
     "shared_engine": true,
     "pure_gui": false,
-    "ended": 7,
-    "accepted": 6
+    "ended": 8,
+    "accepted": 7
   },
   "windows_product_attempts": [
     {
@@ -1240,6 +1273,19 @@
       "tool_calls": 16,
       "workflow_mode": "verified",
       "path": "apps/computer_use/.runtime/xdev-latex-new-02/xdev-latex-new-02-trial/result.json"
+    },
+    {
+      "id": "xdev-latex-repair-01-trial",
+      "task": "product-latex-repair",
+      "status": "complete",
+      "passed": true,
+      "accepted": true,
+      "model_used": true,
+      "pure_gui": false,
+      "seconds": 55.66482369999994,
+      "tool_calls": 4,
+      "workflow_mode": "verified",
+      "path": "apps/computer_use/.runtime/xdev-latex-repair-01/xdev-latex-repair-01-trial/result.json"
     },
     {
       "id": "xdev-python-new-01-trial",
@@ -1313,7 +1359,7 @@
     "preserved_pre_model_attempt": "apps/computer_use/.runtime/xdev-python-repair-01/reconciliation.json",
     "corrected_initial_protocol": "apps/computer_use/.runtime/windows-cross-products-20261004/python-repair-initial-acceptance-v2.json",
     "corrected_repeat_protocol": "apps/computer_use/.runtime/windows-cross-products-20261004/python-repair-repeat-acceptance-v2.json",
-    "real_model_candidate_queued": "xdev-latex-repair-01",
+    "real_model_candidate_queued": "xdev-latex-repair-02",
     "reset_after_verified_repair": "apps/computer_use/.runtime/xdev-python-fixture-reset-02/result.json",
     "first_valid_repair": {
       "path": "apps/computer_use/.runtime/xdev-python-repair-02/xdev-python-repair-02-trial/result.json",
@@ -1327,7 +1373,9 @@
       "complete_video": true
     },
     "python_valid_repeats": 2,
-    "latex_initial_fixture": "apps/computer_use/.runtime/xdev-latex-fixture-01/result.json"
+    "latex_initial_fixture": "apps/computer_use/.runtime/xdev-latex-fixture-01/result.json",
+    "latex_valid_repeats": 1,
+    "latex_first_model_seconds": 55.6648237
   },
   "public_replay_snapshot": {
     "path": "apps/computer_use/.runtime/cross-device-replay-20261004-07",
@@ -1403,6 +1451,33 @@
     "original_prompt_and_grader_unchanged": true,
     "preferences_changed": false,
     "qualified_failure_attribution": "Editor appends a newline; original model literal payload was correct. Does not establish model vision or reasoning sufficiency.",
-    "model_retest_after_optimization": false
+    "model_retest_after_optimization": false,
+    "candidate_adapter": "apps/computer_use/linux_app_semantics.py",
+    "candidate_qualification": "apps/computer_use/.runtime/linux/editor-semantics-candidate-qualification-01/result.json",
+    "live_gateway_upgraded": false
+  },
+  "windows_recovery_candidate": {
+    "stdlib_host_browser_qualification": "apps/computer_use/.runtime/fault-browser-stdlib-qualification-01/result.json",
+    "checks_passed": 44,
+    "model_used": false,
+    "windows_vm_qualification_completed": false,
+    "native_model_trials_completed": 0,
+    "shared_page_template": true,
+    "no_extra_guest_dependency": true,
+    "safety_and_grading_checks_passed": 9
+  },
+  "linux_recovery_batch": {
+    "protocol": "apps/computer_use/.runtime/linux-fault-batch-20261004-protocol.json",
+    "chain": "apps/computer_use/.runtime/linux-fault-batch-chain-01/worker.json",
+    "conditions": [
+      "slow_loading",
+      "focus_dialog",
+      "no_progress"
+    ],
+    "trials": 3,
+    "seconds_per_trial": 600,
+    "tool_call_limit": 100,
+    "retirement_required_before_next": true,
+    "qualifier_not_model_score": true
   }
 }

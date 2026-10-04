@@ -1,13 +1,13 @@
 """Actual host-browser fixture qualification; never a VM or model result."""
 import argparse
 import asyncio
-import contextlib
 import hashlib
 import json
 from pathlib import Path
 import shutil
 import socket
 import subprocess
+import sys
 import time
 
 from playwright.async_api import async_playwright
@@ -15,16 +15,22 @@ from fault_browser_pilot import FIELDS,SERVER
 from browser_pilot import grade_records
 
 
-async def case(browser,directory,condition,viewport):
+async def case(browser,directory,condition,viewport,transport='node'):
     directory.mkdir(exist_ok=False)
     source=SERVER.read_text().replace('__QW3_FAULT_CONDITION__',json.dumps(condition))
     (directory/'server.js').write_text(source)
     with socket.socket() as endpoint:
         endpoint.bind(('127.0.0.1',0));port=endpoint.getsockname()[1]
     stderr=(directory/'server.log').open('wb')
-    process=subprocess.Popen([shutil.which('node'),str(directory/'server.js'),str(directory),str(port)],stdout=stderr,stderr=stderr)
+    if transport=='stdlib':
+        from fault_browser_windows_guest import page
+        (directory/'page.html').write_text(page(condition,SERVER.read_text()),encoding='utf-8')
+        command=[sys.executable,str(Path(__file__).with_name('fault_browser_windows_guest.py')),
+                 '--directory',str(directory),'--condition',condition,'--page',str(directory/'page.html'),'--port',str(port)]
+    else:command=[shutil.which('node'),str(directory/'server.js'),str(directory),str(port)]
+    process=subprocess.Popen(command,stdout=stderr,stderr=stderr)
     context=None
-    result={'condition':condition,'viewport':viewport,'model_used':False,'vm_used':False,
+    result={'condition':condition,'viewport':viewport,'transport':transport,'model_used':False,'vm_used':False,
             'scripted_host_browser_only':True,'started_at':time.time(),
             'fixture_source_sha256':hashlib.sha256(source.encode()).hexdigest(),'checks':{}}
     try:
@@ -86,20 +92,21 @@ async def case(browser,directory,condition,viewport):
 
 
 async def run(args):
-    if not shutil.which('node'):raise ValueError('Use the existing Node runtime')
+    if args.transport=='node' and not shutil.which('node'):raise ValueError('Use the existing Node runtime')
     args.output.mkdir(parents=True,exist_ok=False)
     async with async_playwright() as playwright:
         browser=await playwright.chromium.launch(executable_path=str(args.chrome),headless=True,
             args=['--no-sandbox','--disable-gpu','--no-proxy-server','--disable-background-networking'])
         try:
-            results=await asyncio.gather(*[case(browser,args.output/(name+'-'+condition),condition,viewport)
+            results=await asyncio.gather(*[case(browser,args.output/(name+'-'+condition),condition,viewport,args.transport)
                 for name,viewport in [('desktop',{'width':1360,'height':900}),('mobile',{'width':393,'height':852})]
                 for condition in ['normal','slow_loading','focus_dialog','no_progress']])
         finally:await browser.close()
     summary={'kind':'scripted_host_browser_fault_fixture_qualification','model_used':False,'vm_used':False,
         'native_device_qualification':False,'actual_clock_slow_loading':True,'passed':all(row['passed'] for row in results),
         'checks':sum(len(row['checks']) for row in results),'cases':results,
-        'template_sha256':hashlib.sha256(SERVER.read_bytes()).hexdigest(),
+        'transport':args.transport,'template_sha256':hashlib.sha256(SERVER.read_bytes()).hexdigest(),
+        'stdlib_server_sha256':hashlib.sha256(Path(__file__).with_name('fault_browser_windows_guest.py').read_bytes()).hexdigest() if args.transport=='stdlib' else None,
         'qualification_source_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),'finished_at':time.time()}
     (args.output/'result.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n')
     print({key:summary[key] for key in ['passed','checks','model_used','vm_used']},flush=True)
@@ -110,5 +117,6 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--chrome',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--transport',choices=['node','stdlib'],default='node')
     args=parser.parse_args()
     raise SystemExit(0 if asyncio.run(run(args))['passed'] else 1)
