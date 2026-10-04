@@ -64,11 +64,11 @@ UI19无进度故障处理通过（389.35秒/18调用）：模型修复错误字�
 
 UI19文本11、12均未保存目标文件：361.11秒/15调用、361.79秒/12调用，停止与录像已核验、没有未知输入。编辑器正文已正确写入，两次Save As后的控件观察均是foreground_unmatched、空控件列表，只能视觉操作。12的Desktop侧栏点击(134,98)落在Home，Desktop文件夹的双击(290,451)落在.profile并弹出替换确认；Cancel点击(508,341)也高于实际按钮。模型识别危险的替换后使用Escape取消，没有证明覆盖.profile，目标保存尚未完成。手工观察的目标中心仅用于事后诊断，不作为模型提示或评分输入。纵坐标误差有一致偏高迹象，但尚未证明是模型定位、图像缩放链路或界面状态的哪一项原因，不能据此按固定倍率修正。
 
-文本初始化明确终止旧Gedit并打开空白文档，不能复用Calc“保留旧工作簿”的结论解释这两项失败。初始模型发言还指出画面Chrome和前台Gedit的差异，刷新后恢复一致；截图/前台/控件采集的一致性需要独立核验。优先修复具有真实窗口身份和控件证据的对话框匹配，再单独测相同截图的坐标链路与输入前定位，不降低最终文件验收标准。
+文本初始化明确终止旧Gedit并打开空白文档，不能复用Calc“保留旧工作簿”的结论解释这两项失败。初始模型发言还指出画面Chrome和前台Gedit的差异，刷新后恢复一致；截图/前台/控件采集的一致性需要独立核验。优先修复具有真实窗口身份和控件证据的对话框匹配，再单独测相同截图的坐标链路与输入前定位，不降低最终文件验收标准。 随后只读检查原测试VM确认Save As的实际AT-SPI角色为file chooser；旧驱动只选择frame/dialog，确定漏掉这个角色。独立linux_dialog_candidate.py同时支持官方读取与XML解析的file-chooser角色，仍按精确标题和唯一活动窗口消歧，不增加位置猜测或其他输入例外；十项边界检查通过。在原VM保留的后台Save As树上，六项只读检查通过，候选读到Save和Desktop等目标，旧解析器未匹配，当前真实Chrome前台仍正确拒绝该树。此为后台控件树资格，没有激活窗口或发送输入，不能称为前台输入或模型保存成功。
 
 三平台真实QW3回执丢失阶段中，Android与Windows故障验收通过、Linux失败，三项都未作为独立业务成功。Linux的11项检查中10项成立：原回执找回、未知归零、预算不变、单次原意图送达、查询无新增输入或推理，任务与设备仍暂停；失败的是重启后turn_status从interrupted变为缺失。当前事件处理先记录事件，再修改内存turn_status，之后等待设备暂停/观察，最后保存任务文件；测试看到内存中断状态后关闭应用，可能中止了最后的保存。该持久化竞争已在隔离的事件/设备夹具中复现：未修改SDK49的内存已是interrupted，但等待设备阶段被取消时磁盘记录仍缺少该状态。新增durable_interrupt_candidate.py构建另一个私有候选，只在收到模型终止事件后、任何设备等待之前保存状态；七项检查通过，重启保留中断状态与预算、模型完成仍只记verifying、没有输入或推理。这个资格没有实际模型调用，不能把原Linux失败改成成功；候选仍待真实模型及Windows资格，也没有进入当前40次及后续KVMem包。不能将缺失中断状态解释为已发现新的模型推理或设备输入，也不能改宽原检查后将失败回填为通过。
 
-证据：`.runtime/candidate49-linux-text11-12-diagnostic-01.json`、`.runtime/candidate49-linux-receipt-persistence-diagnostic-01.json`。均只读原记录，当前49b及KVMem候选核心未改变。
+证据：`.runtime/candidate49-linux-text11-12-diagnostic-01.json`、`.runtime/candidate49-linux-receipt-persistence-diagnostic-01.json`、`.runtime/linux-dialog-candidate-01/{build,qualification}.json`。均只读原记录，当前49b及KVMem候选核心未改变。
 
 ## 后续验证顺序
 
