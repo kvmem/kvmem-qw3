@@ -44,8 +44,14 @@ def admitted_child(path,pid=None):
     while time.monotonic()<deadline:
         try:admission=json.loads(path.read_text())
         except (OSError,ValueError):time.sleep(.05);continue
-        if admission.get('status')=='running-separate-pilot' and admission.get('pilot_pid')==(os.getpid() if pid is None else pid):
-            return admission
+        if admission.get('pilot_pid')==(os.getpid() if pid is None else pid):
+            if admission.get('status')=='running-separate-pilot':return admission
+            if admission.get('status')=='running-standalone-pilot':
+                from completed_campaign_pilot import completed_campaign
+                proof=completed_campaign(Path(admission['formal_completion']['campaign']))
+                if proof!=admission['formal_completion']:
+                    raise ValueError('Completed formal campaign identity changed')
+                return admission
         if admission.get('pilot_pid') is not None:break
         time.sleep(.05)
     raise ValueError('Use the identified owned interlude child, never a concurrent model workload')

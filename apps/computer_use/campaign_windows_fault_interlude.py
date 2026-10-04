@@ -1,5 +1,6 @@
 """Reuse the frozen scheduler handoff for one separate Windows recovery pilot."""
 import argparse
+import json
 from pathlib import Path
 import sys
 from unittest.mock import patch
@@ -23,6 +24,15 @@ def run(args):
         state=request(args.app,'/api/state')
         return (result.get('owned_task_retired') is True and not result.get('owned_task_stop_unconfirmed')
                 and state['status']=='idle' and not state.get('uncertain_actions'))
+    plan=json.loads((args.campaign/'plan.json').read_text())
+    if plan.get('status')=='finished':
+        from completed_campaign_pilot import run_completed
+        from osworld_windows.bundle import verify_bundle
+        verify_bundle(args.bundle)
+        if args.engine.resolve()!=Path(plan['engine_runtime']).resolve():
+            raise ValueError('Use the same owned formal engine')
+        child,result_path=specification(args)
+        return run_completed(args,child,result_path,terminal)
     cases=interlude.WINDOWS_CASES|{'windows_browser_fault':('browser',False)}
     with patch.object(interlude,'WINDOWS_CASES',cases),patch.object(interlude,'pilot_spec',specification),\
             patch.object(interlude,'terminal_pilot',terminal):

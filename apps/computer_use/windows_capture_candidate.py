@@ -28,6 +28,31 @@ def digest(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 def generate(base):
     candidate=base
     replacements=[
+        ('    private static Task<ControlHints> pending;',
+         '''    private static Task<ControlHints> pending;
+    private static readonly System.Collections.Concurrent.BlockingCollection<System.Action> requests =
+        new System.Collections.Concurrent.BlockingCollection<System.Action>(1);
+    static DesktopAccessibility() {
+        // Keep all UIA acquisition/cached reads on one lasting MTA apartment,
+        // rather than moving COM element lifetimes between thread-pool tasks.
+        var worker = new System.Threading.Thread(() => {
+            foreach (var collect in requests.GetConsumingEnumerable()) collect();
+        });
+        worker.IsBackground = true;
+        worker.Name = "Qw3ReadOnlyUia";
+        worker.SetApartmentState(System.Threading.ApartmentState.MTA);
+        worker.Start();
+    }'''),
+        ('        pending = Task.Run(() => Collect(handle, width, height));',
+         '''        var completion = new TaskCompletionSource<ControlHints>();
+        pending = completion.Task;
+        requests.Add(() => {
+            try { completion.SetResult(Collect(handle, width, height)); }
+            catch (Exception) { completion.SetResult(new ControlHints { status = "unavailable" }); }
+        });'''),
+        ('            var cache = new CacheRequest();',
+         '            var cache = new CacheRequest();\n'
+         '            cache.AutomationElementMode = AutomationElementMode.None;'),
         ('    public bool focused;\n', '    public bool focused;\n    public string value;\n    public string value_status;\n'),
         ('                ControlType.Edit, ControlType.MenuItem,',
          '                ControlType.Edit, ControlType.Text, ControlType.MenuItem,'),
@@ -65,7 +90,7 @@ def generate(base):
         '$listener = [Net.HttpListener]::new()')
     original="process_id=$PID; version='0.1.0'"
     if candidate.count(original)!=1:raise ValueError('Health provenance anchor changed')
-    candidate=candidate.replace(original,original+"; capture_profile='uia-text-value-v1'; source_sha256=$script:executorSourceSha256; base_source_sha256='"+source_digest+"'")
+    candidate=candidate.replace(original,original+"; capture_profile='uia-text-value-v2'; source_sha256=$script:executorSourceSha256; base_source_sha256='"+source_digest+"'")
     return candidate
 
 
@@ -79,6 +104,7 @@ def stage(output):
               'input_validation_delivery_scopes_receipts_unchanged':True,
               'capture_changes':['visible Text controls','cached ValuePattern values with exact availability',
                                  'password controls excluded before cache retrieval','read-only health source identity'],
+              'uia_threading':'single persistent windowless MTA; cached-only element references; one bounded outstanding capture',
               'qualification_passed':False,'real_model':False}
     (output/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
     return manifest
@@ -91,7 +117,7 @@ def health():
     with opener.open(request,timeout=5) as response:return json.load(response)
 
 
-def install(output):
+def install(output,previous=None):
     manifest=json.loads((output/'manifest.json').read_text())
     if digest(output/'candidate-executor.ps1')!=manifest['candidate_sha256']:
         raise ValueError('Candidate source changed')
@@ -100,6 +126,14 @@ def install(output):
         vm=owned_container('qw3-computer-windows','com.qw3.computer-use.owner','codex-goal-20260930')
         before=health()
         if before.get('paused') is not True:raise ValueError('Pause the owned executor before upgrading capture')
+        installed_expected=manifest['base_sha256']
+        if previous is not None:
+            prior=json.loads((previous/'manifest.json').read_text())
+            if (prior['base_sha256']!=manifest['base_sha256']
+                    or digest(previous/'candidate-executor.ps1')!=prior['candidate_sha256']
+                    or before.get('source_sha256')!=prior['candidate_sha256']):
+                raise ValueError('Previous isolated capture identity changed')
+            installed_expected=prior['candidate_sha256']
         old_pid=before['process_id']
         if type(old_pid) is not int:raise ValueError('No exact executor process identity')
         staged=SHARE/(output.name+'-candidate.ps1');shutil.copyfile(output/'candidate-executor.ps1',staged)
@@ -122,7 +156,7 @@ try {
 }catch{$result.error=$_.Exception.ToString()}
 $result | ConvertTo-Json | Set-Content '\\host.lan\Data\RUN-install.json' -Encoding UTF8
 '''
-        for marker,replacement in [('PID',str(old_pid)),('BASE',manifest['base_sha256']),
+        for marker,replacement in [('PID',str(old_pid)),('BASE',installed_expected),
                                    ('CANDIDATE',manifest['candidate_sha256']),('RUN',output.name)]:
             script=script.replace(marker,replacement)
         target=output/'install.ps1';target.write_text(script,encoding='utf-8-sig')
@@ -139,6 +173,7 @@ $result | ConvertTo-Json | Set-Content '\\host.lan\Data\RUN-install.json' -Encod
             time.sleep(.5)
         report={'kind':'owned_read_only_capture_install','container_id':vm['Id'],
                 'before':before,'after':after,'manifest_sha256':digest(output/'manifest.json'),
+                'previous_installed_source_sha256':installed_expected,
                 'installed':True,'qualification_passed':False,'at':time.time()}
         (output/'install-result.json').write_text(json.dumps(report,indent=2)+'\n')
         return report
@@ -148,6 +183,7 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('operation',choices=['stage','install'])
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--previous',type=Path,help='Verified preceding isolated capture, required for upgrading it')
     args=parser.parse_args()
-    report=stage(args.output) if args.operation=='stage' else install(args.output)
+    report=stage(args.output) if args.operation=='stage' else install(args.output,args.previous)
     print({key:report.get(key) for key in ['candidate_sha256','installed','qualification_passed']})

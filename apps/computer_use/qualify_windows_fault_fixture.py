@@ -18,6 +18,7 @@ from qw3_computer.desktop import Desktop, DesktopRejected
 from qw3_computer.execution import Execution
 import windows_fault_fixture as fixture
 from windows_fault_pilot import independent_grade
+from windows_capture_candidate import health as executor_health
 
 
 def save(path, value):
@@ -46,7 +47,10 @@ async def qualify(args):
             raise ValueError('Administrative probe core differs from the qualified native bundle: '+filename)
     with Path('/tmp/qw3-osworld-vm.lock').open('a+') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        for condition in ('normal','slow_loading','focus_dialog','no_progress'):
+        native=executor_health()
+        report['native_executor']={key:native.get(key) for key in ('process_id','desktop_id','capture_profile',
+                                      'source_sha256','base_source_sha256')}
+        for condition in args.conditions:
             directory=args.output/(args.output.name[:24]+'-'+condition.replace('_','-'))
             directory.mkdir()
             desktop=None;execution=None;descriptor=None
@@ -116,13 +120,10 @@ async def qualify(args):
                     await click(name,{'edit','entry','text-box','textbox'},definition)
                     if condition=='focus_dialog' and name=='Name':
                         await click('Continue form',{'button','push-button'})
-                        focused=[c for c in desktop.latest.get('accessibility',{}).get('controls',[])
-                                 if c.get('name')==name and c.get('kind','').lower() in {'edit','entry','text-box','textbox'}
-                                 and c.get('focused') is True]
-                        # Closing a modal can restore the field's focus. Only
-                        # send another focus click if the fresh receipt does
-                        # not prove this, rather than creating a new transition.
-                        if len(focused)!=1:await click(name,{'edit','entry','text-box','textbox'})
+                        # UIA focus restoration after closing this modal was
+                        # observed without actual text entry. Re-establish the
+                        # field explicitly; completion still needs its value.
+                        await click(name,{'edit','entry','text-box','textbox'})
                     typed=await act({'kind':'type','text':value})
                     value_check=typed['step_check']
                     if not value_check['verified']:
@@ -161,7 +162,9 @@ async def qualify(args):
                 if desktop:await desktop.close()
                 trial['finished_at']=time.time();report['trials'].append(trial);save(args.output/'result.json',report)
             if trial.get('needs_reconciliation') or any(key in trial for key in ('pause_error','cleanup_error')):break
-    report.update(passed=len(report['trials'])==4 and all(t['passed'] for t in report['trials']),
+    report.update(passed=len(report['trials'])==len(args.conditions) and all(t['passed'] for t in report['trials']),
+                  all_four_conditions_qualified=(set(args.conditions)=={'normal','slow_loading','focus_dialog','no_progress'}
+                      and len(report['trials'])==4 and all(t['passed'] for t in report['trials'])),
                   finished_at=time.time())
     save(args.output/'result.json',report)
     return report
@@ -171,6 +174,8 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--bundle',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--conditions',nargs='+',choices=['normal','slow_loading','focus_dialog','no_progress'],
+                        default=['normal','slow_loading','focus_dialog','no_progress'])
     args=parser.parse_args()
     result=asyncio.run(qualify(args))
     print({'passed':result['passed'],'trials':result['trials']},flush=True)

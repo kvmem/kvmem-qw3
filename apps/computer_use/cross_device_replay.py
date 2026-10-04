@@ -42,7 +42,7 @@ function render(side){const t=chosen(side),v=el(side+'Video');v.pause();
  if(t.video){v.src=t.video;v.hidden=false;el(side+'Missing').textContent=''}else{v.removeAttribute('src');v.load();v.hidden=true;el(side+'Missing').textContent='未取得可用录像：'+t.media_status}
  const result=t.kind==='formal-osworld'?'官方评分：'+(t.original_score??'不可用')+' · 无接管通过：'+yn(t.unassisted_passed)+(t.secondary_local_score!=null?'\\n单列本地工作簿指标：'+t.secondary_local_score+'（不是官方分数）':''):'独立产物核验：'+yn(t.artifact_passed)+' · 完整验收：'+yn(t.accepted);
  el(side+'Facts').textContent=t.attempt+'\\n'+(t.kind==='formal-osworld'?'正式 OSWorld · Linux':t.kind==='software-product'?'软件配置验收 · Windows · 受控软件工具':'平台开发任务 · '+t.platform)+' · '+t.arm+'\\n'+result+'\\n任务状态：'+t.agent_status+' · 记录状态：'+t.outcome+'\\n任务耗时：'+sec(t.seconds)+' · 工具调用：'+t.tool_calls+' · 未知动作：'+t.uncertain_actions+'\\n输出预算：'+(t.model_output_tokens??'未记录')+' token · KVMem：'+t.kvmem+' · 视频：'+t.media_kind+'\\n录像时长：'+sec(t.video_duration_seconds)+' · '+t.time_coverage;
- if(t.fault_condition)el(side+'Facts').textContent+='\\n故障：'+t.fault_condition+' · 故障处理验收：'+yn(t.fault_accepted)+(t.fault_condition==='no_progress'?'（安全暂停；业务完成另计）':'');
+ if(t.fault_condition)el(side+'Facts').textContent+='\\n故障：'+t.fault_condition+' · 故障处理验收：'+yn(t.fault_accepted)+(t.fault_condition==='no_progress'?'（考核及时安全暂停；业务完成另计）':'');
  el(side+'Identity').textContent='原结果 SHA256：'+t.result_sha256+(t.video_sha256?' · 导出视频 SHA256：'+t.video_sha256:'');
 }
 function selectTask(){pause();rows=all.filter(t=>t.task===el('task').value);
@@ -109,6 +109,7 @@ def formal_rows(campaign):
             original_score=r.get('score') if r['status']=='scored' else None,
             secondary_local_score=r.get('secondary_local_score'),
             secondary_local_passed=r.get('secondary_local_passed'),
+            started_at=m.get('started_at'),
             unassisted_passed=r.get('unassisted_passed'),seconds=r.get('seconds'),
             tool_calls=r.get('tool_calls'),uncertain_actions=r.get('uncertain_actions'),
             model_output_tokens=state.get('model_output_tokens'),kvmem='on' if m['kvmem'] else 'off',
@@ -121,6 +122,7 @@ def pilot_row(root):
     fault=r.get('fault_condition')
     return root,dict(attempt=identity,task=m['case']+('__'+fault if fault else ''),kind='development-pilot',
         platform=m['case'].split('_',1)[0],arm='verified候选',
+        started_at=m.get('started_at'),
         outcome='accepted' if r.get('accepted') else 'not-accepted',agent_status=r.get('app_status'),
         artifact_passed=r.get('artifact_passed'),accepted=r.get('accepted'),
         seconds=r.get('seconds'),tool_calls=r.get('tool_calls'),uncertain_actions=r.get('uncertain_actions'),
@@ -137,6 +139,7 @@ def product_row(root):
     recording=r.get('recording',{});video=recording.get('artifacts',{}).get('screen.mp4',{})
     return root,dict(attempt=root.name,task=r['task'],kind='software-product',platform='windows',
         arm=r.get('workflow_mode'),outcome=r['status'],agent_status=state.get('status',task.get('outcome')),
+        started_at=r.get('started_at'),
         artifact_passed=guest.get('grade',{}).get('passed'),
         accepted=r.get('passed') is True and recording.get('complete') is True and guest.get('desktop_stopped') is True,
         seconds=task.get('elapsed_seconds'),tool_calls=state.get('tool_calls_used'),
@@ -150,6 +153,9 @@ def export(campaign, pilots, output, port, products=()):
     rows=list(formal_rows(campaign)) if campaign else []
     rows.extend(pilot_row(root) for root in pilots)
     rows.extend(product_row(root) for root in products)
+    # Filesystem glob order is not trial order: the default left/right views
+    # must select the first and latest attempt of each scene consistently.
+    rows.sort(key=lambda pair:(pair[1].get('started_at') or 0,pair[1]['attempt']))
     output.mkdir(parents=True,exist_ok=False)
     exported=[]
     for index,(root,row) in enumerate(rows):
