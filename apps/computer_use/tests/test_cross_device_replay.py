@@ -31,5 +31,13 @@ class RecoveryReplayTests(unittest.TestCase):
             self.assertEqual(row['task'],'linux_browser')
             self.assertIsNone(row['fault_condition'])
 
+    def test_windows_browser_fault_is_not_labeled_linux(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name);self.row(root,'focus_dialog')
+            (root/'pilot-manifest.json').write_text(json.dumps({'case':'windows_browser','video_mode':'vnc'}))
+            row=pilot_row(root)[1]
+            self.assertEqual(row['platform'],'windows')
+            self.assertEqual(row['task'],'windows_browser__focus_dialog')
+
 
 if __name__=='__main__':unittest.main()

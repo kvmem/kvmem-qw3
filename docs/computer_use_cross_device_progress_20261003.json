@@ -665,6 +665,23 @@
       "model_score_valid": false,
       "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/035-legacy-r2/result.json",
       "finished_at": 1791078149.0205479
+    },
+    {
+      "task": "043",
+      "arm": "legacy",
+      "repetition": 2,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 797.7524783234112,
+      "tool_calls": 17,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/043-legacy-r2/result.json",
+      "finished_at": 1791078990.5317972
     }
   ],
   "warnings": [
@@ -1293,13 +1310,11 @@
   "frozen_campaign": {
     "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/plan.json",
     "commit": "9fe52d3ee254786012652ec9fc85f340b71e9dc9",
-    "finished": 34,
+    "finished": 35,
     "total": 40,
-    "current": [
-      "043-legacy-r2"
-    ],
-    "separate_pilot_queued": null,
-    "separate_pilot_status": null
+    "current": [],
+    "separate_pilot_queued": "xdev-linux-fault-batch-02",
+    "separate_pilot_status": "running-separate-pilot"
   },
   "post_freeze_optimizations": {
     "candidate": "cross-device-ui-12",
@@ -1310,8 +1325,8 @@
     "control_id_copy_hint": "Complete20-character observed IDs; the server currently does not enforce identifier enums during decoding, no constrained-decoding benefit claimed"
   },
   "formal_summary": {
-    "ended_attempts": 34,
-    "valid_original_scores": 26,
+    "ended_attempts": 35,
+    "valid_original_scores": 27,
     "infrastructure_failures": 5,
     "unavailable_original_evaluators": 3,
     "successes": 0,
@@ -1339,7 +1354,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791078215.5204737,
+  "updated_at": 1791078997.5222552,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -1480,7 +1495,7 @@
     "preserved_pre_model_attempt": "apps/computer_use/.runtime/xdev-python-repair-01/reconciliation.json",
     "corrected_initial_protocol": "apps/computer_use/.runtime/windows-cross-products-20261004/python-repair-initial-acceptance-v2.json",
     "corrected_repeat_protocol": "apps/computer_use/.runtime/windows-cross-products-20261004/python-repair-repeat-acceptance-v2.json",
-    "real_model_candidate_queued": "xdev-latex-repair-02",
+    "real_model_candidate_queued": null,
     "reset_after_verified_repair": "apps/computer_use/.runtime/xdev-python-fixture-reset-02/result.json",
     "first_valid_repair": {
       "path": "apps/computer_use/.runtime/xdev-python-repair-02/xdev-python-repair-02-trial/result.json",
@@ -1495,19 +1510,26 @@
     },
     "python_valid_repeats": 2,
     "latex_initial_fixture": "apps/computer_use/.runtime/xdev-latex-fixture-01/result.json",
-    "latex_valid_repeats": 1,
-    "latex_first_model_seconds": 55.6648237
+    "latex_valid_repeats": 2,
+    "latex_first_model_seconds": 55.6648237,
+    "latex_repeat_model_seconds": 562.1174021,
+    "latex_repeat_tool_calls": 23
   },
   "public_replay_snapshot": {
-    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-07",
-    "url": "http://127.0.0.1:18139/index.html",
-    "formal_attempts_at_export": 29,
-    "windows_model_trials_at_export": 6,
+    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-08",
+    "url": "http://127.0.0.1:18140/index.html",
+    "formal_attempts_at_export": 34,
+    "windows_model_trials_at_export": 8,
+    "platform_pilots_at_export": 7,
     "includes_python_repair_pair": true,
+    "includes_latex_repair_pair": true,
     "export_is_point_in_time": true,
-    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-07/browser-check.json",
-    "actual_browser_checks_passed": 8,
-    "retained_failed_snapshot_check": "apps/computer_use/.runtime/cross-device-replay-20261004-06/browser-check.json",
+    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check-03.json",
+    "actual_browser_checks_passed": 11,
+    "retained_failed_snapshot_checks": [
+      "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check.json",
+      "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check-02.json"
+    ],
     "partial_formal_videos_not_for_latency_comparison": true
   },
   "material_evidence_audits": {
@@ -1607,11 +1629,32 @@
     "host_passed": 114,
     "host_skipped": 1,
     "model_retest_completed": false,
-    "improvement_demonstrated": false
+    "improvement_demonstrated": false,
+    "frozen_runtime": "apps/computer_use/.runtime/cross-device-ui-13",
+    "commit": "06044fb",
+    "retest_protocol": "apps/computer_use/.runtime/linux-fault-batch-20261004-protocol-02.json",
+    "retest_state": "running",
+    "first_trial": "xdev-linux-slow-loading-02",
+    "windows_fixture_qualification": "apps/computer_use/.runtime/win-fault-qual03",
+    "windows_fixture_qualification_state": "pending"
   },
   "windows_native_client_41": {
     "native_tests_passed": 193,
     "qualification": "apps/computer_use/.runtime/windows-native-client-41/qualification.json",
     "model_retest_completed": false
+  },
+  "windows_native_client_42": {
+    "native_tests_passed": 200,
+    "qualification": "apps/computer_use/.runtime/windows-native-client-42/qualification.json",
+    "model_retest_completed": false
+  },
+  "framework_optimization_14": {
+    "status": "host-qualified-not-model-retested",
+    "host_tests": 114,
+    "passed": 113,
+    "skipped": 1,
+    "diagnosis": "Candidate13 actual model and Windows native fixture revealed control_kind missing from condition oneOf. Added that branch and takeover operation branch; inline step is optional when continuing a saved pending result.",
+    "current_candidate13_sources_frozen": true,
+    "windows_executor_permissions_unchanged": true
   }
 }

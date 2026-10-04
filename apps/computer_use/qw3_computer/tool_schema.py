@@ -156,11 +156,13 @@ workflow_schema['oneOf'] = [
     for op, fields, required in [
         ('status',[],[]),('begin_step',['step_id','goal','conditions'],['step_id','goal','conditions']),
         ('wait',['step_id','timeout_seconds'],[]),('abandon_step',['step_id','reason'],['step_id','reason']),
+        ('request_takeover',['reason'],['reason']),
         ('finish',['conditions','timeout_seconds','goal'],['conditions'])]
 ]
 check_fields = WORKFLOW_TOOLS[0]['inputSchema']['properties']['conditions']['items']['properties']
 WORKFLOW_TOOLS[0]['inputSchema']['properties']['conditions']['items']['oneOf'] = [
-    {'type':'object','properties':{'kind':{'const':kind}, **{key:check_fields[key] for key in fields}},
+    {'type':'object','properties':{'kind':{'const':kind}, **{key:check_fields[key] for key in fields},
+         **({'control_kind':check_fields['control_kind']} if kind=='control_value' else {})},
      'required':['kind', *fields],'additionalProperties':False}
     for kind, fields in [('control_text',['text']),('control_absent',['text']),('control_value',['text','value']),
                          ('foreground_title',['text']),('foreground_app',['text']),('screen_changed',[])]
@@ -175,7 +177,8 @@ def tools_for_platform(platform, workflow=False):
     import copy
     tools = copy.deepcopy(TOOLS)
     if workflow:
-        tools[1]["inputSchema"]["required"].append("step")
+        # Execution requires a step only when no result is pending. Continuing
+        # an existing multi-action step must be representable in the wire schema.
         tools[1]["inputSchema"]["properties"]["coordinate_space"]["enum"] = ["normalized_1000"]
         tools[1]["inputSchema"]["properties"]["coordinate_space"]["description"] = (
             "Required for estimated click/drag/scroll: normalized_1000, both axes0..1000. "
@@ -189,7 +192,7 @@ def tools_for_platform(platform, workflow=False):
             "For system control targets use click_control, not pixel coordinates. "
             "The framework records a step on this exact observation and performs one input in the same call. "
             "Check step_check in the receipt: verified permits a new step; pending needs bounded workflow wait "
-            "or further inputs with the same goal/conditions. To replace a pending step explicitly include "
+            "or further inputs with step omitted. Focus and type may share one value condition. To replace a pending step explicitly include "
             "step.recovery_reason. Do not abandon an already verified step. " + tools[1]["description"])
     else:
         tools[1]["inputSchema"]["properties"].pop("step",None)

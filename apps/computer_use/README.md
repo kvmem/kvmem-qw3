@@ -8,6 +8,13 @@ must submit `step={goal, conditions}` in the same `act` call; this binds to the
 exact observation without a hidden capture. A different pending plan requires
 an explicit recovery reason. Input receipts include the step's verification.
 The `workflow` tool polls or inspects persisted steps and checks final results.
+An unchanged pending condition set keeps its original checkpoint even when the
+action's goal wording changes. To verify a field with the same name as its
+label, `control_value` accepts an exact observed `control_kind`; multiple fields
+of that kind still fail verification. `request_takeover` takes a concrete reason,
+pauses device input, and preserves pending steps and unresolved receipts. Bounded
+workflow waits also participate in the unchanged-state guard, with a 120-second
+window; application changes reset it and active software jobs use their own waits.
 A model turn ending does not pass this gate. Declared visible conditions still need separate
 business acceptance. `legacy` remains available for matched comparisons.
 Successful `workflow finish` pauses input and completes the checked task immediately;

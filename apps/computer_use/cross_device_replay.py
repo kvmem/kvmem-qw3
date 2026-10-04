@@ -120,7 +120,7 @@ def pilot_row(root):
     identity=root.parent.name if root.name=='pilot' else root.name
     fault=r.get('fault_condition')
     return root,dict(attempt=identity,task=m['case']+('__'+fault if fault else ''),kind='development-pilot',
-        platform='android' if m['case'].startswith('android') else 'linux',arm='verified候选',
+        platform=m['case'].split('_',1)[0],arm='verified候选',
         outcome='accepted' if r.get('accepted') else 'not-accepted',agent_status=r.get('app_status'),
         artifact_passed=r.get('artifact_passed'),accepted=r.get('accepted'),
         seconds=r.get('seconds'),tool_calls=r.get('tool_calls'),uncertain_actions=r.get('uncertain_actions'),

@@ -63,6 +63,7 @@ def refresh(progress, campaign):
                                         if job['status']=='running' and not (campaign/job['id']/'result.json').exists()]
     by_id={row['id']:row for row in result['integration_pilots']}
     pilot_paths=[*RUNTIME.glob('candidate-interlude-*/pilot/integration-result.json'),
+                 *RUNTIME.glob('xdev-*/*-pilot/integration-result.json'),
                  *RUNTIME.glob('xdev-*/batch/*/integration-result.json')]
     for path in pilot_paths:
         value=read(path);identity=path.parent.parent.name if path.parent.name=='pilot' else path.parent.name

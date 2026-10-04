@@ -294,6 +294,30 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.desktop.act(request))['duplicate'])
         self.assertEqual(self.effects, 1)
 
+    async def test_inline_field_kind_condition_passes_public_validation_and_preserves_duplicates_as_ambiguous(self):
+        from qw3_computer.execution import Execution
+        from qw3_computer.tool_schema import tools_for_platform
+        self.controls=[{'name':'Name','kind':'entry','value':'Aster','x':0,'y':0,'width':3,'height':3,
+                        'center_x':1,'center_y':1}]
+        await self.desktop.observe()
+        execution=Execution(self.desktop,Path(self.temp.name));self.desktop.execution=execution
+        condition={'kind':'control_value','text':'Name','value':'Aster','control_kind':'entry'}
+        try:
+            first=await self.desktop.act(self.action('field_value_01',action={'kind':'type','text':'Aster'},
+                step={'goal':'Enter the field value','conditions':[condition]}))
+            self.assertTrue(first['step_check']['verified'])
+            self.assertEqual(self.effects,1)
+            self.controls.append(self.controls[0] | {'x':4,'center_x':5})
+            await self.desktop.observe()
+            second=await self.desktop.act(self.action('field_value_02',action={'kind':'type','text':'Aster'},
+                step={'goal':'Enter the next field','conditions':[condition]}))
+            self.assertFalse(second['step_check']['verified'])
+            self.assertEqual(second['step_check']['conditions'][0]['matching_controls'],2)
+            for platform in ['windows','linux','android']:
+                self.assertNotIn('step',tools_for_platform(platform,True)[1]['inputSchema']['required'])
+        finally:
+            self.desktop.execution=None;execution.close()
+
     async def test_old_control_id_with_new_observation_is_rejected_before_dispatch(self):
         controls = await self.observed_controls()
         await self.desktop.observe()

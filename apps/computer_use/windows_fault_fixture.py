@@ -62,7 +62,7 @@ def initialize(value,condition,directory,bundle):
     script=r'''$ErrorActionPreference='Stop'
 $result=@{prepared=$false}
 try {
- $dir='C:\Qw3Computer\CrossDeviceFaults\IDENTITY'
+ $dir='C:\Qw3Computer\P3Tasks\IDENTITY'
  if(Test-Path $dir){throw 'Fixture identity already exists'}
  if(Get-NetTCPConnection -State Listen -LocalPort 18083,8086 -ErrorAction SilentlyContinue){throw 'Native model app or fixture port is occupied'}
  $python='C:\Qw3Computer\clients\CLIENT\python\python.exe'
@@ -76,7 +76,7 @@ try {
  $entries='C:\Qw3Computer\application-entries.json'
  if(Test-Path $entries){Copy-Item $entries "$dir\previous-entries.json"}
  $profile="$dir\BrowserProfile"
- @{version=1;run='IDENTITY';task='cross-device-fault';browser_profile=$profile;browser_urls=@('http://127.0.0.1:8086/');explorer_path='C:\Qw3Computer\outputs'} | ConvertTo-Json | Set-Content $entries -Encoding UTF8
+ @{version=1;run='IDENTITY';task='p3';browser_profile=$profile;browser_urls=@('http://127.0.0.1:8086/');explorer_path='C:\Qw3Computer\outputs'} | ConvertTo-Json | Set-Content $entries -Encoding UTF8
  $worker=Start-Process $python -ArgumentList @('-X','utf8',"$dir\server.py",'--directory',$dir,'--condition','CONDITION','--page',"$dir\page.html",'--port','8086') -WindowStyle Hidden -PassThru -RedirectStandardOutput "$dir\stdout.log" -RedirectStandardError "$dir\stderr.log"
  $result.worker_pid=$worker.Id
  $deadline=[DateTime]::UtcNow.AddSeconds(15)
@@ -103,7 +103,7 @@ def arm(fixture,directory):
     if owned_container('qw3-computer-windows','com.qw3.computer-use.owner','codex-goal-20260930')['Id']!=fixture['container_id']:
         raise ValueError('Windows fixture device changed')
     script=r'''$ErrorActionPreference='Stop'
-$dir='C:\Qw3Computer\CrossDeviceFaults\IDENTITY'
+$dir='C:\Qw3Computer\P3Tasks\IDENTITY'
 $worker=Get-CimInstance Win32_Process -Filter 'ProcessId=PID'
 if(!$worker -or $worker.CommandLine -notlike "*$dir\server.py*"){throw 'Fixture server identity changed'}
 $path="$dir\arm.json"
@@ -119,7 +119,7 @@ def collect(fixture,directory):
     if owned_container('qw3-computer-windows','com.qw3.computer-use.owner','codex-goal-20260930')['Id']!=fixture['container_id']:
         raise ValueError('Fixture container identity changed')
     script=r'''$ErrorActionPreference='Stop'
-$dir='C:\Qw3Computer\CrossDeviceFaults\IDENTITY'
+$dir='C:\Qw3Computer\P3Tasks\IDENTITY'
 $worker=Get-CimInstance Win32_Process -Filter 'ProcessId=PID'
 if($worker -and $worker.CommandLine -notlike "*$dir\server.py*"){throw 'Fixture process identity changed'}
 if($worker){Stop-Process -Id PID -Force}

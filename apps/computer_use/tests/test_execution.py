@@ -180,6 +180,10 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(DesktopError):validate_checks([invalid])
 
     async def test_takeover_retains_pending_steps_and_uncertain_receipts(self):
+        from qw3_computer.tool_schema import WORKFLOW_TOOLS
+        wire=WORKFLOW_TOOLS[0]['inputSchema']
+        self.assertEqual(set(wire['properties']['operation']['enum']),
+                         {branch['properties']['operation']['const'] for branch in wire['oneOf']})
         await self.begin()
         self.device.unresolved_rows = [{'action_id':'lost-reply'}]
         original = self.execution.steps()
