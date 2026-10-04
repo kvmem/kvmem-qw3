@@ -95,7 +95,7 @@ def worker(protocol_path,output):
             directory=output/row['id']
             command=[sys.executable,'-m','platform_pilots','--case',row['case'],'--seconds',str(row['seconds']),
                      '--app',protocol['app'],'--runtime',protocol['app_runtime'],'--output',str(directory),
-                     '--retire-task']
+                     '--retire-task','--linux-video-mode','vnc']
             if row.get('fault'):command+=['--fault',row['fault']]
             with (output/(row['id']+'-launch.log')).open('wb') as log:
                 child=subprocess.Popen(command,cwd=ROOT,stdout=log,stderr=subprocess.STDOUT)
