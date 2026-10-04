@@ -457,20 +457,29 @@ class Controller:
         self.save()
 
     async def note_gui_rejection(self, problem, task_id):
-        """Bound repeated known non-deliveries; observe alone cannot reset it."""
+        """Bound the same mistake, plus a total budget of known non-deliveries.
+
+        Correcting distinct argument fields is not repeating one failed intent.
+        Neither fresh observations nor new action IDs replenish either budget.
+        """
         if self.state["status"] != "running" or self.state.get("id") != task_id:
             return {"paused": self.state["status"] == "paused"}
         guard = self.state.setdefault("gui_recovery", {})
         guard.setdefault("first_rejection_at", time.time())
         guard["rejected_calls"] = guard.get("rejected_calls", 0) + 1
+        category=json.dumps([problem.get('code'),problem.get('path')],separators=(',',':'))
+        categories=guard.setdefault('rejection_categories',{})
+        categories[category]=categories.get(category,0)+1
+        repeated=categories[category]
         guard["last_error"] = problem
         self.save()
-        if guard["rejected_calls"] >= 3:
-            guard["paused_reason"] = "repeated_rejection"
-            self.state["notice"] = "任务连续三次未能发出有效操作，已暂停等待检查或接管。"
+        if repeated >= 3 or guard['rejected_calls'] >= 8:
+            guard["paused_reason"] = "repeated_rejection" if repeated >= 3 else 'rejection_budget'
+            self.state["notice"] = ("同一操作问题连续三次未能纠正，已暂停等待检查或接管。" if repeated >= 3 else
+                                    "多次操作参数修正仍未能发出有效输入，已暂停等待检查或接管。")
             self.save()
             await self.control("pause")
-        return {"rejected_calls": guard["rejected_calls"], "limit": 3,
+        return {"rejected_calls": guard["rejected_calls"], "repeat_count":repeated,"limit": 3,"total_limit":8,
                 "paused": self.state["status"] == "paused"}
 
     async def note_gui_observation(self, observation, task_id, *, minimum_unchanged_seconds=30):

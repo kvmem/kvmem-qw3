@@ -553,6 +553,37 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('gui_recovery', self.controller.state)
         self.assertEqual(self.controller.state['status'], 'running')
 
+    async def test_distinct_format_corrections_do_not_immediately_become_a_repeat_loop(self):
+        from qw3_computer.desktop import DesktopValidationError
+        await self.controller.start_task('Correct units, then declare a step, then recover a pending step')
+        problems=[{'code':'invalid_coordinates','path':'$.coordinate_space'},
+                  {'code':'step_required','path':'$.step'},
+                  {'code':'pending_step','path':'$.step.recovery_reason'}]
+        self.desktop.act=AsyncMock(side_effect=[DesktopValidationError(p | {'message':'No input'}) for p in problems])
+        for index in range(3):
+            result=await self.controller.tool('act',{'action_id':str(index)})
+            text=json.loads(result['content'][0]['text'])
+            self.assertFalse(text['dispatched'])
+            self.assertEqual(text['recovery']['repeat_count'],1)
+            self.assertEqual(self.controller.state['status'],'running')
+        self.assertEqual(self.controller.state['gui_recovery']['rejected_calls'],3)
+        self.controller.client.interrupt.assert_not_called()
+
+    async def test_distinct_errors_still_have_a_total_budget_that_observe_cannot_replenish(self):
+        from qw3_computer.desktop import DesktopValidationError
+        await self.controller.start_task('Never loop forever through different bad fields')
+        self.desktop.act=AsyncMock(side_effect=[DesktopValidationError({'code':'invalid_field',
+            'path':'$.field_'+str(index),'message':'No input'}) for index in range(8)])
+        for index in range(8):
+            result=await self.controller.tool('act',{'action_id':str(index)})
+            self.assertFalse(json.loads(result['content'][0]['text'])['dispatched'])
+            if index<7:await self.controller.tool('observe',{})
+        self.assertEqual(self.controller.state['status'],'paused')
+        self.assertTrue(self.desktop.paused)
+        self.assertEqual(self.controller.state['gui_recovery']['paused_reason'],'rejection_budget')
+        self.assertEqual(self.controller.state['gui_recovery']['rejected_calls'],8)
+        self.controller.client.interrupt.assert_awaited_once()
+
     async def test_evidence_refresh_preserves_error_count_without_triggering_third_format_rejection(self):
         from qw3_computer.desktop import DesktopValidationError
         await self.controller.start_task('Recover after two format corrections and an aged view')
