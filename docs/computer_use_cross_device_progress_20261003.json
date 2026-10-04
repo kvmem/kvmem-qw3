@@ -2357,7 +2357,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791116803.618041,
+  "updated_at": 1791122950.02328,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -2519,52 +2519,56 @@
     "latex_repeat_tool_calls": 23
   },
   "public_replay_snapshot": {
-    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-19",
-    "url": "http://127.0.0.1:18151/index.html",
+    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-21",
+    "url": "http://127.0.0.1:18153/index.html",
     "formal_attempts_at_export": 40,
     "windows_model_trials_at_export": 8,
     "platform_pilots_at_export": 56,
     "includes_python_repair_pair": true,
     "includes_latex_repair_pair": true,
     "export_is_point_in_time": true,
-    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-19/browser-check-01.json",
-    "actual_browser_checks_passed": 87,
+    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-21/browser-check-03.json",
+    "actual_browser_checks_passed": 100,
     "retained_failed_snapshot_checks": [
       "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check.json",
       "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check-02.json",
-      "apps/computer_use/.runtime/cross-device-replay-20261004-17/browser-check-01.json"
+      "apps/computer_use/.runtime/cross-device-replay-20261004-17/browser-check-01.json",
+      "apps/computer_use/.runtime/cross-device-replay-20261004-20/browser-check-01.json"
     ],
     "partial_formal_videos_not_for_latency_comparison": true,
-    "matched_development_osworld_at_export": 13,
+    "matched_development_osworld_at_export": 16,
     "includes_wire_regression_failures": true,
     "development_attempts": 56,
-    "development_osworld_attempts": 13,
+    "development_osworld_attempts": 16,
     "software_product_attempts": 8,
-    "browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-19/browser-check-01.json",
-    "browser_checks_passed": 87,
+    "browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-21/browser-check-03.json",
+    "browser_checks_passed": 100,
     "snapshot_excludes_later_candidate19_trials": false,
     "new_candidate19_terminal_trials_at_export": 8,
     "public_video_storage": "hardlinks of terminal immutable videos; no duplicate video bytes allocated",
-    "previous_snapshot": "apps/computer_use/.runtime/cross-device-replay-20261004-18",
-    "directory": "apps/computer_use/.runtime/cross-device-replay-20261004-19",
+    "previous_snapshot": "apps/computer_use/.runtime/cross-device-replay-20261004-19",
+    "directory": "apps/computer_use/.runtime/cross-device-replay-20261004-21",
     "platform_development_attempts": 56,
     "actual_browser_passed": true,
     "includes_terminal_receipt_trials": true,
     "all_four_candidate49b_terminal_pairs_included": true,
     "snapshot_excludes_later_candidate49b_006_pair": false,
-    "current49b_terminal_trials_at_export": 9,
+    "current49b_terminal_trials_at_export": 12,
     "current49b_matched_pairs_included": [
       "004",
       "013",
       "006",
-      "010"
+      "010",
+      "038",
+      "022"
     ],
     "current49b_038_legacy_r1_included": true,
     "original_failure_rows_retained": true,
     "new_public_videos_use_hardlinks": true,
     "duplicate_video_bytes_allocated": 0,
     "retained_browser_startup_failure_log": "/tmp/qw3-replay19-browser-check01.log",
-    "browser_startup_failure_explained": "Host CPython3.13 environment lacks playwright; browser qualification uses the existing CPython3.12 environment. No dependency was installed."
+    "browser_startup_failure_explained": "Host CPython3.13 environment lacks playwright; browser qualification uses the existing CPython3.12 environment. No dependency was installed.",
+    "new_022_unknown_preserved_and_visible": true
   },
   "material_evidence_audits": {
     "006": {
@@ -2593,10 +2597,10 @@
       0.0
     ],
     "current_cohort_protocol": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/protocol.json",
-    "current_cohort_model_trials_started": 10,
+    "current_cohort_model_trials_started": 15,
     "improvement_demonstrated": false,
     "current_cohort_declared_trials": 40,
-    "current_cohort_queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/queue.json",
+    "current_cohort_queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue.json",
     "previous_candidate45_first_pair": "apps/computer_use/.runtime/linux/candidate45-matched-16k-20261004/first-pair-queue.json",
     "candidate45_first_pair_scores": [
       0.0,
@@ -2612,8 +2616,8 @@
     "waits_for_remaining_eight_followups_and_three_receipt_tests": true,
     "previous_unexecuted_candidate49_retirement": "apps/computer_use/.runtime/linux/candidate49-matched-16k-20261004/retirement-after-quarantine-01.json",
     "current_cohort_status": "running",
-    "current_cohort_model_trials_completed": 9,
-    "current_cohort_current_trial": "038-verified-r1",
+    "current_cohort_model_trials_completed": 14,
+    "current_cohort_current_trial": "043-verified-r1",
     "current_cohort_terminal_trials": [
       {
         "id": "004-verified-r1",
@@ -2865,8 +2869,144 @@
           "unassisted_business_passed": false,
           "accepted": false
         }
+      },
+      {
+        "id": "038-verified-r1",
+        "exit_code": 0,
+        "result": {
+          "status": "scored",
+          "score": 0.0,
+          "passed": false,
+          "stop_reason": "deadline",
+          "agent_status": "stopped",
+          "seconds": 1802.0500124860555,
+          "tool_calls": 30,
+          "uncertain_actions": 0,
+          "turn_error": null,
+          "notice": null,
+          "video_bytes": 2843442,
+          "original_evaluation": 0.0,
+          "unassisted_passed": false,
+          "finished_at": 1791117274.4605372,
+          "candidate_harness": true,
+          "video_collection_passed": true,
+          "video_collection_errors": [],
+          "unassisted_business_passed": false,
+          "accepted": false
+        }
+      },
+      {
+        "id": "022-verified-r1",
+        "exit_code": 0,
+        "result": {
+          "status": "scored",
+          "score": 0.0,
+          "passed": false,
+          "stop_reason": "deadline",
+          "agent_status": "stopped",
+          "seconds": 1802.6709679961205,
+          "tool_calls": 34,
+          "uncertain_actions": 0,
+          "turn_error": null,
+          "notice": null,
+          "video_bytes": 7173410,
+          "original_evaluation": 0.0,
+          "unassisted_passed": false,
+          "finished_at": 1791119138.5782552,
+          "candidate_harness": true,
+          "video_collection_passed": true,
+          "video_collection_errors": [],
+          "unassisted_business_passed": false,
+          "accepted": false
+        }
+      },
+      {
+        "id": "022-legacy-r1",
+        "exit_code": 0,
+        "result": {
+          "status": "scored",
+          "score": 0.0,
+          "passed": false,
+          "agent_status": "paused",
+          "seconds": 49.21247684722766,
+          "tool_calls": 3,
+          "uncertain_actions": 1,
+          "turn_error": null,
+          "notice": "操作结果需要核对，请检查桌面后继续。",
+          "video_bytes": 702857,
+          "original_evaluation": 0.0,
+          "unassisted_passed": false,
+          "finished_at": 1791119246.4885387,
+          "candidate_harness": true,
+          "video_collection_passed": true,
+          "video_collection_errors": [],
+          "unassisted_business_passed": false,
+          "accepted": false
+        }
+      },
+      {
+        "id": "035-legacy-r1",
+        "exit_code": 0,
+        "result": {
+          "status": "evaluator-unavailable",
+          "score": null,
+          "passed": false,
+          "agent_status": "failed",
+          "seconds": 634.1180230760947,
+          "tool_calls": 13,
+          "uncertain_actions": 0,
+          "turn_error": {
+            "message": "stream disconnected before completion: Incomplete response returned, reason: max_output_tokens",
+            "codexErrorInfo": "other",
+            "additionalDetails": null,
+            "misalignment": null
+          },
+          "notice": null,
+          "video_bytes": 1497806,
+          "evaluator_error": "RuntimeError: Task035 evaluator failed during the LLM whole-table judgment.",
+          "secondary_local_score": 0,
+          "secondary_local_passed": false,
+          "unassisted_passed": false,
+          "finished_at": 1791120659.6991384,
+          "candidate_harness": true,
+          "video_collection_passed": true,
+          "video_collection_errors": [],
+          "unassisted_business_passed": false,
+          "accepted": false
+        }
+      },
+      {
+        "id": "035-verified-r1",
+        "exit_code": 0,
+        "result": {
+          "status": "evaluator-unavailable",
+          "score": null,
+          "passed": false,
+          "stop_reason": "deadline",
+          "agent_status": "stopped",
+          "seconds": 1802.2730481741019,
+          "tool_calls": 29,
+          "uncertain_actions": 0,
+          "turn_error": null,
+          "notice": null,
+          "video_bytes": 3124757,
+          "evaluator_error": "RuntimeError: Task035 evaluator failed during the LLM whole-table judgment.",
+          "secondary_local_score": 0,
+          "secondary_local_passed": false,
+          "unassisted_passed": false,
+          "finished_at": 1791122531.8268933,
+          "candidate_harness": true,
+          "video_collection_passed": true,
+          "video_collection_errors": [],
+          "unassisted_business_passed": false,
+          "accepted": false
+        }
       }
-    ]
+    ],
+    "current_cohort_original_halted_queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/queue.json",
+    "current_cohort_continuation_declaration": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/retired-022-continuation.json",
+    "current_cohort_original_unknowns_preserved": 1,
+    "continuation_qualifies_vm_retirement_and_never_replays_unknown": true
   },
   "failure_evidence": {
     "path": "apps/computer_use/.runtime/linux/failure-evidence-26-v2-20261004.json",
@@ -3959,12 +4099,21 @@
     "controller_sha256": "2e9a1b1e881f5c1705e7be1bca55be9fe5589d78b35b2e60e406b6b8d4ad339f",
     "controller_checks_passed": 14,
     "controller_qualification": "apps/computer_use/.runtime/linux/kvmem-matched-49-20261004/controller-qualification-01.json",
-    "queue": "apps/computer_use/.runtime/linux/kvmem-matched-49-20261004/queue-runtime-01/queue.json",
-    "controller_pid": 2542065,
+    "queue": "apps/computer_use/.runtime/linux/kvmem-matched-49-20261004/queue-runtime-02/queue.json",
+    "controller_pid": 2643545,
     "model_trials_started": 0,
     "all_parent_results_required": true,
     "all_parent_vms_retired_required": true,
-    "unknown_input_blocks_dispatch": true
+    "unknown_input_blocks_dispatch": true,
+    "preserved_halted_controller_pid": 2542065,
+    "preserved_halted_queue": "apps/computer_use/.runtime/linux/kvmem-matched-49-20261004/queue-runtime-01/queue.json",
+    "status_at_snapshot": "waiting-for-parent-forty",
+    "continued_wrapper": "apps/computer_use/resumed_kvmem_queue.py",
+    "continued_followup_declaration": "apps/computer_use/.runtime/retired-022-frozen-successors-01.json",
+    "original_trials_profiles_and_source_inventories_unchanged": true,
+    "known_retired_022_unknown_preserved_without_replay": true,
+    "new_unknown_still_blocks_dispatch": true,
+    "actual_model_trials_at_snapshot": 0
   },
   "interruption_persistence_experiment": {
     "build": "apps/computer_use/.runtime/durable-interruption-candidate-01/build.json",
@@ -4031,10 +4180,10 @@
     "protocol_sha256": "b8c09c4465ffd06165bf9c4fce4811c75669bec7c41ab3d4f00a5d96b4bbe220",
     "controller": "apps/computer_use/execution_retest_queue_v2.py",
     "controller_sha256": "5074f4e3e427d47431911f8137f353967caed226810b7a4186773f25bcdc9677",
-    "controller_pid": 2578011,
+    "controller_pid": 2643576,
     "controller_checks_passed": 24,
     "controller_qualification": "apps/computer_use/.runtime/candidate51b-retest-20261004/controller-qualification-01.json",
-    "queue": "apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-01/queue.json",
+    "queue": "apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-02/queue.json",
     "status_at_snapshot": "waiting-for-forty-and-eight",
     "planned_trials": 10,
     "model_trials_completed": 0,
@@ -4055,7 +4204,16 @@
     "historical_unknown_accepted_only_with_exact_frozen_reboot_and_session_proof": true,
     "old_unknown_regraded": false,
     "old_unknown_replayed": false,
-    "quarantine_admission": "apps/computer_use/.runtime/candidate51b-retest-20261004/quarantine-admission.json"
+    "quarantine_admission": "apps/computer_use/.runtime/candidate51b-retest-20261004/quarantine-admission.json",
+    "preserved_halted_controller_pid": 2578011,
+    "preserved_halted_queue": "apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-01/queue.json",
+    "status": "waiting-for-forty-and-eight",
+    "continued_wrapper": "apps/computer_use/resumed_execution_retest_queue.py",
+    "continued_followup_declaration": "apps/computer_use/.runtime/retired-022-frozen-successors-01.json",
+    "original_trials_profiles_and_source_inventories_unchanged": true,
+    "known_retired_022_unknown_preserved_without_replay": true,
+    "new_unknown_still_blocks_dispatch": true,
+    "actual_model_trials_at_snapshot": 0
   },
   "terminal_model_cost_diagnostic": {
     "path": "apps/computer_use/.runtime/candidate49b-terminal-model-cost-03.json",
@@ -4304,5 +4462,68 @@
     "deployment_scheduled": false,
     "current49_kvmem_sdk51b_frozen_sources_unchanged": true,
     "source_and_live_queue_audit": "apps/computer_use/.runtime/completion-comparison-feedback-candidate-01/admission-and-progress-01.json"
+  },
+  "visual_working_context_isolated_candidate": {
+    "recipe": "apps/computer_use/visual_working_context_candidate.py",
+    "build": "apps/computer_use/.runtime/visual-working-context-candidate-03/build.json",
+    "qualification": "apps/computer_use/.runtime/visual-working-context-candidate-03/qualification.json",
+    "host_checks_passed": 34,
+    "actual_codex_mcp_checks_passed": 144,
+    "actual_codex_requests_to_scripted_backend": 33,
+    "retained_terminal_histories_checked": 13,
+    "retained_trace_diagnostic": "apps/computer_use/.runtime/visual-working-context-candidate-03/retained-trace-diagnostic-01.json",
+    "qw3_model_calls": 0,
+    "native_device_inputs": 0,
+    "native_windows_qualified": false,
+    "real_model_retest": false,
+    "deployed_to_active_model_tasks": false,
+    "original_full_source_preserved_losslessly": true,
+    "user_and_ambiguous_images_preserved": true,
+    "historical_reads_cannot_promote_latest_or_clear_progress_guard": true,
+    "history_calls_consume_lifetime_budget": true,
+    "source_missing_pin_uses_explicit_full_input_fallback": true,
+    "latency_improvement_proven": false,
+    "business_improvement_proven": false,
+    "preserved_failed_synthetic_transport": "apps/computer_use/.runtime/visual-working-context-codex-01/failure.json",
+    "source_and_actual_queue_audit": "apps/computer_use/.runtime/visual-working-context-candidate-03/admission-and-progress-01.json",
+    "actual_codex_mcp_qualification": "apps/computer_use/.runtime/visual-working-context-codex-04/result.json",
+    "history_cursor_range_error_is_tool_rejection": true
+  },
+  "retired_022_trial_and_actual_successor_continuation": {
+    "original_case": "022-legacy-r1",
+    "original_result": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/attempts/022-legacy-r1/result.json",
+    "original_unknowns_preserved": 1,
+    "original_task_replayed": false,
+    "original_score_backfilled": false,
+    "continuation_host_checks_passed": 15,
+    "successor_host_checks_passed": 16,
+    "qualification": "apps/computer_use/.runtime/retired-022-frozen-successors-qualification-01.json",
+    "followup_declaration": "apps/computer_use/.runtime/retired-022-frozen-successors-01.json",
+    "actual_registered_controllers": [
+      {
+        "pid": 2639631,
+        "start_ticks": 367571279,
+        "queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue.json",
+        "status": "running",
+        "terminal_trials": 13
+      },
+      {
+        "pid": 2643545,
+        "start_ticks": 367625990,
+        "queue": "apps/computer_use/.runtime/linux/kvmem-matched-49-20261004/queue-runtime-02/queue.json",
+        "status": "waiting-for-parent-forty",
+        "terminal_trials": 0
+      },
+      {
+        "pid": 2643576,
+        "start_ticks": 367626741,
+        "queue": "apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-02/queue.json",
+        "status": "waiting-for-forty-and-eight",
+        "terminal_trials": 0
+      }
+    ],
+    "original_halted_twelve_row_queue_and_zero_trial_waiters_preserved": true,
+    "new_unknown_will_block_further_dispatch": true,
+    "original49_kvmem_sdk51b_profiles_unchanged": true
   }
 }
