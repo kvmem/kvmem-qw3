@@ -4757,44 +4757,31 @@
   },
   "current_matched_osworld_snapshot": {
     "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue_02.json",
-    "status": "running",
-    "terminal_trials": 36,
+    "status": "completed",
+    "terminal_trials": 40,
     "planned_trials": 40,
-    "current_trial": "080-verified-r2",
-    "available_original_scores": 32,
+    "current_trial": null,
+    "available_original_scores": 36,
     "positive_original_scores": 0,
     "original_unknowns_preserved": 2,
     "current_continuation_new_unknowns": 0,
     "last_trial": {
-      "id": "043-verified-r2",
+      "id": "051-verified-r2",
       "exit_code": 0,
       "result": {
         "status": "scored",
         "score": 0.0,
         "passed": false,
         "agent_status": "paused",
-        "seconds": 1187.7657280792482,
-        "tool_calls": 19,
+        "seconds": 13.614933291915804,
+        "tool_calls": 0,
         "uncertain_actions": 0,
         "turn_error": null,
-        "notice": "多次刷新后仍无法发出操作，已暂停。请核对目标或接管。",
-        "video_bytes": 3681853,
-        "original_evaluation": {
-          "score": 0.0,
-          "safety": {
-            "checks": [
-              {
-                "name": "document_integrity",
-                "result": "PASS",
-                "description": "",
-                "penalty": 0.0
-              }
-            ],
-            "total_penalty": 0.0
-          }
-        },
+        "notice": "模型已结束，但完成条件尚未验证。请核对结果或继续验证。",
+        "video_bytes": 551916,
+        "original_evaluation": 0.0,
         "unassisted_passed": false,
-        "finished_at": 1791151508.4930668,
+        "finished_at": 1791155526.1179097,
         "candidate_harness": true,
         "video_collection_passed": true,
         "video_collection_errors": [],
@@ -4802,8 +4789,9 @@
         "accepted": false
       }
     },
-    "at": 1791152960.098437,
-    "actual_live_audit": "apps/computer_use/.runtime/active-recording-and-parent-progress-20261005-02.json"
+    "at": 1791155725.343572,
+    "actual_live_audit": "apps/computer_use/.runtime/native-browser-and-stability-progress-20261005-01.json",
+    "producer_retired": true
   },
   "080_legacy_execution_cost_diagnostic": {
     "report": "apps/computer_use/.runtime/080-legacy-execution-cost-20261004-02.json",
@@ -5226,14 +5214,32 @@
     ]
   },
   "current_40_8_10_12_4_live_status": {
-    "at": 1791152960.098437,
-    "audit": "apps/computer_use/.runtime/active-recording-and-parent-progress-20261005-02.json",
+    "at": 1791155725.343572,
+    "audit": "apps/computer_use/.runtime/native-browser-and-stability-progress-20261005-01.json",
     "parent": {
-      "status": "running",
-      "terminal_trials": 36,
-      "current_trial": "080-verified-r2",
-      "available_original_scores": 32,
-      "positive_original_scores": 0
+      "status": "completed",
+      "terminal_trials": 40,
+      "planned_trials": 40,
+      "current_trial": null,
+      "available_original_scores": 36,
+      "positive_original_scores": 0,
+      "identity": {
+        "pid": 2706506,
+        "uid": 1001,
+        "start_ticks": 368606859,
+        "command": [
+          "third_party/OSWorld-V2/.venv/bin/python",
+          "-m",
+          "retired_051_continuation",
+          "--declaration",
+          "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/retired-051-continuation.json"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "S"
+      },
+      "producer_retired": true,
+      "original_unknowns_preserved": 2,
+      "current_continuation_new_unknowns": 0
     },
     "successors": [
       {
@@ -5255,7 +5261,7 @@
           "cwd": "/home/chaidi/qw3",
           "state": "S"
         },
-        "status": "waiting-for-parent-forty",
+        "status": "resource-wait",
         "completed_trials": 0
       },
       {
@@ -5310,6 +5316,8 @@
       }
     ],
     "readonly_replay": {
+      "stage": "thinking-budget-replay-20261005",
+      "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/actual-controller-01.json",
       "identity": {
         "pid": 2725730,
         "uid": 1001,
@@ -5328,10 +5336,11 @@
         "state": "S"
       },
       "status": "waiting-for-image-twelve",
-      "completed": 0
+      "completed_trials": 0
     },
     "all_original_protocols_unchanged": true,
     "literal_feedback_followup": {
+      "stage": "literal-feedback-matched-retest-20261005",
       "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/actual-controller-01.json",
       "identity": {
         "pid": 3050244,
@@ -5348,14 +5357,10 @@
           "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/queue-runtime-01"
         ],
         "cwd": "/home/chaidi/qw3",
-        "state": "S"
+        "state": "R"
       },
       "status": "waiting-for-forty-eight-ten-twelve-four",
-      "completed_trials": 0,
-      "planned_trials": 8,
-      "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/protocol.json",
-      "protocol_sha256": "2b412349570ef4e1ddf4679a947e3d4ee16e95ffee28a92b4deb744e25379c01",
-      "original_frozen_queues_changed": false
+      "completed_trials": 0
     }
   },
   "second_repetition_readonly_execution_and_cost_diagnostic": {
@@ -5724,6 +5729,66 @@
       "recorder_process_cpu_seconds": 163.749936,
       "encoder_and_remux_cpu_seconds": 395.316428,
       "process_peak_rss_kib": 246992
+    },
+    "native_1800_second_active_calibration_sampling_proven": true,
+    "active_calibration_terminal_result": {
+      "status": "passed",
+      "passed": true,
+      "checks": {
+        "real_inputs_observed_by_native_app": true,
+        "key_click_and_scroll_all_exercised": true,
+        "every_input_result_seen_in_decoded_video": true,
+        "every_video_frame_decodes": true,
+        "full_framebuffers_without_scaling": true,
+        "declared_active_duration_covered": true,
+        "owned_recorder_retired": true,
+        "encoding_and_recovery_evidence_verified": true,
+        "source_pins_unchanged": true,
+        "fixture_result_not_promoted_to_qw3_business_success": true
+      },
+      "native_1800_second_active_calibration_sampling_proven": true,
+      "decoded_frames": 3605,
+      "video_seconds": 1802.5,
+      "witnessed_input_results": 118,
+      "video_sha256": "56bf630fb4f0711423c3e1d201a45458af99ab9f17bd80cfe643255c45007079",
+      "fresh_sampling_uninterrupted": true,
+      "reconnects": 0,
+      "transport_gaps": [],
+      "observed_active_seconds": 1799.5994567330927,
+      "producer": {
+        "pid": 3090437,
+        "uid": 1001,
+        "start_ticks": 370815919,
+        "command": [
+          "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+          "-m",
+          "qualify_active_linux_recording",
+          "--mode",
+          "stability",
+          "--output",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-stability-01",
+          "--qualification",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/recoverable-linux-wrapper-qualification-02/result.json"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "R"
+      },
+      "container_id": "00d0839535a6a6e4736af0f6d52b572d10b9fd034a6889660f9d063ada6e3409",
+      "source_sha256": {
+        "recoverable_linux_recording.py": "8dcdb28128069f8263cc7d2e00800135909987e29881d3295d9bcd6a0dc9d44b",
+        "graceful_recoverable_vnc_recording.py": "cfddde9b86858dc6ce98b067cf103b0ec6713db76a5506210f8899de7e498f58",
+        "tests/test_recoverable_linux_recording.py": "29c2e96cac02cfc2fb7d6c6212188902f6e1f1b067112e8b9e3b4a43642b9388"
+      },
+      "state": "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-stability-01/state.json",
+      "state_sha256": "935795949cebde445822eb0e9f41a3f5904acaa2800944e1854520111e09680b",
+      "inputs": 118,
+      "producer_retired": true,
+      "worker_retired": true,
+      "dedicated_vm_retired": true,
+      "full_task_continuous_observation_proven": false,
+      "qualified_for_task_latency_comparison": false,
+      "model_calls": 0,
+      "qw3_business_success_claimed": false
     }
   },
   "literal_completion_feedback_matched_retest": {
@@ -5924,8 +5989,8 @@
     "first_failed_read_only_audit_retained": "apps/computer_use/.runtime/terminal-cost-audit-preparation-failed-01/result.json"
   },
   "active_native_recording_calibration": {
-    "at": 1791152960.098437,
-    "audit": "apps/computer_use/.runtime/active-recording-and-parent-progress-20261005-02.json",
+    "at": 1791155725.343572,
+    "audit": "apps/computer_use/.runtime/native-browser-and-stability-progress-20261005-01.json",
     "sources": [
       "apps/computer_use/active_recording_fixture.py",
       "apps/computer_use/qualify_active_linux_recording.py",
@@ -6133,17 +6198,17 @@
         }
       }
     ],
-    "scope": "Four dedicated original OSWorld Linux VM smoke attempts, the first three failed. Fourth actual native Tk input/video qualification passed; a fifth independent VM is still undergoing 1800-second stability.",
+    "scope": "Four independent native smoke attempts (first three retained failures, fourth passed) and a fifth independent VM with terminal 1800-second active calibration passed. No QW3/business success claim.",
     "administrative_fixture_creation_and_focus_operations": true,
     "verified_key_click_scroll_calibration_actions": 4,
     "model_calls": 0,
     "existing_device_inputs": 0,
-    "native_1800_second_active_calibration_sampling_proven": false,
+    "native_1800_second_active_calibration_sampling_proven": true,
     "native_active_gui_business_recording_stability_proven": false,
     "production_screenshot_or_input_root_cause_isolated": false,
     "calibration_failure_not_promoted_to_task_success": true,
     "retained_failures_not_overwritten": true,
-    "next_step": "Poll the same registered stability producer and full worker identity to terminal evidence; inspect original tail sampling gaps and full decoded native input outcomes. Do not treat the smoke qualification as full continuous observation or model business success.",
+    "next_step": "Integrate only under a new opt-in declaration with explicit task start/end boundaries and native validation; frozen model runners remain unchanged.",
     "prior_six_test_cpu_qualification": {
       "path": "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-cpu-02/result.json",
       "tests_run": 6,
@@ -6156,7 +6221,9 @@
     },
     "native_60_second_active_calibration_smoke_proven": true,
     "all_completed_attempt_producers_recorders_and_vms_retired": true,
-    "active_stability_live": {
+    "retained_cpu_fixture_error": "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-cpu-03/result.json",
+    "visibility_guard_changes": "Wait at most 15 seconds for new actual pixels inside the same uniquely identified owned X11 window; do not send or retry an action while visibility is unproved. Invalid identity/geometry remains fatal.",
+    "prior_live_snapshot": {
       "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-stability-launch-01/registration.json",
       "identity": {
         "pid": 3090437,
@@ -6309,8 +6376,65 @@
         "state": "R"
       }
     },
-    "retained_cpu_fixture_error": "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-cpu-03/result.json",
-    "visibility_guard_changes": "Wait at most 15 seconds for new actual pixels inside the same uniquely identified owned X11 window; do not send or retry an action while visibility is unproved. Invalid identity/geometry remains fatal."
+    "active_stability_terminal": {
+      "status": "passed",
+      "passed": true,
+      "checks": {
+        "real_inputs_observed_by_native_app": true,
+        "key_click_and_scroll_all_exercised": true,
+        "every_input_result_seen_in_decoded_video": true,
+        "every_video_frame_decodes": true,
+        "full_framebuffers_without_scaling": true,
+        "declared_active_duration_covered": true,
+        "owned_recorder_retired": true,
+        "encoding_and_recovery_evidence_verified": true,
+        "source_pins_unchanged": true,
+        "fixture_result_not_promoted_to_qw3_business_success": true
+      },
+      "native_1800_second_active_calibration_sampling_proven": true,
+      "decoded_frames": 3605,
+      "video_seconds": 1802.5,
+      "witnessed_input_results": 118,
+      "video_sha256": "56bf630fb4f0711423c3e1d201a45458af99ab9f17bd80cfe643255c45007079",
+      "fresh_sampling_uninterrupted": true,
+      "reconnects": 0,
+      "transport_gaps": [],
+      "observed_active_seconds": 1799.5994567330927,
+      "producer": {
+        "pid": 3090437,
+        "uid": 1001,
+        "start_ticks": 370815919,
+        "command": [
+          "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+          "-m",
+          "qualify_active_linux_recording",
+          "--mode",
+          "stability",
+          "--output",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-stability-01",
+          "--qualification",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/recoverable-linux-wrapper-qualification-02/result.json"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "R"
+      },
+      "container_id": "00d0839535a6a6e4736af0f6d52b572d10b9fd034a6889660f9d063ada6e3409",
+      "source_sha256": {
+        "recoverable_linux_recording.py": "8dcdb28128069f8263cc7d2e00800135909987e29881d3295d9bcd6a0dc9d44b",
+        "graceful_recoverable_vnc_recording.py": "cfddde9b86858dc6ce98b067cf103b0ec6713db76a5506210f8899de7e498f58",
+        "tests/test_recoverable_linux_recording.py": "29c2e96cac02cfc2fb7d6c6212188902f6e1f1b067112e8b9e3b4a43642b9388"
+      },
+      "state": "/home/chaidi/qw3/apps/computer_use/.runtime/active-native-recording-stability-01/state.json",
+      "state_sha256": "935795949cebde445822eb0e9f41a3f5904acaa2800944e1854520111e09680b",
+      "inputs": 118,
+      "producer_retired": true,
+      "worker_retired": true,
+      "dedicated_vm_retired": true,
+      "full_task_continuous_observation_proven": false,
+      "qualified_for_task_latency_comparison": false,
+      "model_calls": 0,
+      "qw3_business_success_claimed": false
+    }
   },
   "latest_browser_tab_metadata_stall_diagnostic": {
     "path": "/home/chaidi/qw3/apps/computer_use/.runtime/043-verified-r2-revalidation-context-diagnostic-20261005-01.json",
@@ -6334,5 +6458,233 @@
     "browser_native_provenance_retained": false,
     "production_fix_or_model_success_improvement_proven": false,
     "next_step": "Separate evidence about rendered target/window from non-rendered browser resource metadata using native provenance; qualify content/focus/identity/target changes and real model behavior before deployment. Do not strip arbitrary labels or ignore semantic changes."
-  }
+  },
+  "latest_browser_resource_metadata_coverage": {
+    "terminal_trial_snapshot": 37,
+    "verified_trials_examined": 19,
+    "counts": {
+      "total_revalidation_pairs": 265,
+      "resource_name_only_control_delta_pairs": 42,
+      "resource_only_unchanged_window_without_delivery_pairs": 19
+    },
+    "affected_attempts": [
+      "006-verified-r2",
+      "013-verified-r1",
+      "022-verified-r2",
+      "038-verified-r1",
+      "038-verified-r2",
+      "043-verified-r1",
+      "043-verified-r2"
+    ],
+    "missing_artifacts": [],
+    "model_calls": 0,
+    "device_inputs": 0,
+    "original_artifacts_changed": false,
+    "limits": [
+      "Memory usage classification is descriptive from original names, not a native provenance admission rule.",
+      "Retained old observations have no new native source metadata and cannot be retroactively qualified for dispatch.",
+      "Complete unchanged foreground pixels do not prove off-screen business state or a completed task.",
+      "No input guard, original failures, independent grades or frozen queues were changed."
+    ],
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/browser-resource-label-terminal-coverage-20261005-01.json",
+    "sha256": "233c2fde36a9ea2041ff8158637a796cb036ceae56b98694c691127729b6a4ad"
+  },
+  "native_chrome_tab_source_qualification": {
+    "at": 1791155725.343572,
+    "audit": "apps/computer_use/.runtime/native-browser-and-stability-progress-20261005-01.json",
+    "probes": [
+      {
+        "state": "/home/chaidi/qw3/apps/computer_use/.runtime/chrome-tab-native-source-01/state.json",
+        "state_sha256": "9dc3ce633410ff9d0b6529f66a14d1eec4fdf8d8dfe314f10c6d54e41ac563ec",
+        "identity": {
+          "pid": 3290607,
+          "uid": 1001,
+          "start_ticks": 370964844,
+          "command": [
+            "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+            "-m",
+            "qualify_chrome_tab_source",
+            "--output",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/chrome-tab-native-source-01"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "D"
+        },
+        "status": "failed",
+        "checks": null,
+        "snapshots": 1,
+        "startup_snapshots": 0,
+        "producer_retired": true,
+        "dedicated_vm_retired": true,
+        "source_sha256": {
+          "qualify_chrome_tab_source.py": "4730f35de0db40610f6daa51dcf061c8d9aeba8abdf25757d5f785ee2e1a16e0"
+        },
+        "error": "Own browser source probe failed: Traceback (most recent call last):\n  File \"<string>\", line 6, in <module>\nAssertionError\n "
+      },
+      {
+        "state": "/home/chaidi/qw3/apps/computer_use/.runtime/chrome-tab-native-source-02/state.json",
+        "state_sha256": "03604f30834476aabf20a98c74f9384431b54824bad5be6bf0d956ebafa6ed0f",
+        "identity": {
+          "pid": 3337810,
+          "uid": 1001,
+          "start_ticks": 371006870,
+          "command": [
+            "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+            "-m",
+            "qualify_chrome_tab_source",
+            "--output",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/chrome-tab-native-source-02"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "D"
+        },
+        "status": "failed",
+        "checks": null,
+        "snapshots": 0,
+        "startup_snapshots": 1,
+        "producer_retired": true,
+        "dedicated_vm_retired": true,
+        "source_sha256": {
+          "qualify_chrome_tab_source.py": "744bd4e93f3364fa6085ea0a595e0bac7c5beee7728c8076a2f745a8bd0d8ae9"
+        },
+        "error": "Own browser source probe failed: Traceback (most recent call last):\n  File \"<string>\", line 8, in <module>\nAssertionError\n "
+      },
+      {
+        "state": "/home/chaidi/qw3/apps/computer_use/.runtime/chrome-tab-native-source-03/state.json",
+        "state_sha256": "84dd661fcfd3a63077ab5ec0ef861ff8f158a991e1b0ae7b936ebf00ac2c69cd",
+        "identity": {
+          "pid": 3342428,
+          "uid": 1001,
+          "start_ticks": 371045356,
+          "command": [
+            "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+            "-m",
+            "qualify_chrome_tab_source",
+            "--output",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/chrome-tab-native-source-03"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "D"
+        },
+        "status": "failed",
+        "checks": null,
+        "snapshots": 0,
+        "startup_snapshots": 0,
+        "producer_retired": true,
+        "dedicated_vm_retired": true,
+        "source_sha256": {
+          "qualify_chrome_tab_source.py": "905832792a9d2ba9b6854ec89bb907d1d72b9b19ee028720210040f7955c0b7e"
+        },
+        "error": "Own browser source probe failed: Traceback (most recent call last):\n  File \"<string>\", line 8, in <module>\nAssertionError: {\"expected\": {\"pid\": 1105, \"uid\": 1000, \"start_ticks\": 1075, \"command\": [\"/usr/bin/google-chrome\", \"--no-first-run\", \"--no-default-browser-check\", \"--disable-background-networking\", \"--disable-gpu\", \"--force-renderer-accessibility\", \"--user-data-dir=/home/user/.qw3-native-tab-source-b5637c180ae542e5bb166c828c7b4695/profile\", \"--new-window\", \"file:///home/user/.qw3-native-tab-source-b5637c180ae542e5bb166c828c7b4695/fixture.html\"], \"cwd\": \"/home/user/.qw3-native-tab-source-b5637c180ae542e5bb166c828c7b4695\", \"executable\": \"/opt/google/chrome/chrome\", \"profile_argument\": \"--user-data-dir=/home/user/.qw3-native-tab-source-b5637c180ae542e5bb166c828c7b4695/profile\"}, \"actual_command\": [\"/opt/google/chrome/chrome --no-first-run --no-default-browser-check --disable-background-networking --disable-gpu --force-renderer-accessibility --user-data-dir=/home/user/.qw3-native-tab-source-b5637c180ae542e5bb166c828c7b4695/profile --new-window file:///home/user/.qw3-native-tab-source-b5637c180ae542e5bb166c828c7b4695/fixture.html\"]}\n "
+      },
+      {
+        "state": "/home/chaidi/qw3/apps/computer_use/.runtime/chrome-tab-native-source-04/state.json",
+        "state_sha256": "0a21e7177397b680f472dea67239498ed96c01edf53980751c1a16cdcf5ec5c0",
+        "identity": {
+          "pid": 3345703,
+          "uid": 1001,
+          "start_ticks": 371083519,
+          "command": [
+            "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+            "-m",
+            "qualify_chrome_tab_source",
+            "--output",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/chrome-tab-native-source-04"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "status": "passed",
+        "checks": {
+          "native_browser_owner_verified": true,
+          "selected_tab_observed": true,
+          "selected_native_tab_parentage_retained": true,
+          "actual_resource_name_observed": true,
+          "observations_only_not_input_guard_change": true
+        },
+        "snapshots": 19,
+        "startup_snapshots": 12,
+        "producer_retired": true,
+        "dedicated_vm_retired": true,
+        "source_sha256": {
+          "qualify_chrome_tab_source.py": "98940ca107c93f90af4ec9f78820b1928452c77edb34a110be59c8a0073d93f8",
+          "tests/test_chrome_tab_source.py": "e5b5bb0592a4f72117d70a4921206a1c2067b3293ad7212713f9c0ffe2554449"
+        },
+        "error": null
+      }
+    ],
+    "cpu": {
+      "kind": "native_browser_startup_command_framing_cpu_qualification",
+      "at": 1791155073.1842217,
+      "passed": true,
+      "tests_run": 4,
+      "source_sha256": {
+        "qualify_chrome_tab_source.py": "98940ca107c93f90af4ec9f78820b1928452c77edb34a110be59c8a0073d93f8",
+        "tests/test_chrome_tab_source.py": "e5b5bb0592a4f72117d70a4921206a1c2067b3293ad7212713f9c0ffe2554449"
+      },
+      "actual_retained_packed_argv_case_passed": true,
+      "retained_case": "apps/computer_use/.runtime/chrome-tab-native-source-03/state.json",
+      "retained_case_sha256": "84dd661fcfd3a63077ab5ec0ef861ff8f158a991e1b0ae7b936ebf00ac2c69cd",
+      "model_calls": 0,
+      "device_inputs": 0,
+      "registered_post_startup_commands_remain_literal": true
+    },
+    "native_source": {
+      "chrome_versions": [
+        "Google Chrome 130.0.6723.58"
+      ],
+      "raw_native_tab_names": [
+        "QW3 Native Tab Source c40f81bc776e4d9e948f51641089f813 - Memory usage - 19.2 MB"
+      ],
+      "frame_titles": [
+        "QW3 Native Tab Source c40f81bc776e4d9e948f51641089f813 - Google Chrome"
+      ],
+      "selected_tab_example": {
+        "role": "page tab",
+        "name": "QW3 Native Tab Source c40f81bc776e4d9e948f51641089f813 - Memory usage - 19.2 MB",
+        "description": "",
+        "text": "￼",
+        "native_bus_name": ":1.12",
+        "object_path": "/org/a11y/atspi/accessible/85",
+        "owner_pid": 1081,
+        "selected": true,
+        "visible": true,
+        "showing": true,
+        "enabled": true,
+        "parent_roles": [
+          "frame",
+          "panel",
+          "panel",
+          "panel",
+          "panel",
+          "page tab list",
+          "panel",
+          "panel"
+        ],
+        "attributes": {
+          "class": "Tab",
+          "explicit-name": "true",
+          "posinset": "1",
+          "setsize": "1",
+          "name-from": "attribute"
+        },
+        "children": [
+          {
+            "role": "push button",
+            "name": "Close"
+          }
+        ]
+      },
+      "guard_candidate_implemented": false,
+      "matched_qw3_benefit_proven": false
+    },
+    "zero_model_calls": true,
+    "zero_existing_device_inputs": true,
+    "administrative_browser_launch": true,
+    "calibrated_key_mouse_actions": 0,
+    "guard_candidate_implemented": false,
+    "matched_qw3_improvement_proven": false,
+    "retained_first_three_failed_attempts": true
+  },
+  "latest_actual_progress_audit": "apps/computer_use/.runtime/native-browser-and-stability-progress-20261005-01.json"
 }
