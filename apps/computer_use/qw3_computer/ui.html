@@ -23,7 +23,7 @@ button{border:1px solid #c6cfdc;background:white;border-radius:7px;padding:10px 
 <div class="row"><button class="primary" id="start">开始任务</button><button id="stop">停止</button></div>
 <p class="note">助手只操作选中的测试桌面。你可以随时暂停接管，核对当前画面后继续。</p><div class="warning" id="notice"></div></section>
 <section class="card"><h2>操作与进度</h2><div class="action" id="action">等待任务</div>
-<div class="row"><button id="pause">暂停接管</button><button id="resume">继续任务</button></div>
+<div class="row"><button id="pause">暂停接管</button><button id="resume">继续任务</button><button id="reconcile" hidden>核验上次操作</button></div>
 <label id="ackrow"><input id="ack" type="checkbox"> 我已核对画面，确认可以从当前状态继续。</label>
 <p class="note" id="target"></p></section>
 <section class="card" id="stepsCard" hidden><h2>结果核对</h2><div id="steps" class="messages note"></div><p class="note">每步核对预期结果；最后仍需确认是否满足你的实际需求。</p></section>
@@ -53,6 +53,7 @@ function render(s){state=s;el('status').textContent=s.ready?(labels[s.status]||s
  const running=['starting','running'].includes(s.status),busy=running||s.status==='verifying',paused=s.status==='paused';
  el('start').disabled=!s.ready||busy||paused;el('pause').disabled=!running;el('resume').disabled=!paused||!s.ready;el('stop').disabled=!busy&&!paused;el('refresh').disabled=!s.desktop_paused;
  el('ackrow').style.display=s.uncertain_actions?.length?'block':'none';error(s.notice||s.turn_error?.message||'');
+ el('reconcile').hidden=!s.uncertain_actions?.length;el('reconcile').disabled=!s.desktop_paused||!['paused','stopped'].includes(s.status);
  const actions={click:'点击界面',click_control:'点击控件',type:'输入文字',key:'使用键盘',drag:'拖动',scroll:'滚动',open_app:'打开应用'};
  el('action').textContent=s.current_action?(actions[s.current_action.kind]||'正在操作'):(running?'正在观察和思考…':labels[s.status]||'等待任务');
  const o=s.observation;if(o){el('window').textContent=o.foreground.title||'Windows 桌面';el('target').textContent=`${o.width} × ${o.height} · ${o.foreground.process||'桌面'}`;if(o.sha256!==lastImage){lastImage=o.sha256;el('screen').src='/api/screenshot?v='+encodeURIComponent(lastImage)}}
@@ -62,6 +63,7 @@ function render(s){state=s;el('status').textContent=s.ready?(labels[s.status]||s
 el('start').onclick=()=>post('/api/task',{prompt:el('prompt').value,acknowledge_uncertain:el('ack').checked}).then(s=>{el('ack').checked=false;render(s)}).catch(e=>error(e.message));
 for(const command of ['pause','stop','resume'])el(command).onclick=()=>post('/api/control',{command,acknowledge_uncertain:el('ack').checked}).then(s=>{el('ack').checked=false;render(s)}).catch(e=>error(e.message));
 el('refresh').onclick=()=>post('/api/observe',{}).then(render).catch(e=>error(e.message));
+el('reconcile').onclick=()=>post('/api/reconcile',{}).then(render).catch(e=>error(e.message));
 el('device').onchange=()=>post('/api/device',{device_id:el('device').value}).then(s=>{lastImage='';render(s)}).catch(e=>{el('device').value=state.devices.selected;error(e.message)});
 async function poll(){try{const response=await fetch('/api/state');render(await response.json())}catch(e){error('连接已断开，请检查本地应用。')}setTimeout(poll,600)}poll();
 </script></html>

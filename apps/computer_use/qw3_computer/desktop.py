@@ -105,7 +105,43 @@ class Desktop:
                 result["step_check"] = self.execution.after_delivery(metadata)
             return result
 
-    def unchanged_target_context(self, old, fresh, target):
+    def matched_foreground_bounds(self, old, fresh):
+        """Positive window evidence for Linux; never infer it from absence."""
+        foreground = old.get('foreground')
+        if (old.get('capabilities', {}).get('platform') != 'linux'
+                or fresh.get('capabilities', {}).get('platform') != 'linux'
+                or not isinstance(foreground, dict) or not foreground.get('handle')
+                or not isinstance(foreground.get('title'), str) or not foreground['title']
+                or foreground != fresh.get('foreground')):
+            return None
+        def frames(observation):
+            return [{k: v for k, v in c.items() if k != 'control_id'}
+                    for c in observation.get('accessibility', {}).get('controls', [])
+                    if isinstance(c.get('kind'), str) and c['kind'].casefold() in {'frame', 'window'}
+                    and c.get('name') == foreground['title']]
+        original, current = frames(old), frames(fresh)
+        if len(original) != 1 or original != current:
+            return None
+        frame = original[0]
+        x, y, width, height = (frame.get(k) for k in ('x', 'y', 'width', 'height'))
+        if (any(type(v) is not int for v in (x, y, width, height)) or width <= 0 or height <= 0
+                or not (0 <= x < x + width <= old['width'] and 0 <= y < y + height <= old['height'])
+                or (old['width'], old['height']) != (fresh['width'], fresh['height'])):
+            return None
+        return (x, y, x + width, y + height)
+
+    def unchanged_foreground_window(self, old, fresh):
+        bounds = self.matched_foreground_bounds(old, fresh)
+        if bounds is None:
+            return False
+        from PIL import Image
+        with Image.open(self.runtime/'screenshots'/(old['sha256']+'.png')) as first, \
+             Image.open(self.runtime/'screenshots'/(fresh['sha256']+'.png')) as second:
+            if first.size != (old['width'], old['height']) or second.size != first.size:
+                return False
+            return first.crop(bounds).convert('RGBA').tobytes() == second.crop(bounds).convert('RGBA').tobytes()
+
+    def unchanged_target_context(self, old, fresh, target, *, allow_control_footer=False):
         """Compare stored pixels, never trust a progress hash as target evidence.
 
         A driver may declare desktop chrome outside the working area. Only a
@@ -130,8 +166,21 @@ class Desktop:
             return False
         x, y, width, height = (target.get(k) for k in ('x', 'y', 'width', 'height'))
         if (any(type(v) is not int for v in (x, y, width, height)) or width <= 0 or height <= 0
-                or not (left <= x < x + width <= right and top <= y < y + height <= bottom)):
+                or not (left <= x < x + width <= right and top <= y < y + height <= old['height'])):
             return False
+        if y + height > bottom:
+            # A desktop working region may omit an application's footer as
+            # well as the dock. Extend downward only for a freshly matched
+            # system control inside the same uniquely identified window.
+            # Visual points never receive this exemption. Compare every
+            # pixel in the enlarged rectangle, including the intervening area.
+            if not allow_control_footer:
+                return False
+            frame = self.matched_foreground_bounds(old, fresh)
+            if frame is None or not (frame[0] <= x < x + width <= frame[2]
+                                     and frame[1] <= y < y + height <= frame[3]):
+                return False
+            bounds = [left, top, right, y + height]
         from PIL import Image
         with Image.open(self.runtime/'screenshots'/(old['sha256']+'.png')) as first, \
              Image.open(self.runtime/'screenshots'/(fresh['sha256']+'.png')) as second:
@@ -168,23 +217,39 @@ class Desktop:
             raise DesktopError("Executor receipt does not match the saved action and desktop; reconcile before continuing")
         return result | {"action_id": request["action_id"], "receipt_id": receipt_id}
 
+    async def _reconcile_pending(self):
+        resolved = []
+        for action in self.unresolved():
+            receipt = await self.request('GET', '/actions/' + action['receipt_id'])
+            if receipt.get('status') != 'completed':
+                continue
+            result = self.checked_receipt(receipt['result'], action['receipt_id'], action['request'])
+            mapping = self.db.execute('SELECT mapping FROM coordinate_dispatches WHERE id=?',
+                                      (action['receipt_id'],)).fetchone()
+            if mapping:
+                result = result | {'coordinate_mapping': json.loads(mapping[0])}
+            result = result | {'observation': self.remember(result['observation'])}
+            self.db.execute("UPDATE actions SET status='completed', result=? WHERE id=?",
+                            (json.dumps(result), action['receipt_id']))
+            self.db.commit()
+            resolved.append({'action_id': action['action_id'], 'receipt_id': action['receipt_id']})
+        return {'resolved': resolved, 'remaining': self.unresolved(),
+                'scope': 'Input delivery receipts only; task results still require verification.'}
+
+    async def reconcile_pending(self):
+        """Read saved remote receipts while input remains paused; never replay."""
+        async with self.lock:
+            if not self.paused:
+                raise DesktopError('请先暂停任务，再核验上次操作。')
+            return await self._reconcile_pending()
+
     async def control(self, command, acknowledge_uncertain=False):
         if command != "resume":
             self.paused = True
         if command == "resume":
             # Query the durable remote receipt without reissuing an action.
-            for action in self.unresolved():
-                receipt = await self.request("GET", "/actions/" + action["receipt_id"])
-                if receipt.get("status") == "completed":
-                    result = self.checked_receipt(receipt["result"], action["receipt_id"], action["request"])
-                    mapping = self.db.execute("SELECT mapping FROM coordinate_dispatches WHERE id=?", (action["receipt_id"],)).fetchone()
-                    if mapping:
-                        result = result | {"coordinate_mapping": json.loads(mapping[0])}
-                    metadata = self.remember(result["observation"])
-                    result = result | {"observation": metadata}
-                    self.db.execute("UPDATE actions SET status='completed', result=? WHERE id=?",
-                                    (json.dumps(result), action["receipt_id"]))
-            self.db.commit()
+            async with self.lock:
+                await self._reconcile_pending()
             if self.unresolved():
                 await self.observe()
                 if not acknowledge_uncertain:
@@ -262,7 +327,8 @@ class Desktop:
                              Image.open(self.runtime/'screenshots'/(fresh['sha256']+'.png')) as second:
                             target_valid=first.crop(bounds).convert('RGBA').tobytes()==second.crop(bounds).convert('RGBA').tobytes()
                 context_valid=(aged and guarded_control and target_valid
-                               and self.unchanged_target_context(old,fresh,mapping['control']))
+                               and self.unchanged_target_context(old,fresh,mapping['control'],
+                                                                 allow_control_footer=True))
                 visual_context_valid=False
                 if aged and arguments['action']['kind'] in {'click','drag','scroll'} and controls(old)==controls(fresh):
                     action=dispatched['action']
@@ -271,19 +337,25 @@ class Desktop:
                         {'x':x,'y':y,'width':1,'height':1}) for x,y in points)
                     context_valid=context_valid or visual_context_valid
                 independent_app_intent=arguments['action']['kind']=='open_app'
+                keyboard_context_valid = (aged and arguments['action']['kind'] in {'key', 'type'}
+                    and old.get('accessibility', {}).get('status') == 'ok'
+                    and fresh.get('accessibility', {}).get('status') == 'ok'
+                    and controls(old) == controls(fresh) and self.unchanged_foreground_window(old, fresh))
                 revalidation={'source_observation_id':old['observation_id'],'fresh_observation_id':fresh['observation_id'],
                     'age_milliseconds':time.time()*1000-captured if type(captured) in (int,float) else None,
                     'same_device':same_device,'same_view':same_view,'target_control_valid':target_valid if guarded_control else None,
                     'target_context_unchanged':bool(context_valid),
+                    'foreground_context_unchanged':bool(keyboard_context_valid),
                     'scope':('Explicit allowed app intent' if independent_app_intent else
+                             'Exact full foreground window pixels, identity and semantic evidence' if keyboard_context_valid else
                              'Exact unchanged content and semantic evidence; visual points inside content region' if visual_context_valid else
-                             'Fresh control identity and exact unchanged desktop content region' if context_valid else
+                             'Fresh control identity and exact unchanged desktop content, including proven window footer' if context_valid else
                              'Fresh control identity, bounds and target image region' if guarded_control and not aged else
                              'Exact screenshot, foreground and control evidence'),
                     'input_sent':False}
                 self.db.execute('INSERT INTO revalidations VALUES (?,?,?)',(receipt_id,old['observation_id'],json.dumps(revalidation)))
                 self.db.commit()
-                allowed=same_view or independent_app_intent or visual_context_valid
+                allowed=same_view or independent_app_intent or visual_context_valid or keyboard_context_valid
                 if guarded_control:
                     allowed=target_valid and ((same_view or context_valid) if aged else True)
                 if not same_device or not allowed:

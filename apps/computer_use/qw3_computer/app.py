@@ -456,6 +456,19 @@ class Controller:
         self.state.pop("gui_recovery", None)
         self.save()
 
+    async def reconcile(self):
+        """Check interrupted input without resuming the task or granting budget."""
+        async with self.control_lock:
+            if self.state['status'] not in ('paused', 'stopped') or not self.desktop.paused:
+                raise DesktopError('请先暂停任务，再核验上次操作。')
+            result = await self.desktop.reconcile_pending()
+            self.state['receipt_reconciliation'] = result | {'checked_at': time.time()}
+            self.state['notice'] = ('仍有操作结果未确认，请核对当前画面。' if result['remaining'] else
+                                    '上次操作回执已核验。任务保持暂停，请核对结果后继续。')
+            self.save()
+            await self.desktop.observe()
+            return self.snapshot()
+
     async def note_gui_rejection(self, problem, task_id):
         """Bound the same mistake, plus a total budget of known non-deliveries.
 
@@ -482,7 +495,8 @@ class Controller:
         return {"rejected_calls": guard["rejected_calls"], "repeat_count":repeated,"limit": 3,"total_limit":8,
                 "paused": self.state["status"] == "paused"}
 
-    async def note_gui_observation(self, observation, task_id, *, minimum_unchanged_seconds=30):
+    async def note_gui_observation(self, observation, task_id, *, minimum_unchanged_seconds=30,
+                                   source='observation'):
         if self.state["status"] != "running" or self.state.get("id") != task_id:
             return None
         # An installation job can be making real progress while its desktop
@@ -491,26 +505,36 @@ class Controller:
                 for j in self.software.snapshot(task_id)["jobs"]):
             return None
         guard = self.state.setdefault("gui_recovery", {})
+        refresh = source == 'target_refresh'
+        token_key, since_key, count_key = (('refresh_token', 'refresh_since_monotonic', 'unchanged_refreshes')
+            if refresh else ('observation_token', 'unchanged_since_monotonic', 'unchanged_observations'))
+        if refresh:
+            # An attempted input with refreshed evidence interrupts an
+            # observe-only sequence. Give synchronization its own bounded
+            # counter without clearing argument errors or cumulative budget.
+            for key in ('observation_token', 'unchanged_since_monotonic', 'unchanged_observations'):
+                guard.pop(key, None)
         token = json.dumps([observation.get("foreground"),
                             observation.get("progress_sha256", observation.get("sha256"))], sort_keys=True)
         now = self.recovery_clock()
-        if guard.get("observation_token") != token:
-            guard.update(observation_token=token, unchanged_since_monotonic=now, unchanged_observations=1)
+        if guard.get(token_key) != token:
+            guard.update({token_key: token, since_key: now, count_key: 1})
         else:
-            guard["unchanged_observations"] += 1
+            guard[count_key] += 1
         self.save()
         # A single slow inference is not an observe-only loop. Real changing
         # foreground content resets this window; taskbar clocks do not.
-        if guard["unchanged_observations"] >= 3 and now - guard["unchanged_since_monotonic"] >= minimum_unchanged_seconds:
-            guard["paused_reason"] = "unchanged_observation_loop"
-            self.state["notice"] = "反复查看的窗口持续没有变化，已暂停。请确认是否仍需等待或接管。"
+        if guard[count_key] >= 3 and now - guard[since_key] >= minimum_unchanged_seconds:
+            guard["paused_reason"] = 'unchanged_target_refresh_loop' if refresh else 'unchanged_observation_loop'
+            self.state["notice"] = ('多次刷新后仍无法发出操作，已暂停。请核对目标或接管。' if refresh else
+                                     '反复查看的窗口持续没有变化，已暂停。请确认是否仍需等待或接管。')
             self.save()
             # Interrupting this model tool can cancel its HTTP request. Persist
             # the cause before pause/interrupt, while running remains running.
             # Acceptance still requires the actual paused device/retired task.
             await self.control("pause")
             return {"status": "paused", "reason": guard["paused_reason"],
-                    "unchanged_seconds": now - guard["unchanged_since_monotonic"],
+                    "unchanged_seconds": now - guard[since_key],
                     "hint": "No desktop input was sent. Repeated unchanged observations were paused for user review."}
         return None
 
@@ -615,7 +639,8 @@ class Controller:
                 # format-error counts; never replay input or erase budgets.
                 problem={'code':'evidence_refreshed','path':'$.observation_id','message':str(exc),
                          'hint':'Use this fresh observation to reassess only the next target. No input was sent.'}
-                stalled=await self.note_gui_observation(observation,task_id)
+                stalled=await self.note_gui_observation(observation,task_id,
+                    minimum_unchanged_seconds=120,source='target_refresh')
                 recovery=stalled or {'evidence_refreshed':True,
                     'rejected_calls':self.state.get('gui_recovery',{}).get('rejected_calls',0),'limit':3,
                     'paused':self.state['status']=='paused'}
@@ -625,10 +650,17 @@ class Controller:
             return mcp_observation(observation, {"action_id": arguments.get("action_id"),
                 "status": "rejected", "dispatched": False, "error": str(exc), "problem": problem,
                 "recovery": recovery}) | {"isError": True}
-        except BaseException:
-            if self.desktop.paused:
+        except BaseException as exc:
+            if self.desktop.paused and self.state.get('id') == task_id:
                 self.state["status"] = "paused"
                 self.state["notice"] = "操作结果需要核对，请检查桌面后继续。"
+                self.save()
+                if isinstance(exc, DesktopError) and self.state.get('turn_id'):
+                    # Save uncertainty before interrupting the tool's own
+                    # model turn. Keeping input paused must also stop inference
+                    # from issuing further observations or attempted actions.
+                    with contextlib.suppress(Exception):
+                        await self.client.interrupt(self.state['thread_id'], self.state['turn_id'])
             raise
         finally:
             self.state["current_action"] = None
@@ -747,6 +779,9 @@ def web_app(controller):
         return web.json_response(await controller.followup(body.get("task_id"), body.get("completed_turn_id"),
                                                           body.get("event_id"), body.get("prompt")))
 
+    async def reconcile(request):
+        return web.json_response(await controller.reconcile())
+
     async def observe(request):
         if not controller.desktop.paused:
             raise DesktopError("运行期间请使用暂停接管；刷新观察会使正在推理的坐标失效。")
@@ -770,6 +805,7 @@ def web_app(controller):
     app.router.add_post("/api/task", start)
     app.router.add_post("/api/control", control)
     app.router.add_post("/api/followup", followup)
+    app.router.add_post('/api/reconcile', reconcile)
     app.router.add_post("/api/observe", observe)
     app.router.add_post("/internal/tool", tool)
     return app

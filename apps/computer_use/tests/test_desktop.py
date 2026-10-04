@@ -46,6 +46,7 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.accessibility_extra = {}
         self.observation_extra = {}
         self.receipts = {}
+        self.http_requests = []
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
         buffer = io.BytesIO()
@@ -53,6 +54,7 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.png = buffer.getvalue()
 
         async def handle(request):
+            self.http_requests.append((request.method, request.path))
             if request.path == "/observe":
                 return web.json_response(self.observation())
             if request.path == "/control":
@@ -232,6 +234,87 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.change_pixel((7,0))  # Outside this button; inside the context.
         with self.assertRaises(DesktopRejected):await self.desktop.act(action)
         self.assertEqual(self.effects,0)
+        self.execution.close()
+
+    async def footer_control(self):
+        action = await self.aged_context_control(target_index=1)
+        self.observation_extra['progress_region']['bounds'] = [0, 1, 8, 6]
+        self.controls.append({'name': 'Document', 'kind': 'frame', 'x': 0, 'y': 1,
+                             'width': 8, 'height': 7, 'center_x': 4, 'center_y': 4})
+        controls = (await self.desktop.observe())['accessibility']['controls']
+        self.desktop.latest['captured_at'] = int(time.time()*1000)-65000
+        action.update(observation_id=self.desktop.latest['observation_id'],
+                      action={'kind': 'click_control', 'control_id': controls[1]['control_id']})
+        self.change_pixel((7, 0))  # The external clock, outside both window and working region.
+        return action
+
+    async def test_aged_footer_control_requires_matching_window_and_unchanged_expanded_pixels(self):
+        action = await self.footer_control()
+        result = await self.desktop.act(action)
+        self.assertTrue(result['observation_revalidation']['target_context_unchanged'])
+        self.assertFalse(result['observation_revalidation']['same_view'])
+        self.assertTrue((await self.desktop.act(action))['duplicate'])
+        self.assertEqual(self.effects, 1)
+        self.execution.close()
+
+    async def test_footer_extension_includes_pixels_outside_the_control(self):
+        action = await self.footer_control()
+        self.change_pixel((0, 7))  # Changed footer text away from the matched button.
+        with self.assertRaises(DesktopRejected):
+            await self.desktop.act(action)
+        self.assertEqual(self.effects, 0)
+        self.execution.close()
+
+    async def test_footer_extension_rejects_changed_window(self):
+        action = await self.footer_control()
+        self.controls[-1]['height'] = 6
+        with self.assertRaises(DesktopRejected):
+            await self.desktop.act(action)
+        self.assertEqual(self.effects, 0)
+        self.execution.close()
+
+    async def test_footer_extension_rejects_duplicate_window_evidence(self):
+        action = await self.footer_control()
+        self.controls.append(dict(self.controls[-1]))
+        with self.assertRaises(DesktopRejected):
+            await self.desktop.act(action)
+        self.assertEqual(self.effects, 0)
+        self.execution.close()
+
+    async def test_aged_keyboard_uses_entire_unchanged_foreground_and_semantics_once(self):
+        action = await self.footer_control()
+        action['action'] = {'kind': 'type', 'text': 'Requested value'}
+        result = await self.desktop.act(action)
+        self.assertTrue(result['observation_revalidation']['foreground_context_unchanged'])
+        self.assertTrue((await self.desktop.act(action))['duplicate'])
+        self.assertEqual(self.effects, 1)
+        self.execution.close()
+
+    async def test_keyboard_window_check_rejects_changed_body_even_outside_working_region(self):
+        action = await self.footer_control()
+        action['action'] = {'kind': 'key', 'key': 'ENTER'}
+        self.change_pixel((0, 7))
+        with self.assertRaises(DesktopRejected):
+            await self.desktop.act(action)
+        self.assertEqual(self.effects, 0)
+        self.execution.close()
+
+    async def test_keyboard_window_check_rejects_changed_semantics_or_foreground(self):
+        action = await self.footer_control()
+        action['action'] = {'kind': 'type', 'text': 'Requested value'}
+        self.controls[0]['value'] = 'Changed focus or field value'
+        with self.assertRaises(DesktopRejected):
+            await self.desktop.act(action)
+        self.assertEqual(self.effects, 0)
+        self.execution.close()
+
+    async def test_footer_extension_is_never_used_for_visual_points(self):
+        action = await self.footer_control()
+        action.update(coordinate_space='normalized_1000',
+                      action={'kind': 'click', 'x': 750, 'y': 1000, 'button': 'left', 'clicks': 1})
+        with self.assertRaises(DesktopRejected):
+            await self.desktop.act(action)
+        self.assertEqual(self.effects, 0)
         self.execution.close()
 
     async def test_invalid_or_changed_context_is_not_trusted(self):
@@ -553,6 +636,52 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.desktop.unresolved(), [])
         self.assertTrue((await self.desktop.act(request))["duplicate"])
         self.assertEqual(self.effects, 1)
+
+    async def test_receipts_can_be_reconciled_after_restart_while_input_stays_paused(self):
+        self.mode = 'lost_response'
+        request = self.action(coordinate_space='normalized_1000', action={
+            'kind': 'click', 'x': 500, 'y': 500, 'button': 'left', 'clicks': 1})
+        with self.assertRaises(DesktopError):
+            await self.desktop.act(request)
+        key = self.desktop.unresolved()[0]['receipt_id']
+        await self.desktop.close()
+        self.desktop = Desktop(self.url, 'fixture-token', self.temp.name)
+        await self.desktop.start()
+        before = len(self.http_requests)
+        result = await self.desktop.reconcile_pending()
+        self.assertEqual(self.http_requests[before:], [('GET', '/actions/'+key)])
+        self.assertEqual(result['resolved'], [{'action_id': request['action_id'], 'receipt_id': key}])
+        self.assertEqual(result['remaining'], [])
+        self.assertTrue(self.desktop.paused)
+        self.assertTrue(self.paused)
+        saved = json.loads(self.desktop.db.execute('SELECT result FROM actions WHERE id=?', (key,)).fetchone()[0])
+        self.assertEqual(saved['coordinate_mapping']['dispatched_action']['x'], 4)
+        self.assertEqual(self.effects, 1)
+        with self.assertRaises(DesktopError):
+            await self.desktop.act(request)
+        self.assertEqual(self.effects, 1)
+
+    async def test_paused_reconciliation_keeps_unknown_or_mismatched_receipts_reserved(self):
+        self.mode = 'unknown'
+        with self.assertRaises(DesktopError):
+            await self.desktop.act(self.action())
+        result = await self.desktop.reconcile_pending()
+        self.assertEqual(result['resolved'], [])
+        self.assertEqual(len(result['remaining']), 1)
+        key = result['remaining'][0]['receipt_id']
+        self.receipts[key] = {'status': 'completed', 'result': {
+            'action_id': 'wrong-receipt', 'status': 'completed', 'observation': self.observation()}}
+        with self.assertRaisesRegex(DesktopError, 'does not match'):
+            await self.desktop.reconcile_pending()
+        self.assertTrue(self.desktop.paused)
+        self.assertEqual(len(self.desktop.unresolved()), 1)
+        self.assertEqual(self.effects, 1)
+
+    async def test_paused_reconciliation_rejects_running_input_before_any_query(self):
+        before = len(self.http_requests)
+        with self.assertRaisesRegex(DesktopError, '暂停'):
+            await self.desktop.reconcile_pending()
+        self.assertEqual(len(self.http_requests), before)
 
     async def test_unknown_delivery_requires_explicit_reconciliation(self):
         self.mode = "unknown"

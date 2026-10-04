@@ -605,6 +605,83 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.controller.state['status'],'paused')
         self.assertEqual(self.controller.state['gui_recovery']['rejected_calls'],3)
 
+    async def test_valid_refresh_attempts_do_not_count_as_observe_only_loop_but_remain_bounded(self):
+        await self.controller.start_task('Verify a saved document after a synchronization refresh')
+        self.desktop.act = AsyncMock(side_effect=DesktopRejected('Old view changed; no input sent',
+            observation=self.desktop.latest | {'image': 'fixture'}, evidence_refreshed=True))
+        with patch.object(self.controller, 'recovery_clock', return_value=100):
+            await self.controller.tool('observe', {})
+        for clock in (140, 200):
+            with patch.object(self.controller, 'recovery_clock', return_value=clock):
+                await self.controller.tool('act', {'action_id': str(clock)})
+        self.assertEqual(self.controller.state['status'], 'running')
+        self.assertEqual(self.controller.state['gui_recovery']['unchanged_refreshes'], 2)
+        self.assertNotIn('unchanged_observations', self.controller.state['gui_recovery'])
+        self.controller.client.interrupt.assert_not_called()
+        with patch.object(self.controller, 'recovery_clock', return_value=261):
+            await self.controller.tool('act', {'action_id': 'third-refresh'})
+        self.assertEqual(self.controller.state['status'], 'paused')
+        self.assertEqual(self.controller.state['gui_recovery']['paused_reason'], 'unchanged_target_refresh_loop')
+        self.assertEqual(self.controller.state['tool_calls_used'], 4)
+        self.assertTrue(self.desktop.paused)
+
+    async def test_receipt_reconciliation_keeps_task_paused_and_preserves_budget_and_plan(self):
+        self.controller.state.update(status='paused', id='interrupted-task', thread_id='test-thread',
+                                     turn_id='old-turn', tool_calls_used=100,
+                                     tool_call_limit=100, gui_recovery={'paused_reason': 'receipt_lost'})
+        self.desktop.reconcile_pending = AsyncMock(return_value={'resolved': [{'receipt_id': 'original'}],
+                                                                 'remaining': [], 'scope': 'delivery only'})
+        self.controller.client.turn = AsyncMock()
+        state = await self.controller.reconcile()
+        self.assertEqual(state['status'], 'paused')
+        self.assertTrue(state['desktop_paused'])
+        self.assertEqual(state['tool_calls_used'], 100)
+        self.assertEqual(state['gui_recovery']['paused_reason'], 'receipt_lost')
+        self.controller.client.turn.assert_not_called()
+        self.controller.client.rpc.assert_not_called()
+        self.assertEqual(json.loads(self.controller.state_path.read_text())['receipt_reconciliation']['resolved'],
+                         [{'receipt_id': 'original'}])
+
+    async def test_lost_input_receipt_persists_pause_before_interrupting_model_turn(self):
+        await self.controller.start_task('Complete one desktop operation')
+        pending = [{'receipt_id': 'original', 'status': 'uncertain'}]
+        self.desktop.unresolved = lambda: pending
+        async def lost(_arguments):
+            self.desktop.paused = True
+            raise DesktopError('Completed input reply was lost')
+        self.desktop.act = lost
+        async def interrupted(*_args):
+            saved = json.loads(self.controller.state_path.read_text())
+            self.assertEqual(saved['status'], 'paused')
+            self.assertEqual(saved['tool_calls_used'], 1)
+            self.assertTrue(self.desktop.paused)
+        self.controller.client.interrupt.side_effect = interrupted
+        with self.assertRaisesRegex(DesktopError, 'reply was lost'):
+            await self.controller.tool('act', {'action_id': 'original'})
+        self.controller.client.interrupt.assert_awaited_once()
+        self.assertEqual(self.controller.snapshot()['uncertain_actions'], pending)
+        self.assertEqual(self.controller.state['status'], 'paused')
+
+    async def test_reconciliation_api_refuses_running_task_and_does_not_acknowledge_unknown_delivery(self):
+        self.desktop.reconcile_pending = AsyncMock(return_value={'resolved': [], 'remaining': [{'receipt_id': 'unknown'}]})
+        runner, url = await serve(web_app(self.controller))
+        try:
+            async with aiohttp.ClientSession(trust_env=False) as client:
+                self.controller.state['status'] = 'running'
+                async with client.post(url+'/api/reconcile', json={}) as response:
+                    self.assertEqual(response.status, 409)
+                self.desktop.reconcile_pending.assert_not_called()
+                self.controller.state['status'] = 'paused'
+                async with client.post(url+'/api/reconcile', json={'acknowledge_uncertain': True}) as response:
+                    self.assertEqual(response.status, 200)
+                    state = await response.json()
+                self.assertEqual(state['status'], 'paused')
+                self.assertEqual(state['receipt_reconciliation']['remaining'], [{'receipt_id': 'unknown'}])
+                self.assertTrue(self.desktop.paused)
+                self.controller.client.rpc.assert_not_called()
+        finally:
+            await runner.cleanup()
+
     async def test_unchanged_observe_loop_pauses_but_changing_loading_does_not(self):
         await self.controller.start_task('Observe progress')
         with patch.object(self.controller, 'recovery_clock', return_value=100):
