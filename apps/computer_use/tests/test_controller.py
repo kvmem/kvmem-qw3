@@ -604,6 +604,22 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.controller.state['status'], 'running')
         self.controller.client.interrupt.assert_not_called()
 
+    async def test_validation_rejection_returns_capture_refreshed_during_preflight(self):
+        from qw3_computer.desktop import DesktopValidationError
+        await self.controller.start_task('Continue the existing step')
+        def reject(_arguments):
+            self.desktop.latest = self.desktop.latest | {'observation_id':'fresh'}
+            raise DesktopValidationError({'code':'pending_step','path':'$.step','message':'Existing conditions retained'})
+        self.desktop.act = AsyncMock(side_effect=reject)
+        self.desktop.with_image = lambda observation: observation | {'image':'fixture'}
+        result = await self.controller.tool('act',{'observation_id':'one'})
+        self.assertTrue(result['isError'])
+        payload = json.loads(result['content'][0]['text'])
+        self.assertEqual(payload['observation']['observation_id'],'fresh')
+        self.assertFalse(payload['dispatched'])
+        self.assertEqual(payload['error']['code'],'pending_step')
+        self.assertEqual(self.controller.state['status'],'running')
+
     async def test_repeated_known_executor_rejections_are_bounded(self):
         await self.controller.start_task('Leave a blocked foreground safely')
         self.desktop.act = AsyncMock(side_effect=DesktopRejected('Foreground application is outside the allowed scope'))

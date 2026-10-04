@@ -16,11 +16,13 @@ def validate_checks(checks):
     if not isinstance(checks, list) or not 1 <= len(checks) <= 12:
         raise DesktopError("conditions must contain 1..12 explicit observable conditions")
     for check in checks:
-        if not isinstance(check, dict) or set(check) - {"kind", "text", "value"} or check.get("kind") not in CHECK_KINDS:
+        if not isinstance(check, dict) or set(check) - {"kind", "text", "value", "control_kind"} or check.get("kind") not in CHECK_KINDS:
             raise DesktopError("Unsupported condition; use a documented observable condition")
         required = {"kind"} if check["kind"] == "screen_changed" else {"kind", "text"}
         if check["kind"] == "control_value":
             required.add("value")
+            if "control_kind" in check:
+                required.add("control_kind")
         if set(check) != required or any(not isinstance(check[k], str) or not 1 <= len(check[k]) <= 512 for k in required - {"kind"}):
             raise DesktopError("Condition fields are missing, empty or unsupported")
     return checks
@@ -43,7 +45,8 @@ def check_observation(checks, observation, before):
             passed = complete and not matched
         elif kind == "control_value":
             # Exact value, exact unique control label: never choose a fuzzy match.
-            exact = [c for c in controls if c.get("name") == text]
+            exact = [c for c in controls if c.get("name") == text
+                     and ("control_kind" not in check or c.get("kind") == check["control_kind"])]
             passed = available and len(exact) == 1 and exact[0].get("value") == check["value"]
         elif kind == "foreground_title":
             passed = bool(front.get("title")) and text in front["title"]
@@ -54,8 +57,13 @@ def check_observation(checks, observation, before):
             original = before.get("progress_sha256", before.get("sha256"))
             current = observation.get("progress_sha256", observation.get("sha256"))
             passed = bool(original and current and current != original)
-        evidence.append({"condition": check, "passed": bool(passed), "observation_id": observation.get("observation_id"),
-                         "basis": "visible_observation", "matching_controls": len(matched) if kind.startswith("control_") else None})
+        item = {"condition": check, "passed": bool(passed), "observation_id": observation.get("observation_id"),
+                "basis": "visible_observation", "matching_controls": len(exact) if kind == "control_value"
+                else len(matched) if kind.startswith("control_") else None}
+        if kind == "control_value" and len(exact) > 1:
+            item.update(matching_control_kinds=sorted({str(c.get("kind", "")) for c in exact}),
+                hint="The exact label is ambiguous. Set control_kind to the intended field's observed kind; multiple fields of that kind still cannot be verified.")
+        evidence.append(item)
     return evidence
 
 
@@ -124,7 +132,9 @@ class Execution:
                     raise DesktopError("Step goal must contain 1..1024 characters")
             except DesktopError as exc:
                 raise DesktopValidationError({"code":"invalid_step","path":"$.step","message":str(exc),"hint":"Use a nonempty set of documented observable conditions."}) from exc
-            if pending and (pending[0]["goal"] != definition["goal"] or pending[0]["conditions"] != definition["conditions"]):
+            # The saved result criteria define continuity. Rewording an action
+            # label must not abandon the plan or reset intent reservations.
+            if pending and pending[0]["conditions"] != definition["conditions"]:
                 reason = definition.get("recovery_reason")
                 if not isinstance(reason, str) or not 1 <= len(reason.strip()) <= 1024 or self.desktop.unresolved():
                     raise DesktopValidationError({"code":"pending_step","path":"$.step.recovery_reason",
@@ -196,7 +206,8 @@ class Execution:
             allowed = {"status": {"operation"}, "begin_step": {"operation", "step_id", "goal", "conditions"},
                        "wait": {"operation", "step_id", "timeout_seconds"},
                        "abandon_step": {"operation", "step_id", "reason"},
-                       "finish": {"operation", "conditions", "timeout_seconds", "goal"}}
+                       "finish": {"operation", "conditions", "timeout_seconds", "goal"},
+                       "request_takeover": {"operation", "reason"}}
             required = allowed.get(operation, set()) - {"timeout_seconds"}
             if operation == "wait":
                 required -= {"step_id"}
@@ -206,6 +217,12 @@ class Execution:
                 raise DesktopError("Unsupported workflow operation or fields")
             if operation == "status":
                 return self.status()
+            if operation == "request_takeover":
+                reason = arguments["reason"]
+                if not isinstance(reason, str) or not 1 <= len(reason.strip()) <= 1024:
+                    raise DesktopError("A concrete takeover reason is required")
+                return {"status": "takeover_requested", "reason": reason,
+                        "checkpoint": self.status(), "input_dispatched": False}
             if self.desktop.paused:
                 raise DesktopError("Device is paused; reconcile and resume before workflow changes")
             if "step_id" in arguments and (not isinstance(arguments["step_id"], str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", arguments["step_id"])):

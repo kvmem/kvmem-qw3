@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 from qw3_computer.desktop import DesktopError, DesktopValidationError
-from qw3_computer.execution import Execution, check_observation
+from qw3_computer.execution import Execution, check_observation, validate_checks
 from test_controller import FixtureDesktop, FixtureCodex
 from qw3_computer.app import Controller
 
@@ -149,6 +149,47 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(DesktopError):
             await self.execution.invoke({"operation": "finish", "conditions": [{"kind": "screen_changed"}], "timeout_seconds": 0})
 
+    async def test_reworded_goal_keeps_pending_checkpoint_and_intent_guard(self):
+        await self.begin()
+        original = self.execution.steps()[0]
+        action = {'kind':'key','key':'CTRL+S'}
+        for i in range(2):
+            self.execution.before_dispatch({'step':{'goal':f'Save action {i}', 'conditions':original['conditions']}},
+                                           {'action':action},f'q3_repeat_{i}')
+        self.assertEqual(self.execution.steps(), [original])
+        with self.assertRaises(DesktopValidationError) as caught:
+            self.execution.before_dispatch({'step':{'goal':'Save again','conditions':original['conditions']}},
+                                           {'action':action},'q3_repeat_3')
+        self.assertEqual(caught.exception.problem['code'], 'repeated_intent')
+
+    def test_field_kind_disambiguates_labels_but_not_duplicate_fields(self):
+        controls = [{'name':'Name','kind':'label','value':'Name'},
+                    {'name':'Name','kind':'static','value':'Name'},
+                    {'name':'Name','kind':'entry','value':'Aster'}]
+        observation = {'accessibility':{'status':'ok','truncated':False,'controls':controls}}
+        check = {'kind':'control_value','text':'Name','value':'Aster'}
+        ambiguity = check_observation([check],observation,{})[0]
+        self.assertFalse(ambiguity['passed'])
+        self.assertEqual(ambiguity['matching_controls'], 3)
+        qualified = check | {'control_kind':'entry'}
+        validate_checks([qualified])
+        self.assertTrue(check_observation([qualified],observation,{})[0]['passed'])
+        controls.append({'name':'Name','kind':'entry','value':'Wrong'})
+        self.assertFalse(check_observation([qualified],observation,{})[0]['passed'])
+        for invalid in (check | {'control_kind':''}, {'kind':'control_text','text':'Name','control_kind':'entry'}):
+            with self.assertRaises(DesktopError):validate_checks([invalid])
+
+    async def test_takeover_retains_pending_steps_and_uncertain_receipts(self):
+        await self.begin()
+        self.device.unresolved_rows = [{'action_id':'lost-reply'}]
+        original = self.execution.steps()
+        result = await self.execution.invoke({'operation':'request_takeover','reason':'Delivery needs reconciliation'})
+        self.assertFalse(result['input_dispatched'])
+        self.assertEqual(result['checkpoint']['unresolved_actions'], self.device.unresolved_rows)
+        self.assertEqual(self.execution.steps(), original)
+        with self.assertRaises(DesktopError):
+            await self.execution.invoke({'operation':'request_takeover','reason':' '})
+
     def test_absence_not_proven_by_failed_or_truncated_accessibility(self):
         checks = [{"kind": "control_absent", "text": "Loading"}]
         for status, truncated in (("unavailable", False), ("ok", True)):
@@ -157,6 +198,40 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class VerifiedControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_requested_takeover_pauses_device_and_preserves_checkpoint(self):
+        with tempfile.TemporaryDirectory() as path:
+            controller, checks = await self.make_checked_controller(path)
+            try:
+                controller.state.update(status='running',thread_id='test-thread',turn_id='test-turn')
+                original = controller.workflow.steps()
+                result = await controller.tool('workflow',{'operation':'request_takeover','reason':'The save remains stuck'})
+                self.assertEqual(controller.state['status'], 'paused')
+                self.assertTrue(controller.desktop.paused)
+                self.assertEqual(controller.workflow.steps(), original)
+                controller.client.interrupt.assert_called_once()
+                self.assertFalse(json.loads(result['content'][0]['text'])['task_completed'])
+            finally:await controller.close()
+
+    async def test_bounded_workflow_waits_share_stall_guard_without_counting_polls_as_model_calls(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as path:
+            controller, checks = await self.make_checked_controller(path)
+            try:
+                controller.state.update(status='running',thread_id='test-thread',turn_id='test-turn')
+                pending = await controller.workflow.invoke({'operation':'begin_step','step_id':'save-stall',
+                    'goal':'Save the document','conditions':[{'kind':'control_text','text':'Saved'}]})
+                for clock in (100,150,219):
+                    with patch.object(controller,'recovery_clock',return_value=clock):
+                        await controller.tool('workflow',{'operation':'wait','step_id':pending['step_id'],'timeout_seconds':0})
+                self.assertEqual(controller.state['status'],'running')
+                with patch.object(controller,'recovery_clock',return_value=220):
+                    await controller.tool('workflow',{'operation':'wait','step_id':pending['step_id'],'timeout_seconds':0})
+                self.assertEqual(controller.state['status'],'paused')
+                self.assertEqual(controller.state['gui_recovery']['paused_reason'],'unchanged_observation_loop')
+                self.assertEqual(controller.state['tool_calls_used'],4)
+                self.assertEqual(controller.workflow.steps()[-1]['status'],'pending')
+            finally:await controller.close()
+
     async def make_checked_controller(self, path):
         desktop = FixtureDesktop()
         desktop.task_id = "manual"

@@ -99,9 +99,12 @@ def response_grade(independent,state,*,deadline_reached=False):
     no_uncertain=not state.get('uncertain_actions')
     business=independent['passed'] and independent['saved_visible'] and state['status']=='completed' and no_uncertain
     guard=state.get('gui_recovery',{})
+    takeover=state.get('takeover',{})
+    stopped_for_review=(guard.get('paused_reason')=='unchanged_observation_loop'
+                        or isinstance(takeover.get('reason'),str) and bool(takeover['reason'].strip()))
     prevented_false_completion=(exercised and independent['saved_count']==0
         and state['status']=='paused' and no_uncertain and not deadline_reached
-        and state.get('turn_error') is None and guard.get('paused_reason')=='unchanged_observation_loop')
+        and state.get('turn_error') is None and stopped_for_review)
     passed=(prevented_false_completion if condition=='no_progress' else
             business and exercised and (condition!='focus_dialog' or independent['notice_closed']))
     return {'passed':bool(passed),'condition':condition,'fault_exercised':exercised,

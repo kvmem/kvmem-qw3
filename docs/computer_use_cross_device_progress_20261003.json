@@ -609,6 +609,62 @@
       "model_score_valid": true,
       "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/022-legacy-r2/result.json",
       "finished_at": 1791074641.0093188
+    },
+    {
+      "task": "022",
+      "arm": "verified",
+      "repetition": 2,
+      "status": "scored",
+      "score": 0.0,
+      "agent_status": "paused",
+      "seconds": 820.1202300498262,
+      "tool_calls": 18,
+      "uncertain_actions": 0,
+      "turn_error": null,
+      "unassisted_passed": false,
+      "infrastructure_error": null,
+      "model_score_valid": true,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/022-verified-r2/result.json",
+      "finished_at": 1791075659.093732
+    },
+    {
+      "task": "035",
+      "arm": "verified",
+      "repetition": 2,
+      "status": "infrastructure-failed",
+      "score": null,
+      "agent_status": "paused",
+      "seconds": 54.456933789886534,
+      "tool_calls": 3,
+      "uncertain_actions": 1,
+      "turn_error": null,
+      "unassisted_passed": null,
+      "infrastructure_error": "ConnectionError: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))",
+      "model_score_valid": false,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/035-verified-r2/result.json",
+      "finished_at": 1791076422.3053436
+    },
+    {
+      "task": "035",
+      "arm": "legacy",
+      "repetition": 2,
+      "status": "evaluator-unavailable",
+      "score": null,
+      "agent_status": "failed",
+      "seconds": 367.7941350401379,
+      "tool_calls": 6,
+      "uncertain_actions": 0,
+      "turn_error": {
+        "message": "stream disconnected before completion: Incomplete response returned, reason: max_output_tokens",
+        "codexErrorInfo": "other",
+        "additionalDetails": null,
+        "misalignment": null
+      },
+      "unassisted_passed": false,
+      "infrastructure_error": null,
+      "model_score_valid": false,
+      "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/035-legacy-r2/result.json",
+      "finished_at": 1791078149.0205479
     }
   ],
   "warnings": [
@@ -1088,6 +1144,57 @@
       "fault_response_passed": null,
       "fault_accepted": null,
       "owned_task_retired": null
+    },
+    {
+      "id": "xdev-linux-slow-loading-01",
+      "formal": false,
+      "path": "apps/computer_use/.runtime/xdev-linux-fault-batch-01/batch/xdev-linux-slow-loading-01/integration-result.json",
+      "status": "paused",
+      "seconds": 183.986477966886,
+      "tool_calls": 8,
+      "artifact_passed": false,
+      "accepted": false,
+      "unassisted_passed": false,
+      "video_collection_passed": true,
+      "uncertain_actions": 0,
+      "fault_condition": "slow_loading",
+      "fault_response_passed": false,
+      "fault_accepted": false,
+      "owned_task_retired": true
+    },
+    {
+      "id": "xdev-linux-focus-dialog-01",
+      "formal": false,
+      "path": "apps/computer_use/.runtime/xdev-linux-fault-batch-01/batch/xdev-linux-focus-dialog-01/integration-result.json",
+      "status": "completed",
+      "seconds": 466.3772477339953,
+      "tool_calls": 16,
+      "artifact_passed": true,
+      "accepted": true,
+      "unassisted_passed": true,
+      "video_collection_passed": true,
+      "uncertain_actions": 0,
+      "fault_condition": "focus_dialog",
+      "fault_response_passed": true,
+      "fault_accepted": true,
+      "owned_task_retired": true
+    },
+    {
+      "id": "xdev-linux-no-progress-01",
+      "formal": false,
+      "path": "apps/computer_use/.runtime/xdev-linux-fault-batch-01/batch/xdev-linux-no-progress-01/integration-result.json",
+      "status": "stopped",
+      "seconds": 601.6918626450934,
+      "tool_calls": 17,
+      "artifact_passed": false,
+      "accepted": false,
+      "unassisted_passed": false,
+      "video_collection_passed": true,
+      "uncertain_actions": 0,
+      "fault_condition": "no_progress",
+      "fault_response_passed": false,
+      "fault_accepted": false,
+      "owned_task_retired": true
     }
   ],
   "app_entry": "http://127.0.0.1:18205/",
@@ -1186,13 +1293,13 @@
   "frozen_campaign": {
     "path": "apps/computer_use/.runtime/linux/campaign-v2-20261004/plan.json",
     "commit": "9fe52d3ee254786012652ec9fc85f340b71e9dc9",
-    "finished": 31,
+    "finished": 34,
     "total": 40,
     "current": [
-      "022-verified-r2"
+      "043-legacy-r2"
     ],
-    "separate_pilot_queued": "xdev-latex-repair-02",
-    "separate_pilot_status": "waiting-for-current-formal-attempt"
+    "separate_pilot_queued": null,
+    "separate_pilot_status": null
   },
   "post_freeze_optimizations": {
     "candidate": "cross-device-ui-12",
@@ -1203,10 +1310,10 @@
     "control_id_copy_hint": "Complete20-character observed IDs; the server currently does not enforce identifier enums during decoding, no constrained-decoding benefit claimed"
   },
   "formal_summary": {
-    "ended_attempts": 31,
-    "valid_original_scores": 25,
-    "infrastructure_failures": 4,
-    "unavailable_original_evaluators": 2,
+    "ended_attempts": 34,
+    "valid_original_scores": 26,
+    "infrastructure_failures": 5,
+    "unavailable_original_evaluators": 3,
     "successes": 0,
     "improvement_demonstrated": false
   },
@@ -1232,11 +1339,11 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791076260.651477,
+  "updated_at": 1791078215.5204737,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
-    "started": 7,
+    "started": 8,
     "bundle": "windows-native-client-40",
     "thinking": true,
     "workflow_mode": "verified",
@@ -1244,8 +1351,9 @@
     "timeout_seconds": 900,
     "shared_engine": true,
     "pure_gui": false,
-    "ended": 8,
-    "accepted": 7
+    "ended": 9,
+    "accepted": 8,
+    "latex_repair_accepted_repeats": 2
   },
   "windows_product_attempts": [
     {
@@ -1286,6 +1394,19 @@
       "tool_calls": 4,
       "workflow_mode": "verified",
       "path": "apps/computer_use/.runtime/xdev-latex-repair-01/xdev-latex-repair-01-trial/result.json"
+    },
+    {
+      "id": "xdev-latex-repair-02-trial",
+      "task": "product-latex-repair",
+      "status": "complete",
+      "passed": true,
+      "accepted": true,
+      "model_used": true,
+      "pure_gui": false,
+      "seconds": 562.1174020999997,
+      "tool_calls": 23,
+      "workflow_mode": "verified",
+      "path": "apps/computer_use/.runtime/xdev-latex-repair-02/xdev-latex-repair-02-trial/result.json"
     },
     {
       "id": "xdev-python-new-01-trial",
@@ -1479,5 +1600,18 @@
     "tool_call_limit": 100,
     "retirement_required_before_next": true,
     "qualifier_not_model_score": true
+  },
+  "framework_optimization_13": {
+    "diagnostic": "apps/computer_use/.runtime/cross-device-framework-diagnosis-20261004-01.json",
+    "host_contract_tests": 115,
+    "host_passed": 114,
+    "host_skipped": 1,
+    "model_retest_completed": false,
+    "improvement_demonstrated": false
+  },
+  "windows_native_client_41": {
+    "native_tests_passed": 193,
+    "qualification": "apps/computer_use/.runtime/windows-native-client-41/qualification.json",
+    "model_retest_completed": false
   }
 }

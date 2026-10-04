@@ -303,11 +303,19 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.effects, 0)
         self.assertEqual(self.desktop.unresolved(), [])
 
-    async def test_control_click_rejects_normalized_space_and_unavailable_accessibility(self):
+    async def test_control_click_ignores_redundant_coordinate_space_without_rescaling(self):
         controls = await self.observed_controls()
-        with self.assertRaises(DesktopValidationError):
-            await self.desktop.act(self.action(coordinate_space='normalized_1000',
-                action={'kind': 'click_control', 'control_id': controls[0]['control_id']}))
+        result = await self.desktop.act(self.action(coordinate_space='normalized_1000',
+            action={'kind': 'click_control', 'control_id': controls[1]['control_id']}))
+        self.assertEqual(self.last_dispatched['action']['x'], 6)
+        self.assertEqual(self.last_dispatched['action']['y'], 6)
+        self.assertEqual(result['coordinate_mapping']['coordinate_space'], 'pixels')
+        self.assertEqual(result['coordinate_mapping']['ignored_coordinate_space'], 'normalized_1000')
+        self.assertNotIn('coordinate_space', self.last_dispatched)
+        self.assertEqual(self.effects, 1)
+
+    async def test_control_click_still_rejects_unavailable_accessibility(self):
+        controls = await self.observed_controls()
         self.accessibility_status = 'timeout'
         observation = await self.desktop.observe()
         self.assertTrue(all('control_id' not in c for c in observation['accessibility']['controls']))

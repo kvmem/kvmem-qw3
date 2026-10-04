@@ -106,6 +106,16 @@ class RecoveryGradingTests(unittest.TestCase):
         value=self.sample('slow_loading')
         self.assertFalse(probe.response_grade(value,{'status':'completed','uncertain_actions':[{'status':'uncertain'}]})['passed'])
 
+    def test_explicit_blocker_takeover_is_safe_handling_without_business_success(self):
+        value=self.sample('no_progress')|{'passed':False,'saved_count':0,'saved_visible':False}
+        state={'status':'paused','uncertain_actions':[], 'takeover':{'reason':'Saving remains stuck'}}
+        result=probe.response_grade(value,state)
+        self.assertTrue(result['passed'])
+        self.assertFalse(result['unassisted_business_passed'])
+        self.assertFalse(probe.response_grade(value,state|{'takeover':{'reason':' '}})['passed'])
+        self.assertFalse(probe.response_grade(value,state,deadline_reached=True)['passed'])
+        self.assertFalse(probe.response_grade(value,state|{'uncertain_actions':[{'action_id':'unknown'}]})['passed'])
+
     def test_initializer_reuses_the_owned_transport_without_leaking_patch_to_plain_tasks(self):
         with tempfile.TemporaryDirectory() as name:
             root=Path(name);ordinary=probe.ordinary

@@ -117,23 +117,27 @@ WORKFLOW_TOOLS = [{"name": "workflow", "description":
     "A waiting result is not success and is not evidence that input failed; diagnose focus/dialog/loading before repeating. "
     "For another recovery approach abandon_step with a concrete reason, then begin another step. "
     "status returns durable steps and uncertain receipts. Restarting does not replay input. "
+    "request_takeover with a concrete reason pauses the task and device, preserving pending steps and uncertain receipts. "
+    "Use it before reporting a blocker that prevents safe completion; do not finish or keep waiting indefinitely. "
     "finish requires checked steps and explicit final visible result conditions. screen_changed can verify "
     "a transition but cannot verify final task completion. Conditions: control_text means a visible control name contains text; "
-    "control_absent requires a complete accessibility read; control_value requires a unique exact name and exact value; "
-    "Condition examples: {kind:control_text,text:Saved}, {kind:control_value,text:Name,value:Alice}, "
+    "control_absent requires a complete accessibility read; control_value requires a unique exact name and exact value. "
+    "If labels and fields share a name, set control_kind to the intended field's exact observed kind. "
+    "Condition examples: {kind:control_text,text:Saved}, {kind:control_value,text:Name,value:Alice,control_kind:entry}, "
     "{kind:foreground_app,text:settings}, {kind:screen_changed}. Use text, never value, for foreground_app. "
     "foreground_title contains text; foreground_app is an observed exact process or an app alias explicitly listed in "
     "device capabilities app_processes. Do not guess a process name before launch; use the provided app alias. screen_changed compares foreground "
     "image evidence with step start. Conditions describe task evidence, never commands or grader answers. "
     "Declared visible conditions do not replace independent business acceptance.",
     "inputSchema": {"type": "object", "properties": {
-        "operation": {"type": "string", "enum": ["status", "begin_step", "wait", "abandon_step", "finish"]},
+        "operation": {"type": "string", "enum": ["status", "begin_step", "wait", "abandon_step", "finish", "request_takeover"]},
         "step_id": {"type": "string"}, "goal": {"type": "string"}, "reason": {"type": "string"},
         "timeout_seconds": {"type": "integer", "minimum": 0, "maximum": 20},
         "conditions": {"type": "array", "minItems": 1, "maxItems": 12, "items": {
             "type": "object", "properties": {
                 "kind": {"type": "string", "enum": ["control_text", "control_absent", "control_value", "foreground_title", "foreground_app", "screen_changed"]},
-                "text": {"type": "string"}, "value": {"type": "string"}},
+                "text": {"type": "string"}, "value": {"type": "string"},
+                "control_kind": {"type": "string", "description": "Only for control_value: copy the intended field's exact observed kind to distinguish it from same-named labels."}},
             "required": ["kind"], "additionalProperties": False}}},
         "required": ["operation"], "additionalProperties": False},
     "annotations": {"readOnlyHint": False, "idempotentHint": False}}]

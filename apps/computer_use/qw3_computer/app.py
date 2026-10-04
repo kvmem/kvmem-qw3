@@ -473,7 +473,7 @@ class Controller:
         return {"rejected_calls": guard["rejected_calls"], "limit": 3,
                 "paused": self.state["status"] == "paused"}
 
-    async def note_gui_observation(self, observation, task_id):
+    async def note_gui_observation(self, observation, task_id, *, minimum_unchanged_seconds=30):
         if self.state["status"] != "running" or self.state.get("id") != task_id:
             return None
         # An installation job can be making real progress while its desktop
@@ -492,7 +492,7 @@ class Controller:
         self.save()
         # A single slow inference is not an observe-only loop. Real changing
         # foreground content resets this window; taskbar clocks do not.
-        if guard["unchanged_observations"] >= 3 and now - guard["unchanged_since_monotonic"] >= 30:
+        if guard["unchanged_observations"] >= 3 and now - guard["unchanged_since_monotonic"] >= minimum_unchanged_seconds:
             await self.control("pause")
             guard["paused_reason"] = "unchanged_observation_loop"
             self.state["notice"] = "反复查看的窗口持续没有变化，已暂停。请确认是否仍需等待或接管。"
@@ -534,9 +534,22 @@ class Controller:
             raise DesktopError("Task is not running; wait for user resume")
         if name == "workflow":
             result = await self.workflow.invoke(arguments)
+            if result.get("status") == "takeover_requested":
+                # Keep pending steps and uncertain receipts intact. A pause is
+                # acknowledged by the device before it is reported as safe.
+                await self.control("pause")
+                self.state["takeover"] = {"reason": result["reason"], "requested_at": time.time()}
+                self.state["notice"] = "任务需要接管，已暂停并保留进度。"
+                self.save()
+                result.update(status="paused", task_completed=False, desktop_paused=self.desktop.paused)
             if arguments.get("operation") == "finish" and result.get("verified"):
                 result["task_completed"] = await self.complete_checked_workflow(task_id, result)
             if "observation" in result:
+                if result.get("status") == "waiting":
+                    recovery = await self.note_gui_observation(result["observation"], task_id,
+                                                              minimum_unchanged_seconds=120)
+                    if recovery:
+                        result["recovery"] = recovery
                 return mcp_observation(result["observation"], result)
             return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}
         if name == "software":
@@ -565,9 +578,17 @@ class Controller:
             return mcp_observation(result["observation"], result)
         except DesktopValidationError as exc:
             recovery = await self.note_gui_rejection(exc.problem, task_id)
-            return {"isError": True, "content": [{"type": "text", "text": json.dumps({
+            failure = {
                 "status": "invalid_arguments", "dispatched": False, "error": exc.problem,
-                "recovery": recovery}, ensure_ascii=False)}]}
+                "recovery": recovery}
+            # Target revalidation can capture a fresh observation before a
+            # later step check rejects the call. Expose those IDs to the model.
+            latest = self.desktop.latest
+            if (latest and isinstance(arguments, dict)
+                    and arguments.get("observation_id") is not None
+                    and arguments.get("observation_id") != latest.get("observation_id")):
+                return mcp_observation(self.desktop.with_image(latest), failure) | {"isError": True}
+            return {"isError": True, "content": [{"type": "text", "text": json.dumps(failure, ensure_ascii=False)}]}
         except DesktopRejected as exc:
             # The guest explicitly confirms that no input was dispatched.
             # Return a current screen so recovery need not spend a model turn

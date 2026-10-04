@@ -42,8 +42,8 @@ def identify_controls(observation):
 
 
 def resolve_control(arguments, observation):
-    if arguments.get("coordinate_space") not in (None, "pixels"):
-        raise TargetError("click_control uses the observed control's pixel bounds; do not supply normalized coordinates.")
+    # A control ID contains no model coordinates. A redundant space declaration
+    # cannot change its resolved target; action validation still forbids x/y.
     accessibility = observation.get("accessibility", {})
     if not isinstance(accessibility, dict) or accessibility.get("status") != "ok":
         raise TargetError("Accessibility controls are unavailable for this observation.")
@@ -60,4 +60,6 @@ def resolve_control(arguments, observation):
         "observation_id": observation["observation_id"], "control_id": control_id,
         "control": control, "input_action": arguments["action"], "dispatched_action": action,
         "width": observation["width"], "height": observation["height"]}
+    if "coordinate_space" in arguments:
+        mapping["ignored_coordinate_space"] = arguments["coordinate_space"]
     return dispatched, mapping
