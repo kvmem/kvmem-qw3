@@ -141,7 +141,8 @@ class LinuxDriver:
         with Image.open(io.BytesIO(png)) as image:
             width,height=image.size
             # Exclude the desktop's clock, dock and cursor from foreground progress.
-            region=image.crop((75,30,width,max(31,height-45))).convert('RGB')
+            bounds=(min(75,width-1),min(30,height-1),width,max(min(31,height),height-45))
+            region=image.crop(bounds).convert('RGB')
             progress=hashlib.sha256(region.tobytes()).hexdigest()
         accessibility={'status':'unavailable','controls':[],'truncated':False,'scope':'foreground_window'}
         began=time.monotonic()
@@ -158,7 +159,9 @@ class LinuxDriver:
                              provider='official-osworld-create_atspi_node',read_deadline_seconds=4)
         after=await self.foreground()
         if before!=after:accessibility={'status':'foreground_changed','controls':[],'truncated':False}
-        return {'png':png,'foreground':after,'accessibility':accessibility,'progress_sha256':progress}
+        return {'png':png,'foreground':after,'accessibility':accessibility,'progress_sha256':progress,
+                'progress_region':{'bounds':list(bounds),'coordinate_space':'pixels',
+                                   'scope':'linux_desktop_content_without_clock_and_dock'}}
 
     async def preflight(self,action,observation):
         if action['kind']=='open_app':

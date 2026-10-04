@@ -105,6 +105,40 @@ class Desktop:
                 result["step_check"] = self.execution.after_delivery(metadata)
             return result
 
+    def unchanged_control_context(self, old, fresh, target):
+        """Compare stored pixels, never trust a progress hash as target evidence.
+
+        A driver may declare desktop chrome outside the working area. Only a
+        control entirely inside an unchanged working area can use this path;
+        a dialog's changed text still invalidates its unchanged button.
+        """
+        region = old.get('progress_region')
+        if (not isinstance(region, dict) or region != fresh.get('progress_region')
+                or region.get('coordinate_space') != 'pixels'
+                or region.get('scope') != 'linux_desktop_content_without_clock_and_dock'
+                or old.get('capabilities', {}).get('platform') != 'linux'
+                or not isinstance(old.get('foreground'), dict)
+                or not old['foreground'].get('handle')
+                or old['foreground'] != fresh.get('foreground')):
+            return False
+        bounds = region.get('bounds')
+        if (not isinstance(bounds, list) or len(bounds) != 4
+                or any(type(v) is not int for v in bounds)):
+            return False
+        left, top, right, bottom = bounds
+        if not (0 <= left < right <= old['width'] and 0 <= top < bottom <= old['height']):
+            return False
+        x, y, width, height = (target.get(k) for k in ('x', 'y', 'width', 'height'))
+        if (any(type(v) is not int for v in (x, y, width, height)) or width <= 0 or height <= 0
+                or not (left <= x < x + width <= right and top <= y < y + height <= bottom)):
+            return False
+        from PIL import Image
+        with Image.open(self.runtime/'screenshots'/(old['sha256']+'.png')) as first, \
+             Image.open(self.runtime/'screenshots'/(fresh['sha256']+'.png')) as second:
+            if first.size != (old['width'], old['height']) or second.size != first.size:
+                return False
+            return first.crop(bounds).convert('RGBA').tobytes() == second.crop(bounds).convert('RGBA').tobytes()
+
     def unresolved(self):
         return [{"action_id": json.loads(row[1])["action_id"], "receipt_id": row[0],
                  "request": json.loads(row[1]), "status": row[2]}
@@ -227,11 +261,15 @@ class Desktop:
                         with Image.open(self.runtime/'screenshots'/(old['sha256']+'.png')) as first, \
                              Image.open(self.runtime/'screenshots'/(fresh['sha256']+'.png')) as second:
                             target_valid=first.crop(bounds).convert('RGBA').tobytes()==second.crop(bounds).convert('RGBA').tobytes()
+                context_valid=(aged and guarded_control and target_valid
+                               and self.unchanged_control_context(old,fresh,mapping['control']))
                 independent_app_intent=arguments['action']['kind']=='open_app'
                 revalidation={'source_observation_id':old['observation_id'],'fresh_observation_id':fresh['observation_id'],
                     'age_milliseconds':time.time()*1000-captured if type(captured) in (int,float) else None,
                     'same_device':same_device,'same_view':same_view,'target_control_valid':target_valid if guarded_control else None,
+                    'target_context_unchanged':bool(context_valid),
                     'scope':('Explicit allowed app intent' if independent_app_intent else
+                             'Fresh control identity and exact unchanged desktop content region' if context_valid else
                              'Fresh control identity, bounds and target image region' if guarded_control and not aged else
                              'Exact screenshot, foreground and control evidence'),
                     'input_sent':False}
@@ -239,7 +277,7 @@ class Desktop:
                 self.db.commit()
                 allowed=same_view or independent_app_intent
                 if guarded_control:
-                    allowed=target_valid and (same_view if aged else True)
+                    allowed=target_valid and ((same_view or context_valid) if aged else True)
                 if not same_device or not allowed:
                     raise DesktopRejected('The current target or view changed since the observation. '
                         'No input was sent. Retain the existing plan; reassess its next target against this current observation.',

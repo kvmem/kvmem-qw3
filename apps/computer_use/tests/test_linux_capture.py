@@ -48,6 +48,8 @@ class LinuxCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observation['png'],self.png)
         self.assertEqual([c['name'] for c in observation['accessibility']['controls']],['Save'])
         self.assertEqual(observation['accessibility']['scope'],'foreground_window')
+        self.assertEqual(observation['progress_region'],{'bounds':[75,30,128,83],
+            'coordinate_space':'pixels','scope':'linux_desktop_content_without_clock_and_dock'})
         tree_requests=[r for r in self.requests if r['command'][-1]!=FOREGROUND_SCRIPT]
         self.assertEqual(len(tree_requests),1)
         self.assertEqual(tree_requests[0]['timeout'],4)

@@ -44,6 +44,7 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.controls = None
         self.accessibility_status = "ok"
         self.accessibility_extra = {}
+        self.observation_extra = {}
         self.receipts = {}
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
@@ -91,7 +92,7 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
                 "width": 8, "height": 8, "paused": self.paused}
         if self.controls is not None:
             result['accessibility'] = {'status': self.accessibility_status, 'controls': self.controls} | self.accessibility_extra
-        return result
+        return result | self.observation_extra
 
     async def observed_controls(self):
         self.controls = [
@@ -178,6 +179,75 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         result=await self.desktop.act(action)
         self.assertTrue(result['observation_revalidation']['same_view'])
         self.assertEqual(self.effects,1)
+        self.execution.close()
+
+    async def aged_context_control(self, region=True, target_index=0):
+        self.observation_extra={'foreground':{'handle':'0x12','process':'editor','title':'Document'},
+                                'capabilities':{'platform':'linux'}}
+        if region:
+            self.observation_extra['progress_region']={'bounds':[0,0,8,6],
+                'coordinate_space':'pixels','scope':'linux_desktop_content_without_clock_and_dock'}
+        controls=await self.observed_controls()
+        step=await self.enable_expired_step()
+        return self.action(step=step,action={'kind':'click_control','control_id':controls[target_index]['control_id']})
+
+    def change_pixel(self, point):
+        image=Image.open(io.BytesIO(self.png)).convert('RGB')
+        image.putpixel(point,(255,0,0));buffer=io.BytesIO();image.save(buffer,format='PNG')
+        self.png=buffer.getvalue()
+
+    async def test_aged_control_ignores_clock_outside_proven_unchanged_context(self):
+        action=await self.aged_context_control()
+        self.change_pixel((7,7))
+        result=await self.desktop.act(action)
+        self.assertFalse(result['observation_revalidation']['same_view'])
+        self.assertTrue(result['observation_revalidation']['target_context_unchanged'])
+        self.assertTrue(result['observation_revalidation']['input_sent'])
+        await self.desktop.act(action)
+        self.assertEqual(self.effects,1)
+        self.execution.close()
+
+    async def test_changed_dialog_body_rejects_even_if_button_and_progress_hash_match(self):
+        action=await self.aged_context_control()
+        self.desktop.latest['progress_sha256']='unchanged-advertised-hash'
+        self.observation_extra['progress_sha256']='unchanged-advertised-hash'
+        self.change_pixel((5,3))  # The Save button is still blue and unchanged.
+        with self.assertRaises(DesktopRejected):await self.desktop.act(action)
+        record=json.loads(self.desktop.db.execute('SELECT evidence FROM revalidations').fetchone()[0])
+        self.assertTrue(record['target_control_valid'])
+        self.assertFalse(record['target_context_unchanged'])
+        self.assertEqual(self.effects,0)
+        self.assertEqual(self.desktop.unresolved(),[])
+        self.execution.close()
+
+    async def test_aged_control_without_declared_context_keeps_strict_view_requirement(self):
+        action=await self.aged_context_control(region=False)
+        self.change_pixel((7,7))
+        with self.assertRaises(DesktopRejected):await self.desktop.act(action)
+        self.assertEqual(self.effects,0)
+        self.execution.close()
+
+    async def test_aged_control_partly_outside_context_is_not_revalidated(self):
+        action=await self.aged_context_control(target_index=1)
+        self.change_pixel((7,0))  # Outside this button; inside the context.
+        with self.assertRaises(DesktopRejected):await self.desktop.act(action)
+        self.assertEqual(self.effects,0)
+        self.execution.close()
+
+    async def test_invalid_or_changed_context_is_not_trusted(self):
+        action=await self.aged_context_control()
+        self.change_pixel((7,7))
+        self.observation_extra['progress_region']={'bounds':[0,0,8,99],
+            'coordinate_space':'pixels','scope':'linux_desktop_content_without_clock_and_dock'}
+        with self.assertRaises(DesktopRejected):await self.desktop.act(action)
+        self.assertEqual(self.effects,0)
+        self.execution.close()
+
+    async def test_context_revalidation_never_overrides_changed_foreground(self):
+        action=await self.aged_context_control()
+        self.observation_extra['foreground']={'handle':'0x13','process':'editor','title':'Document'}
+        with self.assertRaises(DesktopRejected):await self.desktop.act(action)
+        self.assertEqual(self.effects,0)
         self.execution.close()
 
     async def test_control_target_is_rechecked_before_one_input_when_source_is_young(self):

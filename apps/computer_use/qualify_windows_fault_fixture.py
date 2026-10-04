@@ -12,6 +12,7 @@ from pathlib import Path
 import shutil
 import time
 import qw3_computer
+from PIL import Image
 
 from fault_browser_pilot import FIELDS
 from qw3_computer.desktop import Desktop, DesktopRejected
@@ -76,7 +77,7 @@ async def qualify(args):
                         'observation_id':desktop.latest['observation_id'],
                         'action_id':'qualification_'+str(sequence),'action':action}
                     if step is not None:arguments['step']=step
-                    if action['kind']=='click_control':arguments['coordinate_space']='normalized_1000'
+                    if action['kind'] in {'click_control','click'}:arguments['coordinate_space']='normalized_1000'
                     return await desktop.act(arguments)
 
                 async def click(name, kinds=None, step=None):
@@ -95,8 +96,10 @@ async def qualify(args):
                         except DesktopRejected:rejected+=1
                     raise RuntimeError('Target remained unstable without input')
 
-                await act({'kind':'open_app','app':'edge'},
-                    {'goal':'Show this request desk','conditions':[{'kind':'foreground_title','text':'Request desk'}]})
+                trial['existing_fixture_browser_foreground']='Request desk' in desktop.latest['foreground'].get('title','')
+                if not trial['existing_fixture_browser_foreground']:
+                    await act({'kind':'open_app','app':'edge'},
+                        {'goal':'Show this request desk','conditions':[{'kind':'foreground_title','text':'Request desk'}]})
                 pending=[s for s in execution.steps() if s['status']=='pending']
                 if pending:
                     checked=await execution.invoke({'operation':'wait','timeout_seconds':20})
@@ -117,13 +120,36 @@ async def qualify(args):
                     if len(candidates)!=1:raise ValueError('Input field cannot be uniquely identified: '+name)
                     definition={'goal':'Enter '+name,'conditions':[{'kind':'control_value','text':name,
                                 'value':value,'control_kind':candidates[0]['kind']}]}
+                    field=candidates[0];field_scene=desktop.latest
                     await click(name,{'edit','entry','text-box','textbox'},definition)
                     if condition=='focus_dialog' and name=='Name':
                         await click('Continue form',{'button','push-button'})
                         # UIA focus restoration after closing this modal was
                         # observed without actual text entry. Re-establish the
                         # field explicitly; completion still needs its value.
-                        await click(name,{'edit','entry','text-box','textbox'})
+                        await desktop.observe()
+                        if desktop.latest.get('accessibility',{}).get('status')=='ok':
+                            await click(name,{'edit','entry','text-box','textbox'})
+                        else:
+                            # Qualification-only visual fallback: derive the
+                            # point from the observed field and prove that its
+                            # label/interior remain at the same screen location.
+                            # No guessed coordinates or unknown input retries.
+                            current=desktop.latest
+                            if any(current.get(k)!=field_scene.get(k) for k in ('desktop_id','width','height','foreground')):
+                                raise ValueError('Field view identity changed before visual refocus')
+                            x,y,w,h=(field[k] for k in ('x','y','width','height'))
+                            regions=[(x,max(0,y-30),x+w,y-3),
+                                     (field['center_x']-12,field['center_y']-10,field['center_x']+12,field['center_y']+10)]
+                            with Image.open(desktop.runtime/'screenshots'/(field_scene['sha256']+'.png')) as source_image, \
+                                 Image.open(desktop.runtime/'screenshots'/(current['sha256']+'.png')) as current_image:
+                                if any(source_image.crop(region).tobytes()!=current_image.crop(region).tobytes() for region in regions):
+                                    raise ValueError('Visible field framing changed; no visual refocus sent')
+                            trial['visual_refocus_used']=True
+                            point={'x':round(field['center_x']*1000/current['width']),
+                                   'y':round(field['center_y']*1000/current['height'])}
+                            trial['visual_refocus_normalized_point']=point
+                            await act({'kind':'click',**point,'button':'left','clicks':1})
                     typed=await act({'kind':'type','text':value})
                     value_check=typed['step_check']
                     if not value_check['verified']:
