@@ -2357,7 +2357,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791128235.893821,
+  "updated_at": 1791130819.026595,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -4163,7 +4163,7 @@
       "on"
     ],
     "repetitions": 2,
-    "status": "waiting-for-parent-forty",
+    "status": "halted-before-eight-after-new-051-unknown",
     "after_candidate49b_all40_and_durable_model_retirement": true,
     "source_framework": "qualified49",
     "experimental_visual_context_included": false,
@@ -4267,7 +4267,7 @@
     "controller_checks_passed": 24,
     "controller_qualification": "apps/computer_use/.runtime/candidate51b-retest-20261004/controller-qualification-01.json",
     "queue": "apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-02/queue.json",
-    "status_at_snapshot": "waiting-for-forty-and-eight",
+    "status_at_snapshot": "halted-no-further-dispatch",
     "planned_trials": 10,
     "model_trials_completed": 0,
     "current49_and_kvmem_sources_unchanged": true,
@@ -4290,13 +4290,14 @@
     "quarantine_admission": "apps/computer_use/.runtime/candidate51b-retest-20261004/quarantine-admission.json",
     "preserved_halted_controller_pid": 2578011,
     "preserved_halted_queue": "apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-01/queue.json",
-    "status": "waiting-for-forty-and-eight",
+    "status": "halted-no-further-dispatch",
     "continued_wrapper": "apps/computer_use/resumed_execution_retest_queue.py",
     "continued_followup_declaration": "apps/computer_use/.runtime/retired-022-frozen-successors-01.json",
     "original_trials_profiles_and_source_inventories_unchanged": true,
     "known_retired_022_unknown_preserved_without_replay": true,
     "new_unknown_still_blocks_dispatch": true,
-    "actual_model_trials_at_snapshot": 0
+    "actual_model_trials_at_snapshot": 0,
+    "controller_currently_live": false
   },
   "terminal_model_cost_diagnostic": {
     "path": "apps/computer_use/.runtime/candidate49b-terminal-model-cost-03.json",
@@ -4594,22 +4595,25 @@
         "pid": 2639631,
         "start_ticks": 367571279,
         "queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue.json",
-        "status": "running",
-        "terminal_trials": 17
+        "status": "halted-no-further-model-dispatch",
+        "terminal_trials": 19,
+        "currently_live": false
       },
       {
         "pid": 2643545,
         "start_ticks": 367625990,
         "queue": "apps/computer_use/.runtime/linux/kvmem-matched-49-20261004/queue-runtime-02/queue.json",
-        "status": "waiting-for-parent-forty",
-        "terminal_trials": 0
+        "status": "halted-no-further-dispatch",
+        "terminal_trials": 0,
+        "currently_live": false
       },
       {
         "pid": 2643576,
         "start_ticks": 367626741,
         "queue": "apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-02/queue.json",
-        "status": "waiting-for-forty-and-eight",
-        "terminal_trials": 0
+        "status": "halted-no-further-dispatch",
+        "terminal_trials": 0,
+        "currently_live": false
       }
     ],
     "original_halted_twelve_row_queue_and_zero_trial_waiters_preserved": true,
@@ -4638,7 +4642,7 @@
     "deployed": false,
     "planned_retest": "docs/computer_use_visual_context_retest_plan_20261004.json",
     "planned_trials": 12,
-    "plan_status": "queued-waiting-for-forty-eight-and-ten",
+    "plan_status": "halted-before-dispatch-after-new-051-unknown",
     "no_new_controller_pid_claimed": false,
     "actual_queue_and_source_audit": "apps/computer_use/.runtime/visual-context-retest-20261004/admission-and-progress-01.json",
     "actual_controller_pid": 2692907,
@@ -4651,12 +4655,14 @@
     "actual_controller_registration": "apps/computer_use/.runtime/visual-context-retest-20261004/actual-controller-01.json",
     "temporary_clients_only": true,
     "fresh_engine_per_trial": true,
-    "original_grades_unchanged": true
+    "original_grades_unchanged": true,
+    "actual_controller_currently_live": false,
+    "successor_waiter_not_yet_created": true
   },
   "terminal_inference_stage_readonly_diagnostic": {
     "recipe": "apps/computer_use/terminal_inference_diagnostic.py",
-    "report": "apps/computer_use/.runtime/terminal-inference-stage-20261004-03.json",
-    "terminal_trials": 17,
+    "report": "apps/computer_use/.runtime/terminal-inference-stage-20261005-01.json",
+    "terminal_trials": 19,
     "reasoning_only_length_stops": [
       "013-legacy-r1",
       "035-legacy-r1"
@@ -4673,35 +4679,38 @@
     "reasoning_budget_replay_planned_separately": true,
     "visual_vs_reasoning_cause_isolated": false,
     "preserved_first_snapshot": "apps/computer_use/.runtime/terminal-inference-stage-20261004-01.json",
-    "preserved_second_snapshot": "apps/computer_use/.runtime/terminal-inference-stage-20261004-02.json"
+    "preserved_second_snapshot": "apps/computer_use/.runtime/terminal-inference-stage-20261004-02.json",
+    "queue_source": "Preserved halted continued_queue.json contains the same exact retained nineteen rows; new queue selector is intentionally not widened.",
+    "preserved_previous_snapshot": "apps/computer_use/.runtime/terminal-inference-stage-20261004-03.json"
   },
   "current_matched_osworld_snapshot": {
-    "at": 1791128235.893821,
-    "queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue.json",
-    "terminal_trials": 17,
+    "at": 1791130819.026595,
+    "queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue_02.json",
+    "status": "running",
+    "terminal_trials": 19,
     "planned_trials": 40,
-    "current_trial": "080-verified-r1",
-    "available_original_scores": 15,
+    "current_trial": "051-legacy-r1",
+    "available_original_scores": 17,
     "positive_original_scores": 0,
-    "original_unknown_preserved": 1,
-    "new_unknowns": 0,
+    "original_unknowns_preserved": 2,
+    "current_continuation_new_unknowns": 0,
     "last_trial": {
-      "id": "080-legacy-r1",
+      "id": "051-verified-r1",
       "exit_code": 0,
       "result": {
         "status": "scored",
         "score": 0.0,
         "passed": false,
         "agent_status": "paused",
-        "seconds": 1689.2413432542235,
-        "tool_calls": 43,
-        "uncertain_actions": 0,
+        "seconds": 726.1993969781324,
+        "tool_calls": 27,
+        "uncertain_actions": 1,
         "turn_error": null,
-        "notice": null,
-        "video_bytes": 5145125,
+        "notice": "操作结果需要核对，请检查桌面后继续。",
+        "video_bytes": 4690269,
         "original_evaluation": 0.0,
         "unassisted_passed": false,
-        "finished_at": 1791127514.918704,
+        "finished_at": 1791129398.8307924,
         "candidate_harness": true,
         "video_collection_passed": true,
         "video_collection_errors": [],
@@ -4722,7 +4731,7 @@
     "invalid_kind_parser_snapshot_preserved": true
   },
   "improvement_evidence_snapshot": {
-    "at": 1791128235.893821,
+    "at": 1791130819.026595,
     "coordinate_diagnostic": {
       "pixel_contract_passed": 0,
       "normalized_contract_passed": 11,
@@ -4746,6 +4755,58 @@
     },
     "complex_osworld_success_improvement_proven": false,
     "image_policy_real_qw3_trials_started": 0,
-    "latency_improvement_proven": false
+    "latency_improvement_proven": false,
+    "complex_osworld_terminal_trials": 19,
+    "complex_osworld_available_scores": 17,
+    "complex_osworld_positive_scores": 0
+  },
+  "retired_051_trial_and_actual_continuation": {
+    "declaration": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/retired-051-continuation.json",
+    "declaration_sha256": "6d66f0926d95762a7944451e7d3fa803ce30a16877f2f53ec695c7b159ca6a0f",
+    "actual_controller": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/actual-retired-051-controller-01.json",
+    "controller_pid": 2706506,
+    "controller_start_ticks": 368606859,
+    "queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue_02.json",
+    "status_at_snapshot": "running",
+    "current_trial_at_snapshot": "051-legacy-r1",
+    "original_terminal_rows_preserved": 19,
+    "original_unknowns_preserved": 2,
+    "old_unknowns_replayed": false,
+    "old_grades_changed": false,
+    "remaining_frozen_trials": 21,
+    "all_old_controllers_confirmed_retired": true,
+    "all_original_trial_vms_and_input_children_retired": true,
+    "cpu_checks_passed": 15,
+    "cpu_qualification": "apps/computer_use/.runtime/retired-051-continuation-qualification-02/result.json",
+    "first_cpu_failure_preserved": "apps/computer_use/.runtime/retired-051-continuation-qualification-01/result.json",
+    "eight_ten_twelve_successor_waiters_still_halted": true
+  },
+  "readonly_thinking_budget_replay": {
+    "status": "implemented-and-qualified-not-queued",
+    "implementation": "apps/computer_use/thinking_budget_replay.py",
+    "controller": "apps/computer_use/thinking_budget_replay_queue.py",
+    "cpu_http_checks_passed": 25,
+    "cpu_http_qualification": "apps/computer_use/.runtime/thinking-budget-replay-qualification-01/result.json",
+    "original_input_trace": "035-legacy-r1/6ecce7c76e284947b8d07aeb1e96526d",
+    "original_request_sha256": "f29e1854e05f8be0cac8f80881838c6b40dbd949b793f6baaaa622b4ab3c97b3",
+    "original_input_tokens": 107482,
+    "original_output_tokens": 16384,
+    "planned_replays": 4,
+    "thinking_budgets": [
+      0,
+      8192,
+      8192,
+      0
+    ],
+    "qw3_calls_started": 0,
+    "device_inputs": 0,
+    "generated_tools_executed": 0,
+    "business_success_claimed": false,
+    "preparation_stopped_record": "apps/computer_use/.runtime/thinking-budget-replay-preparation-failed-01.json",
+    "live_parent_required_for_registration": true,
+    "original_body_except_thinking_budget_preserved": true,
+    "own_model_request_retirement_acknowledgement_required": true,
+    "requires_all_image_policy_trials_terminal_and_controller_retired": true,
+    "latency_or_business_improvement_proven": false
   }
 }
