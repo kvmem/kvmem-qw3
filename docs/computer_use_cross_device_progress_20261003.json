@@ -2357,7 +2357,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791115730.9425657,
+  "updated_at": 1791116803.618041,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -2519,39 +2519,52 @@
     "latex_repeat_tool_calls": 23
   },
   "public_replay_snapshot": {
-    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-18",
-    "url": "http://127.0.0.1:18150/index.html",
+    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-19",
+    "url": "http://127.0.0.1:18151/index.html",
     "formal_attempts_at_export": 40,
     "windows_model_trials_at_export": 8,
     "platform_pilots_at_export": 56,
     "includes_python_repair_pair": true,
     "includes_latex_repair_pair": true,
     "export_is_point_in_time": true,
-    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-18/browser-check-01.json",
-    "actual_browser_checks_passed": 73,
+    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-19/browser-check-01.json",
+    "actual_browser_checks_passed": 87,
     "retained_failed_snapshot_checks": [
       "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check.json",
       "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check-02.json",
       "apps/computer_use/.runtime/cross-device-replay-20261004-17/browser-check-01.json"
     ],
     "partial_formal_videos_not_for_latency_comparison": true,
-    "matched_development_osworld_at_export": 8,
+    "matched_development_osworld_at_export": 13,
     "includes_wire_regression_failures": true,
     "development_attempts": 56,
-    "development_osworld_attempts": 8,
+    "development_osworld_attempts": 13,
     "software_product_attempts": 8,
-    "browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-18/browser-check-01.json",
-    "browser_checks_passed": 73,
+    "browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-19/browser-check-01.json",
+    "browser_checks_passed": 87,
     "snapshot_excludes_later_candidate19_trials": false,
     "new_candidate19_terminal_trials_at_export": 8,
     "public_video_storage": "hardlinks of terminal immutable videos; no duplicate video bytes allocated",
-    "previous_snapshot": "apps/computer_use/.runtime/cross-device-replay-20261004-16",
-    "directory": "apps/computer_use/.runtime/cross-device-replay-20261004-18",
+    "previous_snapshot": "apps/computer_use/.runtime/cross-device-replay-20261004-18",
+    "directory": "apps/computer_use/.runtime/cross-device-replay-20261004-19",
     "platform_development_attempts": 56,
     "actual_browser_passed": true,
     "includes_terminal_receipt_trials": true,
     "all_four_candidate49b_terminal_pairs_included": true,
-    "snapshot_excludes_later_candidate49b_006_pair": true
+    "snapshot_excludes_later_candidate49b_006_pair": false,
+    "current49b_terminal_trials_at_export": 9,
+    "current49b_matched_pairs_included": [
+      "004",
+      "013",
+      "006",
+      "010"
+    ],
+    "current49b_038_legacy_r1_included": true,
+    "original_failure_rows_retained": true,
+    "new_public_videos_use_hardlinks": true,
+    "duplicate_video_bytes_allocated": 0,
+    "retained_browser_startup_failure_log": "/tmp/qw3-replay19-browser-check01.log",
+    "browser_startup_failure_explained": "Host CPython3.13 environment lacks playwright; browser qualification uses the existing CPython3.12 environment. No dependency was installed."
   },
   "material_evidence_audits": {
     "006": {
@@ -4270,5 +4283,26 @@
     "visible_save_button_not_proof_all_attachments_saved": true,
     "model_calls": 0,
     "device_inputs": 0
+  },
+  "completion_comparison_feedback_isolated_candidate": {
+    "recipe": "apps/computer_use/completion_feedback_candidate.py",
+    "helper": "apps/computer_use/completion_feedback.py",
+    "build": "apps/computer_use/.runtime/completion-comparison-feedback-candidate-01/build.json",
+    "qualification": "apps/computer_use/.runtime/completion-comparison-feedback-candidate-01/qualification.json",
+    "host_checks_passed": 12,
+    "retained_actual_condition_comparisons": 56,
+    "retained_verified_arm_attempts": 4,
+    "condition_fields_booleans_and_existing_hints_unchanged": true,
+    "original_failures_and_grades_unchanged": true,
+    "no_app_or_field_identity_inferred": true,
+    "input_delivery_not_inferred_from_missing_completion_evidence": true,
+    "evidence_scope_not_independent_business_acceptance": true,
+    "model_calls": 0,
+    "device_inputs": 0,
+    "native_windows_qualified": false,
+    "real_model_retest": false,
+    "deployment_scheduled": false,
+    "current49_kvmem_sdk51b_frozen_sources_unchanged": true,
+    "source_and_live_queue_audit": "apps/computer_use/.runtime/completion-comparison-feedback-candidate-01/admission-and-progress-01.json"
   }
 }
