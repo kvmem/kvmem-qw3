@@ -2357,7 +2357,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791107563.7398667,
+  "updated_at": 1791108459.834342,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -2519,36 +2519,38 @@
     "latex_repeat_tool_calls": 23
   },
   "public_replay_snapshot": {
-    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-16",
-    "url": "http://127.0.0.1:18148/index.html",
+    "path": "apps/computer_use/.runtime/cross-device-replay-20261004-18",
+    "url": "http://127.0.0.1:18150/index.html",
     "formal_attempts_at_export": 40,
     "windows_model_trials_at_export": 8,
     "platform_pilots_at_export": 56,
     "includes_python_repair_pair": true,
     "includes_latex_repair_pair": true,
     "export_is_point_in_time": true,
-    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-16/browser-check-01.json",
-    "actual_browser_checks_passed": 57,
+    "actual_browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-18/browser-check-01.json",
+    "actual_browser_checks_passed": 73,
     "retained_failed_snapshot_checks": [
       "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check.json",
-      "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check-02.json"
+      "apps/computer_use/.runtime/cross-device-replay-20261004-08/browser-check-02.json",
+      "apps/computer_use/.runtime/cross-device-replay-20261004-17/browser-check-01.json"
     ],
     "partial_formal_videos_not_for_latency_comparison": true,
-    "matched_development_osworld_at_export": 4,
+    "matched_development_osworld_at_export": 8,
     "includes_wire_regression_failures": true,
     "development_attempts": 56,
-    "development_osworld_attempts": 4,
+    "development_osworld_attempts": 8,
     "software_product_attempts": 8,
-    "browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-16/browser-check-01.json",
-    "browser_checks_passed": 57,
+    "browser_check": "apps/computer_use/.runtime/cross-device-replay-20261004-18/browser-check-01.json",
+    "browser_checks_passed": 73,
     "snapshot_excludes_later_candidate19_trials": false,
     "new_candidate19_terminal_trials_at_export": 8,
     "public_video_storage": "hardlinks of terminal immutable videos; no duplicate video bytes allocated",
-    "previous_snapshot": "apps/computer_use/.runtime/cross-device-replay-20261004-15",
-    "directory": "apps/computer_use/.runtime/cross-device-replay-20261004-16",
+    "previous_snapshot": "apps/computer_use/.runtime/cross-device-replay-20261004-16",
+    "directory": "apps/computer_use/.runtime/cross-device-replay-20261004-18",
     "platform_development_attempts": 56,
     "actual_browser_passed": true,
-    "includes_terminal_receipt_trials": true
+    "includes_terminal_receipt_trials": true,
+    "all_four_candidate49b_terminal_pairs_included": true
   },
   "material_evidence_audits": {
     "006": {
@@ -2577,7 +2579,7 @@
       0.0
     ],
     "current_cohort_protocol": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/protocol.json",
-    "current_cohort_model_trials_started": 4,
+    "current_cohort_model_trials_started": 5,
     "improvement_demonstrated": false,
     "current_cohort_declared_trials": 40,
     "current_cohort_queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/queue.json",
@@ -2596,8 +2598,8 @@
     "waits_for_remaining_eight_followups_and_three_receipt_tests": true,
     "previous_unexecuted_candidate49_retirement": "apps/computer_use/.runtime/linux/candidate49-matched-16k-20261004/retirement-after-quarantine-01.json",
     "current_cohort_status": "running",
-    "current_cohort_model_trials_completed": 3,
-    "current_cohort_current_trial": "013-verified-r1",
+    "current_cohort_model_trials_completed": 4,
+    "current_cohort_current_trial": "006-legacy-r1",
     "current_cohort_terminal_trials": [
       {
         "id": "004-verified-r1",
@@ -2670,6 +2672,31 @@
           "original_evaluation": 0.0,
           "unassisted_passed": false,
           "finished_at": 1791106087.6827705,
+          "candidate_harness": true,
+          "video_collection_passed": true,
+          "video_collection_errors": [],
+          "unassisted_business_passed": false,
+          "accepted": false
+        }
+      },
+      {
+        "id": "013-verified-r1",
+        "exit_code": 0,
+        "result": {
+          "status": "scored",
+          "score": 0.0,
+          "passed": false,
+          "stop_reason": "deadline",
+          "agent_status": "stopped",
+          "seconds": 1802.7016997309402,
+          "tool_calls": 41,
+          "uncertain_actions": 0,
+          "turn_error": null,
+          "notice": null,
+          "video_bytes": 6379789,
+          "original_evaluation": 0.0,
+          "unassisted_passed": false,
+          "finished_at": 1791107931.2349677,
           "candidate_harness": true,
           "video_collection_passed": true,
           "video_collection_errors": [],
@@ -3848,5 +3875,65 @@
     "administrative_recovery_not_business_success": true,
     "retained_preparation_failure": "apps/computer_use/.runtime/candidate51-retest-preparation-failed-01/result.json",
     "preparation_failure_sent_input": false
+  },
+  "terminal_model_cost_diagnostic": {
+    "path": "apps/computer_use/.runtime/candidate49b-terminal-model-cost-03.json",
+    "qualification": "apps/computer_use/.runtime/candidate49b-terminal-model-cost-qualification-02.json",
+    "independent_image_count_checks": 8,
+    "model_requests_sent": 0,
+    "device_inputs_sent": 0,
+    "raw_prompts_or_generation_text_exported": false,
+    "attempts": [
+      {
+        "attempt": "004-verified-r1",
+        "requests": 29,
+        "task_seconds": 1803.2984784222208,
+        "first_request_images": 1,
+        "last_request_images": 25,
+        "backend_elapsed_over_task_duration": 0.969862537021187,
+        "reasoning_only_length_stops": 0,
+        "input_tokens_peak": 298776,
+        "backend_seconds": 1748.9516372890212,
+        "engine_first_token_seconds_total": 1635.2074982489999
+      },
+      {
+        "attempt": "004-legacy-r1",
+        "requests": 19,
+        "task_seconds": 854.7951554879546,
+        "first_request_images": 1,
+        "last_request_images": 19,
+        "backend_elapsed_over_task_duration": 0.9198257071398117,
+        "reasoning_only_length_stops": 0,
+        "input_tokens_peak": 180586,
+        "backend_seconds": 786.2625583563931,
+        "engine_first_token_seconds_total": 618.494801395
+      },
+      {
+        "attempt": "013-legacy-r1",
+        "requests": 25,
+        "task_seconds": 943.6265215789899,
+        "first_request_images": 1,
+        "last_request_images": 24,
+        "backend_elapsed_over_task_duration": 0.9013849752968595,
+        "reasoning_only_length_stops": 1,
+        "input_tokens_peak": 118583,
+        "backend_seconds": 850.5707688429393,
+        "engine_first_token_seconds_total": 470.193464855
+      },
+      {
+        "attempt": "013-verified-r1",
+        "requests": 42,
+        "task_seconds": 1802.7016997309402,
+        "first_request_images": 1,
+        "last_request_images": 38,
+        "backend_elapsed_over_task_duration": 0.9409793882015917,
+        "reasoning_only_length_stops": 0,
+        "input_tokens_peak": 207419,
+        "backend_seconds": 1696.3051425227895,
+        "engine_first_token_seconds_total": 1451.693759382
+      }
+    ],
+    "interpretation": "Observed serial backend time dominates these failed attempts; prefix reuse off and full visual history are frozen in both arms. Does not isolate model, visual encoding, prefill or user GPU effects. One final013legacy request spent all16K output in reasoning with no content/tool deltas; no successful-action or causal-speedup claim.",
+    "retained_initial_image_count_failure": "apps/computer_use/.runtime/candidate49b-terminal-model-cost-01.json"
   }
 }
