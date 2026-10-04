@@ -2,6 +2,8 @@
 
 用户授权：2026-10-03。后台使用本地 QW3，不调用顾问。支持 Windows VM、Linux VM、Android 模拟器；macOS/iOS 先保留接口。允许用户同时进行小规模 GPU 测试，只管理本目标创建且确认身份的进程。
 
+2026-10-04后续隔离诊断：SDK51的文件选择器观察与Desktop完整窗口保护存在角色衔接缺口；另需记录驱动返回与后续截图的边界，避免诊断时混淆两类故障。私有后续候选的34项主机合约和六项保留XML兼容性检查通过，尚未部署或进行真实QW3复测。原49的40次对照、8次KVMem和SDK51b十次复测源码/条件不变；这些检查不能充当成功率提升。证据及限制见[观察诊断](computer_use_observation_diagnostics_20261004.md)和`.runtime/post51-boundary-and-phase-candidate-01`。
+
 ## 冻结基线与判断原则
 
 - 修改前基线：`e237c72e2971f281ee7ec76adbe2f840ec9332cf`。Windows client33 的 144/144 合约检查、P3 的 14/16 无接管与 16/16 产物正确保留；这些不是 OSWorld 成功率。

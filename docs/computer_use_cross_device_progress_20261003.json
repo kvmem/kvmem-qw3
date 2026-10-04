@@ -2357,7 +2357,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791110156.8147025,
+  "updated_at": 1791111930.843936,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -2550,7 +2550,8 @@
     "platform_development_attempts": 56,
     "actual_browser_passed": true,
     "includes_terminal_receipt_trials": true,
-    "all_four_candidate49b_terminal_pairs_included": true
+    "all_four_candidate49b_terminal_pairs_included": true,
+    "snapshot_excludes_later_candidate49b_006_pair": true
   },
   "material_evidence_audits": {
     "006": {
@@ -2579,7 +2580,7 @@
       0.0
     ],
     "current_cohort_protocol": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/protocol.json",
-    "current_cohort_model_trials_started": 6,
+    "current_cohort_model_trials_started": 7,
     "improvement_demonstrated": false,
     "current_cohort_declared_trials": 40,
     "current_cohort_queue": "apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/queue.json",
@@ -2598,8 +2599,8 @@
     "waits_for_remaining_eight_followups_and_three_receipt_tests": true,
     "previous_unexecuted_candidate49_retirement": "apps/computer_use/.runtime/linux/candidate49-matched-16k-20261004/retirement-after-quarantine-01.json",
     "current_cohort_status": "running",
-    "current_cohort_model_trials_completed": 5,
-    "current_cohort_current_trial": "006-verified-r1",
+    "current_cohort_model_trials_completed": 6,
+    "current_cohort_current_trial": "010-verified-r1",
     "current_cohort_terminal_trials": [
       {
         "id": "004-verified-r1",
@@ -2721,6 +2722,31 @@
           "original_evaluation": 0.0,
           "unassisted_passed": false,
           "finished_at": 1791109613.0272052,
+          "candidate_harness": true,
+          "video_collection_passed": true,
+          "video_collection_errors": [],
+          "unassisted_business_passed": false,
+          "accepted": false
+        }
+      },
+      {
+        "id": "006-verified-r1",
+        "exit_code": 0,
+        "result": {
+          "status": "scored",
+          "score": 0.0,
+          "passed": false,
+          "stop_reason": "deadline",
+          "agent_status": "stopped",
+          "seconds": 1803.29765171092,
+          "tool_calls": 33,
+          "uncertain_actions": 0,
+          "turn_error": null,
+          "notice": null,
+          "video_bytes": 6045831,
+          "original_evaluation": 0.0,
+          "unassisted_passed": false,
+          "finished_at": 1791111565.7009962,
           "candidate_harness": true,
           "video_collection_passed": true,
           "video_collection_errors": [],
@@ -4013,5 +4039,66 @@
     "old_original_failure_regraded": false,
     "unknown_input_replayed": false,
     "contract_checks_passed": 10
+  },
+  "post_sdk51_isolated_boundary_and_phase_candidate": {
+    "recipe": "apps/computer_use/post_sdk51_candidate.py",
+    "build": "apps/computer_use/.runtime/post51-boundary-and-phase-candidate-01/build.json",
+    "qualification": "apps/computer_use/.runtime/post51-boundary-and-phase-candidate-01/qualification.json",
+    "host_contract_checks_passed": 34,
+    "retained_actual_xml_compatibility_checks_passed": 6,
+    "model_calls": 0,
+    "device_inputs": 0,
+    "native_windows_qualified": false,
+    "real_model_task_acceptance": false,
+    "deployment_scheduled": false,
+    "current49_kvmem_and_sdk51b_frozen_sources_unchanged": true,
+    "historical_unknown_replayed_or_reclassified": false,
+    "diagnostic_phase_journal_does_not_resolve_unknown_actions": true,
+    "source_and_live_queue_audit": "apps/computer_use/.runtime/post51-boundary-and-phase-candidate-01/admission-and-progress-02.json"
+  },
+  "matched006_model_cost_diagnostic": {
+    "path": "apps/computer_use/.runtime/candidate49b-006-model-cost-01.json",
+    "qualification": "apps/computer_use/.runtime/candidate49b-006-model-cost-qualification-02.json",
+    "independent_decoded_image_checks": 4,
+    "retained_failed_qualification": "apps/computer_use/.runtime/candidate49b-006-model-cost-qualification-01.json",
+    "attempts": [
+      {
+        "attempt": "006-legacy-r1",
+        "requests": 34,
+        "task_seconds": 1531.7085465472192,
+        "agent_status": "paused",
+        "first_request_images": 1,
+        "last_request_images": 34,
+        "backend_elapsed_over_task_duration": 0.8686031926664681,
+        "reasoning_only_length_stops": 0,
+        "input_tokens_peak": 156194,
+        "backend_seconds": 1330.44693376543
+      },
+      {
+        "attempt": "006-verified-r1",
+        "requests": 34,
+        "task_seconds": 1803.29765171092,
+        "agent_status": "stopped",
+        "first_request_images": 1,
+        "last_request_images": 23,
+        "backend_elapsed_over_task_duration": 0.9656634790419235,
+        "reasoning_only_length_stops": 0,
+        "input_tokens_peak": 266901,
+        "backend_seconds": 1741.378684099298
+      }
+    ],
+    "model_or_device_calls_for_diagnostic": 0,
+    "causal_latency_improvement_claimed": false
+  },
+  "matched006_condition_diagnostic": {
+    "path": "apps/computer_use/.runtime/candidate49b-006-selector-diagnostic-01.json",
+    "possible_label_value_drift_cases": 1,
+    "step_status_counts": {
+      "abandoned": 3,
+      "verified": 12
+    },
+    "stable_field_identity_proved": false,
+    "original_condition_or_score_changes": false,
+    "interpretation": "One desired value observed at matching role/bounds under a changed name, while the prior exact label failed. The other two value conditions lack that evidence."
   }
 }
