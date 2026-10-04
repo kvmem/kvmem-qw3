@@ -2358,7 +2358,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791144908.0275874,
+  "updated_at": 1791146509.176444,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -2584,7 +2584,7 @@
     "video_full_screen_coverage_not_proven_trials": [
       "051-legacy-r1"
     ],
-    "current_queue_terminal_trials_at_audit": 30,
+    "current_queue_terminal_trials_at_audit": 31,
     "actual_server_identity": {
       "pid": 2838863,
       "uid": 1001,
@@ -2599,7 +2599,7 @@
     "total_rows": 138,
     "recording_qualification_attempts": 1,
     "recording_component_rows_excluded_from_model_denominators": true,
-    "later_terminal_trials_not_yet_exported": 1,
+    "later_terminal_trials_not_yet_exported": 2,
     "duplicated_full_video_bytes_allocated": 0,
     "new_partial_remux_bytes_allocated": 3159973,
     "all128_previous_terminal_rows_retained": true,
@@ -2623,7 +2623,8 @@
     "retained_failed_or_transient_server_registrations": [
       "apps/computer_use/.runtime/replay26-server-registration-01.json",
       "apps/computer_use/.runtime/replay26-server-registration-02.json"
-    ]
+    ],
+    "actual_latest_queue_audit": "apps/computer_use/.runtime/recoverable-linux-wrapper-and-parent-progress-20261005-01.json"
   },
   "material_evidence_audits": {
     "006": {
@@ -4757,30 +4758,30 @@
   "current_matched_osworld_snapshot": {
     "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/candidate49b-matched-16k-20261004/continued_queue_02.json",
     "status": "running",
-    "terminal_trials": 30,
+    "terminal_trials": 31,
     "planned_trials": 40,
-    "current_trial": "022-legacy-r2",
-    "available_original_scores": 28,
+    "current_trial": "022-verified-r2",
+    "available_original_scores": 29,
     "positive_original_scores": 0,
     "original_unknowns_preserved": 2,
     "current_continuation_new_unknowns": 0,
     "last_trial": {
-      "id": "038-legacy-r2",
+      "id": "022-legacy-r2",
       "exit_code": 0,
       "result": {
         "status": "scored",
         "score": 0.0,
         "passed": false,
         "agent_status": "paused",
-        "seconds": 627.9855522541329,
-        "tool_calls": 12,
+        "seconds": 855.588378273882,
+        "tool_calls": 17,
         "uncertain_actions": 0,
         "turn_error": null,
         "notice": null,
-        "video_bytes": 1658721,
+        "video_bytes": 3484216,
         "original_evaluation": 0.0,
         "unassisted_passed": false,
-        "finished_at": 1791144420.0923457,
+        "finished_at": 1791145335.7559829,
         "candidate_harness": true,
         "video_collection_passed": true,
         "video_collection_errors": [],
@@ -4788,8 +4789,8 @@
         "accepted": false
       }
     },
-    "at": 1791144908.0275874,
-    "actual_live_audit": "apps/computer_use/.runtime/replay26-and-parent-progress-20261005-01.json"
+    "at": 1791146509.176444,
+    "actual_live_audit": "apps/computer_use/.runtime/recoverable-linux-wrapper-and-parent-progress-20261005-01.json"
   },
   "080_legacy_execution_cost_diagnostic": {
     "report": "apps/computer_use/.runtime/080-legacy-execution-cost-20261004-02.json",
@@ -4803,7 +4804,7 @@
     "invalid_kind_parser_snapshot_preserved": true
   },
   "improvement_evidence_snapshot": {
-    "at": 1791144908.0275874,
+    "at": 1791146509.176444,
     "coordinate_diagnostic": {
       "pixel_contract_passed": 0,
       "normalized_contract_passed": 11,
@@ -4828,8 +4829,8 @@
     "complex_osworld_success_improvement_proven": false,
     "image_policy_real_qw3_trials_started": 0,
     "latency_improvement_proven": false,
-    "complex_osworld_terminal_trials": 30,
-    "complex_osworld_available_scores": 28,
+    "complex_osworld_terminal_trials": 31,
+    "complex_osworld_available_scores": 29,
     "complex_osworld_positive_scores": 0,
     "short_rule_thinking_diagnostic": {
       "screenshot_thinking_off_passed": 14,
@@ -5212,13 +5213,13 @@
     ]
   },
   "current_40_8_10_12_4_live_status": {
-    "at": 1791144908.0275874,
-    "audit": "apps/computer_use/.runtime/replay26-and-parent-progress-20261005-01.json",
+    "at": 1791146509.176444,
+    "audit": "apps/computer_use/.runtime/recoverable-linux-wrapper-and-parent-progress-20261005-01.json",
     "parent": {
       "status": "running",
-      "terminal_trials": 30,
-      "current_trial": "022-legacy-r2",
-      "available_original_scores": 28,
+      "terminal_trials": 31,
+      "current_trial": "022-verified-r2",
+      "available_original_scores": 29,
       "positive_original_scores": 0
     },
     "successors": [
@@ -5538,5 +5539,111 @@
     "model_business_or_latency_improvement_proven": false,
     "first_fixture_sentinel_failure_retained": "apps/computer_use/.runtime/replay-recording-evidence-qualification-01/result.json",
     "real_zero_byte_mp4_placeholder_admission_regression_verified": true
+  },
+  "recoverable_linux_task_wrapper": {
+    "at": 1791146509.176444,
+    "sources": [
+      "apps/computer_use/recoverable_linux_recording.py",
+      "apps/computer_use/graceful_recoverable_vnc_recording.py",
+      "apps/computer_use/qualify_recoverable_linux_recording.py"
+    ],
+    "source_sha256": {
+      "recoverable_linux_recording.py": "8dcdb28128069f8263cc7d2e00800135909987e29881d3295d9bcd6a0dc9d44b",
+      "graceful_recoverable_vnc_recording.py": "cfddde9b86858dc6ce98b067cf103b0ec6713db76a5506210f8899de7e498f58",
+      "tests/test_recoverable_linux_recording.py": "29c2e96cac02cfc2fb7d6c6212188902f6e1f1b067112e8b9e3b4a43642b9388"
+    },
+    "native_recipe_sha256": "4477caedc08c2d3ea758fb425f5e1227de725fab1e8c3474a12b77d61975ae6a",
+    "wrapper_cpu_qualification": "apps/computer_use/.runtime/recoverable-linux-wrapper-qualification-02/result.json",
+    "wrapper_scripted_rfb_real_subprocess_and_codec_tests": 9,
+    "negative_qualification": "apps/computer_use/.runtime/graceful-recording-negative-qualification-01/result.json",
+    "additional_nonstop_interrupt_and_source_change_tests": 2,
+    "native_lifecycle_qualification": "apps/computer_use/.runtime/recoverable-linux-wrapper-native-02/state.json",
+    "native_lifecycle_checks_passed": 16,
+    "native_lifecycle_frames": 17,
+    "native_lifecycle_seconds": 8.5,
+    "native_lifecycle_fresh_sampling_uninterrupted": true,
+    "native_lifecycle_producer_retired": true,
+    "native_forced_sigterm_during_partial_frame_phase_retested": false,
+    "scripted_real_worker_sigterm_during_partial_frame_qualified": true,
+    "normal_stop_partial_capture_discarded_without_new_observation": true,
+    "only_requested_stop_interrupts_are_gracefully_finalized": true,
+    "source_changed_or_unrelated_interrupt_remains_failure": true,
+    "publication_uses_same_terminal_video_inode": true,
+    "readiness_requires_complete_fresh_frame": true,
+    "failed_publication_cannot_succeed_on_repeated_finish": true,
+    "original_frozen_linux_recording_and_recorder_sources_changed": false,
+    "deployed_to_frozen_model_comparisons_or_pilot_runners": false,
+    "native_active_gui_task_recording_stability_proven": false,
+    "native_1800_second_idle_sampling_stability_proven": false,
+    "stability_actual_live_state": {
+      "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/recoverable-linux-wrapper-stability-controller-01.json",
+      "controller_identity": {
+        "pid": 2862766,
+        "uid": 1001,
+        "start_ticks": 370208623,
+        "command": [
+          "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+          "-m",
+          "qualify_recoverable_linux_recording",
+          "--mode",
+          "stability",
+          "--output",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/recoverable-linux-wrapper-stability-01",
+          "--qualification",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/recoverable-linux-wrapper-qualification-02/result.json",
+          "--protocol",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/protocol.json",
+          "--followup",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/retired-051-frozen-successors-01.json"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "S"
+      },
+      "worker_identity": {
+        "pid": 2862834,
+        "uid": 1001,
+        "start_ticks": 370208918,
+        "command": [
+          "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+          "-m",
+          "graceful_recoverable_vnc_recording",
+          "--output",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/recoverable-linux-wrapper-stability-01/video",
+          "--ffmpeg",
+          "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/lib/python3.12/site-packages/imageio_ffmpeg/binaries/ffmpeg-linux-x86_64-v7.0.2",
+          "--container-name",
+          "qw3-computer-linux",
+          "--container-id",
+          "bcb52434987f397b5f2d9ccf03a3d51feed3ce33776fb710aa78000b6e552b20",
+          "--host",
+          "172.17.0.3",
+          "--port",
+          "5900",
+          "--duration",
+          "1800",
+          "--fps",
+          "2",
+          "--max-wait-seconds",
+          "30",
+          "--reconnect-budget",
+          "3"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "S"
+      },
+      "output": "/home/chaidi/qw3/apps/computer_use/.runtime/recoverable-linux-wrapper-stability-01",
+      "status": "recording",
+      "observed_running_seconds": 175.04489467898384,
+      "native_1800_second_idle_sampling_stability_proven": false,
+      "model_calls": 0,
+      "native_device_inputs": 0
+    },
+    "retained_first_eight_test_qualification": "apps/computer_use/.runtime/recoverable-linux-wrapper-qualification-01/result.json",
+    "retained_native_sigterm_during_frame_failure": "apps/computer_use/.runtime/recoverable-linux-wrapper-native-01/state.json",
+    "original_hash_verified_source_archive": "apps/computer_use/.runtime/recoverable-linux-wrapper-first-source-01/manifest.json",
+    "qualified_current_source_archive": "apps/computer_use/.runtime/recoverable-linux-wrapper-qualified-source-02/manifest.json",
+    "model_calls": 0,
+    "native_device_inputs": 0,
+    "qw3_task_success_or_latency_improvement_proven": false
   }
 }

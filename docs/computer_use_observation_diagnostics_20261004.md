@@ -257,3 +257,18 @@ CPU资格03为17项通过（新增10项＋原回放7项）；第一次资格01�
 实际Playwright/Chrome完成24项验收：原分母与结果保留、缺口进入/离开、双栏播放暂停、片段实际解码及564帧源像素/时间戳证明、051裁切限制、秘密路径不公开、无脚本错误。证据`.runtime/replay26-browser-qualification-01/{result.json,gap-preview.png,partial-preview.png}`；全量导出只包含当前29条，实际队列30条，后一条未导出。旧快照23继续保留。第一次新快照24遗漏四条较早OSWorld开发记录，保留失败且未发布；第二次25保留全部旧记录但零字节MP4挡住片段，保留准入缺口且未发布。最终26才通过完整实际验收。
 
 本地服务启动01错误解析Python符号链接，脱离虚拟环境而缺少aiohttp；保留日志与登记。正确解释器启动02后HTTP和浏览器通过，初始身份登记却在exec前捕获空argv；同一PID/UID/启动时间/工作目录、预期完整参数、源码哈希及实际HTTP内容再次核对一致，新增登记03，不覆盖02或重启进程。上述准备问题不计为模型失败。回放能力改进尚未证明原超时根因、1800秒录制稳定性、模型任务成功或延迟收益；新的录制器仍未替换冻结LinuxRecording包装器。
+
+
+## 2026-10-05 任务录制包装器与停止期间读帧竞态
+
+最新实际审计主队列31/40，29份可用原评分均0，当前022-verified-r2；8/10/12/4后继存活、仍零真实模型试次。审计`.runtime/recoverable-linux-wrapper-and-parent-progress-20261005-01.json`；公开快照26仍仅当前29次终止结果，比主队列少两条，旧数据和冻结条件不改。
+
+`recoverable_linux_recording.py`提供与LinuxRecording相同的start/finish接口，显式不可变配置、完整子进程登记、原生所有者/启动身份检查、完整新帧就绪与原媒体哈希核验。只停止自己的已登记子进程；完整媒体硬链接发布，目标存在或原媒体改变拒绝，失败后再次finish仍失败。第一轮8项真实本地子进程/RFB/视频编解码检查通过，但首次原生8秒停止正落在读取RFB更新头中，stop事件让read抛InterruptedError；原编码循环把它算为失败，16次完整采集、16帧/8秒MKV均保留。原模型、输入与设备状态未改，生产者和录制子进程均实际退役。保留`.runtime/recoverable-linux-wrapper-native-01/state.json`及原日志/媒体，未把原失败转成通过。
+
+隔离变体`graceful_recoverable_vnc_recording.py`复用固定恢复录制器，只有自己的stop事件为true时才允许InterruptedError正常结束编码循环；未完成采集不增加capture、时间戳或像素。最后已验证图像保留到收尾，未观察尾段明确标记；其它异常和身份变化仍失败。编码循环从哈希固定源函数派生一处修改，原vm/record_console.py、resizable_vnc_recording.py和recoverable_vnc_recording.py文件均不变。9项真实脚本RFB/子进程/编码检查通过，包括强制在慢速半帧中SIGTERM、原完整采集计数保持1、未出现半帧蓝像素、尾部为原红色图像且标为旧帧；额外2项证明stop未设置的InterruptedError和原源哈希不一致仍失败。
+
+第二次原生启动/停止资格16项全部通过，17帧/8.5秒视频全部解码，原生1920×1080完整帧缓冲、媒体源硬链接、已登记工作进程实际退出、原动作行及设备/会话/暂停状态完全保持，零模型调用和键鼠输入。第二次实际停止落在采集间隔，fresh_sampling_uninterrupted=true；不能声称该次原生资格强制复现半帧停止分支。原生资格证明包装器生命周期，本地实际子进程/RFB回归证明半帧收尾。证据`.runtime/recoverable-linux-wrapper-qualification-02/result.json`、`.runtime/graceful-recording-negative-qualification-01/result.json`、`.runtime/recoverable-linux-wrapper-native-02/state.json`。首次源版本通过逆向仅三处声明变更并严格匹配两条原SHA保存为`.runtime/recoverable-linux-wrapper-first-source-01/manifest.json`；当前五份源与配方保存在`recoverable-linux-wrapper-qualified-source-02/manifest.json`，它们是来源档案，不是迁移后可直接执行的包。
+
+30分钟空闲原生稳定性测试实际控制器PID2862766、录制器PID2862834均存活，登记为`.runtime/recoverable-linux-wrapper-stability-controller-01.json`，状态为`.runtime/recoverable-linux-wrapper-stability-01/state.json`。冻结1800秒/2fps/30秒捕获上限/3次总重连，目标为独立暂停的Linux试验机，和当前OSWorldVM不同；第一次审计约175秒录制中，不能计为完成。后续应只读核验同一完整句柄和终止结果，不因观察超时重启。即使完成，也只覆盖空闲桌面采样，不是活动GUI半小时稳定性或业务成功/速度证明。当前冻结任务runner与原LinuxRecording不替换。
+
+复现本地包装器检查：`PYTHONPATH=apps/computer_use:apps/computer_use/.runtime/media-qualification third_party/OSWorld-V2/.venv/bin/python -m unittest discover -s apps/computer_use/tests -p test_recoverable_linux_recording.py -v`；非停止异常负例使用同命令替换pattern为test_graceful_recoverable_recording.py。原生入口`qualify_recoverable_linux_recording.py --help`提供lifecycle/stability两种明确范围，要求已完成CPU资格、原SDK协议及实际冻结后继声明；输出目录必须全新，端点认证只由既有助手内部读取，不保存或显示密钥。
