@@ -216,15 +216,17 @@ def tools_for_platform(platform, workflow=False):
         schema['oneOf']=[]
         for action in schema['properties']['action']['oneOf']:
             kind=action['properties']['kind']['const']
-            fields=copy.deepcopy(schema['properties'])
-            fields['action']=action
-            required=list(schema['required'])
+            # Root fields already define types, bounds and allowed members.
+            # Repeated full nested schemas produced parameters={} through
+            # pinned Codex in a real run. Qualify the actual wire, not just
+            # JSON Schema validity, and keep branch selectors compact.
+            # This branch only selects its kind and coordinate requirement.
+            branch={'properties':{'action':{'properties':{'kind':{'const':kind}}}}}
             if kind in {'click','drag','scroll'}:
-                required.append('coordinate_space')
+                branch['required']=['coordinate_space']
             elif kind!='click_control':
-                fields.pop('coordinate_space')
-            schema['oneOf'].append({'type':'object','properties':fields,
-                'required':required,'additionalProperties':False})
+                branch['not']={'required':['coordinate_space']}
+            schema['oneOf'].append(branch)
         legacy_coordinates=(
             'Declare coordinate_space: normalized_1000 for positions estimated from the screenshot (both axes 0..1000), '
             'or pixels for accessibility control centers. The host converts normalized coordinates using the exact latest screenshot dimensions. '

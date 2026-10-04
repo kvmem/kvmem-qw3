@@ -100,6 +100,15 @@ def convert_request(request, backend_model, max_tokens=4096, *, allow_thinking=F
         require(not tool.get("strict"), "strict schema enforcement is unsupported")
         parameters = tool.get("parameters", {"type": "object", "properties": {}})
         require(isinstance(parameters, dict), "tool parameters must be an object")
+        if wire_name=='mcp__computer__act':
+            fields=parameters.get('properties',{})
+            require(isinstance(fields,dict) and {'desktop_id','observation_id','action_id','action'}<=set(fields),
+                'Computer act schema lost its field definitions before model dispatch; no model request was sent')
+            action=fields['action']
+            branches=action.get('oneOf',[]) if isinstance(action,dict) else []
+            require(isinstance(action,dict) and (action.get('type')=='object' or isinstance(branches,list) and any(
+                isinstance(branch,dict) and branch.get('type')=='object' for branch in branches)),
+                'Computer act schema lost its object type before model dispatch; no model request was sent')
         names[wire_name] = (namespace, name)
         tools.append({"type": "function", "function": {
             "name": wire_name, "description": tool.get("description", ""),

@@ -23,6 +23,43 @@ from test_controller import FixtureDesktop
 
 @unittest.skipUnless(os.environ.get("QW3_TEST_CODEX") == "1", "set QW3_TEST_CODEX=1 for real Codex")
 class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_verified_action_schema_reaches_backend_through_actual_codex_mcp(self):
+        calls=[]
+        async def backend(request):
+            body=await request.json();calls.append(body)
+            response=web.StreamResponse(headers={'Content-Type':'text/event-stream'})
+            await response.prepare(request)
+            await chunk(response,{'content':'Schema transport qualification only.'})
+            await chunk(response,finish='stop')
+            await response.write(b'data: [DONE]\n\n')
+            return response
+        app=web.Application();app.router.add_post('/v1/chat/completions',backend)
+        backend_runner,url=await serve(app)
+        try:
+            for platform in ('windows','linux','android'):
+                with tempfile.TemporaryDirectory(prefix='qw3-schema-wire-') as runtime:
+                    desktop=FixtureDesktop();desktop.start=AsyncMock()
+                    pixels=io.BytesIO();Image.new('RGB',(128,96),'blue').save(pixels,format='PNG')
+                    desktop.observe.return_value=desktop.latest|{'image':base64.b64encode(pixels.getvalue()).decode()}
+                    controller=Controller(runtime,desktop,url+'/v1',0,workflow=True,
+                        device_platform=platform,thinking=True,model_output_tokens=16384)
+                    app_runner,app_url=await serve(web_app(controller));controller.port=int(app_url.rsplit(':',1)[1])
+                    try:
+                        offset=len(calls);await controller.start();await controller.start_task('Inspect available tools only; do not send input.')
+                        async with asyncio.timeout(40):
+                            while len(calls)==offset:await asyncio.sleep(.02)
+                        act=next(t['function'] for t in calls[-1]['tools'] if t['function']['name'].endswith('__act'))
+                        fields=act['parameters'].get('properties',{})
+                        self.assertIn('action',fields,'Actual Codex discarded the action schema before the model received it')
+                        self.assertEqual(fields['step']['type'],'object')
+                        self.assertEqual(fields['coordinate_space']['enum'],['normalized_1000'])
+                        self.assertEqual({b['properties']['kind'].get('const',b['properties']['kind'].get('enum',[None])[0]) for b in fields['action']['oneOf']},
+                            {'click_control','click','type','key','drag','scroll','open_app'})
+                        self.assertLess(len(json.dumps(act['parameters'])),8000)
+                    finally:
+                        await controller.close();await app_runner.cleanup()
+        finally:await backend_runner.cleanup()
+
     async def test_completed_reviews_continue_same_codex_history_and_budget(self):
         calls = []
         async def backend(request):

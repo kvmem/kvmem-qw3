@@ -14,6 +14,20 @@ def request(inputs=None):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_computer_action_schema_loss_fails_before_backend_conversion(self):
+        from qw3_computer.tool_schema import tools_for_platform
+        r=request([{'role':'user','content':'Inspect'}])
+        for schema in ({},{'type':'object','properties':{}},
+                       {'properties':{'desktop_id':{},'observation_id':{},'action_id':{},'action':{'type':'string'}}}):
+            r['tools']=[{'type':'function','name':'mcp__computer__act','parameters':schema}]
+            with self.subTest(schema=schema),self.assertRaisesRegex(ProtocolError,'before model dispatch'):
+                convert_request(r,'qw3')
+        for platform in ('windows','linux','android'):
+            for workflow in (False,True):
+                schema=tools_for_platform(platform,workflow)[1]['inputSchema']
+                r['tools']=[{'type':'function','name':'mcp__computer__act','parameters':schema}]
+                self.assertEqual(convert_request(r,'qw3').body['tools'][0]['function']['parameters'],schema)
+
     def test_opt_in_thinking_preserves_reasoning_tool_and_final_message(self):
         thought = {"type": "reasoning", "summary": [], "content": [
             {"type": "reasoning_text", "text": "Check the actual window before typing."}]}
