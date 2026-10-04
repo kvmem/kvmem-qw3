@@ -133,6 +133,12 @@ def run(args):
     def terminal(_,result):
         return (result.get('termination_confirmed') is True
                 and not result.get('owned_task_stop_unconfirmed') and idle(args.app))
+    plan=json.loads((args.campaign/'plan.json').read_text())
+    if plan.get('status')=='finished':
+        from completed_campaign_pilot import run_completed
+        child,result_path=specification(args)
+        return run_completed(args,child,result_path,terminal,
+            watchdog_seconds=sum(row['seconds']+240 for row in protocol['trials'])+120)
     # Reuse the proven scheduler ownership, frozen sources and current-runner
     # handoff unchanged. Only the independently executed child is a batch.
     with patch.object(interlude,'pilot_spec',specification),patch.object(interlude,'terminal_pilot',terminal),\

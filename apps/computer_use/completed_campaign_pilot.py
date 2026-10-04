@@ -47,7 +47,7 @@ def completed_campaign(directory):
             'plan_sha256':hashlib.sha256((directory/'plan.json').read_bytes()).hexdigest()}
 
 
-def run_completed(args,pilot_command,result_path,terminal):
+def run_completed(args,pilot_command,result_path,terminal,*,watchdog_seconds=None):
     with Path('/tmp/qw3-cross-device-model-queue.lock').open('a+') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         completion=completed_campaign(args.campaign)
@@ -69,7 +69,7 @@ def run_completed(args,pilot_command,result_path,terminal):
                 receipt.update(status='running-standalone-pilot',pilot_pid=child.pid,
                                pilot_command=pilot_command,pilot_started_at=time.time())
                 save(args.output/'interlude.json',receipt)
-                code=child.wait(timeout=args.seconds+240)
+                code=child.wait(timeout=args.seconds+240 if watchdog_seconds is None else watchdog_seconds)
             outcome=json.loads(result_path.read_text())
             if not terminal(args,outcome):
                 raise RuntimeError('Development task stop/retirement is unconfirmed')

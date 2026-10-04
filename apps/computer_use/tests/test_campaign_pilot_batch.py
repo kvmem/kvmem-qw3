@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import campaign_pilot_batch as batch
@@ -61,6 +62,21 @@ class BatchSafetyTests(unittest.TestCase):
         with patch.object(batch,'request',return_value={'status':'idle','model_output_tokens':4096,
                          'thinking':True,'tool_call_limit':100}):
             with self.assertRaises(RuntimeError):batch.admitted_app(protocol)
+
+    def test_completed_campaign_uses_standalone_admission_and_total_batch_budget(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name);campaign=root/'formal';campaign.mkdir()
+            (campaign/'plan.json').write_text(json.dumps({'status':'finished'}))
+            args=SimpleNamespace(protocol=root/'protocol.json',output=root/'batch',campaign=campaign)
+            protocol={'app':'http://127.0.0.1:18208','app_runtime':str(root/'runtime'),
+                      'trials':[{'seconds':600},{'seconds':900}]}
+            with patch.object(batch,'load_protocol',return_value=protocol),\
+                 patch('completed_campaign_pilot.run_completed',return_value={'status':'pilot-finished'}) as standalone,\
+                 patch.object(batch.interlude,'run') as original:
+                self.assertEqual(batch.run(args)['status'],'pilot-finished')
+                self.assertEqual(standalone.call_args.kwargs['watchdog_seconds'],2100)
+                self.assertIn('campaign_pilot_batch',standalone.call_args.args[1])
+                original.assert_not_called()
 
 
 if __name__=='__main__':unittest.main()

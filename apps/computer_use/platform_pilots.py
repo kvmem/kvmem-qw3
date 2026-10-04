@@ -103,6 +103,10 @@ def run(args):
         # This is a separate dependency upgrade, not a rewrite of the private
         # core manifest or any earlier pilot's declared configuration.
         declaration=json.loads(dependencies.read_text())
+        for relative,expected in declaration.get('source_sha256',{}).items():
+            source=(ROOT/relative).resolve()
+            if not source.is_relative_to(ROOT/'apps/computer_use') or hashlib.sha256(source.read_bytes()).hexdigest()!=expected:
+                raise ValueError('Declared device dependency source changed: '+relative)
         from device_receipt_qualification import owned_gateway
         from qw3_computer.device_registry import load_registry
         item=load_registry(ROOT/'apps/computer_use/.runtime/cross-device-catalogue.json')[desired]
@@ -113,7 +117,8 @@ def run(args):
                 or hashlib.sha256(entry.read_bytes()).hexdigest()!=declaration['entry_sha256']):
             raise ValueError('Declared candidate gateway dependency changed')
         manifest['device_dependency_upgrade']={'sha256':hashlib.sha256(dependencies.read_bytes()).hexdigest(),
-            'entry_sha256':declaration['entry_sha256'],'gateway_pid':live['pid'],'gateway_device_id':live['device_id']}
+            'entry_sha256':declaration['entry_sha256'],'gateway_pid':live['pid'],'gateway_device_id':live['device_id'],
+            'source_sha256':declaration.get('source_sha256',{})}
     save(directory / "pilot-manifest.json", manifest)
     video = None
     fixture = None

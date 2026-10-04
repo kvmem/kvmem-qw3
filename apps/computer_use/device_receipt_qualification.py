@@ -25,8 +25,10 @@ def owned_gateway(item):
         try:
             if source.stat().st_uid!=os.getuid():continue
             argv=[v.decode() for v in (source/'cmdline').read_bytes().split(b'\0') if v]
-            if not any(entry in argv for entry in ('qw3_computer.device_gateway','device_gateway_entry')):continue
+            if not any(entry in argv for entry in ('qw3_computer.device_gateway','device_gateway_entry',
+                                                   'semantic_device_gateway_entry')):continue
             def option(name):return argv[argv.index(name)+1]
+            if 'semantic_device_gateway_entry' in argv and option('--platform')!='linux':continue
             if (option('--platform')!=item['platform']
                     or option('--port')!=str(urlparse(item['endpoint']).port)
                     or Path(option('--runtime')).resolve()!=item['token_file'].parent):continue
