@@ -225,6 +225,20 @@
       "actual_input_vm_checks": 13,
       "actual_delivered_inputs": 6,
       "actual_rejected_inputs": 2
+    },
+    {
+      "change": "恢复传到QW3的动作内嵌完成条件字段定义",
+      "evidence_level": "isolated_offline_actual_request_replay",
+      "requests": 51,
+      "original_calls_checked": 47,
+      "missing_field_call_identified": 1,
+      "production_installed": false,
+      "business_improvement_proven": false,
+      "source": {
+        "path": "/home/chaidi/qw3/docs/computer_use_native_pilot_contract_diagnostic_20261006.json",
+        "sha256": "677a97c5de461c2c16ffb5ad6db489110df6ca1b8e361f320dca7e204da1988b"
+      },
+      "conclusion": "51份实际原请求离线恢复；未调用模型，不是任务通过率改善。workflow为非空不同定义，未被覆盖。"
     }
   ],
   "complex_task_boundary": {
@@ -1081,5 +1095,81 @@
     "model_trials_completed": 0,
     "native_trials_dispatched": 0,
     "business_improvement_proven": false
+  },
+  "latest_native_pilot_contract_diagnostic_20261006": {
+    "report": {
+      "path": "/home/chaidi/qw3/docs/computer_use_native_pilot_contract_diagnostic_20261006.json",
+      "sha256": "677a97c5de461c2c16ffb5ad6db489110df6ca1b8e361f320dca7e204da1988b"
+    },
+    "new_model_calls": 0,
+    "new_device_inputs": 0,
+    "production_installed": false,
+    "business_improvement_proven": false,
+    "original_failed_pilots": 4,
+    "actual_original_requests": 51,
+    "actual_original_tools": 47,
+    "delivered_inputs": 23,
+    "inline_condition_schemas_lost": 51,
+    "offline_condition_schemas_restored": 51,
+    "one_original_missing_field_call_identified": true,
+    "cpu_checks": 13,
+    "independent_source_refs_checked": 125,
+    "actual_waiters": {
+      "original_pipeline_snapshot": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-status-14.json",
+        "sha256": "7b14cfeac3234ad562d62fb6d168deb0ee5b582b26e1c5472ba7a89b9a4db83c"
+      },
+      "native_snapshot": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-pilot-trace-native-waiter-snapshot-02.json",
+        "sha256": "cb07f9047c1ab902dde57ddc08429e0841b98e7127a8e0af92abe90d820fc93d"
+      },
+      "original_stages": {
+        "image": {
+          "status": "restoring-fresh-off-engine",
+          "completed": 1,
+          "planned": 12,
+          "actual_same_process_live": true
+        },
+        "thinking": {
+          "status": "waiting-for-image-twelve",
+          "completed": 0,
+          "planned": 4,
+          "actual_same_process_live": true
+        },
+        "feedback": {
+          "status": "waiting-for-forty-eight-ten-twelve-four",
+          "completed": 0,
+          "planned": 8,
+          "actual_same_process_live": true
+        },
+        "bounded": {
+          "status": "waiting-for-forty-eight-ten-twelve-four-eight",
+          "completed": 0,
+          "planned": 8,
+          "actual_same_process_live": true
+        },
+        "query": {
+          "status": "waiting-for-complete-bounded-chain",
+          "completed": 0,
+          "planned": 4,
+          "actual_same_process_live": true
+        }
+      },
+      "native_completed": 0,
+      "native_planned": 8,
+      "native_same_generation_live": true,
+      "native_status": "waiting-for-complete-original-query-chain",
+      "latest_gpu": {
+        "at": 1791220023.8716004,
+        "free_mib": 55711,
+        "used_mib": 41540,
+        "gpu_percent": 99,
+        "compute_pids": [
+          "3906950"
+        ]
+      },
+      "minimum_free_mib": 56000,
+      "user_gpu_work_signalled": false
+    }
   }
 }
