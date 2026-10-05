@@ -9817,5 +9817,50 @@
         }
       }
     }
+  },
+  "resource_admission_and_prefix_continuation_20261005": {
+    "report": {
+      "path": "/home/chaidi/qw3/docs/computer_use_resource_handoff_20261005.json",
+      "sha256": "7e8f3912ac7bd24ea2e65e9456066cf215d42c2335ffc3c5c5a24a816eaacaf7"
+    },
+    "goal_status": "active",
+    "actual_snapshot": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-independent-audit-01/result.json",
+      "sha256": "881094964fe5ba0c257a37bf3235b9fe974441126d45cea9212b7215d674b72a"
+    },
+    "retained_image_results": 1,
+    "stages": {
+      "image": {
+        "status": "restoring-fresh-off-engine",
+        "completed": 1,
+        "planned": 12,
+        "actual_same_process_live": true
+      },
+      "thinking": {
+        "status": "waiting-for-image-twelve",
+        "completed": 0,
+        "planned": 4,
+        "actual_same_process_live": true
+      },
+      "feedback": {
+        "status": "waiting-for-forty-eight-ten-twelve-four",
+        "completed": 0,
+        "planned": 8,
+        "actual_same_process_live": true
+      },
+      "bounded": {
+        "status": "waiting-for-forty-eight-ten-twelve-four-eight",
+        "completed": 0,
+        "planned": 8,
+        "actual_same_process_live": true
+      },
+      "query": {
+        "status": "waiting-for-complete-bounded-chain",
+        "completed": 0,
+        "planned": 4,
+        "actual_same_process_live": true
+      }
+    },
+    "new_model_business_gain_proven": false
   }
 }

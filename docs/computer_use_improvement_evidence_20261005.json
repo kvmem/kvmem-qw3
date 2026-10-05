@@ -247,73 +247,177 @@
   ],
   "current_retest_status": {
     "audit": {
-      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-pilot-final-state-01/result.json",
-      "sha256": "a2b703f0e0b15a53db6a89262c4877f71979e69f41905824cca353e7f22c1d93"
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-independent-audit-01/result.json",
+      "sha256": "881094964fe5ba0c257a37bf3235b9fe974441126d45cea9212b7215d674b72a"
     },
     "image_completed": 1,
     "image_planned": 12,
     "current_model_trial_started": false,
-    "all_five_original_controllers_retired": true,
     "stages": {
       "image": {
-        "status": "halted-no-further-dispatch",
+        "status": "restoring-fresh-off-engine",
         "completed": 1,
         "planned": 12,
         "current_trial": "004-recent-observations-r1",
-        "controller": {
-          "pid": 4047078,
-          "live": false,
-          "original_instance_retired": true
-        }
+        "actual_same_process_live": true,
+        "identity": {
+          "pid": 149945,
+          "uid": 1001,
+          "start_ticks": 376597548,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "stable_resource_handoff",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/successors.json",
+            "--stage",
+            "image"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "registration": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/image-registration.json",
+          "sha256": "218c11326bd40eb8349998cee7d2ef62bfafdd16832ec59f8f4e7405e8fd8311"
+        },
+        "queue": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-independent-audit-01/image-queue.json",
+          "sha256": "242265cc9d0e8a4c97333936f93cbb646b5556f0fd14bb8c5a2ed702bd852ae6"
+        },
+        "source_live_queue": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/image-queue/queue.json"
       },
       "thinking": {
-        "status": "halted-no-further-dispatch",
+        "status": "waiting-for-image-twelve",
         "completed": 0,
         "planned": 4,
         "current_trial": null,
-        "controller": {
-          "pid": 4052815,
-          "live": false,
-          "original_instance_retired": true
-        }
+        "actual_same_process_live": true,
+        "identity": {
+          "pid": 155219,
+          "uid": 1001,
+          "start_ticks": 376616251,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "stable_resource_handoff",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/successors.json",
+            "--stage",
+            "thinking"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "registration": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/thinking-registration.json",
+          "sha256": "26464346ca7a75892c151d83fc8d4b5c7566686f0bef04da6da36b7c46cdd5f6"
+        },
+        "queue": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-independent-audit-01/thinking-queue.json",
+          "sha256": "2c44f952e415996f6595caa84bfe7ff33189cc6a399926e4e0ed0744d0bba58b"
+        },
+        "source_live_queue": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/thinking-queue/queue.json"
       },
       "feedback": {
-        "status": "halted-no-further-dispatch",
+        "status": "waiting-for-forty-eight-ten-twelve-four",
         "completed": 0,
         "planned": 8,
         "current_trial": null,
-        "controller": {
-          "pid": 4056401,
-          "live": false,
-          "original_instance_retired": true
-        }
+        "actual_same_process_live": true,
+        "identity": {
+          "pid": 157910,
+          "uid": 1001,
+          "start_ticks": 376636620,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "stable_resource_handoff",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/successors.json",
+            "--stage",
+            "feedback"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "registration": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/feedback-registration.json",
+          "sha256": "2fe63e2d68ef8ab802520c819064e32582bc3ece2790ade3dab687579e7d3092"
+        },
+        "queue": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-independent-audit-01/feedback-queue.json",
+          "sha256": "4a738f721182e9d6537a99aae4c809b30de8478f7d8d3557957893f70d4dd954"
+        },
+        "source_live_queue": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/feedback-queue/queue.json"
       },
       "bounded": {
-        "status": "halted-no-further-dispatch",
+        "status": "waiting-for-forty-eight-ten-twelve-four-eight",
         "completed": 0,
         "planned": 8,
         "current_trial": null,
-        "controller": {
-          "pid": 4061726,
-          "live": false,
-          "original_instance_retired": true
-        }
+        "actual_same_process_live": true,
+        "identity": {
+          "pid": 163217,
+          "uid": 1001,
+          "start_ticks": 376671224,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "stable_resource_deferred",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-bounded-20261005-01/declaration.json",
+            "--stage",
+            "bounded"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "registration": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-bounded-20261005-01/registration.json",
+          "sha256": "49637b49eb16ec7f3aa9c06a13f95e0c600a10568c3f1db4f5c1617ece366957"
+        },
+        "queue": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-independent-audit-01/bounded-queue.json",
+          "sha256": "b7c5ae7d5e86950b660886319b1127cdc37cc4026eb6c971a44ababcd3ae939c"
+        },
+        "source_live_queue": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-bounded-20261005-01/queue-runtime-01/queue.json"
       },
       "query": {
-        "status": "halted-no-further-dispatch",
+        "status": "waiting-for-complete-bounded-chain",
         "completed": 0,
         "planned": 4,
         "current_trial": null,
-        "controller": {
-          "pid": 4070594,
-          "live": false,
-          "original_instance_retired": true
-        }
+        "actual_same_process_live": true,
+        "identity": {
+          "pid": 173846,
+          "uid": 1001,
+          "start_ticks": 376701528,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "stable_resource_deferred",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-query-20261005-01/declaration.json",
+            "--stage",
+            "query"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "registration": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-query-20261005-01/registration.json",
+          "sha256": "b1cafa602b41359d15ad5e071f65b5462cb5f2210c8913b870061a80ccd0404b"
+        },
+        "queue": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-independent-audit-01/query-queue.json",
+          "sha256": "442c56c0d877511a8104da95ad7340f82a2952cd485de17945f09fdd18955db1"
+        },
+        "source_live_queue": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-query-20261005-01/queue-runtime-01/queue.json"
       }
     },
-    "engine_startup_failure": {
-      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-pilot-engine-admission-failure-01.json",
-      "sha256": "06967671f46994fbb5dd39f35102fd141c6989bfedeaaee3ad23a750e8e531a8"
+    "resource_recovery_report": {
+      "path": "/home/chaidi/qw3/docs/computer_use_resource_handoff_20261005.json",
+      "sha256": "7e8f3912ac7bd24ea2e65e9456066cf215d42c2335ffc3c5c5a24a816eaacaf7"
     },
     "business_gain_proven": false
   },
@@ -857,5 +961,77 @@
     "actual_material_checks": 24,
     "model_requests": 0,
     "business_improvement_proven": false
+  },
+  "previous_retest_status_before_resource_continuation": {
+    "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-pilot-final-state-01/result.json",
+      "sha256": "a2b703f0e0b15a53db6a89262c4877f71979e69f41905824cca353e7f22c1d93"
+    },
+    "image_completed": 1,
+    "image_planned": 12,
+    "current_model_trial_started": false,
+    "all_five_original_controllers_retired": true,
+    "stages": {
+      "image": {
+        "status": "halted-no-further-dispatch",
+        "completed": 1,
+        "planned": 12,
+        "current_trial": "004-recent-observations-r1",
+        "controller": {
+          "pid": 4047078,
+          "live": false,
+          "original_instance_retired": true
+        }
+      },
+      "thinking": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 4,
+        "current_trial": null,
+        "controller": {
+          "pid": 4052815,
+          "live": false,
+          "original_instance_retired": true
+        }
+      },
+      "feedback": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 8,
+        "current_trial": null,
+        "controller": {
+          "pid": 4056401,
+          "live": false,
+          "original_instance_retired": true
+        }
+      },
+      "bounded": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 8,
+        "current_trial": null,
+        "controller": {
+          "pid": 4061726,
+          "live": false,
+          "original_instance_retired": true
+        }
+      },
+      "query": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 4,
+        "current_trial": null,
+        "controller": {
+          "pid": 4070594,
+          "live": false,
+          "original_instance_retired": true
+        }
+      }
+    },
+    "engine_startup_failure": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-pilot-engine-admission-failure-01.json",
+      "sha256": "06967671f46994fbb5dd39f35102fd141c6989bfedeaaee3ad23a750e8e531a8"
+    },
+    "business_gain_proven": false
   }
 }
