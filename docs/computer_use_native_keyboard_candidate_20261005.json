@@ -1,0 +1,103 @@
+{
+  "kind": "qualified_isolated_native_keyboard_execution_candidate",
+  "checked_at": 1791194976.6346583,
+  "build": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-candidate-20261005-02/build.json",
+    "sha256": "0314d1d331746c5cade72f44b8d5d0e74183a148c94a31a774fcae91e6cd8b72"
+  },
+  "source_sha256": {
+    "native_window_evidence.py": "f8d8773b429571edf5cfb066f217ffebe7d2637ede4adab9a7ce57dd8223b147",
+    "native_window_adapter.py": "9af763103d1fddc7ab9ec6ceed52da972cc673ff2a9f45a7fb0d6d2d81a45c6c",
+    "qualify_native_window_evidence.py": "78f608ea25830d4d8f4474b8257474bb87c340ebf1a9aca627d92ffe6c4dff16",
+    "native_keyboard_execution.py": "6336aa924b99989e22e48c9b49d090f311c2b01f76b365352ae11a67119a2e10",
+    "native_keyboard_candidate.py": "9ea9240c201681a4b17690440e629fd89200cbfa447b5e25508e1e3850ddd099",
+    "qualify_native_keyboard_gate.py": "1dc477756a8e8ba154273e4ea8b39eee311f06197017b4157bd3e6e4b388af75",
+    "tests/test_native_window_evidence.py": "8db41deaa61633606e7443a86b7dd5c3372a417c52bdd81698e3a6ff74969596",
+    "tests/test_native_window_adapter.py": "646e55fcdf926cbb69bec49272e8dae2846c051aa57943e0840cc16f280f34d0",
+    "tests/test_qualify_native_window_evidence.py": "3322e2a0a48582de0417040d5849d201cfc39a8c27929db6c12ff6e501bc809c",
+    "tests/test_native_keyboard_execution.py": "c8f0bac4ed4a4264c76e7d4a4af5bfebd8e69c3a98f10134c9c980455ee800b2",
+    "tests/test_native_keyboard_candidate.py": "6bdd83f8cac4850820dd3eed3623d72b991cf5168a6de92826bfdea1a558e422"
+  },
+  "cpu_qualification": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-cpu-03/result.json",
+    "sha256": "8e1b8cb6fca4ffcb8fa82c26dd33aa4f9444443f88ec9bebede1a2879fa0c8a0"
+  },
+  "cpu_checks": 44,
+  "original_cpu_qualification_42": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-cpu-01/result.json",
+    "sha256": "f1b562c8895040c9893e9df38abc381a7bf3ecdea2db516b16b77b7acd4e28cc"
+  },
+  "prior_cpu_qualification_44": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-cpu-02/result.json",
+    "sha256": "17c00afe5bf92ded94a307c275d0e11696d1c654c48e07206141abfc32719a69"
+  },
+  "actual_readonly_native_gate": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-gate-live-01/result.json",
+    "sha256": "109280586c1ec6e5760f9ae0fda329b68854f7816041b9482a644cf9c497ea73"
+  },
+  "actual_gate_probes": 6,
+  "actual_gate_source_binding": {
+    "original_qualified_build": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-candidate-20261005-01/build.json",
+      "sha256": "9afcef1f73577ecd71aa97a2d58639e7e33b78e180c2d5c6376d240a87790bbc"
+    },
+    "all_prior_candidate_bytes_identical": true,
+    "only_unchanged_canonical_gateway_entry_added": true
+  },
+  "final_actual_state": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-final-audit-02/result.json",
+    "sha256": "305206febdd41152133b83314e587f6a6436e24448f16d9e21f3f328f57f06f5"
+  },
+  "original_build_inventory_failure": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-build-failure-01/result.json",
+    "sha256": "7c6a72d6ba82397ccfbf2d8c4d90860f61892e2489c757e778fa4fb052bfc4ee"
+  },
+  "changed_framework_files": [
+    "qw3_computer/desktop.py",
+    "qw3_computer/linux_driver.py",
+    "qw3_computer/native_window_evidence.py",
+    "qw3_computer/native_window_adapter.py",
+    "qw3_computer/native_keyboard_execution.py"
+  ],
+  "preserved": [
+    "Original Windows and Android driver bytes, gateway action reservations and receipts.",
+    "Original completion-condition implementation, tool schemas, model prompt path and independent graders.",
+    "Original 50-second revalidation threshold, task budgets, thinking, DFlash and model configuration.",
+    "Full client pixels, raw control labels/values and focus ancestry; no arbitrary pixel masks."
+  ],
+  "execution_changes": [
+    "Bracket Linux screenshots with actual native window, process generation and raw focus reads.",
+    "For aged key/type actions, additionally accept unchanged native client pixels and raw focus plus unchanged observed controls, including explicitly missing controls.",
+    "Recheck native window/process/raw focus in the guest process before desktop input; check again after clipboard preparation before paste.",
+    "Use an exact nonce-bound success result for confirmed no-input rejection; transport or guest failures are not treated as no-input proof."
+  ],
+  "qualification_scope": {
+    "cpu_tests_use_simulated_inputs": true,
+    "vm_gate_body_prints_only": true,
+    "model_requests": 0,
+    "device_inputs": 0,
+    "new_vm_input_owner_started": false,
+    "real_model_retest": false,
+    "frozen_active_framework_changed": false,
+    "production_deployment": false,
+    "business_success_improvement_proven": false
+  },
+  "remaining": [
+    "Actual keyboard/paste delivery and changing-focus recovery on an isolated input-owned VM.",
+    "Matched QW3 GUI retests of Linux Calc and OSWorld080 with original task materials, budgets and scores.",
+    "A separate action-specific control identity policy for the Save-button case; this keyboard candidate still rejects internal client changes.",
+    "A separate adaptive thinking-budget experiment; inference time is not isolated thinking time."
+  ],
+  "required_retest_metrics": [
+    "Independent business completion and original official scores where available.",
+    "Completed input receipts, confirmed rejections and repeated evidence refreshes, separated from tool calls.",
+    "Task time, model request time, prompt/output tokens and shared GPU load; compare successful matched tasks separately.",
+    "Unknown delivery, administrative recovery, recorder collection and replay evidence."
+  ],
+  "current_sdk_terminal": {
+    "completed": 8,
+    "fully_accepted": 0,
+    "fault_response_passed": 4
+  },
+  "goal_status": "active"
+}

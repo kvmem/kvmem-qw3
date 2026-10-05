@@ -184,6 +184,13 @@
         "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-eight-terminal-report-01/result.json",
         "sha256": "aec9bb866dffc350cc0e6acb7004f36189fe1abf8b02eeacfbe4028b28845eb6"
       }
+    },
+    {
+      "change": "独立Linux原生键盘核验与输入前窗口/进程/焦点保护",
+      "qualification_checks": 44,
+      "readonly_vm_gate_probes": 6,
+      "source": "/home/chaidi/qw3/docs/computer_use_native_keyboard_candidate_20261005.json",
+      "conclusion": "组件检查通过；真实VM探针只打印结果，没有键鼠输入或QW3任务。尚不能记为业务成功率改善。"
     }
   ],
   "complex_task_boundary": {
@@ -263,7 +270,12 @@
       "model_trials_not_replayed": true
     },
     "native_window_qualification_document": "/home/chaidi/qw3/docs/computer_use_native_window_evidence_20261005.json",
-    "business_gain_proven": false
+    "business_gain_proven": false,
+    "latest_actual_state": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-final-audit-02/result.json",
+      "sha256": "305206febdd41152133b83314e587f6a6436e24448f16d9e21f3f328f57f06f5"
+    },
+    "sdk_completed_at_latest_live_check": 8
   },
   "previous_retest_status_snapshot": {
     "audit": {

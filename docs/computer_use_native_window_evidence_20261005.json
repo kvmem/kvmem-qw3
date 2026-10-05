@@ -75,5 +75,6 @@
     "model_trials_not_replayed": true
   },
   "business_success_improvement_proven": false,
-  "next_action": "Build a private SDK51 observer/keyboard execution candidate with an immediate native process/window/focus guard. Keep the original frozen pipeline running and grades unchanged."
+  "next_action": "Build a private SDK51 observer/keyboard execution candidate with an immediate native process/window/focus guard. Keep the original frozen pipeline running and grades unchanged.",
+  "next_stage_candidate_document": "/home/chaidi/qw3/docs/computer_use_native_keyboard_candidate_20261005.json"
 }
