@@ -361,3 +361,24 @@ CPU资格03为17项通过（新增10项＋原回放7项）；第一次资格01�
 第四次来源探针PID3345703实际退役，自有容器996c7aefdaa7d145e2a79d22b9631e436a9e10116e29e8c57b008403230fad33已移除；`.runtime/chrome-tab-native-source-04/state.json`五项原生核验通过，12份启动观察及19份登记后观察，45.45秒严格观察。Chrome130.0.6723.58原生选中标签来自同一AT-SPI bus/object、owner PID1081、class=Tab、page-tab-list祖先及frame；name附带Memory usage，text仅对象占位符，不能拿它当独立标题来源。独立frame标题是原页面名加Google Chrome后缀，网页document不进入来源遍历。行政浏览器启动可能改变该独立VM的焦点，不能称所有操作零输入；实际校准键鼠与模型调用为零。
 
 这一步建立了后续窄化保护规则的实际来源依据，尚无生产观察注解、输入保护候选或新QW3成绩。后续应仅区分有实际浏览器来源及独立标题的选中原生标签资源信息；继续保留原始名称、身份、语义和完成条件，完整窗口像素/目标位置仍须核验；身份、焦点、内容、表单值变化或来源不完整继续拒绝。新声明和负例资格后再同条件模型复测，不能中途修改SDK51b或其他冻结队列。
+
+
+## 2026-10-05 浏览器运行信息候选与KVMem运行环境恢复
+
+本轮分类为实际进展：新候选/验证文件、原生来源资格、精确工具事件诊断和真实恢复的KVMem首试；不是单纯重复状态或重启观测超时。最新实际审计`.runtime/browser-runtime-and-memory-recovery-progress-20261005-01.json`，原40/40、36份可用原评分全0、035四份不可用、两条历史未知均保留。
+
+资源名称相关的19份无送达/整窗相同重核验不能全算误拒绝。新增`.runtime/browser-resource-stall-action-kinds-20261005-02.json`按原wire action和source observation匹配started/completed事件：15份明确evidence_refreshed，分别scroll4、click_control4、click5、type2；其余含out_of_range、step_required、事件不完整或未分类。四次已确认的系统控件点击中，一次目标是资源文字变化的page-tab，另三次是link。这一诊断保留全部原任务/事件哈希，零输入/模型，不给旧观察补造原生属性或改评分。首版只按wire ID连接产生一份两次匹配、两份无completed事件的结果，保留01；02增加确切源观察和started事件，仍保留歧义。
+
+新增`browser_runtime_metadata.py`只给本机原生AT-SPI浏览器chrome区域提供来源注解：X11前台窗口PID、Chrome可执行文件及进程代次、bus/object/window路径、唯一选中Tab原生class/祖先，以及独立窗口标题；网页document不参与来源识别，原官方任务树仍完整读取。原始name/value均留存，包含Memory usage的用户页面标题也不剥离。控件其他字段、身份、焦点与布局必须相同；缺失、未知或歧义来源继续原规则。私有SDK51候选额外要求完整窗口实际像素相同，视觉/系统控件目标完整在窗口内；键盘只有正的原生焦点对象不变才放行。同一选中标签的资源名称变化可凭相同原生目标和像素准入，不靠任意名称归一化。步骤条件/任务评分不改，输入送达不当完成。
+
+CPU05的21项检查通过：真实本机HTTP、SQLite收据、一次送达/重复不再输入、窗口内变化/值变化/焦点变化/越界/重复来源/旧记录无来源等负例；增加原生标签自身目标场景，原pending步骤仍pending。CPU01因沙箱拒绝测试套接字失败保留，CPU02十九项通过；首次实际打包误把完整framework清单当平面package清单，失败源留在CPU02。CPU03新增完整清单回归时发现SDK私有目录不含原task/evaluator源，一项失败保留；CPU04二十项通过，明确从原位置按声明哈希验证并归档辅助源，避免搬迁后改变它们的ROOT。CPU05为实际目标诊断追加测试，范围未减小。
+
+`.runtime/browser-runtime-native-01/qualification.json`真实独立Linux VM读取资格通过：候选01的八次读屏均包含唯一正确原生标签、来源owner与已登记Chrome主进程匹配，六项核验通过；生产者PID3363087及自有VM已实际退役，八份原图SHA均核验。行政浏览器启动可能改变此独立VM焦点；现有设备与校准键鼠输入为零、模型为零。资源值全为19.1 MB、没有实际变值，focus_objects为空；不据此证明原生键盘或点击收益。候选02的driver/helper与01完全同字节，仅Desktop增加同一原生标签目标保护，原生来源资格可支持相同reader，不能支持新Desktop原生派发或真实模型结果。候选未部署到冻结比较或pilot，production/native dispatch/model资格仍false。
+
+原KVMem控制器在显存等待结束后启动过首个035-OFF试验，不是一直零派发：实际子进程3366401已退出，`task_035.py`导入链在Python3.13环境缺少cssselect，发生于load_task_from_file、VM创建/agent启动之前。原目录保留result/runner-result/traceback/manifest，无VM、初始化截图、应用或网关记录。原result为infrastructure-failed、score=null、没有uncertain_actions字段，保持原样，不能补写0或当模型能力失败。原控制器严格终止资格未满足而停止并保留自有引擎PID3365877；SDK/image/thinking/feedback随后停止，全部旧控制器实际退役且各自完成试次零。
+
+运行环境续跑只接受这个按哈希冻结的确切pre-VM失败；十项CPU资格通过，活进程、其他任务、已完成试次、初始化或任一设备/任务记录、未终止结果或改变的源形状均拒绝。新声明`.runtime/linux/kvmem-runner-runtime-continuation-20261005/continuation.json`复制原八项protocol及OFF/ON acceptance字节，新证据目录，不覆盖旧失败。复用原40次使用的现成OSWorld CPython3.12.13 venv，cssselect/lxml/numpy/PyAV/aiohttp/原runner/app/gateway导入已实际通过；初次额外探测jsonschema缺失，但它不属于这些运行组件的实际依赖，没有下载或安装。声明保存解释器与源哈希、旧五个实际身份及停止状态、自有原引擎完整身份；只在所有旧试验已退休、App空闲并锁定模型后按原逻辑退役自有引擎、等待共享显存并启动各自新引擎，不影响用户其他GPU进程。
+
+新控制器PID3371750/UID1001/start_ticks371417942已实际运行，注册`.runtime/runner-runtime-memory-launch-01/registration.json`。首个035-kvmem-off-r1的原任务VM已创建、initialized_at=1791158571.8321788，任务子进程和引擎实际身份核验相同；完成模型对照仍零，不把“正在运行”记为成功。后续SDK10/image12/thinking4/feedback8尚未恢复，应以新实际memory登记和物理结果目录作受控衔接，并继续全部原终止/身份/收据保护。
+
+后续浏览器比较应先补实际原生资源变值、目标点击与输入框焦点资格，再在相同原生observer的严格规则/新规则两侧测试013及043各两次、相反顺序，共八次开发复测；固定原材料/初始化/独立评分、16K输出、1800秒/250调用、thinking/DFlash2、KVMem OFF/完整截图历史/顾问OFF。新比较须排在既有8/10/12/4/8之后，避免并行模型负载；控制器和OFF/ON冻结声明尚未创建，不能算已排队。重点报告真实送达、反复刷新停滞、条件误满足、端到端评分及额外读屏成本，而非仅合约通过数量。
