@@ -7037,7 +7037,7 @@
     "superseded_by_capacity_recovery": "apps/computer_use/.runtime/kvmem-capacity-and-successors-progress-20261005-01.json",
     "current_runtime_controller_retired_after_second_trial_engine_failure": true
   },
-  "latest_actual_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-09.json",
+  "latest_actual_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-12.json",
   "kvmem_capacity_recovery": {
     "kind": "actual_kvmem_capacity_and_successors_progress",
     "checked_at": "2026-10-05T00:52:13.412921+00:00",
@@ -8403,5 +8403,23 @@
     "prior_snapshot_and_results_preserved": true,
     "unfinished080_excluded": true,
     "model_gain_claim": false
+  },
+  "current_query_gate_diagnostic": {
+    "report": "/home/chaidi/qw3/apps/computer_use/.runtime/kvmem-query-gate-terminal-diagnostic-02.json",
+    "source_retirement": "/home/chaidi/qw3/apps/computer_use/.runtime/kvmem-query-gate-terminal-lineage-01.json",
+    "all_scorer_events": 95,
+    "below_budget_identity_events": 16,
+    "above_budget_window_fallback_events": 79,
+    "above_budget_captured_query_events": 0,
+    "above_budget_requests": 7,
+    "above_budget_requests_with_scorer_events": 6,
+    "reason": "same-user-query guided-off continuation gate sets reselect=off; pressure ingest has no captured query; recompute default true does not bypass admission",
+    "cpu_qualification": "/home/chaidi/qw3/apps/computer_use/.runtime/kvmem-query-gate-qualification-03/result.json",
+    "python_checks": 10,
+    "cpp_policy_checks": 14,
+    "prepared_saved_input_plan": "/home/chaidi/qw3/apps/computer_use/.runtime/kvmem-query-refresh-saved-input-plan-01.json",
+    "saved_input_model_trials_started": 0,
+    "production_binary_or_conditions_changed": false,
+    "business_or_latency_gain_proven": false
   }
 }

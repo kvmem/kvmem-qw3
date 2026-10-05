@@ -474,3 +474,5 @@ ON在超过131072 token后实际出现pressure-prefill历史选择，但终止�
 只读审计`.runtime/improvement-status-live-audit-20261005-03.json`确认共同预算KVMem仍2/8，080-ON实际运行，同一任务已记录23份完成推理；SDK10、图像12、thinking预算4、反馈8及有限续轮8的登记等待器全部存活、各零试次。此次核验零新增模型请求、零设备输入、零进程信号，不能把等待器资格当作改善成绩。
 
 现有证据中坐标约定、实际工具参数传递和短规则thinking对照的改善最明确；Windows Calc thinking与Python修复流程选择各仅有一组开发速度对照。Python/LaTeX混合工具8/8是受控能力验证，没有同条件旧路线作为速度或成功率提升基线。截图分块放大仅17/24→18/24、请求耗时中位数0.366→1.162秒，收益不足以作为默认策略。正式OSWorld的36份可用评分全0、四份035不可用仍保留，后续候选及KVMem未证明复杂任务收益。
+
+后续已按实际request plan逐次诊断查询回退，定位同目标/guided-off的reselect抑制；区分前16条完整历史事件与超过窗口的79条回退，并准备同引擎短→长的真实saved-input资格。十项解析边界与14项原策略检查通过，实际模型资格尚未派发。完整证据与限制见[查询刷新诊断](computer_use_kvmem_refresh_diagnostic_20261005.md)；不能再把未显式开启recompute作为已证实根因。

@@ -458,6 +458,12 @@ if(QW3_BUILD_TESTS)
     add_test(NAME qw3-kvmem-request-plan
         COMMAND qw3-kvmem-request-plan)
 
+    add_executable(qw3-kvmem-computer-use-refresh
+        tests/kvmem_computer_use_refresh_test.cpp)
+    target_include_directories(qw3-kvmem-computer-use-refresh PRIVATE src include)
+    add_test(NAME qw3-kvmem-computer-use-refresh
+        COMMAND qw3-kvmem-computer-use-refresh)
+
     add_executable(qw3-tool-call-stream tests/tool_call_stream_test.cpp)
     target_include_directories(qw3-tool-call-stream PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src)

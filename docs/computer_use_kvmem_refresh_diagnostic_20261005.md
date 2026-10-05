@@ -1,0 +1,42 @@
+# 长桌面任务的 KVMem 查询刷新诊断
+
+2026-10-05。共同显存配置035第一轮ON的实际日志显示：长工具任务保持同一用户目标、guided refresh关闭时，服务端把自动查询重选抑制为off。随后冷预填采用有界pressure窗口，执行器没有捕获查询，Mean-K回退window-profile。现有八次对照继续保持原配置；本诊断不改变其成绩或条件。
+
+## 实际证据
+
+来源为`quota1-035-kvmem-on-r1`的终止引擎日志。原引擎3486935和runner3487549的登记身份与实际退役已经独立核验；原结果仍为官方评分器不可用、辅助本地0、accepted=false。
+
+| 范围 | 请求数 | scorer事件 | 窗口回退 | 捕获查询 |
+| --- | ---: | ---: | ---: | ---: |
+| 全部输入仍在131072窗口内 | 16 | 16 | 16 | 0 |
+| 输入已超过131072 | 7 | 79 | 79 | 0 |
+
+前16次事件选择了全部source blocks，不能据此声称历史丢失。后7个请求全部记录continuation gate的reselect=off、有效服务端query span与pressure-prefill；其中6次产生79条scorer事件，query_expected/query_captured均0，第7次在模型请求取消前没有scorer事件，不推断其未记录行为。故障不只是查询坐标缺失：服务端知道span，却没有授权执行器做当前查询选择。
+
+首个超过窗口的原始请求为181074输入token，服务端query span为[3944,13218)，score query message为3；原始请求没有指定kvmem_reselect或guided参数。原请求沿服务默认auto进入，而延续相同用户查询的gate随后将其改为off。原启动配置guided_refresh=off、prefix_reuse=false保持。
+
+同一实际运行080-ON的后续活动前缀也观察到此路径：104条scorer事件中29条选择全部历史，超过窗口75条全部回退、查询捕获0；六个above-budget请求中五个已产生scorer事件。证据`kvmem-080-query-gate-active-prefix-01.json`只覆盖当时快照，不作为终止结果或跨任务改善。
+
+源码`kvmem_harness_refresh_decision`在同一用户查询且guided refresh关闭时返回不重选。服务端据此设置reselect=Off，`kvmem_query_lifecycle`不会进入select_active；prefix reuse关闭也不产生warm capture。recompute-query虽在当前EngineOptions默认true，仍被这些前置条件限制。日志中mtp标签不足以把故障归因于DFlash。
+
+## 已完成的资格与工具
+
+新增`kvmem_retrieval_diagnostic.py`按真实请求边界区分全历史可容纳与超过窗口、服务端span与执行器query、正常最终计划与不完整活动行；仅导出结构、计数和源哈希，不导出任务或查询文字。十项检查通过，包含真实query_expected/query_captured是行数而非布尔值的回归、部分日志、缺字段、重复序号、跨请求gate污染与成功查询反例。
+
+新CPU策略测试复用原refresh/request-plan头文件，在上述181074、131072、65536、28672实际配置上通过14项检查。现有两个C++策略测试另通过。证明启用现有both模式可让该持续增长轨迹进入private-query刷新，并保持短回调的有界宽限、原窗口/生成/输出预算；不证明GPU查询捕获、业务正确性或延迟改善。仅boundary模式在此调用中不提供middecode增长阈值，不能与both的私有查询行为混为一谈。
+
+第一次新C++检查因测试类型拼写错误编译失败，原源码与日志完整保留；修正测试后通过，没有修改生产策略。初次解析器按布尔值限制查询行数，源复核后增加真实行数反例，旧版及九项资格保留，当前十项通过。
+
+证据目录均相对`apps/computer_use/.runtime/`：
+
+- `kvmem-query-gate-terminal-diagnostic-02.json`：当前解析器的完整终止日志结构核验。
+- `kvmem-query-gate-terminal-lineage-01.json`：来源进程实际退役与首份诊断哈希。
+- `kvmem-query-gate-qualification-01/`、`02/`、`03/`：全部初始失败、通过、精确源码和当前资格。
+
+## 独立真实模型资格的准备
+
+`kvmem-query-refresh-saved-input-plan-01.json`已准备，尚未派发或登记等待器。两侧每次新引擎，顺序control/candidate/candidate/control；先发送原13225-token请求，再发送原181074-token请求，均保留原始请求字节、thinking与16384输出上限。两份档案已无损恢复并核验root task与score query的消息哈希一致；模型生成的工具调用只记录、零执行，不向桌面输入。
+
+control保持guided-reselect=off；candidate使用现有both，其他模型、DFlash、FP8、窗口、quota1、历史图像和prefix reuse配置相同。须在现有冻结模型流水线完整终止及退役、获得原串行锁、用户应用与网关空闲、满足GPU余量后才可执行；当前计划不是已运行试次。
+
+这一步先验收control复现known-conversation抑制、candidate真正捕获私有查询并执行非回退查询评分。单独将长请求发给冷引擎属于ColdAboveBudget，不能复现本次问题；不能用那种试验假装已修复桌面延续流程。即使机制资格通过，仍需同条件真实桌面任务证明质量/速度改善。
