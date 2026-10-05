@@ -442,3 +442,15 @@ CPU05的21项检查通过：真实本机HTTP、SQLite收据、一次送达/重�
 当前资格为engine9项、memory19项、operations12项、successors37项；后者含原等待循环的零部署/零派发边界，均不算模型业务成绩。早期PIDFD接口缺失及Path夹具错误的资格失败保留；Linux系统调用回退已由自有测试进程的真实冻结/恢复检查覆盖。GPU采样是整卡数值、包含其他工作，不能记为本进程显存峰值或稳定速度。首版零派发准备、两个400、TIME_WAIT以及原全空闲容量失败全部单列。
 
 实际声明：`.runtime/linux/kvmem-shared-quota-20261005-05/declaration.json`；原生健康资格：`.runtime/linux/kvmem-shared-quota-20261005-04/startup-post-retirement-qualification.json`；后继声明：`.runtime/shared-quota-successors-20261005/successors.json`；最终快照：`.runtime/shared-quota-current-progress-20261005-03.json`。当前已完成的40次Linux主对照仍为36份可用原评分全0、035四份不可用。KVMem配对收益、SDK51/图像/反馈真实改善和有限续轮业务复测均未证明；目标仍active，当前健康及CPU资格不能替代它们。
+
+## 2026-10-05 新首试终止与实际长历史等待瓶颈
+
+共同ratio1.0的新首试quota1-035-kvmem-off-r1已终止，1412.71秒、20次工具调用、uncertain_actions=0。原result为evaluator-unavailable、score=null、accepted=false；辅助本地指标0，不补写有效官方零分。agent_status=failed，错误为后台socket读取超时；20份已完成推理及最后一份失败metrics均保留，录像收集通过。旧1802.61秒首试不作为新配对的一侧。
+
+只读计时诊断`.runtime/shared-quota-off-latency-diagnostic-01.json`按实际metrics和原生引擎完整计时核验：输入从13217增至209818 token，完成请求总时长从7.465增至117.461秒，首模型内容从4.589增至110.226秒。20次已完成请求的原生prefill合计1093.701秒、decode合计95.769秒，prefill占这些请求的引擎处理时间91.946%。此处prefill是读取上下文，decode包含思考与动作生成，不能把全部模型时间称为纯思考。第21份失败请求在0.474秒收到后台事件，之后未记录模型内容，180.479秒触发Timeout on reading data from socket；冻结bridge仍是180秒sock_read、600秒总期限。最后一份没有完整原生prefill或usage，不为它推算token和预填时长。
+
+这些事实支持把长历史处理和静默等待列为当前优化重点，不证明视觉理解已完全解决，也不证明共享GPU占用或图像增长各自的因果贡献。保持正在运行的冻结预算、包和输入条件；优先完成已声明的历史图像12次对照和思考预算4次回放，后续再基于相同材料设计有界等待复测。不能仅增加超时掩盖无进度，也不能把候选减小JSON字节当作实际速度收益。
+
+另补齐实际冻结SDK/image成功终止交接回调的CPU资格：12项通过、零跳过、零模型和设备输入。新测试保留fresh8与SDK10的生产库存/结果SHA/未知输入验证、两个实际回调作用域及服务交接检查；历史40证明、静态协议资格和主机进程/VM探针明确使用夹具。正例实际走到交接返回；旧八项ID、缺项/重复、改变的结果或比例/协议、未知输入、PID复用、未退休producer、改变的SDK顺序/服务交接与缺失client/registry均拒绝或保持等待。源码不修改任何现有活动helper、测试或协议。首轮夹具缺少临时目录导致12项setup错误，原源与失败记录保留；修复夹具后全通过。证据`.runtime/shared-quota-terminal-handoff-cpu-01/result.json`和`.runtime/shared-quota-terminal-handoff-cpu-02/result.json`。这是复测衔接资格，不能算业务改善。
+
+最新只读快照`.runtime/shared-quota-current-progress-20261005-06.json`确认新队列1/8、当前035-ON真实任务：控制器3468661、引擎3486935、runner3487549相同实际实例，14份已完成推理，其中最后输入112613 token。四个后继同一实际实例保持0/10、0/12、0/4、0/8。审计05误读旧current字段而显示null，06改读生产者current_trial/child并保留05原文件，没有更改生产队列。新首试未成功，ON尚未结束，开关质量/延迟收益仍未证明；目标继续活动。
