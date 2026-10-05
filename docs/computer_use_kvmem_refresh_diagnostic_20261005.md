@@ -46,3 +46,5 @@ control保持guided-reselect=off；candidate使用现有both，其他模型、DF
 准备计划原文件保留为prepared_not_dispatched。随后新建不可覆盖的`.runtime/query-refresh-readonly-20261005/protocol.json`，明确KVMem两侧均开启、仅guided refresh为off/both，顺序off/both/both/off；每轮先原13225-token请求，再原181074-token请求，要求完整流、同一引擎、原输入token及退役回执。工具调用仅记录，零执行；初次请求或身份失败不发送第二份请求。
 
 HTTP九项、原启动器九项、严格串行队列十三项资格全部通过，共31项，均无QW3或桌面输入；首次沙箱TCP绑定失败、早期测试源码及队列资格分别保留。实际等待器PID3585544/UID1001/start_ticks373428016已经登记，快照16确认存活、0/4，等待原40＋新KVMem8＋SDK10＋图像12＋thinking4＋反馈8＋有限续轮8完整结束与退役。各级源哈希、结果库存、VM退役、未知输入及最后自有引擎检查保持，结束后恢复原OFF用户入口。未修改现有运行程序；当前没有模型机制改善、业务提升或延迟收益。完整绑定见[运行声明](computer_use_query_refresh_runtime_20261005.json)。
+
+快照18更新：原KVMem队列在5/8后遇到下一次OFF启动前的端口占用检查失败，未派发任务；全部后继因前序停止而自然退出，PID3585544已退役、0/4。独立端口续跑仅保留五份结果并执行余下三次，实际已运行；查询刷新及其他后继尚未重新绑定。上段16的存活状态是保留的历史快照，不能作为当前运行依据；原协议、资格与失败仍保持。

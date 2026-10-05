@@ -57,9 +57,11 @@
   "generated_tool_calls_executed": 0,
   "advisor_enabled": false,
   "model_success_improvement_proven": false,
-  "latest_live_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-16.json",
-  "checked_at": 1791179085.0039017,
-  "status_at_latest_audit": "waiting-for-complete-bounded-chain",
+  "latest_live_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-18.json",
+  "checked_at": 1791181131.1370895,
+  "status_at_latest_audit": "halted-no-further-dispatch",
   "completed_replays_at_latest_audit": 0,
-  "actual_registered_process_live": true
+  "actual_registered_process_live": false,
+  "predecessor_port_failure_preserved": true,
+  "successor_rebinding_completed": false
 }
