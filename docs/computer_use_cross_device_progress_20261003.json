@@ -9734,5 +9734,21 @@
     "five_actual_live_producers": true,
     "model_trials_completed": 0,
     "business_gain_proven": false
+  },
+  "native_control_delivery_20261005": {
+    "document": "/home/chaidi/qw3/docs/computer_use_native_control_delivery_20261005.json",
+    "checked_at": 1791203535.0090032,
+    "qualification_passed": true,
+    "actual_vm_checks": 12,
+    "cpu_tests": 16,
+    "model_calls": 0,
+    "real_qw3_gain_proven": false,
+    "prepared_model_trials": 8,
+    "registered_model_controller": false,
+    "frozen_pipeline_audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/save-control-final-state-01/result.json",
+      "sha256": "d038219a5f34662579080c37b51315b0787b2f6bb24d1b7f4cc856248079d9a7"
+    },
+    "replay_url": "http://127.0.0.1:18165/index.html"
   }
 }

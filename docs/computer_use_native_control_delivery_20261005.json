@@ -1,0 +1,198 @@
+{
+  "kind": "actual_native_button_invocation_save_and_recovery_qualification",
+  "checked_at": 1791203535.0039048,
+  "goal_turn_classification": "progress",
+  "previous_status_only_turn_classification": "no_progress",
+  "goal_status": "active",
+  "advisor_used": false,
+  "problem": "Whole-client pixel freshness can reject the correctly identified Save button after irrelevant editor changes.",
+  "change": "Separate native invocation from visual mouse input. Require positive provider object identity, native window/process/raw focus, button state/action, exact target ROI and unchanged observed semantic controls. Invoke one native action with nonce-bound pre-invocation rejection; false or lost invocation reply remains uncertain.",
+  "sources": {
+    "native_control_evidence.py": {
+      "path": "/home/chaidi/qw3/apps/computer_use/native_control_evidence.py",
+      "sha256": "3121b54885fe6ccd4aef2073cfbecb7ded20772934cb916ffa3132ca779134a5"
+    },
+    "native_control_execution.py": {
+      "path": "/home/chaidi/qw3/apps/computer_use/native_control_execution.py",
+      "sha256": "c82aa49331b4d792f6b6fe7aa7bef736eaef1074a8ce2f190c06e4a7b57eb8b4"
+    },
+    "native_control_candidate.py": {
+      "path": "/home/chaidi/qw3/apps/computer_use/native_control_candidate.py",
+      "sha256": "c09c4fbbe0f167fe0d5928bc651905d0fb81cf5c7a5f747e646937bf19ef622e"
+    },
+    "qualify_native_control_probe.py": {
+      "path": "/home/chaidi/qw3/apps/computer_use/qualify_native_control_probe.py",
+      "sha256": "c56d28c3cfe358751fdf3177c099d2714c219dd1236c4c00b7b21a5c4c7bf313"
+    },
+    "qualify_native_control_delivery.py": {
+      "path": "/home/chaidi/qw3/apps/computer_use/qualify_native_control_delivery.py",
+      "sha256": "d1cb64e4b513bedf784b71494a498022f96ab703c143eef98b1a6f1f6158411d"
+    },
+    "native_control_replay.py": {
+      "path": "/home/chaidi/qw3/apps/computer_use/native_control_replay.py",
+      "sha256": "db2196ccc978f97d588262e175acdc52325fff1859e54c697c68ed7a816d88de"
+    },
+    "tests/test_native_control_execution.py": {
+      "path": "/home/chaidi/qw3/apps/computer_use/tests/test_native_control_execution.py",
+      "sha256": "b6f48cd6b83be39f02b6eadd4caaa3eb66e6d1b5953f2934bb3b3b88c2f5b748"
+    },
+    "tests/test_native_control_receipts.py": {
+      "path": "/home/chaidi/qw3/apps/computer_use/tests/test_native_control_receipts.py",
+      "sha256": "51e8a4610a2f3cdc342190abc08300d0698ba317b9a94bb4a47fa3cefa351ea8"
+    }
+  },
+  "candidate_build": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-candidate-20261005-02/build.json",
+    "sha256": "a07266aed63d31f470aa2b5fbcd60fc8def54a519b907e1eeb8fb1a4c8343c8a"
+  },
+  "cpu_qualification": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-cpu-01/result.json",
+    "sha256": "3fd03f7092b49f4e0f815a2f0b01a622802df7b2d4f769f64df5f5ae0fa46cb8"
+  },
+  "cpu_tests": 16,
+  "actual_qualification": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-delivery-live-02/result.json",
+    "sha256": "11329c5817789c1e34ef5b6c87cdcdb582790b88887eeefdbce9345c251bcaf3"
+  },
+  "actual_checks": {
+    "aged_native_control_path_exercised": true,
+    "unchanged_target_despite_changed_view": true,
+    "actual_native_action_invoked_once": true,
+    "actual_save_as_transition_verified": true,
+    "duplicate_returns_saved_receipt_without_second_input": true,
+    "actual_focus_fault_rejected_before_native_invocation": true,
+    "fresh_observation_recovers_via_alternative_shortcut": true,
+    "file_created_by_location_enter": true,
+    "saved_file_independently_correct": true,
+    "no_uncertain_inputs": true,
+    "durable_receipts_match_actual_requests": true,
+    "unobserved_business_completion_not_claimed": true
+  },
+  "actual_checks_passed": 12,
+  "gateway_receipt_counts": {
+    "completed": 6,
+    "rejected": 1
+  },
+  "independently_saved_file": {
+    "exists": true,
+    "text": "QW3 native button qualification\n"
+  },
+  "model_requests": 0,
+  "real_qw3_retest": false,
+  "business_success_claimed": false,
+  "isolated_historical_policy_diagnostic": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-exact-policy-replay-01/result.json",
+    "sha256": "59109015d991804688d6fc65a94517122ff0d1cfc782eedcde20844c98bdbd29"
+  },
+  "policy_diagnostic_scope": "Offline exact historical source evaluated on the old/fresh real capture pair used by successful candidate invocation. The isolated clock equals the actual fresh capture time; capture timestamps/bytes unchanged. Not a second live baseline trial.",
+  "same_capture_result": {
+    "original_policy_rejected": true,
+    "original_target_valid": true,
+    "candidate_native_action_accepted": true,
+    "target_pixels_unchanged": true,
+    "changed_client_pixels": 103
+  },
+  "independent_audit": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-independent-verification-02/result.json",
+    "sha256": "e9617828b867c259919c9d0ac5f8011842bf41c16dd4450efe5090b09c666939"
+  },
+  "retained_failures": [
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-delivery-import-failure-01/result.json",
+      "sha256": "e958445508794b521bbc5adec8fe9349bc5ee2fc3f6c43d57fa8b8691997694a"
+    },
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-delivery-live-01/result.json",
+      "sha256": "fc387da990f426aa9f5e29ed24f397a847afa75fdc26ef8a6a9ceeee3bbbaf3a"
+    },
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-independent-verification-01/result.json",
+      "sha256": "9abfea2b1e79d69ebf6b3bc7cf0b0b5790592fa4f5df4222e6825b07d6e3676e"
+    }
+  ],
+  "failure_findings": [
+    "Direct script launch selected the regular package ahead of the private candidate; module launch fixes source selection before any VM/input.",
+    "The first live test passed six local checks but its repeated same-button recovery was refused by the existing intent limit. The second test preserves the limit and uses standard Ctrl+S after fresh recovery.",
+    "The live historical policy capture temporarily changed328 Save-edge pixels. This live rejection cannot isolate whole-client protection; the exact-recorded policy diagnostic does."
+  ],
+  "videos": {
+    "native-control-interface-probe-live-01": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-interface-probe-live-01/continuous.mp4",
+      "sha256": "d1269db2a00bae8d30f4124e58e663de866cfc4f92aa2e160d61b5618a9225ce",
+      "decoded_frames": 11
+    },
+    "native-control-delivery-live-01": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-delivery-live-01/interrupted.mp4",
+      "sha256": "6ff7ae41bd83ad09d7fa77c563aaef59d7557b6b0620f3133134a6bb239d9983",
+      "decoded_frames": 206
+    },
+    "native-control-delivery-live-02": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-delivery-live-02/continuous.mp4",
+      "sha256": "ac072b398dade284c7320d472df44d9b6334512cd7b3ad31f19bc6819f7a6b2c",
+      "decoded_frames": 263
+    }
+  },
+  "replay": {
+    "url": "http://127.0.0.1:18165/index.html",
+    "directory": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-replay-20261005-01",
+    "browser_check": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-replay-browser-01/browser-check.json",
+      "sha256": "0a409cb2473b6dbfe5e64068f85e5ac03ff8c34a55a5bcb6f2229b736a12956b"
+    },
+    "scope": "3 real2fps sampled recordings; not an end-to-end model or task latency comparison"
+  },
+  "prepared_model_retest": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-model-retest-20261005-01/protocol.json",
+    "sha256": "b36f465ecd64d9b839d5c8f0b949ac70a66dd2181f097f05e31d3948951445e0"
+  },
+  "planned_model_trials": 8,
+  "model_controller_registered": false,
+  "current_frozen_pipeline": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/save-control-final-state-01/result.json",
+    "sha256": "d038219a5f34662579080c37b51315b0787b2f6bb24d1b7f4cc856248079d9a7"
+  },
+  "current_frozen_stages": {
+    "image": {
+      "status": "restoring-fresh-off-engine",
+      "completed": 0,
+      "planned": 12,
+      "actual_live": true
+    },
+    "thinking": {
+      "status": "waiting-for-image-twelve",
+      "completed": 0,
+      "planned": 4,
+      "actual_live": true
+    },
+    "feedback": {
+      "status": "waiting-for-forty-eight-ten-twelve-four",
+      "completed": 0,
+      "planned": 8,
+      "actual_live": true
+    },
+    "bounded": {
+      "status": "waiting-for-forty-eight-ten-twelve-four-eight",
+      "completed": 0,
+      "planned": 8,
+      "actual_live": true
+    },
+    "query": {
+      "status": "waiting-for-complete-bounded-chain",
+      "completed": 0,
+      "planned": 4,
+      "actual_live": true
+    }
+  },
+  "limits": [
+    "Fixed real Gedit component qualification, not unassisted model success or OSWorld improvement.",
+    "Only complete foreground native push-button evidence enables this candidate route. Partial Office observations, unmatched identities and visual inputs retain the previous requirements.",
+    "Actual VM focus rejection is tested; disabled/deleted controls and false/lost replies are CPU boundary tests, not additional live VM cases.",
+    "The separately qualified keyboard base is unchanged; outcome conditions, budgets, schema, Windows/Android sources and running frozen experiment packages were preserved.",
+    "The new QW3 comparison is prepared only. Controller qualification, actual terminal handoff and model execution remain."
+  ],
+  "next": [
+    "Complete the frozen36 downstream model experiments under their original resource threshold without stopping user work.",
+    "Qualify live widget disable/removal faults before generalizing native control admission.",
+    "Implement and qualify the independent native-button QW3 controller, then execute the eight matched Gedit/Calc trials with unchanged materials, graders and budgets."
+  ]
+}
