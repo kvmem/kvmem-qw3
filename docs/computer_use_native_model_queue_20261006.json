@@ -1,0 +1,345 @@
+{
+  "kind": "qualified_and_registered_original_native_control_model_queue",
+  "checked_at": 1791217385.5043306,
+  "goal_status": "active",
+  "goal_turn_classification": "progress",
+  "previous_goal_turn_classification": "no-progress",
+  "previous_turn_reason": "Only summarized unchanged measurement records; no implementation or live-handle polling.",
+  "declaration": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-model-queue-20261006-01/declaration.json",
+    "sha256": "cededfcc16864a0e2fdf8fe3090c22ee248d27a54e455675b0b599eefa4ab7b8"
+  },
+  "registration": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-model-queue-20261006-01/registration.json",
+    "sha256": "c5501a4c5c0a4bc582380d0d09650b8a0f8e598f8a427282c9f12aaeeaf71c45"
+  },
+  "identity": {
+    "pid": 354765,
+    "uid": 1001,
+    "start_ticks": 377284282,
+    "command": [
+      "/home/chaidi/qw3/.venv/bin/python",
+      "-m",
+      "native_control_model_queue",
+      "run",
+      "--declaration",
+      "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-model-queue-20261006-01/declaration.json"
+    ],
+    "cwd": "/home/chaidi/qw3",
+    "state": "R"
+  },
+  "actual_same_generation_live": true,
+  "status": "waiting-for-complete-original-query-chain",
+  "prepared_study": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-model-retest-20261005-01/protocol.json",
+    "sha256": "b36f465ecd64d9b839d5c8f0b949ac70a66dd2181f097f05e31d3948951445e0"
+  },
+  "study_bytes_unchanged": true,
+  "trials": [
+    {
+      "id": "native-control-linux_text-native-keyboard-control-r1",
+      "case": "linux_text",
+      "arm": "native-keyboard-control",
+      "repetition": 1,
+      "seconds": 360,
+      "tools": 100
+    },
+    {
+      "id": "native-control-linux_calc-native-keyboard-control-r1",
+      "case": "linux_calc",
+      "arm": "native-keyboard-control",
+      "repetition": 1,
+      "seconds": 900,
+      "tools": 100
+    },
+    {
+      "id": "native-control-linux_text-native-button-candidate-r1",
+      "case": "linux_text",
+      "arm": "native-button-candidate",
+      "repetition": 1,
+      "seconds": 360,
+      "tools": 100
+    },
+    {
+      "id": "native-control-linux_calc-native-button-candidate-r1",
+      "case": "linux_calc",
+      "arm": "native-button-candidate",
+      "repetition": 1,
+      "seconds": 900,
+      "tools": 100
+    },
+    {
+      "id": "native-control-linux_text-native-button-candidate-r2",
+      "case": "linux_text",
+      "arm": "native-button-candidate",
+      "repetition": 2,
+      "seconds": 360,
+      "tools": 100
+    },
+    {
+      "id": "native-control-linux_calc-native-button-candidate-r2",
+      "case": "linux_calc",
+      "arm": "native-button-candidate",
+      "repetition": 2,
+      "seconds": 900,
+      "tools": 100
+    },
+    {
+      "id": "native-control-linux_text-native-keyboard-control-r2",
+      "case": "linux_text",
+      "arm": "native-keyboard-control",
+      "repetition": 2,
+      "seconds": 360,
+      "tools": 100
+    },
+    {
+      "id": "native-control-linux_calc-native-keyboard-control-r2",
+      "case": "linux_calc",
+      "arm": "native-keyboard-control",
+      "repetition": 2,
+      "seconds": 900,
+      "tools": 100
+    }
+  ],
+  "bounds": {
+    "predecessor_wait_seconds": 172800,
+    "resource_wait_seconds": 21600,
+    "min_free_mib": 56000,
+    "headroom_stability_seconds": 30,
+    "launcher_wait_seconds": 60,
+    "model_ready_seconds": 600,
+    "child_observation_interval_seconds": 10,
+    "administrative_observation_notice_seconds": 1200
+  },
+  "model_profile": null,
+  "model_concurrency": 1,
+  "advisor_enabled": false,
+  "native_model_trials_completed": 0,
+  "native_model_trials_dispatched": 0,
+  "planned_native_model_trials": 8,
+  "business_improvement_proven": false,
+  "qualification_scope": "Serial queue and receipt validation plus actual waiting process. No native QW3 task has run.",
+  "cpu_qualification": {
+    "evidence": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-model-queue-cpu-03/result.json",
+      "sha256": "1204cfed7083ffd2c25829c8ca6d5956f06dfc1a9d2b729a2844e564356b5062"
+    },
+    "tests": 34,
+    "errors": 0,
+    "failures": 0,
+    "skipped": 0,
+    "model_calls": 0,
+    "device_inputs": 0,
+    "scope": "Actual queue/collection/handoff logic on CPU fixtures; model, host and historical40 probes are explicit fixtures."
+  },
+  "independent_audit": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-model-queue-independent-audit-01/result.json",
+    "sha256": "eca2b39e741215cf00e082ca17716e06e8cd47f9b8c3b6cea36686efdf24c5bb"
+  },
+  "decoder_actual_movie_probes": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-model-queue-video-probes-01/result.json",
+    "sha256": "599669cf75bfb1467d76bb80b3313112e7a66e5e1426cbbf12fa1319242d1730"
+  },
+  "independently_decoded_existing_movies": [
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-model-stack-control-02/recording/continuous.mp4",
+      "sha256": "00f8aed559d0e08acee7c8700bbef53ecfdc49eb7ea6fbed0e9f3862321a211d",
+      "frames": 7,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-model-stack-candidate-01/recording/continuous.mp4",
+      "sha256": "1517466296410ea72b58d6be800df72363d58f23579adb8fefc47e973ce8a8fa",
+      "frames": 7,
+      "width": 1920,
+      "height": 1080
+    }
+  ],
+  "actual_readonly_preflight": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-model-queue-readonly-01/result.json",
+    "sha256": "f4faa388bd2cd0d437f7e4a99368ab9d3a53f223ce43529b0c496df80d5d099d"
+  },
+  "source_sha256": {
+    "native_control_model_queue.py": "bbb27079bc0d8cb508dbc532e8fe725d807630a03c1efde3382b9c75afcf1c05",
+    "tests/test_native_control_model_queue.py": "6247acd100db85af70bc3065fc951c4c5b917fd4ef5ded45011659c156de5c0c",
+    "qualify_native_control_model_queue.py": "96b7daf2c642cb2d5ea9cc984ebd23b1a896348841d9dcef965ad9fe140eec35",
+    "native_control_video_probe.py": "3c8ac3aac9c67f64e28fd65b84aaaa19dc6b305851d0ce81e574346c70793aee",
+    "tests/test_query_refresh_replay_queue.py": "7ea99b6365eaaf34d73b30b79749cb8cf17a7d7e69d8cffe2e69a34bd3206215",
+    "native_control_model_trial.py": "cca356568a9964ba0e622b256ca81267acd759051a099dc43a5061b2f11f4953",
+    "native_control_model_stack.py": "0688bfe05178a82fa26c1642a85f6877bcb942c599c8936d43d33d5aaaa8795e",
+    "native_control_pilot_adapter.py": "8e73897bf0324cf3c3307c593492f72fb3ffe118ce4eda7fe828c23ba2d12b41",
+    "stable_resource_deferred.py": "26426d1191712e87e40e1d91ac81403b68fa11bd48b8c88b82c5e90e2f0660e6",
+    "stable_resource_startup.py": "673a15e4da8ca291feea2021f7f72035c48ef6223b35b0dfd2ba7802786b793a",
+    "stable_query_startup.py": "8627b316134a92d8f3afa251e814bd3c9c190d3aa0dd23028683e35bdf5e6bfd"
+  },
+  "original_query_registration": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-query-20261005-01/registration.json",
+    "sha256": "b1cafa602b41359d15ad5e071f65b5462cb5f2210c8913b870061a80ccd0404b"
+  },
+  "original_five_stages": {
+    "image": {
+      "identity": {
+        "pid": 149945,
+        "uid": 1001,
+        "start_ticks": 376597548,
+        "command": [
+          "/home/chaidi/qw3/.venv/bin/python",
+          "-m",
+          "stable_resource_handoff",
+          "--declaration",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/successors.json",
+          "--stage",
+          "image"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "R"
+      },
+      "same_actual_generation_live": true,
+      "completed": 1,
+      "planned": 12,
+      "status": "restoring-fresh-off-engine",
+      "registration": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/image-registration.json",
+        "sha256": "218c11326bd40eb8349998cee7d2ef62bfafdd16832ec59f8f4e7405e8fd8311"
+      }
+    },
+    "thinking": {
+      "identity": {
+        "pid": 155219,
+        "uid": 1001,
+        "start_ticks": 376616251,
+        "command": [
+          "/home/chaidi/qw3/.venv/bin/python",
+          "-m",
+          "stable_resource_handoff",
+          "--declaration",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/successors.json",
+          "--stage",
+          "thinking"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "R"
+      },
+      "same_actual_generation_live": true,
+      "completed": 0,
+      "planned": 4,
+      "status": "waiting-for-image-twelve",
+      "registration": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/thinking-registration.json",
+        "sha256": "26464346ca7a75892c151d83fc8d4b5c7566686f0bef04da6da36b7c46cdd5f6"
+      }
+    },
+    "feedback": {
+      "identity": {
+        "pid": 157910,
+        "uid": 1001,
+        "start_ticks": 376636620,
+        "command": [
+          "/home/chaidi/qw3/.venv/bin/python",
+          "-m",
+          "stable_resource_handoff",
+          "--declaration",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/successors.json",
+          "--stage",
+          "feedback"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "R"
+      },
+      "same_actual_generation_live": true,
+      "completed": 0,
+      "planned": 8,
+      "status": "waiting-for-forty-eight-ten-twelve-four",
+      "registration": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/feedback-registration.json",
+        "sha256": "2fe63e2d68ef8ab802520c819064e32582bc3ece2790ade3dab687579e7d3092"
+      }
+    },
+    "bounded": {
+      "identity": {
+        "pid": 163217,
+        "uid": 1001,
+        "start_ticks": 376671224,
+        "command": [
+          "/home/chaidi/qw3/.venv/bin/python",
+          "-m",
+          "stable_resource_deferred",
+          "--declaration",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-bounded-20261005-01/declaration.json",
+          "--stage",
+          "bounded"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "R"
+      },
+      "same_actual_generation_live": true,
+      "completed": 0,
+      "planned": 8,
+      "status": "waiting-for-forty-eight-ten-twelve-four-eight",
+      "registration": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-bounded-20261005-01/registration.json",
+        "sha256": "49637b49eb16ec7f3aa9c06a13f95e0c600a10568c3f1db4f5c1617ece366957"
+      }
+    },
+    "query": {
+      "identity": {
+        "pid": 173846,
+        "uid": 1001,
+        "start_ticks": 376701528,
+        "command": [
+          "/home/chaidi/qw3/.venv/bin/python",
+          "-m",
+          "stable_resource_deferred",
+          "--declaration",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-query-20261005-01/declaration.json",
+          "--stage",
+          "query"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "R"
+      },
+      "same_actual_generation_live": true,
+      "completed": 0,
+      "planned": 4,
+      "status": "waiting-for-complete-bounded-chain",
+      "registration": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-query-20261005-01/registration.json",
+        "sha256": "b1cafa602b41359d15ad5e071f65b5462cb5f2210c8913b870061a80ccd0404b"
+      }
+    }
+  },
+  "original_pipeline_snapshot": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-status-11.json",
+    "sha256": "8d78364668446335d3859ffe10c441ca1458e7d343d20245723b559e2feee8d0"
+  },
+  "gpu": {
+    "at": 1791217135.9172122,
+    "free_mib": 55711,
+    "used_mib": 41540,
+    "gpu_percent": 100,
+    "compute_pids": [
+      "3906950"
+    ]
+  },
+  "retained_cpu_failure": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-model-queue-cpu-01/result.json",
+    "sha256": "5d78cfc767a8e9b41aad9099133161de8d854a44a8342d8d70f1e1c5550a1fef"
+  },
+  "retained_failure_reason": "Nine test setup failures omitted the bounded fixture directory; one assertion referenced a restored method after its mock scope. Both fixed before qualification. No model/device dispatch.",
+  "original_controllers_or_protocols_modified": false,
+  "original_grades_or_completed_attempts_overwritten": false,
+  "child_timeout_policy": "Re-poll the same confirmed child; never replay on observation timeout. The original pilot still owns the task deadline.",
+  "completed_trial_evidence": [
+    "Unchanged original independent business result, including failures",
+    "Actual GUI/thinking/context/tool-budget profile and request bytes",
+    "Private stack, descendants, original recorder and same VM actually retired",
+    "Original continuous video hash and full independent decode",
+    "Same prompt across the two arms for each case/repetition"
+  ],
+  "next": [
+    "Poll the exact six registered controller generations; retain terminal failures.",
+    "After full original query handoff, bind the qualified real OFF engine and run the eight original pilots serially.",
+    "Compare full business acceptance, latency, tool calls, input rejection causes and paired videos; do not infer improvement from component checks."
+  ]
+}

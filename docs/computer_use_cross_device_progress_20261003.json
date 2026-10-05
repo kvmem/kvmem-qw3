@@ -9877,5 +9877,38 @@
     "model_controller_registered": false,
     "model_trials_completed": 0,
     "business_improvement_proven": false
+  },
+  "native_model_queue_registered_20261006": {
+    "report": {
+      "path": "/home/chaidi/qw3/docs/computer_use_native_model_queue_20261006.json",
+      "sha256": "4d6140f31dc36eedd04e997f0e17b15b3453549082a5b030490bd11c43a6e1f0"
+    },
+    "independent_audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-model-queue-independent-audit-01/result.json",
+      "sha256": "eca2b39e741215cf00e082ca17716e06e8cd47f9b8c3b6cea36686efdf24c5bb"
+    },
+    "model_controller_registered": true,
+    "actual_same_generation_live": true,
+    "controller_identity": {
+      "pid": 354765,
+      "uid": 1001,
+      "start_ticks": 377284282,
+      "command": [
+        "/home/chaidi/qw3/.venv/bin/python",
+        "-m",
+        "native_control_model_queue",
+        "run",
+        "--declaration",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-model-queue-20261006-01/declaration.json"
+      ],
+      "cwd": "/home/chaidi/qw3",
+      "state": "R"
+    },
+    "status": "waiting-for-complete-original-query-chain",
+    "cpu_tests": 34,
+    "planned_model_trials": 8,
+    "model_trials_completed": 0,
+    "native_trials_dispatched": 0,
+    "business_improvement_proven": false
   }
 }
