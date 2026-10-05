@@ -459,7 +459,7 @@ CPU05的21项检查通过：真实本机HTTP、SQLite收据、一次送达/重�
 
 新035第一组两侧均已自然终止，原结果均为evaluator-unavailable、score=null、secondary_local_score=0、accepted=false。OFF为1412.71秒/20次工具调用，后台读取超时；ON为1802.62秒/22次调用，到达原任务期限，turn_error=null。两侧未知输入均0，原录像收集通过，旧OFF业务前缀没有复用。材料、框架、权限、种子、thinking/DFlash、上下文/输出和1800秒/250调用预算逐字段核验一致，共同显存比例1.0。22次调用不等于更多业务进度，两个不同失败终点的时长不能作为加速比；共享GPU负载仍是限制。证据`.runtime/shared-quota-first035-terminal-pair-01.json`保留两份原结果/manifest/引擎日志及全部计时哈希。
 
-ON在超过131072 token后实际出现pressure-prefill历史选择，但终止日志的95条scorer事件全部为requested=mean-k、used=window-profile、fallback=1，原因是query_span_missing/single_query_not_ready；成功查询Mean-K事件0。不能把这轮称作已经验证查询相关检索的开关比较。较早活动前缀证据`.runtime/shared-quota-on-effective-retrieval-prefix-01.json`也保留；日志中的mtp标签不单独证明故障由DFlash造成。当前源码的旧query-replay还受查询/实时后缀是否分离和生成预留长度等条件限制；另有现成recompute-query路径支持有预算的查询重建，值得在保留DFlash和原窗口的独立资格中验证。此路径尚未在本轮任务开启，不修改活动八项条件或提前宣称收益。
+ON在超过131072 token后实际出现pressure-prefill历史选择，但终止日志的95条scorer事件全部为requested=mean-k、used=window-profile、fallback=1，原因是query_span_missing/single_query_not_ready；成功查询Mean-K事件0。不能把这轮称作已经验证查询相关检索的开关比较。较早活动前缀证据`.runtime/shared-quota-on-effective-retrieval-prefix-01.json`也保留；日志中的mtp标签不单独证明故障由DFlash造成。当前源码的旧query-replay还受查询/实时后缀是否分离和生成预留长度等条件限制；另有现成recompute-query路径支持有预算的查询重建，值得在保留DFlash和原窗口的独立资格中验证。源码复核发现EngineOptions的kvmem_recompute_query默认true，CLI仅提供关闭参数，另有环境覆盖；实际进入仍取决于qc_select_active等条件。因此不能从未设置开启参数推断它未开启，窗口回退的路径原因仍需独立验证；不修改活动八项条件或提前宣称收益。
 
 有限续轮八项开发比较现已从计划进入实际等待：新增bounded_continuation_retest_queue复用原feedback串行循环及image的自有引擎/资源/收据监督，只使用已通过资格的SDK51 control/candidate，两侧差异仍仅app生命周期及bounded_turn_continuation。051、004各两次、顺序反转，原材料/GUI权限/累计预算/初始化/独立评分/录制器不变。16项CPU检查通过，覆盖完整原八项循环、实际合格包、停止不派发、原目录拒绝、未知输入、候选上限和实际任务/请求计时模式；不算业务成绩。两侧已用现有OSWorld CPython3.12解释器导入私有app、辅助观察及录像依赖，通过且零模型/输入，没有安装软件。
 
@@ -468,3 +468,9 @@ ON在超过131072 token后实际出现pressure-prefill历史选择，但终止�
 [回放快照28](http://127.0.0.1:18160/index.html)已实际服务并通过32项真实浏览器检查：新增两个终止录像，共152条记录/146份视频，原150条及媒体SHA/inode保持，正式40和平台/软件分母不变。新场景“OSWorld KVMem 同配置对照 035 · 第1轮”单独分组，避免默认把旧不同显存配置OFF混为配对；两侧不可用官方分数、本地0、20/22调用、读取超时/窗口回退提示均显示。两份新视频实际解码、同时播放和暂停通过，旧裁切、尺寸差异、采样缺口提示及私有路径404保持。未结束080不导出，快照27仍保留。证据`.runtime/replay28-build-01/export.json`与`.runtime/replay28-browser-qualification-01/result.json`；这是回放交付进展，不是业务成功或完整起止对齐的延迟资格。
 
 最新实际快照`.runtime/shared-quota-current-progress-20261005-09.json`确认原memory同一控制器2/8，正在为080-ON创建新引擎；已退役035的旧runner/engine实际身份为None，不能误归为080的新任务丢失。四个后继及有限续轮等待器均实际存活，仍0试次。当前复杂任务及查询检索收益仍未证明，目标继续活动。
+
+### 改善效果答复的最新核验
+
+只读审计`.runtime/improvement-status-live-audit-20261005-03.json`确认共同预算KVMem仍2/8，080-ON实际运行，同一任务已记录23份完成推理；SDK10、图像12、thinking预算4、反馈8及有限续轮8的登记等待器全部存活、各零试次。此次核验零新增模型请求、零设备输入、零进程信号，不能把等待器资格当作改善成绩。
+
+现有证据中坐标约定、实际工具参数传递和短规则thinking对照的改善最明确；Windows Calc thinking与Python修复流程选择各仅有一组开发速度对照。Python/LaTeX混合工具8/8是受控能力验证，没有同条件旧路线作为速度或成功率提升基线。截图分块放大仅17/24→18/24、请求耗时中位数0.366→1.162秒，收益不足以作为默认策略。正式OSWorld的36份可用评分全0、四份035不可用仍保留，后续候选及KVMem未证明复杂任务收益。
