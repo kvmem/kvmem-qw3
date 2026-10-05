@@ -2358,7 +2358,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": 1791200083.4935498,
+  "updated_at": 1791214649.316417,
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -9862,5 +9862,20 @@
       }
     },
     "new_model_business_gain_proven": false
+  },
+  "native_model_stack_qualification_20261005": {
+    "report": {
+      "path": "/home/chaidi/qw3/docs/computer_use_native_model_stack_20261005.json",
+      "sha256": "a78d2c497247f0e7c785c7adad40bcdea297e7b54cb2ce1a10beb28b2c2e2259"
+    },
+    "stack_cpu_tests": 14,
+    "trial_cpu_tests": 8,
+    "actual_private_stacks": 2,
+    "actual_stack_checks_per_arm": 13,
+    "model_inference_requests": 0,
+    "device_actions": 0,
+    "model_controller_registered": false,
+    "model_trials_completed": 0,
+    "business_improvement_proven": false
   }
 }

@@ -1033,5 +1033,20 @@
       "sha256": "06967671f46994fbb5dd39f35102fd141c6989bfedeaaee3ad23a750e8e531a8"
     },
     "business_gain_proven": false
+  },
+  "native_model_stack_qualification_only": {
+    "report": {
+      "path": "/home/chaidi/qw3/docs/computer_use_native_model_stack_20261005.json",
+      "sha256": "a78d2c497247f0e7c785c7adad40bcdea297e7b54cb2ce1a10beb28b2c2e2259"
+    },
+    "stack_cpu_tests": 14,
+    "trial_cpu_tests": 8,
+    "actual_private_stacks": 2,
+    "actual_stack_checks_per_arm": 13,
+    "model_inference_requests": 0,
+    "device_actions": 0,
+    "model_controller_registered": false,
+    "model_trials_completed": 0,
+    "business_improvement_proven": false
   }
 }
