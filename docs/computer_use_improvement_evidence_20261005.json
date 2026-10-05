@@ -199,74 +199,75 @@
     }
   },
   "next_priority": [
-    "修复有正向窗口与焦点证据支持的执行误拒绝，并做同材料预算复测。",
-    "区分动作送达、步骤证据与独立业务完成；保留原失败。",
-    "完成已冻结的SDK、图像历史、思考预算和反馈复测，之后再决定默认配置。"
+    "Continue all frozen original comparisons and retain independent artifacts, faults and videos.",
+    "Qualify native window, focus and target identities; replace whole-window pixel equality only with positive action-specific evidence in a separate candidate.",
+    "Test adaptive thinking separately from execution changes; do not enlarge task budgets or mask arbitrary pixel differences.",
+    "Expose step requirements before input and keep transition conditions separate from verified business outcomes."
   ],
   "current_retest_status": {
     "audit": {
-      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-23.json",
-      "sha256": "b325e3ee44254cf9a631baacc584c5727d0c7ffd9b3500654c29d6275de277c2"
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-24.json",
+      "sha256": "9e5d741fdc89dbb28aa5a234d9d1fb724f08c0e6ee28a98476f011088c6d23c0"
     },
     "memory_completed": 8,
     "memory_planned": 8,
-    "current": null,
+    "sdk_completed_at_snapshot": 3,
     "four_new_successors": {
       "sdk": {
-        "status": "halted-no-further-dispatch",
-        "completed": 0,
+        "status": "running",
+        "completed": 4,
         "planned": 10,
-        "actual_live": false,
-        "actual_retired": true,
-        "error": "SafetyHalt: New owned service exited before readiness"
+        "actual_live": true
       },
       "image": {
-        "status": "halted-no-further-dispatch",
+        "status": "waiting-for-forty-eight-and-ten",
         "completed": 0,
         "planned": 12,
-        "actual_live": false,
-        "actual_retired": true,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+        "actual_live": true
       },
       "thinking": {
-        "status": "halted-no-further-dispatch",
+        "status": "waiting-for-image-twelve",
         "completed": 0,
         "planned": 4,
-        "actual_live": false,
-        "actual_retired": true,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+        "actual_live": true
       },
       "feedback": {
-        "status": "halted-no-further-dispatch",
+        "status": "waiting-for-forty-eight-ten-twelve-four",
         "completed": 0,
         "planned": 8,
-        "actual_live": false,
-        "actual_retired": true,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+        "actual_live": true
       }
     },
     "deferred_stages": {
       "bounded": {
+        "status": "waiting-for-forty-eight-ten-twelve-four-eight",
         "completed": 0,
         "planned": 8,
+        "actual_live": true,
         "qualified": true,
-        "registered": false,
-        "preparation_halted_before_creation": true,
-        "reason": "Fresh feedback predecessor halted during Android service handoff"
+        "registered": true
       },
       "query": {
+        "status": "waiting-for-complete-bounded-chain",
         "completed": 0,
         "planned": 4,
+        "actual_live": true,
         "qualified": true,
-        "registered": false,
-        "preparation_not_started": true
+        "registered": true
       }
     },
-    "ready_owned_off_engine_pid": 3717776,
-    "android_container_actual_ready": true,
-    "android_gateway_session_not_yet_recreated": true,
-    "pending": "Qualified continuation of partial SDK deployment: retain live owned OFF engine and paused Linux gateway; recreate Android gateway in fresh runtime, then model client; route all frozen trials to fresh controllers.",
-    "business_gain_proven": false
+    "staged_deployment_completed": true,
+    "android_gateway_session_created": true,
+    "all_six_successors_registered": true,
+    "second_text_terminal_separately_recorded": true,
+    "document": "/home/chaidi/qw3/docs/computer_use_staged_recovery_20261005.json",
+    "business_gain_proven": false,
+    "latest_live_check": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/staged-sdk-doc-update-01/final-live-check.json",
+      "sha256": "06b3daf1549948e226c6278f63dd16f054faec7f1b330df347b3cb9b9afe2402"
+    },
+    "sdk_completed_at_latest_live_check": 4,
+    "current": "xdev-linux-calc-09"
   },
   "previous_retest_status_snapshot": {
     "audit": {
@@ -437,5 +438,102 @@
     "android_container_ready_after_capacity_and_stale_lock_recovery": true,
     "additional_model_trials_completed": 0,
     "not_business_success": true
+  },
+  "previous_retest_status_before_staged_sdk_recovery": {
+    "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-23.json",
+      "sha256": "b325e3ee44254cf9a631baacc584c5727d0c7ffd9b3500654c29d6275de277c2"
+    },
+    "memory_completed": 8,
+    "memory_planned": 8,
+    "current": null,
+    "four_new_successors": {
+      "sdk": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 10,
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: New owned service exited before readiness"
+      },
+      "image": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 12,
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+      },
+      "thinking": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 4,
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+      },
+      "feedback": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 8,
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+      }
+    },
+    "deferred_stages": {
+      "bounded": {
+        "completed": 0,
+        "planned": 8,
+        "qualified": true,
+        "registered": false,
+        "preparation_halted_before_creation": true,
+        "reason": "Fresh feedback predecessor halted during Android service handoff"
+      },
+      "query": {
+        "completed": 0,
+        "planned": 4,
+        "qualified": true,
+        "registered": false,
+        "preparation_not_started": true
+      }
+    },
+    "ready_owned_off_engine_pid": 3717776,
+    "android_container_actual_ready": true,
+    "android_gateway_session_not_yet_recreated": true,
+    "pending": "Qualified continuation of partial SDK deployment: retain live owned OFF engine and paused Linux gateway; recreate Android gateway in fresh runtime, then model client; route all frozen trials to fresh controllers.",
+    "business_gain_proven": false
+  },
+  "latest_execution_failure_diagnostic": {
+    "report": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/sdk51-linux-text13-diagnostic-01/result.json",
+      "sha256": "b65e4731554940bd20c3499550bf23876dadd2247eb382ce448213059bb04af1"
+    },
+    "original_result": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/attempts/xdev-linux-text-13/integration-result.json",
+      "sha256": "53d95f7ae91a3decb291cc302e667d47ec3c9882690e79177035f3481d420c7a"
+    },
+    "model_requests": 0,
+    "device_inputs": 0,
+    "task_seconds": 362.1997846229933,
+    "tool_calls": 6,
+    "completed_inputs": 2,
+    "exact_backend_tool_associations": 6,
+    "inference_seconds": 346.77023073425516,
+    "inference_fraction_of_task_seconds": 0.9574004332862912,
+    "save_target_itself_unchanged": true,
+    "save_input_not_sent": true,
+    "save_rejection_pixel_change_outside_save_button": [
+      370,
+      145,
+      371,
+      156
+    ],
+    "caret_blink_is_inference_not_proven_origin": true,
+    "model_cost_not_isolated_thinking": true,
+    "first_read_schema_failure_preserved": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/sdk51-linux-text13-diagnostic-01/first-read-schema-failure.json",
+      "sha256": "736798008a66037843f1860d1de10850bf36b64bdd1d0c129ab61c6c71ada190"
+    }
   }
 }
