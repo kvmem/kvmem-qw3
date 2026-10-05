@@ -15,7 +15,7 @@
 
 首个超过窗口的原始请求为181074输入token，服务端query span为[3944,13218)，score query message为3；原始请求没有指定kvmem_reselect或guided参数。原请求沿服务默认auto进入，而延续相同用户查询的gate随后将其改为off。原启动配置guided_refresh=off、prefix_reuse=false保持。
 
-同一实际运行080-ON的后续活动前缀也观察到此路径：104条scorer事件中29条选择全部历史，超过窗口75条全部回退、查询捕获0；六个above-budget请求中五个已产生scorer事件。证据`kvmem-080-query-gate-active-prefix-01.json`只覆盖当时快照，不作为终止结果或跨任务改善。
+080-ON随后自然终止，官方0分，1802.68秒/34工具调用，deadline、未知输入0、录像收集通过；原runner/engine已实际退役。完整104条scorer事件中29条选择全部历史，超过窗口75条全部回退、查询捕获0；六个above-budget请求中五个产生scorer事件。活动前缀`kvmem-080-query-gate-active-prefix-01.json`保留；终止证据为`kvmem-080-query-gate-terminal-01.json`及`shared-quota-first080-on-terminal-01.json`。OFF尚未完成，不能形成开关质量/速度结论；这一路径也不解释其他任务在短历史阶段的失败。
 
 源码`kvmem_harness_refresh_decision`在同一用户查询且guided refresh关闭时返回不重选。服务端据此设置reselect=Off，`kvmem_query_lifecycle`不会进入select_active；prefix reuse关闭也不产生warm capture。recompute-query虽在当前EngineOptions默认true，仍被这些前置条件限制。日志中mtp标签不足以把故障归因于DFlash。
 
