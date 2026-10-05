@@ -201,13 +201,13 @@
   ],
   "current_retest_status": {
     "audit": {
-      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-19.json",
-      "sha256": "10f71121ba4bb9b526eac97c8b9a39665ef879179cba318a1c4c6a333bbaf18d"
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-20.json",
+      "sha256": "0cc01c30d6732d346cd453af11a9d72ba442f7ea7939069c73f2ecf194ec520e"
     },
-    "memory_completed": 5,
+    "memory_completed": 7,
     "memory_planned": 8,
-    "current": "quota1-035-kvmem-off-r2",
-    "rebound_four_stages": {
+    "current": "quota1-080-kvmem-on-r2",
+    "rebound_all_six_stages": {
       "sdk": {
         "completed": 0,
         "planned": 10,
@@ -227,11 +227,18 @@
         "completed": 0,
         "planned": 8,
         "actual_registered_process_live": true
+      },
+      "bounded": {
+        "completed": 0,
+        "planned": 8,
+        "actual_registered_process_live": true
+      },
+      "query": {
+        "completed": 0,
+        "planned": 4,
+        "actual_registered_process_live": true
       }
     },
-    "remaining_bindings": [
-      "bounded-continuation",
-      "query-refresh"
-    ]
+    "remaining_bindings": []
   }
 }

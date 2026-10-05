@@ -44,5 +44,30 @@
   },
   "latest_actual_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-18.json",
   "predecessor_port_failure_preserved": true,
-  "successor_rebinding_completed": false
+  "successor_rebinding_completed": true,
+  "latest_restored_routing_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-20.json",
+  "current_active_routing_registration": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-port-20261005-01/registration.json",
+  "current_active_routing_protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-port-20261005-01/protocol.json",
+  "current_active_routing_queue": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-port-20261005-01/queue-runtime-01/queue.json",
+  "current_active_routing_identity": {
+    "pid": 3645356,
+    "uid": 1001,
+    "start_ticks": 373925501,
+    "command": [
+      "/home/chaidi/qw3/.venv/bin/python",
+      "-m",
+      "shared_quota_port_deferred",
+      "--declaration",
+      "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-port-20261005-01/declaration.json",
+      "--stage",
+      "bounded"
+    ],
+    "cwd": "/home/chaidi/qw3",
+    "state": "R"
+  },
+  "current_active_routing_status": "waiting-for-forty-eight-ten-twelve-four-eight",
+  "current_active_routing_completed": 0,
+  "current_active_routing_actual_live": true,
+  "current_active_routing_binding_document": "/home/chaidi/qw3/docs/computer_use_shared_quota_port_deferred_runtime_20261005.json",
+  "original_registration_and_halt_fields_preserved_as_history": true
 }
