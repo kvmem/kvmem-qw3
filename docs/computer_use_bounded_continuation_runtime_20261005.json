@@ -1,0 +1,40 @@
+{
+  "kind": "actual_frozen_bounded_continuation_retest_runtime_binding",
+  "checked_at": 1791174816.0061243,
+  "plan": "docs/computer_use_bounded_continuation_retest_plan_20261005.json",
+  "plan_sha256": "be29cc072e64c0a67aa9d9ce8eb77cee08c5522a159ea6ebfb2f58bfd8cde4ee",
+  "plan_original_bytes_preserved": true,
+  "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-retest-20261005/protocol.json",
+  "protocol_sha256": "c2cb89afc5cb7fef6b9383630675431e6f4c53cbd8248e3163c08f513b001bcd",
+  "qualification": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-retest-cpu-01/result.json",
+  "qualification_sha256": "741605eba3909fc9c4a058602fd16e83851daf8b3ad309d0700dbbe83eb24ad9",
+  "cpu_checks": 16,
+  "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-retest-launch-01/registration.json",
+  "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-retest-20261005/queue-runtime-01/queue.json",
+  "actual_pid": 3505961,
+  "actual_start_ticks": 373031927,
+  "actual_live": true,
+  "status": "waiting-for-forty-eight-ten-twelve-four-eight",
+  "completed": 0,
+  "planned": 8,
+  "parent_declared_order": "40/8/10/12/4/8 → bounded8",
+  "frameworks": {
+    "control": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-retest-20261005/control/framework",
+    "candidate": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-retest-20261005/candidate/framework"
+  },
+  "candidate_changes": [
+    "app.py",
+    "bounded_turn_continuation.py"
+  ],
+  "unchanged": [
+    "original task assets/initializer/evaluator",
+    "GUI permissions",
+    "1800seconds/250calls cumulative budget",
+    "QW3 thinking/DFlash2/OFF/524288context/16384output",
+    "full image history and recorder"
+  ],
+  "runtime_import_qualification": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-retest-20261005/runtime-qualification.json",
+  "real_model_gain_proven": false,
+  "advisor_enabled": false,
+  "active_goal_preserved": true
+}

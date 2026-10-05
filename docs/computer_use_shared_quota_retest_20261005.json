@@ -90,7 +90,7 @@
       "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-shared-quota-20261005-04/startup-qualification.json"
     ]
   },
-  "current_snapshot": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-06.json",
+  "current_snapshot": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-09.json",
   "subsequent_frozen_trials": {
     "sdk": 10,
     "image": 12,
@@ -99,8 +99,8 @@
   },
   "business_gain_proven": false,
   "unlimited_goal_active": true,
-  "current_completed": 1,
-  "current_trial": "quota1-035-kvmem-on-r1",
+  "current_completed": 2,
+  "current_trial": "quota1-080-kvmem-on-r1",
   "first_result": {
     "id": "quota1-035-kvmem-off-r1",
     "status": "evaluator-unavailable",
@@ -111,5 +111,9 @@
     "accepted": false
   },
   "terminal_latency_diagnostic": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-off-latency-diagnostic-01.json",
-  "additional_terminal_handoff_cpu_qualification": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-terminal-handoff-cpu-02/result.json"
+  "additional_terminal_handoff_cpu_qualification": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-terminal-handoff-cpu-02/result.json",
+  "first035_terminal_pair": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-first035-terminal-pair-01.json",
+  "actual_ON_strategy": "window-profile fallback in all95 terminal scorer events; no successful query mean-k",
+  "bounded_continuation_successor_binding": "/home/chaidi/qw3/docs/computer_use_bounded_continuation_runtime_20261005.json",
+  "public_replay": "http://127.0.0.1:18160/index.html"
 }
