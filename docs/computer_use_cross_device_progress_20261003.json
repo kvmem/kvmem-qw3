@@ -7093,6 +7093,287 @@
     "original_profiles_changed": false,
     "completed_model_trials": 0,
     "remaining_successors_restarted": false,
-    "next_step": "Follow the same live eight-trial memory continuation; restore SDK/image/thinking/feedback admission against its new physical receipts and process identity without changing their frozen model loops or cases."
+    "next_step": "Follow the same live eight-trial memory continuation; restore SDK/image/thinking/feedback admission against its new physical receipts and process identity without changing their frozen model loops or cases.",
+    "superseded_by_capacity_recovery": "apps/computer_use/.runtime/kvmem-capacity-and-successors-progress-20261005-01.json",
+    "current_runtime_controller_retired_after_second_trial_engine_failure": true
+  },
+  "latest_actual_audit": "apps/computer_use/.runtime/kvmem-capacity-and-successors-progress-20261005-01.json",
+  "kvmem_capacity_recovery": {
+    "kind": "actual_kvmem_capacity_and_successors_progress",
+    "checked_at": "2026-10-05T00:52:13.412921+00:00",
+    "turn_classification": "progress",
+    "previous_goal_turn": "verified_wait",
+    "main": {
+      "status": "completed",
+      "terminal": 40,
+      "available_original_scores": 36,
+      "positive_original_scores": 0,
+      "historical_unknowns_preserved": 2
+    },
+    "memory": {
+      "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/kvmem-capacity-launch-01/registration.json",
+      "declaration": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-capacity-continuation-20261005/continuation.json",
+      "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-capacity-continuation-20261005/queue-runtime-01/queue.json",
+      "identity": {
+        "pid": 3391613,
+        "uid": 1001,
+        "start_ticks": 371687541,
+        "command": [
+          "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+          "-m",
+          "kvmem_capacity_continuation",
+          "--declaration",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-capacity-continuation-20261005/continuation.json"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "R"
+      },
+      "actual_live": true,
+      "status": "resource-wait",
+      "completed": 1,
+      "planned": 8,
+      "current": "035-kvmem-on-r1",
+      "admission_min_free_mib": 93000,
+      "original_protocol_sha256": "a4a924ad92c0de22d531eb5b0c58f6bb1610a1c26e3907c38678f2470fc4f380",
+      "original_profiles_changed": false,
+      "completed_prefix_preserved": 1,
+      "completed_prefix_replayed": false,
+      "first_result": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-runner-runtime-continuation-20261005/attempts/035-kvmem-off-r1/result.json",
+        "sha256": "0190781623d54486eb342460da2581db13ac050f0337ac6a4a3d89c4fcc1fe10",
+        "status": "evaluator-unavailable",
+        "accepted": false,
+        "seconds": 1802.6137320687994,
+        "tool_calls": 20,
+        "uncertain_actions": 0,
+        "original_evaluation": null
+      }
+    },
+    "successors": {
+      "sdk": {
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/sdk-registration.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-05/queue.json",
+        "identity": {
+          "pid": 3394420,
+          "uid": 1001,
+          "start_ticks": 371696774,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "runner_runtime_successors",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/successors.json",
+            "--stage",
+            "sdk"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "actual_live": true,
+        "status": "waiting-for-forty-and-eight",
+        "completed": 0,
+        "planned": 10
+      },
+      "image": {
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/image-registration.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/queue-runtime-04/queue.json",
+        "identity": {
+          "pid": 3394812,
+          "uid": 1001,
+          "start_ticks": 371700756,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "runner_runtime_successors",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/successors.json",
+            "--stage",
+            "image"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "actual_live": true,
+        "status": "waiting-for-forty-eight-and-ten",
+        "completed": 0,
+        "planned": 12
+      },
+      "thinking": {
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/thinking-registration.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/queue-runtime-02/queue.json",
+        "identity": {
+          "pid": 3395270,
+          "uid": 1001,
+          "start_ticks": 371705069,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "runner_runtime_successors",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/successors.json",
+            "--stage",
+            "thinking"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "actual_live": true,
+        "status": "waiting-for-image-twelve",
+        "completed": 0,
+        "planned": 4
+      },
+      "feedback": {
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/feedback-registration.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/queue-runtime-02/queue.json",
+        "identity": {
+          "pid": 3395769,
+          "uid": 1001,
+          "start_ticks": 371711113,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "runner_runtime_successors",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/successors.json",
+            "--stage",
+            "feedback"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "actual_live": true,
+        "status": "waiting-for-forty-eight-ten-twelve-four",
+        "completed": 0,
+        "planned": 8
+      }
+    },
+    "retired_new_failure_controllers": [
+      {
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-memory-launch-01/registration.json",
+        "identity": {
+          "pid": 3371750,
+          "uid": 1001,
+          "start_ticks": 371417942,
+          "command": [
+            "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+            "-m",
+            "runner_runtime_continuation",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-runner-runtime-continuation-20261005/continuation.json"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "actual_retired": true,
+        "status": "halted-no-further-dispatch",
+        "completed": 1,
+        "error": "SafetyHalt: Fresh engine exited; no model trial dispatched"
+      },
+      {
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-20261005/sdk-registration.json",
+        "identity": {
+          "pid": 3388154,
+          "uid": 1001,
+          "start_ticks": 371622561,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "runner_runtime_successors",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-20261005/successors.json",
+            "--stage",
+            "sdk"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "actual_retired": true,
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+      },
+      {
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-20261005/image-registration.json",
+        "identity": {
+          "pid": 3388617,
+          "uid": 1001,
+          "start_ticks": 371626188,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "runner_runtime_successors",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-20261005/successors.json",
+            "--stage",
+            "image"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "actual_retired": true,
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+      }
+    ],
+    "gpu": {
+      "at": 1791161533.4626102,
+      "free_mib": 55275,
+      "used_mib": 41976,
+      "gpu_percent": 97,
+      "compute_pids": [
+        "3060767"
+      ]
+    },
+    "capacity_failure": {
+      "log": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-runner-runtime-continuation-20261005/engines/035-kvmem-on-r1/engine.log",
+      "sha256": "575ad6827236fa5e76198fbdc0c4f19502ea0d2740b67cbf3b290df7389c2db6",
+      "required_blocks": 1536,
+      "allowed_blocks": 1304,
+      "model_trial_dispatched": false,
+      "original_failure_preserved": true,
+      "source": "src/qwen_executor.cpp:11181",
+      "global_cuda_used_includes_other_processes": true
+    },
+    "qualification": {
+      "capacity": {
+        "kind": "kvmem_capacity_continuation_cpu_qualification",
+        "passed": true,
+        "tests_run": 14,
+        "source_sha256": {
+          "kvmem_capacity_continuation.py": "35a9699fbeb99845ea0756239d38b6a53b0a0309241bfe2b28dda166d2b7320e",
+          "tests/test_kvmem_capacity_continuation.py": "599560b005e117d0910ba5d7ffb12ecc5e7e620732103c5be21a34472e7e6108"
+        },
+        "model_calls": 0,
+        "device_inputs": 0,
+        "exit_code": 0
+      },
+      "successors": {
+        "kind": "runner_runtime_successors_cpu_qualification",
+        "passed": true,
+        "tests_run": 43,
+        "source_sha256": {
+          "runner_runtime_successors.py": "97976ec85d5f4261d49a84e830e42c44ff314f7f37559c8331a670856648a1d6",
+          "tests/test_runner_runtime_successors.py": "d31d4100517010b2aa58c9fd15e9f5043f76b844efbb59c77b0ce928a5f8d50f"
+        },
+        "model_calls": 0,
+        "device_inputs": 0,
+        "exit_code": 0
+      },
+      "current_tests_passed": 57,
+      "model_calls": 0,
+      "device_inputs": 0
+    },
+    "frozen_original_protocols_unchanged": true,
+    "advisor_enabled": false,
+    "remaining_model_trials_completed": false,
+    "complex_success_improvement_demonstrated": false,
+    "limitations": [
+      "93000MiB is a conservative declared startup prerequisite, not a measured guaranteed full-task capacity.",
+      "Current GPU free space is below prerequisite; no other user process was changed.",
+      "First035 official grader remains unavailable; no success or valid zero score claimed.",
+      "Runtime recovery and CPU checks are not model efficacy improvements."
+    ],
+    "audit_writer_first_attempt": "KeyError from absent original_evaluation field; raw result unchanged; corrected by reading optional field."
   }
 }
