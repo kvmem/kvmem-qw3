@@ -427,3 +427,18 @@ CPU05的21项检查通过：真实本机HTTP、SQLite收据、一次送达/重�
 八项同条件开发复测计划选051、004，每任务control/candidate各两次并交错顺序，使用同一SDK51基础、原任务source SHA、thinking/DFlash2、OFF/16K输出、原1800秒/250调用、GUI权限和独立评分；明确是根据失败选出的开发任务，不作陌生任务泛化。方案`.runtime/bounded-turn-candidate-02`和[计划](computer_use_bounded_continuation_retest_plan_20261005.json)仍未部署或派发，原素材完整冻结、运行包/控制器及实际GPU资格仍需完成；不得把计划当存活队列。旧计划保存在`.runtime/bounded-turn-retest-plan-01.json`，原八项等协议和成绩不改。
 
 最新实际审计`.runtime/bounded-turn-and-pipeline-progress-20261005-02.json`确认五个原登记控制器仍活：KVMem1/8处于035-ON resource-wait，GPU空闲55975MiB低于93000MiB；SDK10/image12/thinking4/feedback8仍零派发。主40次的36份可用原评分全0和035四份不可用保持；本轮零QW3、零真实设备输入、顾问关闭。有限续轮是已资格的隔离候选，实际成功率/速度改善仍未证明，目标继续活动。
+
+
+## 2026-10-05 共同显存预算与真实配对恢复
+
+本轮分类为progress；此前状态答复只核对既有记录，没有推进任务。旧容量控制器在空闲显存97,234MiB、没有其他compute PID时自然尝试ON启动，仍因默认ratio0.5只允许1304blocks、原选取及生成预算需要1536blocks而失败。该控制器、自有引擎及四个零试次后继均已实际退出；交接预检在发送任何信号之前拒绝旧的“纯等待”范围。全部原失败、035-OFF第一份评分器不可用记录、原1/8前缀及协议保留。不能继续把启动失败只归给其他GPU占用。
+
+新增shared_quota_engine/memory/operations/successors四个独立适配器，不改原启动器、二进制、已冻结框架或任务runner。新八次035/080×OFF/ON×两轮对照的两侧都显式加入`--kvmem-gpu-memory-ratio 1.0`；保留524288上下文、131072选取/预填、65536生成预留、48GiB CPU缓存、DFlash2、thinking、全部历史图像、关闭前缀复用、16K输出和1800秒/250调用。默认工作池仍为原选取加生成预算；比例不是物理显存占用测量。旧OFF结果不作为新配对一侧，八项使用quota1前缀，避免和旧VM退役核验的名称冲突。
+
+真实ON引擎已在共享GPU上加载并返回READY，自有同一实例已退出、端口已释放。第一次单用户健康消息、第二次系统加用户消息均被message语义历史准入拒绝；第二次保存了明确400正文。系统指令不作为历史段，第三次采用明确标注的合成多轮健康探针，60输入token/1输出token，健康请求约0.336秒；这不是桌面任务、长上下文检索或延迟改善证据。第三次终止端口检查遇到TIME_WAIT：ss确认无监听服务、同一PID已消失，稍后只读重核验通过，保留原失败终止记录，不重复推理。首份旧OFF实际请求经无损档案核验的角色为system/developer/user/user，仅导出结构及哈希，不导出内容或工具。
+
+新八次控制器PID3468661已实际运行；最终审计为0/8完成，当前quota1-035-kvmem-off-r1运行。该OFF引擎PID3470826及runner PID3471476完整身份已核验，因此两种引擎均有当前共享负载下的实际启动证据，业务成绩还未产生。原10/12/4/8后继协议和源包字节不变，四个新控制器PID3477480/3478208/3478662/3479537实际存活、零派发，分别等待前序真实终止及退役。新路由同时更新有效协议哈希和八项新ID；SDK与image的严格库存、原结果哈希、未知输入和实际进程检查保留。
+
+当前资格为engine9项、memory19项、operations12项、successors37项；后者含原等待循环的零部署/零派发边界，均不算模型业务成绩。早期PIDFD接口缺失及Path夹具错误的资格失败保留；Linux系统调用回退已由自有测试进程的真实冻结/恢复检查覆盖。GPU采样是整卡数值、包含其他工作，不能记为本进程显存峰值或稳定速度。首版零派发准备、两个400、TIME_WAIT以及原全空闲容量失败全部单列。
+
+实际声明：`.runtime/linux/kvmem-shared-quota-20261005-05/declaration.json`；原生健康资格：`.runtime/linux/kvmem-shared-quota-20261005-04/startup-post-retirement-qualification.json`；后继声明：`.runtime/shared-quota-successors-20261005/successors.json`；最终快照：`.runtime/shared-quota-current-progress-20261005-03.json`。当前已完成的40次Linux主对照仍为36份可用原评分全0、035四份不可用。KVMem配对收益、SDK51/图像/反馈真实改善和有限续轮业务复测均未证明；目标仍active，当前健康及CPU资格不能替代它们。
