@@ -410,3 +410,20 @@ CPU05的21项检查通过：真实本机HTTP、SQLite收据、一次送达/重�
 此案例提示任务未完成时有限自动续轮值得单独验证，尚未实现或证明收益。候选必须保持总时间/调用预算、用户停止/接管/安全暂停、不确定送达不重放和无进度上限；不能用无限续轮掩盖停滞。现有冻结协议、队列和客户端保持不变，复测仍应独立验收，不将模型宣告开始或结束当完成。
 
 最新实际只读审计`.runtime/improvement-status-live-audit-20261005-02.json`核验五个登记控制器和快照27 HTTP存活。KVMem保持1/8，当前035-ON资源等待、空闲55975MiB低于93000MiB；SDK/image/thinking/feedback仍0/10、0/12、0/4、0/8。初次状态读取误用completed/current字段而报首试0，原审计01保留，02改读实际trials/current_trial，没有更改生产队列。所有本轮导出/诊断/核验均零模型和输入；复杂OSWorld36份可用原评分全0，KVMem配对收益仍未证明。
+
+
+## 2026-10-05 有限零工具续轮候选与实际Codex故障核验
+
+在SDK51的精确app源SHA0df0b0d94c66d30695d7c226450ffc1b205e580aa5ff056da2a94d038b9063a1上构建独立control/candidate副本，不改现有冻结包。新helper只对原活动GUI轮正常结束、该轮零工具调用且完成未验证的情况最多请求两轮；同任务/thread、原观察/步骤、累计预算与无进度计数保留。每任务最多1800秒的候选续轮期限及每次30秒投递期限均有界，原外部任务期限继续生效。用户控制、接管、未知输入、证据/模型错误、工具额度耗尽、改变的模式/设备或重启均不自动继续；counter与投递reservation在await之前持久化，丢回复不重试。开始/结束发言不等于完成；完成仍依赖原checked workflow。
+
+初始candidate01通过18项、增加投递期限后19项CPU与18组/225项实际Codex通路核验，源按原SHA归档。随后检查发现仅暂停设备不足以确认未识别新turn已退役；candidate02在确认回复丢失时关闭该任务自有Codex实例、禁用ready并保留uncertain。最终19项CPU资格零失败/零跳过，普通qw3_computer导入缓存不被私有SDK别名测试污染。证据`.runtime/bounded-turn-cpu-04/result.json`，当前helper SHA71772aa7e0759050dda8a70aefbb3a5ba0257b02c4dc8b44afe9782ca3cf06f6、build SHA b47200d3642d44bdb9679d93cfbdd8b9fc014584ce65a6ef87a15b169271cf4c。普通仓库检查可运行独立policy检查；私有SDK行为资格必须提供QW3_BOUNDED_TEST_PACKAGE且不可跳过，缺少候选包不伪装成完整通过。
+
+最终实际Codex0.159.2/本地合成后端共24组、294项通过，三种平台工具目录各自覆盖control/candidate及四类情景：连续空轮到上限、续轮后明确接管、经原步骤条件完成、turn/start已返回新ID后故意丢失确认。总42次合成后端请求，不是QW3模型调用。所有真实MCP步骤共享同一累计额度；窗口/设备为合成数据，零原生输入，不能当三平台真实设备资格或业务改善。故障情景中新turn已建立，自有Codex关闭在第二次合成推理到达后端之前完成，不能据此声称QW3推理已实际启动或退役；后续真实runner仍须核验模型/服务/VM实际退出。
+
+原生资格02在第八组失败：首次看到paused/ready=false时，自有Codex仍处于收尾，断言退役过早；最后清理已确认该进程实际退出。原failed报告和精确源保留，规则未放宽。资格03有界等待同一个consume生命周期句柄退出，再保留原实际进程退役断言，完整24组通过；所有三轮自有Codex/MCP子进程最终扫描为空。证据`.runtime/bounded-turn-native-02/result.json`与`.runtime/bounded-turn-native-03/result.json`，不是因为观测时间到而重启仍活动的业务任务。
+
+另外只读恢复051-verified-r2实际request.archive并核验原字节SHA：三个tool Schema都有效；act的desktop_id/observation_id/action_id/action及动作字段存在，参数4228字节，workflow2161字节，observe空参数67字节符合其接口。原请求/后端/metrics哈希前后一致，说明这一请求没有旧的空动作定义回归，不证明模型遵从、总体harness正确或其他39次失败根因。证据`.runtime/051-zero-tool-actual-schema-diagnostic-20261005-01.json`；未执行生成动作或新模型请求。
+
+八项同条件开发复测计划选051、004，每任务control/candidate各两次并交错顺序，使用同一SDK51基础、原任务source SHA、thinking/DFlash2、OFF/16K输出、原1800秒/250调用、GUI权限和独立评分；明确是根据失败选出的开发任务，不作陌生任务泛化。方案`.runtime/bounded-turn-candidate-02`和[计划](computer_use_bounded_continuation_retest_plan_20261005.json)仍未部署或派发，原素材完整冻结、运行包/控制器及实际GPU资格仍需完成；不得把计划当存活队列。旧计划保存在`.runtime/bounded-turn-retest-plan-01.json`，原八项等协议和成绩不改。
+
+最新实际审计`.runtime/bounded-turn-and-pipeline-progress-20261005-02.json`确认五个原登记控制器仍活：KVMem1/8处于035-ON resource-wait，GPU空闲55975MiB低于93000MiB；SDK10/image12/thinking4/feedback8仍零派发。主40次的36份可用原评分全0和035四份不可用保持；本轮零QW3、零真实设备输入、顾问关闭。有限续轮是已资格的隔离候选，实际成功率/速度改善仍未证明，目标继续活动。

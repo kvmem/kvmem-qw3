@@ -6704,7 +6704,7 @@
     "matched_qw3_improvement_proven": false,
     "retained_first_three_failed_attempts": true
   },
-  "latest_actual_progress_audit": "apps/computer_use/.runtime/replay27-and-capacity-progress-20261005-01.json",
+  "latest_actual_progress_audit": "apps/computer_use/.runtime/bounded-turn-and-pipeline-progress-20261005-02.json",
   "browser_runtime_metadata_candidate_progress": {
     "at": 1791158727.3052092,
     "audit": "apps/computer_use/.runtime/browser-runtime-and-memory-recovery-progress-20261005-01.json",
@@ -7037,7 +7037,7 @@
     "superseded_by_capacity_recovery": "apps/computer_use/.runtime/kvmem-capacity-and-successors-progress-20261005-01.json",
     "current_runtime_controller_retired_after_second_trial_engine_failure": true
   },
-  "latest_actual_audit": "apps/computer_use/.runtime/improvement-status-live-audit-20261005-02.json",
+  "latest_actual_audit": "apps/computer_use/.runtime/bounded-turn-and-pipeline-progress-20261005-02.json",
   "kvmem_capacity_recovery": {
     "kind": "actual_kvmem_capacity_and_successors_progress",
     "checked_at": "2026-10-05T00:52:13.412921+00:00",
@@ -7511,8 +7511,7 @@
     "model_success_or_latency_gain_proven": false
   },
   "current_pipeline_live_status": {
-    "kind": "status_request_improvement_evidence_live_audit",
-    "checked_at": "2026-10-05T01:49:40.501281+00:00",
+    "checked_at": "2026-10-05T02:27:43.007151+00:00",
     "pipeline": {
       "memory": {
         "identity": {
@@ -7529,14 +7528,12 @@
           "cwd": "/home/chaidi/qw3",
           "state": "S"
         },
+        "actual_live": true,
         "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/kvmem-capacity-launch-01/registration.json",
         "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-capacity-continuation-20261005/queue-runtime-01/queue.json",
-        "actual_live": true,
         "status": "resource-wait",
         "completed": 1,
-        "current": "035-kvmem-on-r1",
-        "queue_counter_field": "trials",
-        "queue_sha256": "ba2ac02d13fbca8bf780e408cdf07d51451cc692eeb5f9b8e6716debcce4ac07"
+        "current": "035-kvmem-on-r1"
       },
       "sdk": {
         "identity": {
@@ -7555,14 +7552,12 @@
           "cwd": "/home/chaidi/qw3",
           "state": "S"
         },
+        "actual_live": true,
         "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/sdk-registration.json",
         "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-05/queue.json",
-        "actual_live": true,
         "status": "waiting-for-forty-and-eight",
         "completed": 0,
-        "current": null,
-        "queue_counter_field": "trials",
-        "queue_sha256": "078579dd777f8d7f5af31eb733ffa6ee9f888be03f18e8a7988596833a0f0005"
+        "current": null
       },
       "image": {
         "identity": {
@@ -7581,14 +7576,12 @@
           "cwd": "/home/chaidi/qw3",
           "state": "S"
         },
+        "actual_live": true,
         "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/image-registration.json",
         "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/queue-runtime-04/queue.json",
-        "actual_live": true,
         "status": "waiting-for-forty-eight-and-ten",
         "completed": 0,
-        "current": null,
-        "queue_counter_field": "trials",
-        "queue_sha256": "10f564cf34045be4ffe4a744f8871fe7cdb40998bcf5830e43176917314a75e7"
+        "current": null
       },
       "thinking": {
         "identity": {
@@ -7607,14 +7600,12 @@
           "cwd": "/home/chaidi/qw3",
           "state": "S"
         },
+        "actual_live": true,
         "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/thinking-registration.json",
         "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/queue-runtime-02/queue.json",
-        "actual_live": true,
         "status": "waiting-for-image-twelve",
         "completed": 0,
-        "current": null,
-        "queue_counter_field": "trials",
-        "queue_sha256": "2b658886d2372d57e799f53710845892bec81cfc4055924af21dd3ce11f5587c"
+        "current": null
       },
       "feedback": {
         "identity": {
@@ -7633,38 +7624,17 @@
           "cwd": "/home/chaidi/qw3",
           "state": "S"
         },
+        "actual_live": true,
         "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/feedback-registration.json",
         "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/queue-runtime-02/queue.json",
-        "actual_live": true,
         "status": "waiting-for-forty-eight-ten-twelve-four",
         "completed": 0,
-        "current": null,
-        "queue_counter_field": "trials",
-        "queue_sha256": "6bf8704c9bc54ba8363911f25efe2a3c0882b64ea54d2fcbf3919fd0f57492c5"
+        "current": null
       }
     },
-    "replay": {
-      "url": "http://127.0.0.1:18159/index.html",
-      "actual_live": true,
-      "actual_http_bytes_match": true,
-      "identity": {
-        "pid": 3403035,
-        "uid": 1001,
-        "start_ticks": 371835263,
-        "command": [
-          "/home/chaidi/qw3/.venv/bin/python",
-          "/home/chaidi/qw3/apps/computer_use/.runtime/cross-device-replay-20261005-27/serve.py"
-        ],
-        "cwd": "/home/chaidi/qw3",
-        "state": "S"
-      }
-    },
-    "gpu_free_used_utilization": "55975, 41276, 99",
-    "advisor_enabled": false,
-    "model_calls": 0,
-    "device_inputs": 0,
-    "preserved_initial_counter_field_read_error": "/home/chaidi/qw3/apps/computer_use/.runtime/improvement-status-live-audit-20261005-01.json",
-    "counter_correction": "Read trials and current_trial from the actual registered queues; no producer or source result changed."
+    "gpu": "55975, 41276, 99",
+    "qw3_model_calls_this_turn": 0,
+    "real_device_inputs_this_turn": 0
   },
   "zero_action_completed_turn_diagnostic": {
     "audit": "apps/computer_use/.runtime/zero-action-completed-turn-diagnostic-20261005-02.json",
@@ -7683,9 +7653,203 @@
     "source_records_unchanged": true,
     "model_calls": 0,
     "device_inputs": 0,
-    "bounded_continuation_implemented": false,
+    "bounded_continuation_implemented": true,
     "model_improvement_proven": false,
     "remaining_39_failures_not_explained_by_this_case": true,
-    "preserved_initial_diagnostic": "apps/computer_use/.runtime/zero-action-completed-turn-diagnostic-20261005-01.json"
+    "preserved_initial_diagnostic": "apps/computer_use/.runtime/zero-action-completed-turn-diagnostic-20261005-01.json",
+    "implementation_scope": "Private SDK51 candidate02; not production deployed or QW3 retested",
+    "selected_actual_request_schema_qualification": "apps/computer_use/.runtime/051-zero-tool-actual-schema-diagnostic-20261005-01.json",
+    "selected_act_definition_not_empty": true,
+    "root_cause_proven": false
+  },
+  "bounded_zero_tool_continuation_candidate": {
+    "kind": "actual_bounded_turn_candidate_progress",
+    "checked_at": "2026-10-05T02:27:43.007151+00:00",
+    "previous_goal_turn": "progress",
+    "turn_classification": "progress",
+    "pipeline": {
+      "memory": {
+        "identity": {
+          "pid": 3391613,
+          "uid": 1001,
+          "start_ticks": 371687541,
+          "command": [
+            "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+            "-m",
+            "kvmem_capacity_continuation",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-capacity-continuation-20261005/continuation.json"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        },
+        "actual_live": true,
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/kvmem-capacity-launch-01/registration.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-capacity-continuation-20261005/queue-runtime-01/queue.json",
+        "status": "resource-wait",
+        "completed": 1,
+        "current": "035-kvmem-on-r1"
+      },
+      "sdk": {
+        "identity": {
+          "pid": 3394420,
+          "uid": 1001,
+          "start_ticks": 371696774,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "runner_runtime_successors",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/successors.json",
+            "--stage",
+            "sdk"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        },
+        "actual_live": true,
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/sdk-registration.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-05/queue.json",
+        "status": "waiting-for-forty-and-eight",
+        "completed": 0,
+        "current": null
+      },
+      "image": {
+        "identity": {
+          "pid": 3394812,
+          "uid": 1001,
+          "start_ticks": 371700756,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "runner_runtime_successors",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/successors.json",
+            "--stage",
+            "image"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        },
+        "actual_live": true,
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/image-registration.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/queue-runtime-04/queue.json",
+        "status": "waiting-for-forty-eight-and-ten",
+        "completed": 0,
+        "current": null
+      },
+      "thinking": {
+        "identity": {
+          "pid": 3395270,
+          "uid": 1001,
+          "start_ticks": 371705069,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "runner_runtime_successors",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/successors.json",
+            "--stage",
+            "thinking"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        },
+        "actual_live": true,
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/thinking-registration.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/queue-runtime-02/queue.json",
+        "status": "waiting-for-image-twelve",
+        "completed": 0,
+        "current": null
+      },
+      "feedback": {
+        "identity": {
+          "pid": 3395769,
+          "uid": 1001,
+          "start_ticks": 371711113,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "runner_runtime_successors",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/successors.json",
+            "--stage",
+            "feedback"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        },
+        "actual_live": true,
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/feedback-registration.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/queue-runtime-02/queue.json",
+        "status": "waiting-for-forty-eight-ten-twelve-four",
+        "completed": 0,
+        "current": null
+      }
+    },
+    "gpu": "55975, 41276, 99",
+    "candidate": {
+      "manifest": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-turn-candidate-02/build.json",
+      "sha256": "b47200d3642d44bdb9679d93cfbdd8b9fc014584ce65a6ef87a15b169271cf4c",
+      "changed_files": [
+        "app.py",
+        "bounded_turn_continuation.py"
+      ],
+      "production_deployed": false,
+      "real_model_retest": false,
+      "lost_acknowledgement_closes_owned_codex_runtime": true
+    },
+    "cpu_qualification": {
+      "kind": "isolated_bounded_turn_cpu_qualification",
+      "passed": true,
+      "tests_run": 19,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "source_sha256": {
+        "bounded_turn_continuation.py": "71772aa7e0759050dda8a70aefbb3a5ba0257b02c4dc8b44afe9782ca3cf06f6",
+        "bounded_turn_candidate.py": "9aa30a76107b8838549c0dc4e6d1d96d72342828ab7ea5d8213b650382bb2b7f",
+        "tests/test_bounded_turn_continuation.py": "21252f1052533b5c09ef6cc15811af1e4eaedb2ed3236e3bf4e3264f9ec27c05"
+      },
+      "candidate_manifest_sha256": "b47200d3642d44bdb9679d93cfbdd8b9fc014584ce65a6ef87a15b169271cf4c",
+      "model_calls": 0,
+      "device_inputs": 0,
+      "normal_package_import_cache_unchanged": true,
+      "real_model_improvement_proven": false,
+      "lost_acknowledgement_closes_owned_runtime": true,
+      "source_archive": "apps/computer_use/.runtime/bounded-turn-cpu-04/source-archive"
+    },
+    "actual_codex_transport_qualification": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-turn-native-03/result.json",
+      "sha256": "07f503255e3984449d0e7d1108459fa8eaa77b7b956430c22a92d09e73750bfc",
+      "passed": true,
+      "runs": 24,
+      "checks_passed": 294,
+      "synthetic_backend_requests": 42,
+      "all_owned_native_processes_retired": true,
+      "native_windows_linux_android_devices_tested": false,
+      "preserved_initial_actual_fault_qualification_failure": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-turn-native-02/result.json",
+      "failure_reason": "Qualification read a paused device before the same owned Codex lifecycle had completed closing; same actual handle exit is now awaited."
+    },
+    "selected_original_schema_diagnostic": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/051-zero-tool-actual-schema-diagnostic-20261005-01.json",
+      "sha256": "b57829b5e380e5d40ec3d43b3a480c21d2e1a5fe71995ac9a457ea30a186cb13",
+      "selected_act_definition_not_empty": true,
+      "root_cause_proven": false
+    },
+    "retest_plan": {
+      "path": "/home/chaidi/qw3/docs/computer_use_bounded_continuation_retest_plan_20261005.json",
+      "sha256": "be29cc072e64c0a67aa9d9ce8eb77cee08c5522a159ea6ebfb2f58bfd8cde4ee",
+      "planned_trials": 8,
+      "actual_dispatched": 0,
+      "live_controller_registered": false,
+      "previous_plan_snapshot": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-turn-retest-plan-01.json",
+      "previous_plan_sha256": "277d0a75d6976d6ef015e6d43f67b1bd2ee3891584be42a2c3407a30d667a411"
+    },
+    "qw3_model_calls": 0,
+    "real_device_inputs": 0,
+    "advisor_enabled": false,
+    "business_success_or_latency_improvement_proven": false,
+    "preserved_earlier_progress_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-turn-and-pipeline-progress-20261005-01.json"
   }
 }
