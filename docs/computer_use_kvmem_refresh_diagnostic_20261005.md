@@ -15,7 +15,7 @@
 
 首个超过窗口的原始请求为181074输入token，服务端query span为[3944,13218)，score query message为3；原始请求没有指定kvmem_reselect或guided参数。原请求沿服务默认auto进入，而延续相同用户查询的gate随后将其改为off。原启动配置guided_refresh=off、prefix_reuse=false保持。
 
-080-ON随后自然终止，官方0分，1802.68秒/34工具调用，deadline、未知输入0、录像收集通过；原runner/engine已实际退役。完整104条scorer事件中29条选择全部历史，超过窗口75条全部回退、查询捕获0；六个above-budget请求中五个产生scorer事件。活动前缀`kvmem-080-query-gate-active-prefix-01.json`保留；终止证据为`kvmem-080-query-gate-terminal-01.json`及`shared-quota-first080-on-terminal-01.json`。OFF尚未完成，不能形成开关质量/速度结论；这一路径也不解释其他任务在短历史阶段的失败。
+080-ON随后自然终止，官方0分，1802.68秒/34工具调用，deadline、未知输入0、录像收集通过；原runner/engine已实际退役。完整104条scorer事件中29条选择全部历史，超过窗口75条全部回退、查询捕获0；六个above-budget请求中五个产生scorer事件。活动前缀`kvmem-080-query-gate-active-prefix-01.json`保留；终止证据为`kvmem-080-query-gate-terminal-01.json`及`shared-quota-first080-on-terminal-01.json`。快照16确认同组OFF已终止：官方0分、1152.71秒/27调用、未知输入0、录像收集通过，agent因持续无法操作而暂停。两侧失败且停止原因不同，耗时差不能解释为提速；本路径也不解释其他任务在短历史阶段的失败。
 
 源码`kvmem_harness_refresh_decision`在同一用户查询且guided refresh关闭时返回不重选。服务端据此设置reselect=Off，`kvmem_query_lifecycle`不会进入select_active；prefix reuse关闭也不产生warm capture。recompute-query虽在当前EngineOptions默认true，仍被这些前置条件限制。日志中mtp标签不足以把故障归因于DFlash。
 
@@ -40,3 +40,9 @@
 control保持guided-reselect=off；candidate使用现有both，其他模型、DFlash、FP8、窗口、quota1、历史图像和prefix reuse配置相同。须在现有冻结模型流水线完整终止及退役、获得原串行锁、用户应用与网关空闲、满足GPU余量后才可执行；当前计划不是已运行试次。
 
 这一步先验收control复现known-conversation抑制、candidate真正捕获私有查询并执行非回退查询评分。单独将长请求发给冷引擎属于ColdAboveBudget，不能复现本次问题；不能用那种试验假装已修复桌面延续流程。即使机制资格通过，仍需同条件真实桌面任务证明质量/速度改善。
+
+## 独立运行绑定与当前状态
+
+准备计划原文件保留为prepared_not_dispatched。随后新建不可覆盖的`.runtime/query-refresh-readonly-20261005/protocol.json`，明确KVMem两侧均开启、仅guided refresh为off/both，顺序off/both/both/off；每轮先原13225-token请求，再原181074-token请求，要求完整流、同一引擎、原输入token及退役回执。工具调用仅记录，零执行；初次请求或身份失败不发送第二份请求。
+
+HTTP九项、原启动器九项、严格串行队列十三项资格全部通过，共31项，均无QW3或桌面输入；首次沙箱TCP绑定失败、早期测试源码及队列资格分别保留。实际等待器PID3585544/UID1001/start_ticks373428016已经登记，快照16确认存活、0/4，等待原40＋新KVMem8＋SDK10＋图像12＋thinking4＋反馈8＋有限续轮8完整结束与退役。各级源哈希、结果库存、VM退役、未知输入及最后自有引擎检查保持，结束后恢复原OFF用户入口。未修改现有运行程序；当前没有模型机制改善、业务提升或延迟收益。完整绑定见[运行声明](computer_use_query_refresh_runtime_20261005.json)。

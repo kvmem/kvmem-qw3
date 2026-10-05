@@ -1,0 +1,65 @@
+{
+  "kind": "actual_serial_saved_input_query_refresh_runtime_binding",
+  "source_plan": "/home/chaidi/qw3/apps/computer_use/.runtime/kvmem-query-refresh-saved-input-plan-01.json",
+  "source_plan_sha256": "222749d3fae8a4dd3d89c69b1dfc2164e906eb3af3ce4c6403d53f4d63a05a79",
+  "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-readonly-20261005/protocol.json",
+  "protocol_sha256": "7e22b2e94b1c0f43d7bc4e974e7d79c0d3568262344aa48562070ff2dceead27",
+  "actual_registration": "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-replay-launch-01/registration.json",
+  "actual_controller": {
+    "pid": 3585544,
+    "uid": 1001,
+    "start_ticks": 373428016,
+    "command": [
+      "/home/chaidi/qw3/.venv/bin/python",
+      "-m",
+      "query_refresh_replay_queue",
+      "run",
+      "--protocol",
+      "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-readonly-20261005/protocol.json",
+      "--state-dir",
+      "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-readonly-20261005/queue-runtime-01"
+    ],
+    "cwd": "/home/chaidi/qw3",
+    "state": "R"
+  },
+  "actual_queue": "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-readonly-20261005/queue-runtime-01/queue.json",
+  "status_at_registration": "waiting-for-complete-bounded-chain",
+  "completed_replays_at_registration": 0,
+  "planned_replays": 4,
+  "request_order": [
+    "seed",
+    "pressure"
+  ],
+  "source_input_tokens": {
+    "seed": 13225,
+    "pressure": 181074
+  },
+  "generation_profile_unchanged": true,
+  "kvmem": "on for both refresh modes",
+  "refresh_mode_order": [
+    "off",
+    "both",
+    "both",
+    "off"
+  ],
+  "qualification": {
+    "http": "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-http-qualification-02/result.json",
+    "http_checks": 9,
+    "engine": "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-engine-qualification-01/result.json",
+    "engine_checks": 9,
+    "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-queue-qualification-01/result.json",
+    "queue_checks": 13
+  },
+  "serial_parent": "Original40 + fresh KVMem8 + SDK10 + image12 + thinking4 + feedback8 + bounded8; real terminal, retirement, result hashes and idle service receipts required.",
+  "original_pipeline_sources_conditions_and_failures_preserved": true,
+  "shared_gpu_min_free_mib": 56000,
+  "final_engine_policy": "restore original OFF on complete; preserve live evidence without further dispatch on failure",
+  "generated_tool_calls_executed": 0,
+  "advisor_enabled": false,
+  "model_success_improvement_proven": false,
+  "latest_live_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-16.json",
+  "checked_at": 1791179085.0039017,
+  "status_at_latest_audit": "waiting-for-complete-bounded-chain",
+  "completed_replays_at_latest_audit": 0,
+  "actual_registered_process_live": true
+}

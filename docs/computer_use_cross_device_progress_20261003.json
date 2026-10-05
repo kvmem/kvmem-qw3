@@ -7037,7 +7037,7 @@
     "superseded_by_capacity_recovery": "apps/computer_use/.runtime/kvmem-capacity-and-successors-progress-20261005-01.json",
     "current_runtime_controller_retired_after_second_trial_engine_failure": true
   },
-  "latest_actual_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-13.json",
+  "latest_actual_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-16.json",
   "kvmem_capacity_recovery": {
     "kind": "actual_kvmem_capacity_and_successors_progress",
     "checked_at": "2026-10-05T00:52:13.412921+00:00",
@@ -7511,12 +7511,50 @@
     "model_success_or_latency_gain_proven": false
   },
   "current_pipeline_live_status": {
-    "audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-13.json",
-    "memory_completed": 3,
+    "audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-16.json",
+    "checked_at": 1791179085.0039017,
+    "memory_completed": 4,
     "memory_planned": 8,
-    "current_trial": "quota1-080-kvmem-off-r1",
-    "status": "starting-fresh-engine",
-    "other_five_queues_completed": 0,
+    "current_trial": "quota1-035-kvmem-on-r2",
+    "status": "running",
+    "successors": {
+      "sdk": {
+        "status": "waiting-for-forty-and-eight",
+        "completed": 0,
+        "planned": 10,
+        "actual_live": true
+      },
+      "image": {
+        "status": "waiting-for-forty-eight-and-ten",
+        "completed": 0,
+        "planned": 12,
+        "actual_live": true
+      },
+      "thinking": {
+        "status": "waiting-for-image-twelve",
+        "completed": 0,
+        "planned": 4,
+        "actual_live": true
+      },
+      "feedback": {
+        "status": "waiting-for-forty-eight-ten-twelve-four",
+        "completed": 0,
+        "planned": 8,
+        "actual_live": true
+      }
+    },
+    "bounded": {
+      "status": "waiting-for-forty-eight-ten-twelve-four-eight",
+      "completed": 0,
+      "planned": 8,
+      "actual_live": true
+    },
+    "query_refresh": {
+      "status": "waiting-for-complete-bounded-chain",
+      "completed": 0,
+      "planned": 4,
+      "actual_live": true
+    },
     "actual_registered_waiters_live": true
   },
   "zero_action_completed_turn_diagnostic": {
@@ -7872,6 +7910,13 @@
       "kind": "actual_fresh_shared_quota_cohort_and_successors",
       "checked_at": 1791173645.553871,
       "audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-06.json",
+      "preserved_full_original_snapshot": true
+    },
+    {
+      "kind": "readonly_query_refresh_and_first080_pair_progress",
+      "checked_at": 1791179085.0039017,
+      "audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-16.json",
+      "previous_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-13.json",
       "preserved_full_original_snapshot": true
     }
   ],
@@ -8370,5 +8415,58 @@
     "captured_query_events": 0,
     "OFF_pair_completed": false,
     "business_or_latency_gain_proven": false
+  },
+  "query_refresh_runtime_binding": {
+    "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-readonly-20261005/protocol.json",
+    "protocol_sha256": "7e22b2e94b1c0f43d7bc4e974e7d79c0d3568262344aa48562070ff2dceead27",
+    "actual_registration": "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-replay-launch-01/registration.json",
+    "actual_queue": "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-readonly-20261005/queue-runtime-01/queue.json",
+    "planned_replays": 4,
+    "completed_replays_at_latest_audit": 0,
+    "status_at_latest_audit": "waiting-for-complete-bounded-chain",
+    "actual_registered_process_live": true,
+    "generated_tool_calls_executed": 0,
+    "model_success_improvement_proven": false,
+    "document": "docs/computer_use_query_refresh_runtime_20261005.json",
+    "qualification_checks": 31,
+    "latest_live_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-16.json",
+    "advisor_enabled": false
+  },
+  "first080_common_quota_terminal_pair": {
+    "audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-16.json",
+    "attempts": [
+      {
+        "id": "quota1-080-kvmem-on-r1",
+        "result_path": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-shared-quota-20261005-05/attempts/quota1-080-kvmem-on-r1/result.json",
+        "result_sha256": "144b7fc1edff951326a335a2b58ded2c4d72bf6cc15371bfeaf52d627f228ca3",
+        "score": 0.0,
+        "seconds": 1802.6789164151996,
+        "tool_calls": 34,
+        "uncertain_actions": 0,
+        "agent_status": "stopped",
+        "accepted": false,
+        "video_collection_passed": true,
+        "stop_reason": "deadline",
+        "notice": null
+      },
+      {
+        "id": "quota1-080-kvmem-off-r1",
+        "result_path": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-shared-quota-20261005-05/attempts/quota1-080-kvmem-off-r1/result.json",
+        "result_sha256": "0c773a1201f41780fea189848c0d99655afd57a0e3c16a9bfbf2d6090cfaf854",
+        "score": 0.0,
+        "seconds": 1152.7105833422393,
+        "tool_calls": 27,
+        "uncertain_actions": 0,
+        "agent_status": "paused",
+        "accepted": false,
+        "video_collection_passed": true,
+        "stop_reason": null,
+        "notice": "多次刷新后仍无法发出操作，已暂停。请核对目标或接管。"
+      }
+    ],
+    "both_official_zero": true,
+    "stopping_conditions_differ": true,
+    "business_or_latency_gain_proven": false,
+    "public_videos_exported": false
   }
 }
