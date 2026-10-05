@@ -318,3 +318,13 @@ KVMem八次对照已预声明，控制器已实际运行并等待49b的全部40�
 首次审计将绝对归档路径与相对 CLI 目录比较而失败，原记录保留；修正路径后重读同一批原产物，未重启服务或重做 VM 测试。两侧没有绑定引擎，上下文采用未绑定默认值，不能算 524288 模型栈验收。新的八项模型对照仍 0/8，串行控制器未登记；需完成试验入口、原八项真实终止与进程退出交接，再绑定实际 OFF 引擎并检查上下文。
 
 原六个控制器仍为原实际代次，图像 1/12、其他五组 0/4、0/8、0/8、0/4、0/8；可用 55711 MiB 仍低于 56000 MiB 门槛，未干预用户 GPU 工作。目标 active，无新任务成功率或延迟改善结论。证据：[服务栈说明](computer_use_condition_schema_vm_stacks_20261006.md)、[报告](computer_use_condition_schema_vm_stacks_20261006.json)、`.runtime/condition-schema-model-stack-independent-audit-02/result.json`及 `.runtime/stable-resource-handoff-status-17.json`。
+
+## 2026-10-06 完成条件独立试验入口与串行交接
+
+本轮完成独立条件对照入口与串行控制器，归为 progress。两侧复用原任务执行、独立评分和连续录像，只改变内嵌条件定义。新增证据核验真实模型请求、修复侧完整定义及终止状态，原失败成绩保留。交接复用原收集器逐一核验原生八次和更早完整库存，在新进程的内存副本里比较原成绩和录像，不写原队列；接收最终原 OFF 引擎，而非已退役的查询引擎。观察超时只重新读取同一实际句柄。
+
+最终十五项 CPU 检查通过，二十一个源码文件与资格归档一致。完整终止交接用例是明确夹具，真实前序仍未结束，不能记为实际模型验收。两侧 CPython 3.12 实际导入正确私有框架，无需安装 jsonschema。第一轮测试导入语法错误、第二轮两项工具顺序夹具错误、第三轮旧十三项通过记录全部保留，不累加覆盖。首次沙箱声明准备因宿主进程不可见而拒绝，在创建目录前停止；读取真实宿主身份后成功，无原进程重启。
+
+新控制器 PID565205、UID1001、start_ticks377964847、完整命令和工作目录已独立核验，同代次存活，0/8，等待原生八次及全部前序。原六个控制器仍是同一实例，图像 1/12、其他五组 0/4、0/8、0/8、0/4、0/8；当前可用 55711 MiB 低于原 56000 MiB 连续三十秒门槛，没有用户 GPU 信号、模型请求或桌面输入。原复杂 OSWorld 和 KVMem 效果结论不改；目标 active。
+
+证据：[入口与队列说明](computer_use_condition_schema_model_queue_20261006.md)、[报告](computer_use_condition_schema_model_queue_20261006.json)、`.runtime/condition-schema-model-queue-cpu-04/result.json`、`.runtime/condition-schema-model-queue-preflight-01/result.json`及`.runtime/condition-schema-model-queue-independent-audit-01/result.json`。下一步轮询七个实际句柄，在原完整终止与退役交接后绑定原引擎，核验上下文并执行八次 QW3 同条件对照，保留业务成绩、耗时、动作错误和连续录像。

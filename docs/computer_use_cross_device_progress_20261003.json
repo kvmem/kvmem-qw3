@@ -10136,5 +10136,49 @@
       "minimum_free_mib": 56000,
       "user_compute_pid_signalled": false
     }
+  },
+  "condition_schema_model_queue_registered_20261006": {
+    "document": {
+      "path": "/home/chaidi/qw3/docs/computer_use_condition_schema_model_queue_20261006.json",
+      "sha256": "629e1369dbcfefa62dc7b3df3045ade1bee5c3d18705d7581ba596383d533b6e"
+    },
+    "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/condition-schema-model-queue-independent-audit-01/result.json",
+      "sha256": "2caba49a9cad6434ab94370f9fbca52ec7b8af40f16795139f4f0a41cce6c571"
+    },
+    "controller": {
+      "pid": 565205,
+      "uid": 1001,
+      "start_ticks": 377964847,
+      "command": [
+        "/home/chaidi/qw3/.venv/bin/python",
+        "-m",
+        "condition_schema_model_queue",
+        "run",
+        "--declaration",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/condition-schema-model-queue-20261006-01/declaration.json"
+      ],
+      "cwd": "/home/chaidi/qw3",
+      "state": "R"
+    },
+    "completed": 0,
+    "planned": 8,
+    "status": "registered-waiting-not-dispatched",
+    "qualification_tests": 15,
+    "qualified_source_files": 21,
+    "private_imports": 2,
+    "actual_terminal_native_handoff_exercised": false,
+    "business_gain_proven": false,
+    "model_calls": 0,
+    "device_inputs": 0,
+    "gpu": {
+      "at": 1791223942.0829577,
+      "free_mib": 55711,
+      "used_mib": 41540,
+      "gpu_percent": 99,
+      "compute_pids": [
+        "3906950"
+      ]
+    }
   }
 }
