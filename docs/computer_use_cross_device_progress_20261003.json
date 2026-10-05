@@ -2520,111 +2520,51 @@
     "latex_repeat_tool_calls": 23
   },
   "public_replay_snapshot": {
-    "path": "apps/computer_use/.runtime/cross-device-replay-20261005-26",
-    "url": "http://127.0.0.1:18158/index.html",
+    "path": "apps/computer_use/.runtime/cross-device-replay-20261005-27",
+    "url": "http://127.0.0.1:18159/index.html",
+    "previous_snapshot": "apps/computer_use/.runtime/cross-device-replay-20261005-26",
+    "total_rows": 150,
+    "public_videos": 144,
+    "previous_rows_unchanged": 138,
+    "appended_rows": 12,
     "formal_attempts_at_export": 40,
-    "windows_model_trials_at_export": 8,
-    "platform_pilots_at_export": 56,
-    "includes_python_repair_pair": true,
-    "includes_latex_repair_pair": true,
-    "export_is_point_in_time": true,
-    "actual_browser_check": "apps/computer_use/.runtime/replay26-browser-qualification-01/result.json",
-    "actual_browser_checks_passed": 24,
-    "retained_failed_snapshot_checks": [
-      "apps/computer_use/.runtime/cross-device-replay-20261005-23/browser-check-01.json",
-      "apps/computer_use/.runtime/cross-device-replay-23-browser-preparation-failed-02.json",
-      "apps/computer_use/.runtime/cross-device-replay-20261005-24/export-preservation-failure.json",
-      "apps/computer_use/.runtime/cross-device-replay-20261005-25/partial-source-admission-gap.json"
-    ],
-    "partial_formal_videos_not_for_latency_comparison": true,
-    "matched_development_osworld_at_export": 33,
-    "includes_wire_regression_failures": true,
-    "development_attempts": 56,
-    "development_osworld_attempts": 33,
-    "software_product_attempts": 8,
-    "browser_check": "apps/computer_use/.runtime/replay26-browser-qualification-01/result.json",
-    "browser_checks_passed": 24,
-    "snapshot_excludes_later_candidate19_trials": false,
-    "new_candidate19_terminal_trials_at_export": 8,
-    "public_video_storage": "131 hardlinked immutable terminal videos plus one separately remuxed verified partial recording; original media unchanged",
-    "previous_snapshot": "apps/computer_use/.runtime/cross-device-replay-20261005-23",
-    "directory": "apps/computer_use/.runtime/cross-device-replay-20261005-26",
     "platform_development_attempts": 56,
-    "actual_browser_passed": true,
-    "includes_terminal_receipt_trials": true,
-    "all_four_candidate49b_terminal_pairs_included": true,
-    "snapshot_excludes_later_candidate49b_006_pair": false,
-    "current49b_terminal_trials_at_export": 29,
-    "current49b_matched_pairs_included": [
-      "004",
-      "013",
-      "006",
-      "010",
-      "038",
-      "022",
-      "035",
-      "043",
-      "080",
-      "051"
-    ],
-    "current49b_038_legacy_r1_included": true,
-    "original_failure_rows_retained": true,
-    "new_public_videos_use_hardlinks": true,
-    "duplicate_video_bytes_allocated": 3159973,
-    "retained_browser_startup_failure_log": "/tmp/qw3-replay19-browser-check01.log",
-    "browser_startup_failure_explained": "Host CPython3.13 environment lacks playwright; browser qualification uses the existing CPython3.12 environment. No dependency was installed.",
-    "new_022_unknown_preserved_and_visible": true,
-    "actual_browser_qualification": "apps/computer_use/.runtime/replay26-browser-qualification-01/result.json",
-    "current_candidate49b_terminal_trials": 29,
-    "shared_hardlinked_videos": 131,
-    "duplicate_media_bytes": 3159973,
-    "task035_official_unavailable_separate_local_score": true,
-    "task043_two_distinct_terminal_videos_included": true,
-    "task051_legacy_video_cropped_warning_visible": true,
+    "software_product_attempts": 8,
+    "development_osworld_attempts": 45,
+    "recording_qualification_rows": 1,
+    "current49b_terminal_trials_at_export": 40,
+    "kvmem_terminal_trials_at_export": 1,
+    "pre_task_startup_interruptions_separate": 1,
+    "formal_denominator_unchanged": true,
+    "original_scores_unchanged": true,
+    "kvmem_paired_gain_proven": false,
+    "actual_browser_qualification": "apps/computer_use/.runtime/replay27-browser-qualification-01/result.json",
+    "actual_browser_checks_passed": 25,
+    "cpu_qualification": "apps/computer_use/.runtime/incremental-replay-cpu-01/result.json",
+    "cpu_checks_passed": 10,
+    "verified_new_retained_desktop_pngs": 259,
     "video_full_screen_coverage_not_proven_trials": [
-      "051-legacy-r1"
+      "051-legacy-r1",
+      "051-legacy-r2"
     ],
-    "current_queue_terminal_trials_at_audit": 33,
+    "previous_partial_video_and_sampling_gap_limits_preserved": true,
+    "export_is_point_in_time": true,
     "actual_server_identity": {
-      "pid": 2838863,
+      "pid": 3403035,
       "uid": 1001,
-      "start_ticks": 369967739,
+      "start_ticks": 371835263,
       "command": [
         "/home/chaidi/qw3/.venv/bin/python",
-        "/home/chaidi/qw3/apps/computer_use/.runtime/cross-device-replay-20261005-26/serve.py"
+        "/home/chaidi/qw3/apps/computer_use/.runtime/cross-device-replay-20261005-27/serve.py"
       ],
       "cwd": "/home/chaidi/qw3",
       "state": "S"
     },
-    "total_rows": 138,
-    "recording_qualification_attempts": 1,
-    "recording_component_rows_excluded_from_model_denominators": true,
-    "later_terminal_trials_not_yet_exported": 4,
-    "duplicated_full_video_bytes_allocated": 0,
-    "new_partial_remux_bytes_allocated": 3159973,
-    "all128_previous_terminal_rows_retained": true,
-    "original_grades_and_media_unchanged": true,
-    "partial_006_verified_r2": {
-      "duration_seconds": 282,
-      "decoded_frames": 564,
-      "original_task_seconds": 1801.2906276527792,
-      "original_score": 0.0,
-      "original_public_mp4_bytes": 0,
-      "source_mkv_sha256": "4e356b1942c686bb18940aeccdb211807138c3f64120179e588bd64e0c1fb5a0",
-      "new_public_video": "trial-132-partial.mp4",
-      "all_decoded_pixels_and_timestamps_preserved": true,
-      "original_recording_complete": false,
-      "is_full_task_recording": false
-    },
-    "native_recovery_gap_visible_on_seek_and_play": true,
-    "gap_held_frames_are_new_observations": false,
-    "actual_server_registration": "/home/chaidi/qw3/apps/computer_use/.runtime/replay26-server-registration-03.json",
-    "actual_live_audit": "apps/computer_use/.runtime/replay26-and-parent-progress-20261005-01.json",
-    "retained_failed_or_transient_server_registrations": [
-      "apps/computer_use/.runtime/replay26-server-registration-01.json",
-      "apps/computer_use/.runtime/replay26-server-registration-02.json"
-    ],
-    "actual_latest_queue_audit": "apps/computer_use/.runtime/feedback-retest-queue-and-parent-progress-20261005-01.json"
+    "actual_server_live_at_audit": true,
+    "actual_http_bytes_match": true,
+    "model_success_or_latency_gain_proven": false,
+    "contains_private_requests": false,
+    "contains_credentials": false
   },
   "material_evidence_audits": {
     "006": {
@@ -6764,7 +6704,7 @@
     "matched_qw3_improvement_proven": false,
     "retained_first_three_failed_attempts": true
   },
-  "latest_actual_progress_audit": "apps/computer_use/.runtime/browser-runtime-and-memory-recovery-progress-20261005-01.json",
+  "latest_actual_progress_audit": "apps/computer_use/.runtime/replay27-and-capacity-progress-20261005-01.json",
   "browser_runtime_metadata_candidate_progress": {
     "at": 1791158727.3052092,
     "audit": "apps/computer_use/.runtime/browser-runtime-and-memory-recovery-progress-20261005-01.json",
@@ -7097,7 +7037,7 @@
     "superseded_by_capacity_recovery": "apps/computer_use/.runtime/kvmem-capacity-and-successors-progress-20261005-01.json",
     "current_runtime_controller_retired_after_second_trial_engine_failure": true
   },
-  "latest_actual_audit": "apps/computer_use/.runtime/kvmem-capacity-and-successors-progress-20261005-01.json",
+  "latest_actual_audit": "apps/computer_use/.runtime/improvement-status-live-audit-20261005-02.json",
   "kvmem_capacity_recovery": {
     "kind": "actual_kvmem_capacity_and_successors_progress",
     "checked_at": "2026-10-05T00:52:13.412921+00:00",
@@ -7375,5 +7315,377 @@
       "Runtime recovery and CPU checks are not model efficacy improvements."
     ],
     "audit_writer_first_attempt": "KeyError from absent original_evaluation field; raw result unchanged; corrected by reading optional field."
+  },
+  "retained_public_replay_snapshots": [
+    {
+      "path": "apps/computer_use/.runtime/cross-device-replay-20261005-26",
+      "url": "http://127.0.0.1:18158/index.html",
+      "formal_attempts_at_export": 40,
+      "windows_model_trials_at_export": 8,
+      "platform_pilots_at_export": 56,
+      "includes_python_repair_pair": true,
+      "includes_latex_repair_pair": true,
+      "export_is_point_in_time": true,
+      "actual_browser_check": "apps/computer_use/.runtime/replay26-browser-qualification-01/result.json",
+      "actual_browser_checks_passed": 24,
+      "retained_failed_snapshot_checks": [
+        "apps/computer_use/.runtime/cross-device-replay-20261005-23/browser-check-01.json",
+        "apps/computer_use/.runtime/cross-device-replay-23-browser-preparation-failed-02.json",
+        "apps/computer_use/.runtime/cross-device-replay-20261005-24/export-preservation-failure.json",
+        "apps/computer_use/.runtime/cross-device-replay-20261005-25/partial-source-admission-gap.json"
+      ],
+      "partial_formal_videos_not_for_latency_comparison": true,
+      "matched_development_osworld_at_export": 33,
+      "includes_wire_regression_failures": true,
+      "development_attempts": 56,
+      "development_osworld_attempts": 33,
+      "software_product_attempts": 8,
+      "browser_check": "apps/computer_use/.runtime/replay26-browser-qualification-01/result.json",
+      "browser_checks_passed": 24,
+      "snapshot_excludes_later_candidate19_trials": false,
+      "new_candidate19_terminal_trials_at_export": 8,
+      "public_video_storage": "131 hardlinked immutable terminal videos plus one separately remuxed verified partial recording; original media unchanged",
+      "previous_snapshot": "apps/computer_use/.runtime/cross-device-replay-20261005-23",
+      "directory": "apps/computer_use/.runtime/cross-device-replay-20261005-26",
+      "platform_development_attempts": 56,
+      "actual_browser_passed": true,
+      "includes_terminal_receipt_trials": true,
+      "all_four_candidate49b_terminal_pairs_included": true,
+      "snapshot_excludes_later_candidate49b_006_pair": false,
+      "current49b_terminal_trials_at_export": 29,
+      "current49b_matched_pairs_included": [
+        "004",
+        "013",
+        "006",
+        "010",
+        "038",
+        "022",
+        "035",
+        "043",
+        "080",
+        "051"
+      ],
+      "current49b_038_legacy_r1_included": true,
+      "original_failure_rows_retained": true,
+      "new_public_videos_use_hardlinks": true,
+      "duplicate_video_bytes_allocated": 3159973,
+      "retained_browser_startup_failure_log": "/tmp/qw3-replay19-browser-check01.log",
+      "browser_startup_failure_explained": "Host CPython3.13 environment lacks playwright; browser qualification uses the existing CPython3.12 environment. No dependency was installed.",
+      "new_022_unknown_preserved_and_visible": true,
+      "actual_browser_qualification": "apps/computer_use/.runtime/replay26-browser-qualification-01/result.json",
+      "current_candidate49b_terminal_trials": 29,
+      "shared_hardlinked_videos": 131,
+      "duplicate_media_bytes": 3159973,
+      "task035_official_unavailable_separate_local_score": true,
+      "task043_two_distinct_terminal_videos_included": true,
+      "task051_legacy_video_cropped_warning_visible": true,
+      "video_full_screen_coverage_not_proven_trials": [
+        "051-legacy-r1"
+      ],
+      "current_queue_terminal_trials_at_audit": 33,
+      "actual_server_identity": {
+        "pid": 2838863,
+        "uid": 1001,
+        "start_ticks": 369967739,
+        "command": [
+          "/home/chaidi/qw3/.venv/bin/python",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/cross-device-replay-20261005-26/serve.py"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "S"
+      },
+      "total_rows": 138,
+      "recording_qualification_attempts": 1,
+      "recording_component_rows_excluded_from_model_denominators": true,
+      "later_terminal_trials_not_yet_exported": 4,
+      "duplicated_full_video_bytes_allocated": 0,
+      "new_partial_remux_bytes_allocated": 3159973,
+      "all128_previous_terminal_rows_retained": true,
+      "original_grades_and_media_unchanged": true,
+      "partial_006_verified_r2": {
+        "duration_seconds": 282,
+        "decoded_frames": 564,
+        "original_task_seconds": 1801.2906276527792,
+        "original_score": 0.0,
+        "original_public_mp4_bytes": 0,
+        "source_mkv_sha256": "4e356b1942c686bb18940aeccdb211807138c3f64120179e588bd64e0c1fb5a0",
+        "new_public_video": "trial-132-partial.mp4",
+        "all_decoded_pixels_and_timestamps_preserved": true,
+        "original_recording_complete": false,
+        "is_full_task_recording": false
+      },
+      "native_recovery_gap_visible_on_seek_and_play": true,
+      "gap_held_frames_are_new_observations": false,
+      "actual_server_registration": "/home/chaidi/qw3/apps/computer_use/.runtime/replay26-server-registration-03.json",
+      "actual_live_audit": "apps/computer_use/.runtime/replay26-and-parent-progress-20261005-01.json",
+      "retained_failed_or_transient_server_registrations": [
+        "apps/computer_use/.runtime/replay26-server-registration-01.json",
+        "apps/computer_use/.runtime/replay26-server-registration-02.json"
+      ],
+      "actual_latest_queue_audit": "apps/computer_use/.runtime/feedback-retest-queue-and-parent-progress-20261005-01.json"
+    }
+  ],
+  "incremental_terminal_replay_qualification": {
+    "directory": "/home/chaidi/qw3/apps/computer_use/.runtime/cross-device-replay-20261005-27",
+    "url": "http://127.0.0.1:18159/index.html",
+    "server_identity": {
+      "pid": 3403035,
+      "uid": 1001,
+      "start_ticks": 371835263,
+      "command": [
+        "/home/chaidi/qw3/.venv/bin/python",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/cross-device-replay-20261005-27/serve.py"
+      ],
+      "cwd": "/home/chaidi/qw3",
+      "state": "R"
+    },
+    "actual_live": true,
+    "actual_http_bytes_match": true,
+    "rows": 150,
+    "old_rows_preserved": 138,
+    "new_rows": 12,
+    "current_main_comparison_exported": 40,
+    "kvmem_rows": 1,
+    "startup_interruptions": 1,
+    "cpu_qualification": {
+      "kind": "incremental_replay_cpu_qualification",
+      "passed": true,
+      "tests_run": 10,
+      "source_sha256": {
+        "incremental_replay_snapshot.py": "03e479676b980087345b1ae34f2bf0e7dfff7203c5138f2b9ff5a31b4f71c9d1",
+        "tests/test_incremental_replay_snapshot.py": "5d99963f93b269a97d2756d86cb903c7df4734cb77151cfdc8a24cdc01b08592"
+      },
+      "model_calls": 0,
+      "device_inputs": 0,
+      "exit_code": 0
+    },
+    "actual_browser_qualification": {
+      "kind": "actual_browser_incremental_terminal_replay_qualification",
+      "passed": true,
+      "at": 1791162624.9284723,
+      "checks": {
+        "all138_previous_public_rows_unchanged": true,
+        "all_previous_movies_hashes_and_inodes_unchanged": true,
+        "all40_current_main_comparison_rows_exported": true,
+        "formal40_denominator_unchanged": true,
+        "platform56_software8_and_component1_unchanged": true,
+        "150_model_or_component_rows_and_startup_event_separate": true,
+        "no_startup_grade_or_started_model_invented": true,
+        "single_kvmem_off_original_unavailable_grade_preserved": true,
+        "new12_desktop_geometries_read_from_retained_pngs": true,
+        "only_named_public_assets_are_served": true,
+        "actual_summary_has45_development_osworld_rows": true,
+        "actual_startup_failure_shows_capacity_and_no_model_claim": true,
+        "kvmem_single_attempt_has_no_paired_comparison_claim": true,
+        "actual_kvmem_grade_and_calls_shown_without_zero_score": true,
+        "actual_kvmem_movie_decodes_and_dual_playback_works": true,
+        "actual_dual_pause_works": true,
+        "latest051_original_zero_grade_and_actual1920_movie_size": true,
+        "old051_crop_limitation_is_visible": true,
+        "newly_detected051_size_mismatch_is_visible": true,
+        "new_size_limitation_keeps_original_zero_grade": true,
+        "latest051_movie_actually_decodes": true,
+        "retained_sampling_gap_overlay_still_works": true,
+        "gap_overlay_clears_after_actual_fresh_frame": true,
+        "private_path_outside_public_snapshot_is_not_served": true,
+        "no_actual_browser_script_errors": true
+      },
+      "page_errors": [],
+      "model_calls": 0,
+      "device_inputs": 0,
+      "checks_passed": 25,
+      "rows": 150,
+      "actual_browser": true,
+      "snapshot_summary_sha256": "ba526c8706d4f57fd40543a0bf569d5905f8228ecf75bda0a83c4d30fe13feb6",
+      "snapshot_html_sha256": "a29de58513fa285d866b7b620587d62882386bac396df533387f1a636096c05d",
+      "url": "http://127.0.0.1:18159/index.html",
+      "model_success_or_latency_gain_proven": false,
+      "finished_at": 1791162627.469965
+    },
+    "public_videos": 144,
+    "new_observation_geometries": 259,
+    "new_video_geometry_limitations": [
+      "('development-osworld', 'candidate49b-matched-16k-20261004', '051-legacy-r2')"
+    ],
+    "full_task_pixel_alignment_proven": false,
+    "model_success_or_latency_gain_proven": false
+  },
+  "current_pipeline_live_status": {
+    "kind": "status_request_improvement_evidence_live_audit",
+    "checked_at": "2026-10-05T01:49:40.501281+00:00",
+    "pipeline": {
+      "memory": {
+        "identity": {
+          "pid": 3391613,
+          "uid": 1001,
+          "start_ticks": 371687541,
+          "command": [
+            "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+            "-m",
+            "kvmem_capacity_continuation",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-capacity-continuation-20261005/continuation.json"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        },
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/kvmem-capacity-launch-01/registration.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-capacity-continuation-20261005/queue-runtime-01/queue.json",
+        "actual_live": true,
+        "status": "resource-wait",
+        "completed": 1,
+        "current": "035-kvmem-on-r1",
+        "queue_counter_field": "trials",
+        "queue_sha256": "ba2ac02d13fbca8bf780e408cdf07d51451cc692eeb5f9b8e6716debcce4ac07"
+      },
+      "sdk": {
+        "identity": {
+          "pid": 3394420,
+          "uid": 1001,
+          "start_ticks": 371696774,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "runner_runtime_successors",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/successors.json",
+            "--stage",
+            "sdk"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        },
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/sdk-registration.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-05/queue.json",
+        "actual_live": true,
+        "status": "waiting-for-forty-and-eight",
+        "completed": 0,
+        "current": null,
+        "queue_counter_field": "trials",
+        "queue_sha256": "078579dd777f8d7f5af31eb733ffa6ee9f888be03f18e8a7988596833a0f0005"
+      },
+      "image": {
+        "identity": {
+          "pid": 3394812,
+          "uid": 1001,
+          "start_ticks": 371700756,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "runner_runtime_successors",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/successors.json",
+            "--stage",
+            "image"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        },
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/image-registration.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/queue-runtime-04/queue.json",
+        "actual_live": true,
+        "status": "waiting-for-forty-eight-and-ten",
+        "completed": 0,
+        "current": null,
+        "queue_counter_field": "trials",
+        "queue_sha256": "10f564cf34045be4ffe4a744f8871fe7cdb40998bcf5830e43176917314a75e7"
+      },
+      "thinking": {
+        "identity": {
+          "pid": 3395270,
+          "uid": 1001,
+          "start_ticks": 371705069,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "runner_runtime_successors",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/successors.json",
+            "--stage",
+            "thinking"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        },
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/thinking-registration.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/queue-runtime-02/queue.json",
+        "actual_live": true,
+        "status": "waiting-for-image-twelve",
+        "completed": 0,
+        "current": null,
+        "queue_counter_field": "trials",
+        "queue_sha256": "2b658886d2372d57e799f53710845892bec81cfc4055924af21dd3ce11f5587c"
+      },
+      "feedback": {
+        "identity": {
+          "pid": 3395769,
+          "uid": 1001,
+          "start_ticks": 371711113,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "runner_runtime_successors",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/successors.json",
+            "--stage",
+            "feedback"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        },
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/runner-runtime-successors-capacity-20261005/feedback-registration.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/queue-runtime-02/queue.json",
+        "actual_live": true,
+        "status": "waiting-for-forty-eight-ten-twelve-four",
+        "completed": 0,
+        "current": null,
+        "queue_counter_field": "trials",
+        "queue_sha256": "6bf8704c9bc54ba8363911f25efe2a3c0882b64ea54d2fcbf3919fd0f57492c5"
+      }
+    },
+    "replay": {
+      "url": "http://127.0.0.1:18159/index.html",
+      "actual_live": true,
+      "actual_http_bytes_match": true,
+      "identity": {
+        "pid": 3403035,
+        "uid": 1001,
+        "start_ticks": 371835263,
+        "command": [
+          "/home/chaidi/qw3/.venv/bin/python",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/cross-device-replay-20261005-27/serve.py"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "S"
+      }
+    },
+    "gpu_free_used_utilization": "55975, 41276, 99",
+    "advisor_enabled": false,
+    "model_calls": 0,
+    "device_inputs": 0,
+    "preserved_initial_counter_field_read_error": "/home/chaidi/qw3/apps/computer_use/.runtime/improvement-status-live-audit-20261005-01.json",
+    "counter_correction": "Read trials and current_trial from the actual registered queues; no producer or source result changed."
+  },
+  "zero_action_completed_turn_diagnostic": {
+    "audit": "apps/computer_use/.runtime/zero-action-completed-turn-diagnostic-20261005-02.json",
+    "checked": 40,
+    "zero_action_completed_turns": 1,
+    "counts_by_arm": {
+      "verified": 1
+    },
+    "selected_attempt": "051-verified-r2",
+    "selected_tool_calls": 0,
+    "selected_seconds": 13.614933291915804,
+    "selected_native_finish_reason": "stop",
+    "selected_turn_error": null,
+    "no_output_budget_error_observed_in_selected_attempt": true,
+    "available_tool_names_not_full_parameter_schema_qualification": true,
+    "source_records_unchanged": true,
+    "model_calls": 0,
+    "device_inputs": 0,
+    "bounded_continuation_implemented": false,
+    "model_improvement_proven": false,
+    "remaining_39_failures_not_explained_by_this_case": true,
+    "preserved_initial_diagnostic": "apps/computer_use/.runtime/zero-action-completed-turn-diagnostic-20261005-01.json"
   }
 }
