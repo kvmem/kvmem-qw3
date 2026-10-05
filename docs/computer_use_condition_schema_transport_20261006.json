@@ -1,0 +1,257 @@
+{
+  "kind": "isolated_condition_schema_candidate_actual_codex_transport",
+  "checked_at": 1791221617.3021297,
+  "goal_status": "active",
+  "goal_turn_classification": "progress",
+  "previous_goal_turn_classification": "progress",
+  "advisor_used": false,
+  "outcome": "A new private candidate restores the trusted inline act conditions after actual pinned Codex transport across Windows, Linux and Android catalogs. Plain catalogs remain unchanged. No QW3 or desktop task was run.",
+  "sources": {
+    "candidate_build": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/condition-schema-candidate-20261006-02/build.json",
+      "sha256": "30ee9719de01b844b4400fc7af7a05d930289d9be50e4e6f5e4634d828617d92"
+    },
+    "cpu": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/condition-schema-wire-cpu-02/result.json",
+      "sha256": "7c44fcc878b7031f6e57bcfddeeecab7d75263f7d44e52a29d53fe034b49ad52"
+    },
+    "actual_transport": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/condition-schema-transport-20261006-03/result.json",
+      "sha256": "470ff3198a1838c9154a37d6d20396b9c235cb2a4ea76dd6e6b22fc58c53e4d9"
+    },
+    "independent_audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/condition-schema-transport-independent-audit-01/result.json",
+      "sha256": "2cd4e3749a8e23cce276b9f1843308b10bdfbc7c36152d77a0d731405a4b001a"
+    },
+    "cpython312_import": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/condition-schema-private-import-01/result.json",
+      "sha256": "1401d1084b036da02ef0543c783106a2c8d8881c181158b633b65bccbbeec7ed"
+    },
+    "prior_failure_retirement_audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/condition-schema-earlier-failures-retirement-audit-01.json",
+      "sha256": "72b01a27d41996129d662ad45ad497c8121325ff552f91fc6789c180384614d9"
+    }
+  },
+  "candidate_framework": "/home/chaidi/qw3/apps/computer_use/.runtime/condition-schema-candidate-20261006-02/framework",
+  "changed_package_files": [
+    "qw3_computer/protocol.py",
+    "qw3_computer/condition_schema_wire.py"
+  ],
+  "source_base_build": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-candidate-20261005-02/build.json",
+    "sha256": "a07266aed63d31f470aa2b5fbcd60fc8def54a519b907e1eeb8fb1a4c8343c8a"
+  },
+  "actual_cases": [
+    {
+      "platform": "windows",
+      "workflow": false,
+      "passed": true,
+      "all_registered_processes_retired": true,
+      "tools_excluded_by_unchanged_bridge_policy": [
+        "list_mcp_resource_templates",
+        "list_mcp_resources",
+        "read_mcp_resource",
+        "request_user_input"
+      ]
+    },
+    {
+      "platform": "windows",
+      "workflow": true,
+      "passed": true,
+      "incoming_inline_shape": "opaque",
+      "incoming_inline_items_opaque": true,
+      "restored_inline_variants": 6,
+      "all_registered_processes_retired": true,
+      "tools_excluded_by_unchanged_bridge_policy": [
+        "list_mcp_resource_templates",
+        "list_mcp_resources",
+        "read_mcp_resource",
+        "request_user_input"
+      ]
+    },
+    {
+      "platform": "linux",
+      "workflow": false,
+      "passed": true,
+      "all_registered_processes_retired": true,
+      "tools_excluded_by_unchanged_bridge_policy": [
+        "list_mcp_resource_templates",
+        "list_mcp_resources",
+        "read_mcp_resource",
+        "request_user_input"
+      ]
+    },
+    {
+      "platform": "linux",
+      "workflow": true,
+      "passed": true,
+      "incoming_inline_shape": "opaque",
+      "incoming_inline_items_opaque": true,
+      "restored_inline_variants": 6,
+      "all_registered_processes_retired": true,
+      "tools_excluded_by_unchanged_bridge_policy": [
+        "list_mcp_resource_templates",
+        "list_mcp_resources",
+        "read_mcp_resource",
+        "request_user_input"
+      ]
+    },
+    {
+      "platform": "android",
+      "workflow": false,
+      "passed": true,
+      "all_registered_processes_retired": true,
+      "tools_excluded_by_unchanged_bridge_policy": [
+        "list_mcp_resource_templates",
+        "list_mcp_resources",
+        "read_mcp_resource",
+        "request_user_input"
+      ]
+    },
+    {
+      "platform": "android",
+      "workflow": true,
+      "passed": true,
+      "incoming_inline_shape": "known-codex-normalization",
+      "incoming_inline_items_opaque": false,
+      "restored_inline_variants": 6,
+      "all_registered_processes_retired": true,
+      "tools_excluded_by_unchanged_bridge_policy": [
+        "list_mcp_resource_templates",
+        "list_mcp_resources",
+        "read_mcp_resource",
+        "request_user_input"
+      ]
+    }
+  ],
+  "actual_codex_binary": {
+    "path": "/home/chaidi/.codex/packages/standalone/releases/0.159.2-x86_64-unknown-linux-musl/bin/codex",
+    "sha256": "1748767b230ebfc3d4ab7e4e254920d0c0ad9691fd8c11f190e7d44511a4a92e"
+  },
+  "actual_codex_version": "codex-cli 0.159.2",
+  "cpu_tests": 10,
+  "independent_source_refs_checked": 125,
+  "fixture_backend_requests": 6,
+  "model_inference_requests": 0,
+  "device_inputs": 0,
+  "tool_dispatch_attempts": 0,
+  "repair_scope": {
+    "opaque_items_repaired_for": [
+      "windows",
+      "linux"
+    ],
+    "known_exact_normalization_restored_for": [
+      "android"
+    ],
+    "android_normalization": "The actual client converts string const selectors into single-value enums and removes control_kind descriptions and array maxItems. Only the exact trusted normalized item structure is accepted.",
+    "trusted_condition_variants": 6,
+    "condition_min_items": 1,
+    "condition_max_items": 12,
+    "unknown_nonempty_definition_refused": true,
+    "actual_requests_only_inline_conditions_changed": true,
+    "workflow_definition_changed": false,
+    "plain_mode_changed": false,
+    "unchanged_bridge_policy_filters": [
+      "list_mcp_resources",
+      "list_mcp_resource_templates",
+      "read_mcp_resource",
+      "request_user_input"
+    ]
+  },
+  "runtime_compatibility": {
+    "actual_cpython312_import_passed": true,
+    "jsonschema_runtime_dependency": false,
+    "model_context_tokens": 524288,
+    "max_output_tokens": 16384,
+    "thinking": true
+  },
+  "current_frozen_sources_changed": false,
+  "current_native_eight_changed": false,
+  "production_installed": false,
+  "business_improvement_proven": false,
+  "actual_pipeline": {
+    "original_snapshot": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-status-15.json",
+      "sha256": "b34ec40029aa62f8992ee5923c90c79b18c5e9bd1ee33bde9383f356f2afc9bb"
+    },
+    "native_snapshot": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/condition-schema-transport-native-waiter-snapshot-01.json",
+      "sha256": "f34e2cbd6724ddb93f8933b05b0f6015a9df4c45e5e4461aa404e0ca9d0e8136"
+    },
+    "stages": {
+      "image": {
+        "status": "restoring-fresh-off-engine",
+        "completed": 1,
+        "planned": 12,
+        "actual_same_process_live": true
+      },
+      "thinking": {
+        "status": "waiting-for-image-twelve",
+        "completed": 0,
+        "planned": 4,
+        "actual_same_process_live": true
+      },
+      "feedback": {
+        "status": "waiting-for-forty-eight-ten-twelve-four",
+        "completed": 0,
+        "planned": 8,
+        "actual_same_process_live": true
+      },
+      "bounded": {
+        "status": "waiting-for-forty-eight-ten-twelve-four-eight",
+        "completed": 0,
+        "planned": 8,
+        "actual_same_process_live": true
+      },
+      "query": {
+        "status": "waiting-for-complete-bounded-chain",
+        "completed": 0,
+        "planned": 4,
+        "actual_same_process_live": true
+      }
+    },
+    "native_completed": 0,
+    "native_planned": 8,
+    "native_same_generation_live": true,
+    "native_status": "waiting-for-complete-original-query-chain",
+    "gpu": {
+      "at": 1791221406.7037964,
+      "free_mib": 55711,
+      "used_mib": 41540,
+      "gpu_percent": 100,
+      "compute_pids": [
+        "3906950"
+      ]
+    },
+    "minimum_free_mib": 56000,
+    "user_compute_pid_signalled": false
+  },
+  "preserved_earlier_attempts": [
+    {
+      "result": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/condition-schema-transport-20261006-01/result.json",
+        "sha256": "80ecaef3258eb7baa5758a438a645e9c633500fdf86bc93c94411c1e05853f38"
+      },
+      "reason": "The collector compared unfiltered conversion with the bridge body, overlooking the existing four-tool filter; one fixture response, zero tool dispatch. Raw Responses were not archived before this failure in that version."
+    },
+    {
+      "result": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/condition-schema-transport-20261006-02/result.json",
+        "sha256": "19cb31e1c471cec87a7a307b3a8f989264eb820d274ec5755b7bdfed761dd76a"
+      },
+      "reason": "Five cases passed; Android verified was rejected because its known nonempty normalized schema differed from the initial strict guard; five fixture responses, zero tool dispatch."
+    },
+    {
+      "result": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/condition-schema-wire-cpu-01/result.json",
+        "sha256": "02b77d28441b6337d8091b7a47106d60093a31f1e6f64fa0734e0dac3134bcf6"
+      },
+      "reason": "Nine passing CPU checks describe the initial helper/collector source, not the final candidate."
+    }
+  ],
+  "next_steps": [
+    "Keep and finish all original frozen model comparisons unchanged, including native-control eight.",
+    "Qualify the repaired candidate in an actual private VM/client stack, then freeze a separate matched wire-control/repair cohort with the original material, budgets, permissions and independent grading.",
+    "Evaluate actual artifact success, step errors, latency and continuous videos before adopting the repaired candidate as a product default."
+  ]
+}
