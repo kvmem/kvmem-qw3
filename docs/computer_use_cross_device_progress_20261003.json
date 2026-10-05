@@ -2358,7 +2358,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": "2026-10-05T07:43:09.812647+00:00",
+  "updated_at": "2026-10-05T08:24:24.891803+00:00",
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -7037,7 +7037,7 @@
     "superseded_by_capacity_recovery": "apps/computer_use/.runtime/kvmem-capacity-and-successors-progress-20261005-01.json",
     "current_runtime_controller_retired_after_second_trial_engine_failure": true
   },
-  "latest_actual_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-22.json",
+  "latest_actual_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-23.json",
   "kvmem_capacity_recovery": {
     "kind": "actual_kvmem_capacity_and_successors_progress",
     "checked_at": "2026-10-05T00:52:13.412921+00:00",
@@ -7511,76 +7511,74 @@
     "model_success_or_latency_gain_proven": false
   },
   "current_pipeline_live_status": {
-    "audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-22.json",
-    "checked_at": 1791186189.8126473,
+    "audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-23.json",
+    "checked_at": 1791188664.891803,
     "memory_completed": 8,
     "memory_planned": 8,
-    "current_trial": null,
-    "status": "memory-completed-successors-pre-task-halted",
+    "status": "pre-task-android-halt-services-recovered-awaiting-qualified-phase-continuation",
     "actual_registered_memory_live": false,
-    "memory_controller_and_final_engine_retired": true,
-    "new_matched_prefix_retained": 5,
-    "new_completed_trials": 3,
+    "current_trial": null,
     "rebound_successors": {
       "sdk": {
         "status": "halted-no-further-dispatch",
         "completed": 0,
         "planned": 10,
-        "actual_registered_process_live": false,
-        "actual_registered_process_retired": true,
-        "error": "SafetyHalt: New owned service exited before readiness",
-        "finished_at": 1791184959.2683816
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: New owned service exited before readiness"
       },
       "image": {
         "status": "halted-no-further-dispatch",
         "completed": 0,
         "planned": 12,
-        "actual_registered_process_live": false,
-        "actual_registered_process_retired": true,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
-        "finished_at": 1791184959.8572428
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
       },
       "thinking": {
         "status": "halted-no-further-dispatch",
         "completed": 0,
         "planned": 4,
-        "actual_registered_process_live": false,
-        "actual_registered_process_retired": true,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
-        "finished_at": 1791184962.0185053
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
       },
       "feedback": {
         "status": "halted-no-further-dispatch",
         "completed": 0,
         "planned": 8,
-        "actual_registered_process_live": false,
-        "actual_registered_process_retired": true,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
-        "finished_at": 1791184963.0765316
-      },
-      "bounded": {
-        "status": "halted-no-further-dispatch",
-        "completed": 0,
-        "planned": 8,
-        "actual_registered_process_live": false,
-        "actual_registered_process_retired": true,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
-        "finished_at": 1791184968.4809208
-      },
-      "query": {
-        "status": "halted-no-further-dispatch",
-        "completed": 0,
-        "planned": 4,
-        "actual_registered_process_live": false,
-        "actual_registered_process_retired": true,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
-        "finished_at": 1791184970.7051692
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
       }
     },
-    "original_six_halted_queues_preserved": true,
-    "new_six_halted_queues_preserved": true,
-    "original_port_available_at_audit": true,
-    "recovery_dispatch_started": false
+    "deferred_stages": {
+      "bounded": {
+        "completed": 0,
+        "planned": 8,
+        "qualified": true,
+        "registered": false,
+        "preparation_halted_before_creation": true,
+        "reason": "Fresh feedback predecessor halted during Android service handoff"
+      },
+      "query": {
+        "completed": 0,
+        "planned": 4,
+        "qualified": true,
+        "registered": false,
+        "preparation_not_started": true
+      }
+    },
+    "ready_owned_off_engine_pid": 3717776,
+    "linux_gateway_actual_live": true,
+    "android_container_actual_ready": true,
+    "android_gateway_session_not_yet_recreated": true,
+    "remaining_bindings": [
+      "qualified-partial-deployment-continuation",
+      "bounded8",
+      "query4"
+    ],
+    "business_gain_proven": false
   },
   "zero_action_completed_turn_diagnostic": {
     "audit": "apps/computer_use/.runtime/zero-action-completed-turn-diagnostic-20261005-02.json",
@@ -9281,5 +9279,86 @@
     "new_task_dispatch_count": 0,
     "original_port_available_at_audit": true,
     "fresh_recovery_not_started": true
+  },
+  "previous_pipeline_status_before_handoff_and_android_failure": {
+    "audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-22.json",
+    "checked_at": 1791186189.8126473,
+    "memory_completed": 8,
+    "memory_planned": 8,
+    "current_trial": null,
+    "status": "memory-completed-successors-pre-task-halted",
+    "actual_registered_memory_live": false,
+    "memory_controller_and_final_engine_retired": true,
+    "new_matched_prefix_retained": 5,
+    "new_completed_trials": 3,
+    "rebound_successors": {
+      "sdk": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 10,
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: New owned service exited before readiness",
+        "finished_at": 1791184959.2683816
+      },
+      "image": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 12,
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "finished_at": 1791184959.8572428
+      },
+      "thinking": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 4,
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "finished_at": 1791184962.0185053
+      },
+      "feedback": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 8,
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "finished_at": 1791184963.0765316
+      },
+      "bounded": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 8,
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "finished_at": 1791184968.4809208
+      },
+      "query": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 4,
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "finished_at": 1791184970.7051692
+      }
+    },
+    "original_six_halted_queues_preserved": true,
+    "new_six_halted_queues_preserved": true,
+    "original_port_available_at_audit": true,
+    "recovery_dispatch_started": false
+  },
+  "handoff_and_android_dependency_recovery": {
+    "document": "/home/chaidi/qw3/docs/computer_use_handoff_recovery_20261005.json",
+    "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-23.json",
+      "sha256": "b325e3ee44254cf9a631baacc584c5727d0c7ffd9b3500654c29d6275de277c2"
+    },
+    "checks": 105,
+    "actual_task_trials_completed": 0
   }
 }

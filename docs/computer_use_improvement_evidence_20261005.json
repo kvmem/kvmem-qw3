@@ -1,6 +1,6 @@
 {
   "kind": "computer_use_measured_improvement_scope_audit",
-  "checked_at": 1791186189.8126473,
+  "checked_at": 1791188664.891803,
   "advisor_used": false,
   "entries": [
     {
@@ -205,6 +205,113 @@
   ],
   "current_retest_status": {
     "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-23.json",
+      "sha256": "b325e3ee44254cf9a631baacc584c5727d0c7ffd9b3500654c29d6275de277c2"
+    },
+    "memory_completed": 8,
+    "memory_planned": 8,
+    "current": null,
+    "four_new_successors": {
+      "sdk": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 10,
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: New owned service exited before readiness"
+      },
+      "image": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 12,
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+      },
+      "thinking": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 4,
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+      },
+      "feedback": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 8,
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+      }
+    },
+    "deferred_stages": {
+      "bounded": {
+        "completed": 0,
+        "planned": 8,
+        "qualified": true,
+        "registered": false,
+        "preparation_halted_before_creation": true,
+        "reason": "Fresh feedback predecessor halted during Android service handoff"
+      },
+      "query": {
+        "completed": 0,
+        "planned": 4,
+        "qualified": true,
+        "registered": false,
+        "preparation_not_started": true
+      }
+    },
+    "ready_owned_off_engine_pid": 3717776,
+    "android_container_actual_ready": true,
+    "android_gateway_session_not_yet_recreated": true,
+    "pending": "Qualified continuation of partial SDK deployment: retain live owned OFF engine and paused Linux gateway; recreate Android gateway in fresh runtime, then model client; route all frozen trials to fresh controllers.",
+    "business_gain_proven": false
+  },
+  "previous_retest_status_snapshot": {
+    "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-20.json",
+      "sha256": "0cc01c30d6732d346cd453af11a9d72ba442f7ea7939069c73f2ecf194ec520e"
+    },
+    "memory_completed": 7,
+    "memory_planned": 8,
+    "current": "quota1-080-kvmem-on-r2",
+    "rebound_all_six_stages": {
+      "sdk": {
+        "completed": 0,
+        "planned": 10,
+        "actual_registered_process_live": true
+      },
+      "image": {
+        "completed": 0,
+        "planned": 12,
+        "actual_registered_process_live": true
+      },
+      "thinking": {
+        "completed": 0,
+        "planned": 4,
+        "actual_registered_process_live": true
+      },
+      "feedback": {
+        "completed": 0,
+        "planned": 8,
+        "actual_registered_process_live": true
+      },
+      "bounded": {
+        "completed": 0,
+        "planned": 8,
+        "actual_registered_process_live": true
+      },
+      "query": {
+        "completed": 0,
+        "planned": 4,
+        "actual_registered_process_live": true
+      }
+    },
+    "remaining_bindings": []
+  },
+  "previous_retest_status_before_handoff_and_android_failure": {
+    "audit": {
       "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-22.json",
       "sha256": "ff9b0c7d96f93f6b61d88dddd41c9ec28c7d7d5dba9d5554d455ae8111e451e0"
     },
@@ -322,46 +429,13 @@
     },
     "original_port_available_at_audit": true
   },
-  "previous_retest_status_snapshot": {
-    "audit": {
-      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-20.json",
-      "sha256": "0cc01c30d6732d346cd453af11a9d72ba442f7ea7939069c73f2ecf194ec520e"
-    },
-    "memory_completed": 7,
-    "memory_planned": 8,
-    "current": "quota1-080-kvmem-on-r2",
-    "rebound_all_six_stages": {
-      "sdk": {
-        "completed": 0,
-        "planned": 10,
-        "actual_registered_process_live": true
-      },
-      "image": {
-        "completed": 0,
-        "planned": 12,
-        "actual_registered_process_live": true
-      },
-      "thinking": {
-        "completed": 0,
-        "planned": 4,
-        "actual_registered_process_live": true
-      },
-      "feedback": {
-        "completed": 0,
-        "planned": 8,
-        "actual_registered_process_live": true
-      },
-      "bounded": {
-        "completed": 0,
-        "planned": 8,
-        "actual_registered_process_live": true
-      },
-      "query": {
-        "completed": 0,
-        "planned": 4,
-        "actual_registered_process_live": true
-      }
-    },
-    "remaining_bindings": []
+  "infrastructure_recovery_evidence": {
+    "document": "/home/chaidi/qw3/docs/computer_use_handoff_recovery_20261005.json",
+    "checks": 105,
+    "actual_original_port_handoff_passed": true,
+    "android_container_oom_preserved": true,
+    "android_container_ready_after_capacity_and_stale_lock_recovery": true,
+    "additional_model_trials_completed": 0,
+    "not_business_success": true
   }
 }
