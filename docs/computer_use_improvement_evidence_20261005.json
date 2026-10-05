@@ -1,6 +1,6 @@
 {
   "kind": "computer_use_measured_improvement_scope_audit",
-  "checked_at": 1791197980.3372402,
+  "checked_at": 1791200083.497134,
   "advisor_used": false,
   "entries": [
     {
@@ -216,8 +216,8 @@
   ],
   "current_retest_status": {
     "audit": {
-      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-delivery-final-audit-03/result.json",
-      "sha256": "14cf9b1e64eda2e8ce310002f647172804fd5d352296e93e8352587af0c08ccf"
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/static-handoff-final-status-01/result.json",
+      "sha256": "844161576fa228783fa66643696ad3ab8401bcf1b1dd41a1a01f1c9340813fb3"
     },
     "memory_completed": 8,
     "memory_planned": 8,
@@ -225,53 +225,52 @@
     "sdk_planned": 10,
     "sdk_fully_accepted": 0,
     "sdk_fault_response_passed": 4,
-    "current": null,
+    "current": "004-full-retrievable-r1",
+    "current_model_trial_started": false,
     "current_child_actual_live": false,
     "stages": {
-      "sdk": {
-        "status": "completed",
-        "completed": 10,
-        "actual_live": false,
-        "actual_retired": true,
-        "error": null
-      },
       "image": {
-        "status": "halted-no-further-dispatch",
+        "status": "restoring-fresh-off-engine",
         "completed": 0,
-        "actual_live": false,
-        "actual_retired": true,
-        "error": "SafetyHalt: Original OSWorld source admission or budget changed"
+        "planned": 12,
+        "actual_live": true
       },
       "thinking": {
-        "status": "halted-no-further-dispatch",
+        "status": "waiting-for-image-twelve",
         "completed": 0,
-        "actual_live": false,
-        "actual_retired": true,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+        "planned": 4,
+        "actual_live": true
       },
       "feedback": {
-        "status": "halted-no-further-dispatch",
+        "status": "waiting-for-forty-eight-ten-twelve-four",
         "completed": 0,
-        "actual_live": false,
-        "actual_retired": true,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+        "planned": 8,
+        "actual_live": true
       },
       "bounded": {
-        "status": "halted-no-further-dispatch",
+        "status": "waiting-for-forty-eight-ten-twelve-four-eight",
         "completed": 0,
-        "actual_live": false,
-        "actual_retired": true,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+        "planned": 8,
+        "actual_live": true
       },
       "query": {
-        "status": "halted-no-further-dispatch",
+        "status": "waiting-for-complete-bounded-chain",
         "completed": 0,
-        "actual_live": false,
-        "actual_retired": true,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+        "planned": 4,
+        "actual_live": true
       }
     },
-    "native_keyboard_delivery_document": "/home/chaidi/qw3/docs/computer_use_native_keyboard_delivery_20261005.json",
+    "minimum_free_mib": 56000,
+    "latest_gpu_snapshot": {
+      "at": 1791199892.5241783,
+      "free_mib": 55711,
+      "used_mib": 41540,
+      "gpu_percent": 100,
+      "compute_pids": [
+        "3906950"
+      ]
+    },
+    "recovery_document": "/home/chaidi/qw3/docs/computer_use_static_handoff_recovery_20261005.json",
     "business_gain_proven": false
   },
   "previous_retest_status_snapshot": {
@@ -675,5 +674,65 @@
   "latest_pipeline_halt_diagnostic": {
     "path": "/home/chaidi/qw3/apps/computer_use/.runtime/image-admission-terminal-diagnostic-01/result.json",
     "sha256": "d97aec37de971d9d38ff9181bc06fcb31f28a7393e6e91dd206d0ea62b698a30"
+  },
+  "previous_retest_status_before_static_admission_recovery": {
+    "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-delivery-final-audit-03/result.json",
+      "sha256": "14cf9b1e64eda2e8ce310002f647172804fd5d352296e93e8352587af0c08ccf"
+    },
+    "memory_completed": 8,
+    "memory_planned": 8,
+    "sdk_completed": 10,
+    "sdk_planned": 10,
+    "sdk_fully_accepted": 0,
+    "sdk_fault_response_passed": 4,
+    "current": null,
+    "current_child_actual_live": false,
+    "stages": {
+      "sdk": {
+        "status": "completed",
+        "completed": 10,
+        "actual_live": false,
+        "actual_retired": true,
+        "error": null
+      },
+      "image": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Original OSWorld source admission or budget changed"
+      },
+      "thinking": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+      },
+      "feedback": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+      },
+      "bounded": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+      },
+      "query": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+      }
+    },
+    "native_keyboard_delivery_document": "/home/chaidi/qw3/docs/computer_use_native_keyboard_delivery_20261005.json",
+    "business_gain_proven": false
   }
 }
