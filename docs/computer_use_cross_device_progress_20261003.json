@@ -9750,5 +9750,72 @@
       "sha256": "d038219a5f34662579080c37b51315b0787b2f6bb24d1b7f4cc856248079d9a7"
     },
     "replay_url": "http://127.0.0.1:18165/index.html"
+  },
+  "native_pilot_preparation_20261005": {
+    "report": {
+      "path": "/home/chaidi/qw3/docs/computer_use_native_pilot_preparation_20261005.json",
+      "sha256": "35d54c7bb3ab419b482dc760c5e33af563c6109cbf4d578e31a1073109364925"
+    },
+    "goal_status": "active",
+    "cpu_tests": 21,
+    "actual_material_vms": 4,
+    "model_trials_dispatched": 0,
+    "latest_pipeline": {
+      "image": {
+        "status": "halted-no-further-dispatch",
+        "completed": 1,
+        "planned": 12,
+        "current_trial": "004-recent-observations-r1",
+        "controller": {
+          "pid": 4047078,
+          "live": false,
+          "original_instance_retired": true
+        }
+      },
+      "thinking": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 4,
+        "current_trial": null,
+        "controller": {
+          "pid": 4052815,
+          "live": false,
+          "original_instance_retired": true
+        }
+      },
+      "feedback": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 8,
+        "current_trial": null,
+        "controller": {
+          "pid": 4056401,
+          "live": false,
+          "original_instance_retired": true
+        }
+      },
+      "bounded": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 8,
+        "current_trial": null,
+        "controller": {
+          "pid": 4061726,
+          "live": false,
+          "original_instance_retired": true
+        }
+      },
+      "query": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 4,
+        "current_trial": null,
+        "controller": {
+          "pid": 4070594,
+          "live": false,
+          "original_instance_retired": true
+        }
+      }
+    }
   }
 }

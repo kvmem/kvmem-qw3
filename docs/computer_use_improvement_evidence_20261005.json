@@ -247,61 +247,74 @@
   ],
   "current_retest_status": {
     "audit": {
-      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/save-control-final-state-01/result.json",
-      "sha256": "d038219a5f34662579080c37b51315b0787b2f6bb24d1b7f4cc856248079d9a7"
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-pilot-final-state-01/result.json",
+      "sha256": "a2b703f0e0b15a53db6a89262c4877f71979e69f41905824cca353e7f22c1d93"
     },
-    "memory_completed": 8,
-    "memory_planned": 8,
-    "sdk_completed": 10,
-    "sdk_planned": 10,
-    "sdk_fully_accepted": 0,
-    "sdk_fault_response_passed": 4,
-    "current": "004-full-retrievable-r1",
+    "image_completed": 1,
+    "image_planned": 12,
     "current_model_trial_started": false,
-    "current_child_actual_live": false,
+    "all_five_original_controllers_retired": true,
     "stages": {
       "image": {
-        "status": "restoring-fresh-off-engine",
-        "completed": 0,
+        "status": "halted-no-further-dispatch",
+        "completed": 1,
         "planned": 12,
-        "actual_live": true
+        "current_trial": "004-recent-observations-r1",
+        "controller": {
+          "pid": 4047078,
+          "live": false,
+          "original_instance_retired": true
+        }
       },
       "thinking": {
-        "status": "waiting-for-image-twelve",
+        "status": "halted-no-further-dispatch",
         "completed": 0,
         "planned": 4,
-        "actual_live": true
+        "current_trial": null,
+        "controller": {
+          "pid": 4052815,
+          "live": false,
+          "original_instance_retired": true
+        }
       },
       "feedback": {
-        "status": "waiting-for-forty-eight-ten-twelve-four",
+        "status": "halted-no-further-dispatch",
         "completed": 0,
         "planned": 8,
-        "actual_live": true
+        "current_trial": null,
+        "controller": {
+          "pid": 4056401,
+          "live": false,
+          "original_instance_retired": true
+        }
       },
       "bounded": {
-        "status": "waiting-for-forty-eight-ten-twelve-four-eight",
+        "status": "halted-no-further-dispatch",
         "completed": 0,
         "planned": 8,
-        "actual_live": true
+        "current_trial": null,
+        "controller": {
+          "pid": 4061726,
+          "live": false,
+          "original_instance_retired": true
+        }
       },
       "query": {
-        "status": "waiting-for-complete-bounded-chain",
+        "status": "halted-no-further-dispatch",
         "completed": 0,
         "planned": 4,
-        "actual_live": true
+        "current_trial": null,
+        "controller": {
+          "pid": 4070594,
+          "live": false,
+          "original_instance_retired": true
+        }
       }
     },
-    "minimum_free_mib": 56000,
-    "latest_gpu_snapshot": {
-      "at": 1791203401.0257401,
-      "free_mib": 55711,
-      "used_mib": 41540,
-      "gpu_percent": 100,
-      "compute_pids": [
-        "3906950"
-      ]
+    "engine_startup_failure": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-pilot-engine-admission-failure-01.json",
+      "sha256": "06967671f46994fbb5dd39f35102fd141c6989bfedeaaee3ad23a750e8e531a8"
     },
-    "recovery_document": "/home/chaidi/qw3/docs/computer_use_static_handoff_recovery_20261005.json",
     "business_gain_proven": false
   },
   "previous_retest_status_snapshot": {
@@ -774,5 +787,75 @@
     "planned_model_trials": 8,
     "model_controller_registered": false,
     "replay_url": "http://127.0.0.1:18165/index.html"
+  },
+  "previous_retest_status_before_native_pilot_preparation": {
+    "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/save-control-final-state-01/result.json",
+      "sha256": "d038219a5f34662579080c37b51315b0787b2f6bb24d1b7f4cc856248079d9a7"
+    },
+    "memory_completed": 8,
+    "memory_planned": 8,
+    "sdk_completed": 10,
+    "sdk_planned": 10,
+    "sdk_fully_accepted": 0,
+    "sdk_fault_response_passed": 4,
+    "current": "004-full-retrievable-r1",
+    "current_model_trial_started": false,
+    "current_child_actual_live": false,
+    "stages": {
+      "image": {
+        "status": "restoring-fresh-off-engine",
+        "completed": 0,
+        "planned": 12,
+        "actual_live": true
+      },
+      "thinking": {
+        "status": "waiting-for-image-twelve",
+        "completed": 0,
+        "planned": 4,
+        "actual_live": true
+      },
+      "feedback": {
+        "status": "waiting-for-forty-eight-ten-twelve-four",
+        "completed": 0,
+        "planned": 8,
+        "actual_live": true
+      },
+      "bounded": {
+        "status": "waiting-for-forty-eight-ten-twelve-four-eight",
+        "completed": 0,
+        "planned": 8,
+        "actual_live": true
+      },
+      "query": {
+        "status": "waiting-for-complete-bounded-chain",
+        "completed": 0,
+        "planned": 4,
+        "actual_live": true
+      }
+    },
+    "minimum_free_mib": 56000,
+    "latest_gpu_snapshot": {
+      "at": 1791203401.0257401,
+      "free_mib": 55711,
+      "used_mib": 41540,
+      "gpu_percent": 100,
+      "compute_pids": [
+        "3906950"
+      ]
+    },
+    "recovery_document": "/home/chaidi/qw3/docs/computer_use_static_handoff_recovery_20261005.json",
+    "business_gain_proven": false
+  },
+  "native_pilot_preparation": {
+    "report": {
+      "path": "/home/chaidi/qw3/docs/computer_use_native_pilot_preparation_20261005.json",
+      "sha256": "35d54c7bb3ab419b482dc760c5e33af563c6109cbf4d578e31a1073109364925"
+    },
+    "cpu_tests": 21,
+    "actual_material_vms": 4,
+    "actual_material_checks": 24,
+    "model_requests": 0,
+    "business_improvement_proven": false
   }
 }
