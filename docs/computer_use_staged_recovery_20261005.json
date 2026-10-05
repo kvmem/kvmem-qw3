@@ -928,51 +928,40 @@
   },
   "current_stages": {
     "sdk": {
-      "actual_live": true,
       "status": "running",
-      "completed": 4,
-      "current": "xdev-linux-calc-09",
-      "current_child_actual_live": true,
-      "last_two": [
-        {
-          "id": "xdev-linux-text-13",
-          "accepted": false
-        },
-        {
-          "id": "xdev-linux-text-14",
-          "accepted": false
-        }
-      ]
+      "completed": 8,
+      "planned": 10,
+      "actual_live": true
     },
     "image": {
-      "actual_live": true,
       "status": "waiting-for-forty-eight-and-ten",
       "completed": 0,
-      "current": null
+      "planned": 12,
+      "actual_live": true
     },
     "thinking": {
-      "actual_live": true,
       "status": "waiting-for-image-twelve",
       "completed": 0,
-      "current": null
+      "planned": 4,
+      "actual_live": true
     },
     "feedback": {
-      "actual_live": true,
       "status": "waiting-for-forty-eight-ten-twelve-four",
       "completed": 0,
-      "current": null
-    },
-    "bounded": {
-      "actual_live": true,
-      "status": "waiting-for-forty-eight-ten-twelve-four-eight",
-      "completed": 0
-    },
-    "query": {
-      "actual_live": true,
-      "status": "waiting-for-complete-bounded-chain",
-      "completed": 0
+      "planned": 8,
+      "actual_live": true
     }
   },
-  "sdk_terminal_trials_at_latest_live_check": 4,
-  "latest_current_trial": "xdev-linux-calc-09"
+  "sdk_terminal_trials_at_latest_live_check": {
+    "completed": 8,
+    "fully_accepted": 0,
+    "fault_response_passed": 4,
+    "model_trials_not_replayed": true
+  },
+  "latest_current_trial": "004-candidate51-r1",
+  "latest_actual_snapshot": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-25.json",
+    "sha256": "555f70472a4f2163438b7f97d3be22927af2749de84614770bec3e0296113875"
+  },
+  "native_window_qualification_document": "/home/chaidi/qw3/docs/computer_use_native_window_evidence_20261005.json"
 }
