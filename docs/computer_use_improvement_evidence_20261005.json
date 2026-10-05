@@ -1245,5 +1245,81 @@
       "minimum_free_mib": 56000,
       "user_compute_pid_signalled": false
     }
+  },
+  "latest_condition_schema_separate_vm_stack_qualification_20261006": {
+    "report": {
+      "path": "/home/chaidi/qw3/docs/computer_use_condition_schema_vm_stacks_20261006.json",
+      "sha256": "4dc54cbf078c88c8b254fc88b94efa9ec2fcc71553953b69c54c1874b45d749b"
+    },
+    "separate_planned_model_trials": 8,
+    "separate_model_trials_completed": 0,
+    "separate_model_controller_registered": false,
+    "actual_linux_vm_stacks": 2,
+    "checks_per_stack": 13,
+    "decoded_frames_per_video": 7,
+    "cpu_tests": 5,
+    "model_requests": 0,
+    "device_inputs": 0,
+    "actual_engine_bound": false,
+    "production_installed": false,
+    "business_improvement_proven": false,
+    "original_native_eight_modified": false,
+    "actual_pipeline": {
+      "original_snapshot": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-status-17.json",
+        "sha256": "1fd6c57b01b26abbce3ea3b84f89e8f139dc0b3ae9cdef08411860fb8ae5b902"
+      },
+      "native_snapshot": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/condition-schema-stack-native-waiter-snapshot-02.json",
+        "sha256": "30d916bb24a3016668b5bad714714448cc62b737f19c2fe48467975896082e6e"
+      },
+      "original_stages": {
+        "image": {
+          "status": "restoring-fresh-off-engine",
+          "completed": 1,
+          "planned": 12,
+          "actual_same_process_live": true
+        },
+        "thinking": {
+          "status": "waiting-for-image-twelve",
+          "completed": 0,
+          "planned": 4,
+          "actual_same_process_live": true
+        },
+        "feedback": {
+          "status": "waiting-for-forty-eight-ten-twelve-four",
+          "completed": 0,
+          "planned": 8,
+          "actual_same_process_live": true
+        },
+        "bounded": {
+          "status": "waiting-for-forty-eight-ten-twelve-four-eight",
+          "completed": 0,
+          "planned": 8,
+          "actual_same_process_live": true
+        },
+        "query": {
+          "status": "waiting-for-complete-bounded-chain",
+          "completed": 0,
+          "planned": 4,
+          "actual_same_process_live": true
+        }
+      },
+      "original_native_completed": 0,
+      "original_native_planned": 8,
+      "original_native_same_generation_live": true,
+      "original_native_status": "waiting-for-complete-original-query-chain",
+      "gpu": {
+        "at": 1791222674.0793989,
+        "free_mib": 55711,
+        "used_mib": 41540,
+        "gpu_percent": 99,
+        "compute_pids": [
+          "3906950"
+        ]
+      },
+      "minimum_free_mib": 56000,
+      "user_compute_pid_signalled": false
+    }
   }
 }
