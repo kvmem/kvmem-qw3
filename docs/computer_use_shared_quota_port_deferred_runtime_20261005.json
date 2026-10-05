@@ -1,9 +1,9 @@
 {
   "kind": "actual_frozen_port_deferred_runtime_binding",
-  "checked_at": 1791184449.1787438,
+  "checked_at": 1791186189.8126473,
   "audit": {
-    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-20.json",
-    "sha256": "0cc01c30d6732d346cd453af11a9d72ba442f7ea7939069c73f2ecf194ec520e"
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-22.json",
+    "sha256": "ff9b0c7d96f93f6b61d88dddd41c9ec28c7d7d5dba9d5554d455ae8111e451e0"
   },
   "qualification": {
     "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-deferred-cpu-01/result.json",
@@ -17,7 +17,7 @@
       "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-port-20261005-01/queue-runtime-01/queue.json",
       "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-port-20261005-01/protocol.json",
       "protocol_sha256": "c619e9c691ff19ec4e18f3152a86aa6888dfc68325680f0c25b54a73f9049471",
-      "status": "waiting-for-forty-eight-ten-twelve-four-eight",
+      "status": "halted-no-further-dispatch",
       "completed": 0,
       "planned": 8,
       "identity": {
@@ -37,24 +37,12 @@
           "cwd": "/home/chaidi/qw3",
           "state": "R"
         },
-        "actual": {
-          "pid": 3645356,
-          "uid": 1001,
-          "start_ticks": 373925501,
-          "command": [
-            "/home/chaidi/qw3/.venv/bin/python",
-            "-m",
-            "shared_quota_port_deferred",
-            "--declaration",
-            "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-port-20261005-01/declaration.json",
-            "--stage",
-            "bounded"
-          ],
-          "cwd": "/home/chaidi/qw3",
-          "state": "R"
-        },
-        "same_actual_identity": true
-      }
+        "actual": null,
+        "same_actual_identity": false,
+        "actual_registered_process_retired": true
+      },
+      "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+      "finished_at": 1791184968.4809208
     },
     "query": {
       "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-port-20261005-01/registration.json",
@@ -62,7 +50,7 @@
       "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-port-20261005-01/queue-runtime-01/queue.json",
       "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-port-20261005-01/protocol.json",
       "protocol_sha256": "d5140ed9b106005312b326087d4e5ebf2d7602da0a098bb92b5d2b6ff2b6ddd6",
-      "status": "waiting-for-complete-bounded-chain",
+      "status": "halted-no-further-dispatch",
       "completed": 0,
       "planned": 4,
       "identity": {
@@ -82,24 +70,12 @@
           "cwd": "/home/chaidi/qw3",
           "state": "R"
         },
-        "actual": {
-          "pid": 3653494,
-          "uid": 1001,
-          "start_ticks": 373954120,
-          "command": [
-            "/home/chaidi/qw3/.venv/bin/python",
-            "-m",
-            "shared_quota_port_deferred",
-            "--declaration",
-            "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-port-20261005-01/declaration.json",
-            "--stage",
-            "query"
-          ],
-          "cwd": "/home/chaidi/qw3",
-          "state": "S"
-        },
-        "same_actual_identity": true
-      }
+        "actual": null,
+        "same_actual_identity": false,
+        "actual_registered_process_retired": true
+      },
+      "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+      "finished_at": 1791184970.7051692
     }
   },
   "original_packages_and_saved_inputs_preserved": true,
@@ -109,5 +85,152 @@
   "remaining_bindings": [],
   "actual_qw3_deferred_trials_completed": 0,
   "business_gain_proven": false,
-  "advisor_enabled": false
+  "advisor_enabled": false,
+  "previous_verified_running_snapshot": {
+    "checked_at": 1791184449.1787438,
+    "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-20.json",
+      "sha256": "0cc01c30d6732d346cd453af11a9d72ba442f7ea7939069c73f2ecf194ec520e"
+    },
+    "stages": {
+      "bounded": {
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-port-20261005-01/registration.json",
+        "declaration": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-port-20261005-01/declaration.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-port-20261005-01/queue-runtime-01/queue.json",
+        "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-port-20261005-01/protocol.json",
+        "protocol_sha256": "c619e9c691ff19ec4e18f3152a86aa6888dfc68325680f0c25b54a73f9049471",
+        "status": "waiting-for-forty-eight-ten-twelve-four-eight",
+        "completed": 0,
+        "planned": 8,
+        "identity": {
+          "registered": {
+            "pid": 3645356,
+            "uid": 1001,
+            "start_ticks": 373925501,
+            "command": [
+              "/home/chaidi/qw3/.venv/bin/python",
+              "-m",
+              "shared_quota_port_deferred",
+              "--declaration",
+              "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-port-20261005-01/declaration.json",
+              "--stage",
+              "bounded"
+            ],
+            "cwd": "/home/chaidi/qw3",
+            "state": "R"
+          },
+          "actual": {
+            "pid": 3645356,
+            "uid": 1001,
+            "start_ticks": 373925501,
+            "command": [
+              "/home/chaidi/qw3/.venv/bin/python",
+              "-m",
+              "shared_quota_port_deferred",
+              "--declaration",
+              "/home/chaidi/qw3/apps/computer_use/.runtime/bounded-continuation-port-20261005-01/declaration.json",
+              "--stage",
+              "bounded"
+            ],
+            "cwd": "/home/chaidi/qw3",
+            "state": "R"
+          },
+          "same_actual_identity": true
+        }
+      },
+      "query": {
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-port-20261005-01/registration.json",
+        "declaration": "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-port-20261005-01/declaration.json",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-port-20261005-01/queue-runtime-01/queue.json",
+        "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-port-20261005-01/protocol.json",
+        "protocol_sha256": "d5140ed9b106005312b326087d4e5ebf2d7602da0a098bb92b5d2b6ff2b6ddd6",
+        "status": "waiting-for-complete-bounded-chain",
+        "completed": 0,
+        "planned": 4,
+        "identity": {
+          "registered": {
+            "pid": 3653494,
+            "uid": 1001,
+            "start_ticks": 373954120,
+            "command": [
+              "/home/chaidi/qw3/.venv/bin/python",
+              "-m",
+              "shared_quota_port_deferred",
+              "--declaration",
+              "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-port-20261005-01/declaration.json",
+              "--stage",
+              "query"
+            ],
+            "cwd": "/home/chaidi/qw3",
+            "state": "R"
+          },
+          "actual": {
+            "pid": 3653494,
+            "uid": 1001,
+            "start_ticks": 373954120,
+            "command": [
+              "/home/chaidi/qw3/.venv/bin/python",
+              "-m",
+              "shared_quota_port_deferred",
+              "--declaration",
+              "/home/chaidi/qw3/apps/computer_use/.runtime/query-refresh-port-20261005-01/declaration.json",
+              "--stage",
+              "query"
+            ],
+            "cwd": "/home/chaidi/qw3",
+            "state": "S"
+          },
+          "same_actual_identity": true
+        }
+      }
+    },
+    "remaining_bindings": []
+  },
+  "current_status": "halted-no-further-dispatch",
+  "fresh_recovery_not_started": true,
+  "sdk_pre_task_failure": {
+    "launcher_log": "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-07/engine-launch.log",
+    "launcher_log_sha256": "13c5fb7fdb2a57346036bdeab36292de8101aabda8c1e906d3c4698bec4418ca",
+    "original_error": "SafetyHalt: New owned service exited before readiness",
+    "exact_port_failure_confirmed": true,
+    "engine_runtime_created": false,
+    "current_child": {
+      "pid": 3688851,
+      "uid": 1001,
+      "start_ticks": 374071617,
+      "command": [
+        "/home/chaidi/qw3/.venv/bin/python",
+        "/home/chaidi/qw3/apps/computer_use/run_engine.py",
+        "--run-dir",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/engine-off",
+        "--method",
+        "dflash2",
+        "--kvmem",
+        "off",
+        "--prefix-reuse",
+        "off",
+        "--visual-history",
+        "pin-all",
+        "--guided-refresh",
+        "off",
+        "--context-tokens",
+        "524288",
+        "--gpu-sharing",
+        "spare-capacity",
+        "--min-free-mib",
+        "56000",
+        "--lock-timeout",
+        "5"
+      ],
+      "cwd": "/home/chaidi/qw3",
+      "state": "R"
+    },
+    "current_child_actual_retired": true,
+    "owned_memory_final_engine_retirement": {
+      "pid": 3657999,
+      "retired": true,
+      "new_instance_preserved": false
+    },
+    "new_task_dispatch_count": 0
+  }
 }

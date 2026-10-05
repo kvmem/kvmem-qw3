@@ -30,13 +30,13 @@
 
 ## 当前进度（2026-10-05）
 
-最新只读快照20确认共同配置KVMem对照7/8终止，080-ON第二轮正在运行；当前控制器及实际引擎/runner身份均相符。035-OFF第二轮1802.74秒/22调用到期限，官方评分不可用、本地0；080-OFF第二轮934.68秒/27调用因持续无法操作而暂停，官方0。两项无未知输入、录像收集通过，原五份完成前缀保持。新的独立后继入口又通过41项CPU检查，实际补登记有限续轮8项与查询刷新4项；全部六组10/12/4/8/8/4等待器均存活、零派发，原任务/材料/候选包/模型/预算/评分和保存输入不变。原六个停止队列及全部失败保持，未重启旧任务。审计为`.runtime/shared-quota-current-progress-20261005-20.json`，见[四组后继运行绑定](computer_use_shared_quota_port_successors_runtime_20261005.json)与[两组补充绑定](computer_use_shared_quota_port_deferred_runtime_20261005.json)。原40次中36份可用官方评分仍全0，035四份不可用。
+最新只读快照22确认共同配置 KVMem 开关对照已全部终止（8/8）：080 四份可用官方评分均为 0；035 四份官方评分不可用、本地检查均为 0；全部无未知输入，录像收集通过。最后 080-ON 第二轮为 844.93 秒/26 调用后暂停，未超过检索预算，不能据此推断查询检索效果。不同停止原因下的耗时差不算提速。[完整八次结果](computer_use_kvmem_same_quota_results_20261005.json)保留原结果哈希。随后 SDK 在派发任务前因原引擎端口占用而启动失败，六组后继全部停止且各为零试次；自有最终 ON 引擎和控制器已退出，未影响其他 GPU 工作。核对时原端口已可绑定，但失败时的占用者未被观测，不能判定根因。新的有界交接恢复尚未启动，所有旧队列和失败保持。审计为 `.runtime/shared-quota-current-progress-20261005-22.json`，见[四组后继状态](computer_use_shared_quota_port_successors_runtime_20261005.json)与[两组补充状态](computer_use_shared_quota_port_deferred_runtime_20261005.json)。原 40 次中 36 份可用官方评分仍全 0，035 四份不可用。
 
 已从原结果重新统计[改善证据](computer_use_improvement_evidence_20261005.json)：坐标0/12→11/12、同模板工具传递修复0/12→8/12完整通过且11/12产物正确、短规则thinking准确性、固定Windows焦点以及两组单任务时间/调用数改善均有相应范围证据。后两组各侧仅一次，不能推广为稳定加速。复杂OSWorld、KVMem、图像历史、条件反馈与有限续轮仍无端到端成功率提升证明。
 
 080第一轮两侧官方评分均0、未知输入均0、录像收集通过：ON为1802.68秒/34调用后到达期限，OFF为1152.71秒/27调用后因持续无法操作而暂停。停止原因不同且均未完成，不能将耗时差算作提速。[新回放快照29](http://127.0.0.1:18161/index.html)通过39项真实浏览器检查，新增两份080录像，原152条记录和媒体保持，共154条/148份视频。末段诊断证明OFF三次键盘翻页被原窗口核验规则拒绝：控件观察foreground_unmatched、三对重截图差异仅为任务栏时钟；已有仅视觉目标的候选不覆盖此问题。下一步先独立核验窗口、几何和焦点来源，详见[窗口停滞诊断](computer_use_native_window_diagnostic_20261005.md)。
 
-KVMem持续任务查询gate的实际诊断保持：035-ON第一轮超过窗口的79条、080-ON第一轮的75条评分均回退窗口，查询捕获0；035-ON第二轮新增五个超过预算请求、175条评分同样全部回退，查询捕获0，其中四个请求具有明确gate抑制证据。整体日志含启动健康探针，计数不当作业务得分。同目标/guided-off策略抑制select_active，recompute默认开启不能绕过。原四次saved-input off/both比较的31项HTTP/引擎/队列资格保留；实际原等待器3585544的停止记录不改，新等待器3653494已登记、0/4，等待整条链终止后运行；仍无查询检索质量或速度改善证明。原输入字节、顺序、模型/思考/采样和引擎配置保持。详见[运行声明](computer_use_query_refresh_runtime_20261005.json)、[查询刷新诊断](computer_use_kvmem_refresh_diagnostic_20261005.md)及`.runtime/shared-quota-second035-terminal-pair-01/result.json`。
+KVMem持续任务查询gate的实际诊断保持：035-ON第一轮超过窗口的79条、080-ON第一轮的75条评分均回退窗口，查询捕获0；035-ON第二轮新增五个超过预算请求、175条评分同样全部回退，查询捕获0，其中四个请求具有明确gate抑制证据。整体日志含启动健康探针，计数不当作业务得分。同目标/guided-off策略抑制select_active，recompute默认开启不能绕过。原四次saved-input off/both比较的31项HTTP/引擎/队列资格保留；实际原等待器3585544及新等待器3653494的停止记录均保持；新等待器因前述 SDK 启动失败连锁停止，0/4，尚未执行查询复测；仍无查询检索质量或速度改善证明。原输入字节、顺序、模型/思考/采样和引擎配置保持。详见[运行声明](computer_use_query_refresh_runtime_20261005.json)、[查询刷新诊断](computer_use_kvmem_refresh_diagnostic_20261005.md)及`.runtime/shared-quota-second035-terminal-pair-01/result.json`。
 
 活动录制已完成独立30分钟原生校准：118次真实按键/点击/滚动回调全部在录像中确认，3605帧/1802.5秒完整解码，零重连、零已记录传输缺口，十项核验通过；生产者、录制器及自有VM已实际退役。此前三次烟测失败和第四次62秒烟测保留，后者的0.377秒尾部缺口不改。新结果证明活动校准录制链路稳定，尚不是QW3业务成功或具有明确生产任务起止的延迟对照；未替换冻结runner。证据见[观察诊断](computer_use_observation_diagnostics_20261004.md)及`.runtime/native-browser-and-stability-progress-20261005-01.json`。
 

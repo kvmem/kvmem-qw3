@@ -1,9 +1,9 @@
 {
   "kind": "actual_frozen_port_successors_runtime_binding",
-  "checked_at": 1791182567.6241186,
+  "checked_at": 1791186189.8126473,
   "audit": {
-    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-19.json",
-    "sha256": "10f71121ba4bb9b526eac97c8b9a39665ef879179cba318a1c4c6a333bbaf18d"
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-22.json",
+    "sha256": "ff9b0c7d96f93f6b61d88dddd41c9ec28c7d7d5dba9d5554d455ae8111e451e0"
   },
   "declaration": {
     "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/successors.json",
@@ -20,7 +20,7 @@
       "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/protocol.json",
       "protocol_sha256": "b8c09c4465ffd06165bf9c4fce4811c75669bec7c41ab3d4f00a5d96b4bbe220",
       "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-07/queue.json",
-      "status": "waiting-for-forty-and-eight",
+      "status": "halted-no-further-dispatch",
       "completed": 0,
       "planned": 10,
       "identity": {
@@ -40,31 +40,19 @@
           "cwd": "/home/chaidi/qw3",
           "state": "R"
         },
-        "actual": {
-          "pid": 3632217,
-          "uid": 1001,
-          "start_ticks": 373799980,
-          "command": [
-            "/home/chaidi/qw3/.venv/bin/python",
-            "-m",
-            "shared_quota_port_successors",
-            "--declaration",
-            "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/successors.json",
-            "--stage",
-            "sdk"
-          ],
-          "cwd": "/home/chaidi/qw3",
-          "state": "S"
-        },
-        "same_actual_identity": true
-      }
+        "actual": null,
+        "same_actual_identity": false,
+        "actual_registered_process_retired": true
+      },
+      "error": "SafetyHalt: New owned service exited before readiness",
+      "finished_at": 1791184959.2683816
     },
     "image": {
       "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/image-registration.json",
       "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/protocol.json",
       "protocol_sha256": "ac297f6d8a062fb9e27465beedd89fbadb85c566899d23373ad5e7902cbd49c2",
       "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/queue-runtime-06/queue.json",
-      "status": "waiting-for-forty-eight-and-ten",
+      "status": "halted-no-further-dispatch",
       "completed": 0,
       "planned": 12,
       "identity": {
@@ -84,31 +72,19 @@
           "cwd": "/home/chaidi/qw3",
           "state": "R"
         },
-        "actual": {
-          "pid": 3633913,
-          "uid": 1001,
-          "start_ticks": 373814083,
-          "command": [
-            "/home/chaidi/qw3/.venv/bin/python",
-            "-m",
-            "shared_quota_port_successors",
-            "--declaration",
-            "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/successors.json",
-            "--stage",
-            "image"
-          ],
-          "cwd": "/home/chaidi/qw3",
-          "state": "S"
-        },
-        "same_actual_identity": true
-      }
+        "actual": null,
+        "same_actual_identity": false,
+        "actual_registered_process_retired": true
+      },
+      "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+      "finished_at": 1791184959.8572428
     },
     "thinking": {
       "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/thinking-registration.json",
       "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/protocol.json",
       "protocol_sha256": "811254645a84ae1c4bf8f9ec0cb0b3b0eae3522b69ca8308c030b497491586f7",
       "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/queue-runtime-04/queue.json",
-      "status": "waiting-for-image-twelve",
+      "status": "halted-no-further-dispatch",
       "completed": 0,
       "planned": 4,
       "identity": {
@@ -128,31 +104,19 @@
           "cwd": "/home/chaidi/qw3",
           "state": "R"
         },
-        "actual": {
-          "pid": 3634370,
-          "uid": 1001,
-          "start_ticks": 373815524,
-          "command": [
-            "/home/chaidi/qw3/.venv/bin/python",
-            "-m",
-            "shared_quota_port_successors",
-            "--declaration",
-            "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/successors.json",
-            "--stage",
-            "thinking"
-          ],
-          "cwd": "/home/chaidi/qw3",
-          "state": "S"
-        },
-        "same_actual_identity": true
-      }
+        "actual": null,
+        "same_actual_identity": false,
+        "actual_registered_process_retired": true
+      },
+      "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+      "finished_at": 1791184962.0185053
     },
     "feedback": {
       "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/feedback-registration.json",
       "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/protocol.json",
       "protocol_sha256": "2b412349570ef4e1ddf4679a947e3d4ee16e95ffee28a92b4deb744e25379c01",
       "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/queue-runtime-04/queue.json",
-      "status": "waiting-for-forty-eight-ten-twelve-four",
+      "status": "halted-no-further-dispatch",
       "completed": 0,
       "planned": 8,
       "identity": {
@@ -172,24 +136,12 @@
           "cwd": "/home/chaidi/qw3",
           "state": "R"
         },
-        "actual": {
-          "pid": 3635129,
-          "uid": 1001,
-          "start_ticks": 373817147,
-          "command": [
-            "/home/chaidi/qw3/.venv/bin/python",
-            "-m",
-            "shared_quota_port_successors",
-            "--declaration",
-            "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/successors.json",
-            "--stage",
-            "feedback"
-          ],
-          "cwd": "/home/chaidi/qw3",
-          "state": "S"
-        },
-        "same_actual_identity": true
-      }
+        "actual": null,
+        "same_actual_identity": false,
+        "actual_registered_process_retired": true
+      },
+      "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+      "finished_at": 1791184963.0765316
     }
   },
   "original_protocols_changed": false,
@@ -201,11 +153,244 @@
     "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-launch-01/continued-startup.json",
     "sha256": "315067ccb93529b74409e55d258d8d6069b172354dbbd18c3f15e47c35cc06ce"
   },
-  "remaining_bindings": [
-    "bounded-continuation",
-    "query-refresh"
-  ],
+  "remaining_bindings": [],
   "actual_qw3_successor_trials_completed": 0,
   "business_gain_proven": false,
-  "advisor_enabled": false
+  "advisor_enabled": false,
+  "previous_verified_running_snapshot": {
+    "checked_at": 1791182567.6241186,
+    "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-19.json",
+      "sha256": "10f71121ba4bb9b526eac97c8b9a39665ef879179cba318a1c4c6a333bbaf18d"
+    },
+    "actual_stages": {
+      "sdk": {
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/sdk-registration.json",
+        "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/protocol.json",
+        "protocol_sha256": "b8c09c4465ffd06165bf9c4fce4811c75669bec7c41ab3d4f00a5d96b4bbe220",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-07/queue.json",
+        "status": "waiting-for-forty-and-eight",
+        "completed": 0,
+        "planned": 10,
+        "identity": {
+          "registered": {
+            "pid": 3632217,
+            "uid": 1001,
+            "start_ticks": 373799980,
+            "command": [
+              "/home/chaidi/qw3/.venv/bin/python",
+              "-m",
+              "shared_quota_port_successors",
+              "--declaration",
+              "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/successors.json",
+              "--stage",
+              "sdk"
+            ],
+            "cwd": "/home/chaidi/qw3",
+            "state": "R"
+          },
+          "actual": {
+            "pid": 3632217,
+            "uid": 1001,
+            "start_ticks": 373799980,
+            "command": [
+              "/home/chaidi/qw3/.venv/bin/python",
+              "-m",
+              "shared_quota_port_successors",
+              "--declaration",
+              "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/successors.json",
+              "--stage",
+              "sdk"
+            ],
+            "cwd": "/home/chaidi/qw3",
+            "state": "S"
+          },
+          "same_actual_identity": true
+        }
+      },
+      "image": {
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/image-registration.json",
+        "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/protocol.json",
+        "protocol_sha256": "ac297f6d8a062fb9e27465beedd89fbadb85c566899d23373ad5e7902cbd49c2",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/queue-runtime-06/queue.json",
+        "status": "waiting-for-forty-eight-and-ten",
+        "completed": 0,
+        "planned": 12,
+        "identity": {
+          "registered": {
+            "pid": 3633913,
+            "uid": 1001,
+            "start_ticks": 373814083,
+            "command": [
+              "/home/chaidi/qw3/.venv/bin/python",
+              "-m",
+              "shared_quota_port_successors",
+              "--declaration",
+              "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/successors.json",
+              "--stage",
+              "image"
+            ],
+            "cwd": "/home/chaidi/qw3",
+            "state": "R"
+          },
+          "actual": {
+            "pid": 3633913,
+            "uid": 1001,
+            "start_ticks": 373814083,
+            "command": [
+              "/home/chaidi/qw3/.venv/bin/python",
+              "-m",
+              "shared_quota_port_successors",
+              "--declaration",
+              "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/successors.json",
+              "--stage",
+              "image"
+            ],
+            "cwd": "/home/chaidi/qw3",
+            "state": "S"
+          },
+          "same_actual_identity": true
+        }
+      },
+      "thinking": {
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/thinking-registration.json",
+        "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/protocol.json",
+        "protocol_sha256": "811254645a84ae1c4bf8f9ec0cb0b3b0eae3522b69ca8308c030b497491586f7",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/thinking-budget-replay-20261005/queue-runtime-04/queue.json",
+        "status": "waiting-for-image-twelve",
+        "completed": 0,
+        "planned": 4,
+        "identity": {
+          "registered": {
+            "pid": 3634370,
+            "uid": 1001,
+            "start_ticks": 373815524,
+            "command": [
+              "/home/chaidi/qw3/.venv/bin/python",
+              "-m",
+              "shared_quota_port_successors",
+              "--declaration",
+              "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/successors.json",
+              "--stage",
+              "thinking"
+            ],
+            "cwd": "/home/chaidi/qw3",
+            "state": "R"
+          },
+          "actual": {
+            "pid": 3634370,
+            "uid": 1001,
+            "start_ticks": 373815524,
+            "command": [
+              "/home/chaidi/qw3/.venv/bin/python",
+              "-m",
+              "shared_quota_port_successors",
+              "--declaration",
+              "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/successors.json",
+              "--stage",
+              "thinking"
+            ],
+            "cwd": "/home/chaidi/qw3",
+            "state": "S"
+          },
+          "same_actual_identity": true
+        }
+      },
+      "feedback": {
+        "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/feedback-registration.json",
+        "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/protocol.json",
+        "protocol_sha256": "2b412349570ef4e1ddf4679a947e3d4ee16e95ffee28a92b4deb744e25379c01",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/literal-feedback-matched-retest-20261005/queue-runtime-04/queue.json",
+        "status": "waiting-for-forty-eight-ten-twelve-four",
+        "completed": 0,
+        "planned": 8,
+        "identity": {
+          "registered": {
+            "pid": 3635129,
+            "uid": 1001,
+            "start_ticks": 373817147,
+            "command": [
+              "/home/chaidi/qw3/.venv/bin/python",
+              "-m",
+              "shared_quota_port_successors",
+              "--declaration",
+              "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/successors.json",
+              "--stage",
+              "feedback"
+            ],
+            "cwd": "/home/chaidi/qw3",
+            "state": "R"
+          },
+          "actual": {
+            "pid": 3635129,
+            "uid": 1001,
+            "start_ticks": 373817147,
+            "command": [
+              "/home/chaidi/qw3/.venv/bin/python",
+              "-m",
+              "shared_quota_port_successors",
+              "--declaration",
+              "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-successors-20261005-01/successors.json",
+              "--stage",
+              "feedback"
+            ],
+            "cwd": "/home/chaidi/qw3",
+            "state": "S"
+          },
+          "same_actual_identity": true
+        }
+      }
+    },
+    "remaining_bindings": [
+      "bounded-continuation",
+      "query-refresh"
+    ]
+  },
+  "current_status": "halted-no-further-dispatch",
+  "fresh_recovery_not_started": true,
+  "sdk_pre_task_failure": {
+    "launcher_log": "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-07/engine-launch.log",
+    "launcher_log_sha256": "13c5fb7fdb2a57346036bdeab36292de8101aabda8c1e906d3c4698bec4418ca",
+    "original_error": "SafetyHalt: New owned service exited before readiness",
+    "exact_port_failure_confirmed": true,
+    "engine_runtime_created": false,
+    "current_child": {
+      "pid": 3688851,
+      "uid": 1001,
+      "start_ticks": 374071617,
+      "command": [
+        "/home/chaidi/qw3/.venv/bin/python",
+        "/home/chaidi/qw3/apps/computer_use/run_engine.py",
+        "--run-dir",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/engine-off",
+        "--method",
+        "dflash2",
+        "--kvmem",
+        "off",
+        "--prefix-reuse",
+        "off",
+        "--visual-history",
+        "pin-all",
+        "--guided-refresh",
+        "off",
+        "--context-tokens",
+        "524288",
+        "--gpu-sharing",
+        "spare-capacity",
+        "--min-free-mib",
+        "56000",
+        "--lock-timeout",
+        "5"
+      ],
+      "cwd": "/home/chaidi/qw3",
+      "state": "R"
+    },
+    "current_child_actual_retired": true,
+    "owned_memory_final_engine_retirement": {
+      "pid": 3657999,
+      "retired": true,
+      "new_instance_preserved": false
+    },
+    "new_task_dispatch_count": 0
+  }
 }

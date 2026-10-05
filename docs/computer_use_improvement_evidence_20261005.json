@@ -1,6 +1,6 @@
 {
   "kind": "computer_use_measured_improvement_scope_audit",
-  "checked_at": 1791182487.0377984,
+  "checked_at": 1791186189.8126473,
   "advisor_used": false,
   "entries": [
     {
@@ -179,7 +179,11 @@
     },
     {
       "change": "KVMem",
-      "conclusion": "对照未完成；目前已终止试次没有业务通过，已有ON日志存在窗口评分回退，查询检索收益未证明。"
+      "conclusion": "同配置8次开关对照全部终止；080四份可用官方评分均0，035四份官方不可用、本地均0。未观察到任务完成收益；停止原因不同，不能将耗时差当作提速。查询检索收益也未证明。",
+      "source": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-eight-terminal-report-01/result.json",
+        "sha256": "aec9bb866dffc350cc0e6acb7004f36189fe1abf8b02eeacfbe4028b28845eb6"
+      }
     }
   ],
   "complex_task_boundary": {
@@ -200,6 +204,125 @@
     "完成已冻结的SDK、图像历史、思考预算和反馈复测，之后再决定默认配置。"
   ],
   "current_retest_status": {
+    "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-22.json",
+      "sha256": "ff9b0c7d96f93f6b61d88dddd41c9ec28c7d7d5dba9d5554d455ae8111e451e0"
+    },
+    "checked_at": 1791186189.8126473,
+    "memory_completed": 8,
+    "memory_planned": 8,
+    "current": null,
+    "memory_controller_retired": true,
+    "memory_final_engine_retired": true,
+    "rebound_all_six_stages": {
+      "sdk": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 10,
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: New owned service exited before readiness",
+        "finished_at": 1791184959.2683816
+      },
+      "image": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 12,
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "finished_at": 1791184959.8572428
+      },
+      "thinking": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 4,
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "finished_at": 1791184962.0185053
+      },
+      "feedback": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 8,
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "finished_at": 1791184963.0765316
+      },
+      "bounded": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 8,
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "finished_at": 1791184968.4809208
+      },
+      "query": {
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 4,
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "finished_at": 1791184970.7051692
+      }
+    },
+    "pending": "Fresh qualified engine handoff recovery; old halted queues retained, no model task retry has started.",
+    "sdk_startup_failure": {
+      "launcher_log": "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-07/engine-launch.log",
+      "launcher_log_sha256": "13c5fb7fdb2a57346036bdeab36292de8101aabda8c1e906d3c4698bec4418ca",
+      "original_error": "SafetyHalt: New owned service exited before readiness",
+      "exact_port_failure_confirmed": true,
+      "engine_runtime_created": false,
+      "current_child": {
+        "pid": 3688851,
+        "uid": 1001,
+        "start_ticks": 374071617,
+        "command": [
+          "/home/chaidi/qw3/.venv/bin/python",
+          "/home/chaidi/qw3/apps/computer_use/run_engine.py",
+          "--run-dir",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/engine-off",
+          "--method",
+          "dflash2",
+          "--kvmem",
+          "off",
+          "--prefix-reuse",
+          "off",
+          "--visual-history",
+          "pin-all",
+          "--guided-refresh",
+          "off",
+          "--context-tokens",
+          "524288",
+          "--gpu-sharing",
+          "spare-capacity",
+          "--min-free-mib",
+          "56000",
+          "--lock-timeout",
+          "5"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "R"
+      },
+      "current_child_actual_retired": true,
+      "owned_memory_final_engine_retirement": {
+        "pid": 3657999,
+        "retired": true,
+        "new_instance_preserved": false
+      },
+      "new_task_dispatch_count": 0
+    },
+    "completed_eight_report": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-eight-terminal-report-01/result.json",
+      "sha256": "aec9bb866dffc350cc0e6acb7004f36189fe1abf8b02eeacfbe4028b28845eb6"
+    },
+    "original_port_available_at_audit": true
+  },
+  "previous_retest_status_snapshot": {
     "audit": {
       "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-20.json",
       "sha256": "0cc01c30d6732d346cd453af11a9d72ba442f7ea7939069c73f2ecf194ec520e"

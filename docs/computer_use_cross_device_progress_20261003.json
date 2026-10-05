@@ -2358,7 +2358,7 @@
     "event_isolation": "Copy only the append journal bytes since this pilot start; earlier logs preserved with scope correction",
     "canonical_gateway_entry": "Separate canonical import entry avoids __main__ duplicate exception identity; deployed only development Linux/Android gateways; frozen formal launcher unchanged"
   },
-  "updated_at": "2026-10-05T04:33:36.006124+00:00",
+  "updated_at": "2026-10-05T07:43:09.812647+00:00",
   "windows_product_protocol": {
     "path": "apps/computer_use/.runtime/windows-cross-products-20261004/protocol.json",
     "predeclared_trials": 8,
@@ -7037,7 +7037,7 @@
     "superseded_by_capacity_recovery": "apps/computer_use/.runtime/kvmem-capacity-and-successors-progress-20261005-01.json",
     "current_runtime_controller_retired_after_second_trial_engine_failure": true
   },
-  "latest_actual_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-20.json",
+  "latest_actual_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-22.json",
   "kvmem_capacity_recovery": {
     "kind": "actual_kvmem_capacity_and_successors_progress",
     "checked_at": "2026-10-05T00:52:13.412921+00:00",
@@ -7511,60 +7511,76 @@
     "model_success_or_latency_gain_proven": false
   },
   "current_pipeline_live_status": {
-    "audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-20.json",
-    "checked_at": 1791184449.1787438,
-    "memory_completed": 7,
+    "audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-22.json",
+    "checked_at": 1791186189.8126473,
+    "memory_completed": 8,
     "memory_planned": 8,
-    "current_trial": "quota1-080-kvmem-on-r2",
-    "status": "running",
-    "actual_registered_memory_live": true,
+    "current_trial": null,
+    "status": "memory-completed-successors-pre-task-halted",
+    "actual_registered_memory_live": false,
+    "memory_controller_and_final_engine_retired": true,
     "new_matched_prefix_retained": 5,
-    "new_completed_trials": 2,
-    "registered_children_actual_same": {
-      "child": true,
-      "registered_engine": true
-    },
-    "all_six_successor_rebinding_completed": true,
+    "new_completed_trials": 3,
     "rebound_successors": {
       "sdk": {
-        "status": "waiting-for-forty-and-eight",
+        "status": "halted-no-further-dispatch",
         "completed": 0,
         "planned": 10,
-        "actual_registered_process_live": true
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: New owned service exited before readiness",
+        "finished_at": 1791184959.2683816
       },
       "image": {
-        "status": "waiting-for-forty-eight-and-ten",
+        "status": "halted-no-further-dispatch",
         "completed": 0,
         "planned": 12,
-        "actual_registered_process_live": true
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "finished_at": 1791184959.8572428
       },
       "thinking": {
-        "status": "waiting-for-image-twelve",
+        "status": "halted-no-further-dispatch",
         "completed": 0,
         "planned": 4,
-        "actual_registered_process_live": true
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "finished_at": 1791184962.0185053
       },
       "feedback": {
-        "status": "waiting-for-forty-eight-ten-twelve-four",
+        "status": "halted-no-further-dispatch",
         "completed": 0,
         "planned": 8,
-        "actual_registered_process_live": true
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "finished_at": 1791184963.0765316
       },
       "bounded": {
-        "status": "waiting-for-forty-eight-ten-twelve-four-eight",
+        "status": "halted-no-further-dispatch",
         "completed": 0,
         "planned": 8,
-        "actual_registered_process_live": true
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "finished_at": 1791184968.4809208
       },
       "query": {
-        "status": "waiting-for-complete-bounded-chain",
+        "status": "halted-no-further-dispatch",
         "completed": 0,
         "planned": 4,
-        "actual_registered_process_live": true
+        "actual_registered_process_live": false,
+        "actual_registered_process_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "finished_at": 1791184970.7051692
       }
     },
-    "remaining_bindings": [],
-    "original_six_halted_queues_preserved": true
+    "original_six_halted_queues_preserved": true,
+    "new_six_halted_queues_preserved": true,
+    "original_port_available_at_audit": true,
+    "recovery_dispatch_started": false
   },
   "zero_action_completed_turn_diagnostic": {
     "audit": "apps/computer_use/.runtime/zero-action-completed-turn-diagnostic-20261005-02.json",
@@ -8486,102 +8502,24 @@
     "public_videos_exported": true
   },
   "shared_quota_port_runtime_recovery": {
-    "binding_document": "/home/chaidi/qw3/docs/computer_use_shared_quota_port_runtime_20261005.json",
     "kind": "actual_exact_shared_quota_port_continuation_runtime_binding",
-    "latest_live_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-18.json",
-    "checked_at": 1791181131.1370895,
+    "latest_live_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-22.json",
+    "checked_at": 1791186189.8126473,
     "declaration": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-shared-quota-port-20261005-01/continuation.json",
     "declaration_sha256": "a347c29edbea72566c005113c17c588063cb0927251d222b0b56da8699fc137c",
     "protocol": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-shared-quota-port-20261005-01/protocol.json",
     "protocol_sha256": "66ba7add9cc660306ae456d092d6e84653ddf2a3f7e10e2fd697225faabdd8a5",
     "registration": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-launch-01/registration.json",
-    "actual_identity": {
-      "pid": 3618113,
-      "uid": 1001,
-      "start_ticks": 373670278,
-      "command": [
-        "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
-        "-m",
-        "shared_quota_port_continuation",
-        "--declaration",
-        "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-shared-quota-port-20261005-01/continuation.json"
-      ],
-      "cwd": "/home/chaidi/qw3",
-      "state": "S"
-    },
+    "actual_identity": null,
     "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-shared-quota-port-20261005-01/queue-runtime-01/queue.json",
-    "status": "running",
-    "current": "quota1-035-kvmem-off-r2",
-    "completed": 5,
+    "status": "completed",
+    "current": null,
+    "completed": 8,
     "planned": 8,
     "completed_matched_prefix_retained": 5,
-    "remaining_model_trials": 3,
-    "new_model_trials_completed": 0,
-    "actual_children": {
-      "child": {
-        "pid": 3621084,
-        "uid": 1001,
-        "start_ticks": 373675018,
-        "command": [
-          "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
-          "-m",
-          "osworld_office_candidate_run",
-          "--task",
-          "035",
-          "--arm",
-          "verified",
-          "--output",
-          "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-shared-quota-port-20261005-01/attempts/quota1-035-kvmem-off-r2",
-          "--framework",
-          "/home/chaidi/qw3/apps/computer_use/.runtime/linux/candidate49-matched-16k-20261004/candidate49/framework",
-          "--engine-runtime",
-          "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-shared-quota-port-20261005-01/engines/quota1-035-kvmem-off-r2",
-          "--formal-campaign",
-          "/home/chaidi/qw3/apps/computer_use/.runtime/linux/campaign-v2-20261004",
-          "--acceptance-manifest",
-          "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-shared-quota-port-20261005-01/off/acceptance.json",
-          "--pilot-app",
-          "http://127.0.0.1:18213",
-          "--model-output-tokens",
-          "16384"
-        ],
-        "cwd": "/home/chaidi/qw3",
-        "state": "S"
-      },
-      "registered_engine": {
-        "pid": 3620688,
-        "uid": 1001,
-        "start_ticks": 373671805,
-        "command": [
-          "/home/chaidi/qw3/build-dflash-integration/qw3",
-          "serve",
-          "--model",
-          "/home/chaidi/qw3/models/Qwen3.8-27B-Q8_0.gguf",
-          "--vision-model",
-          "/home/chaidi/qw3/models/Qwen3.8-27B-BF16",
-          "--vision-device",
-          "cuda",
-          "--host",
-          "127.0.0.1",
-          "--port",
-          "18080",
-          "--ctx",
-          "524288",
-          "--kv-dtype",
-          "fp8",
-          "--speculative-method",
-          "dflash2",
-          "--prefill-chunk",
-          "2048",
-          "--dflash-model",
-          "/home/chaidi/qw3/models/Qwen3.8-27B-DFlash2-BF16",
-          "--kvmem-gpu-memory-ratio",
-          "1.0"
-        ],
-        "cwd": "/home/chaidi/qw3",
-        "state": "S"
-      }
-    },
+    "remaining_model_trials": 0,
+    "new_model_trials_completed": 3,
+    "actual_children": {},
     "cpu_qualification": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-port-qualification-04/result.json",
     "cpu_checks": 18,
     "original_eight_trial_protocol_bytes_retained": true,
@@ -8589,9 +8527,105 @@
     "engine_profiles_changed": false,
     "port_bind_admission_seconds": 120,
     "original_conflicting_listener_unproven": true,
-    "retired_successor_queues_not_yet_rebound": true,
+    "retired_successor_queues_not_yet_rebound": false,
     "advisor_enabled": false,
-    "business_or_latency_gain_proven": false
+    "business_or_latency_gain_proven": false,
+    "previous_verified_running_snapshot": {
+      "latest_live_audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-18.json",
+      "checked_at": 1791181131.1370895,
+      "actual_identity": {
+        "pid": 3618113,
+        "uid": 1001,
+        "start_ticks": 373670278,
+        "command": [
+          "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+          "-m",
+          "shared_quota_port_continuation",
+          "--declaration",
+          "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-shared-quota-port-20261005-01/continuation.json"
+        ],
+        "cwd": "/home/chaidi/qw3",
+        "state": "S"
+      },
+      "status": "running",
+      "current": "quota1-035-kvmem-off-r2",
+      "completed": 5,
+      "remaining_model_trials": 3,
+      "new_model_trials_completed": 0,
+      "actual_children": {
+        "child": {
+          "pid": 3621084,
+          "uid": 1001,
+          "start_ticks": 373675018,
+          "command": [
+            "/home/chaidi/qw3/third_party/OSWorld-V2/.venv/bin/python",
+            "-m",
+            "osworld_office_candidate_run",
+            "--task",
+            "035",
+            "--arm",
+            "verified",
+            "--output",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-shared-quota-port-20261005-01/attempts/quota1-035-kvmem-off-r2",
+            "--framework",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/linux/candidate49-matched-16k-20261004/candidate49/framework",
+            "--engine-runtime",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-shared-quota-port-20261005-01/engines/quota1-035-kvmem-off-r2",
+            "--formal-campaign",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/linux/campaign-v2-20261004",
+            "--acceptance-manifest",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/linux/kvmem-shared-quota-port-20261005-01/off/acceptance.json",
+            "--pilot-app",
+            "http://127.0.0.1:18213",
+            "--model-output-tokens",
+            "16384"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        },
+        "registered_engine": {
+          "pid": 3620688,
+          "uid": 1001,
+          "start_ticks": 373671805,
+          "command": [
+            "/home/chaidi/qw3/build-dflash-integration/qw3",
+            "serve",
+            "--model",
+            "/home/chaidi/qw3/models/Qwen3.8-27B-Q8_0.gguf",
+            "--vision-model",
+            "/home/chaidi/qw3/models/Qwen3.8-27B-BF16",
+            "--vision-device",
+            "cuda",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "18080",
+            "--ctx",
+            "524288",
+            "--kv-dtype",
+            "fp8",
+            "--speculative-method",
+            "dflash2",
+            "--prefill-chunk",
+            "2048",
+            "--dflash-model",
+            "/home/chaidi/qw3/models/Qwen3.8-27B-DFlash2-BF16",
+            "--kvmem-gpu-memory-ratio",
+            "1.0"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "S"
+        }
+      },
+      "retired_successor_queues_not_yet_rebound": true
+    },
+    "actual_controller_retired": true,
+    "actual_final_engine_retired": true,
+    "completed_eight_report": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-eight-terminal-report-01/result.json",
+      "sha256": "aec9bb866dffc350cc0e6acb7004f36189fe1abf8b02eeacfbe4028b28845eb6"
+    },
+    "latest_successor_status": "All six fresh successors halted before task dispatch; fresh engine handoff recovery not started."
   },
   "public_replay_snapshot29": {
     "url": "http://127.0.0.1:18161/index.html",
@@ -8866,7 +8900,13 @@
     ],
     "actual_qw3_successor_trials_completed": 0,
     "business_gain_proven": false,
-    "advisor_enabled": false
+    "advisor_enabled": false,
+    "latest_terminal_audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-22.json",
+      "sha256": "ff9b0c7d96f93f6b61d88dddd41c9ec28c7d7d5dba9d5554d455ae8111e451e0"
+    },
+    "current_status": "halted-no-further-dispatch",
+    "current_actual_live": false
   },
   "measured_improvement_scope_audit": {
     "report": "/home/chaidi/qw3/docs/computer_use_improvement_evidence_20261005.json",
@@ -9034,7 +9074,13 @@
     "remaining_bindings": [],
     "actual_qw3_deferred_trials_completed": 0,
     "business_gain_proven": false,
-    "advisor_enabled": false
+    "advisor_enabled": false,
+    "latest_terminal_audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-22.json",
+      "sha256": "ff9b0c7d96f93f6b61d88dddd41c9ec28c7d7d5dba9d5554d455ae8111e451e0"
+    },
+    "current_status": "halted-no-further-dispatch",
+    "current_actual_live": false
   },
   "second035_matched_terminal_pair": {
     "report": {
@@ -9116,5 +9162,124 @@
       "video_collection_passed": true
     },
     "public_replay_exported": false
+  },
+  "previous_pipeline_status_before_completed_memory_and_sdk_halt": {
+    "audit": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-20.json",
+    "checked_at": 1791184449.1787438,
+    "memory_completed": 7,
+    "memory_planned": 8,
+    "current_trial": "quota1-080-kvmem-on-r2",
+    "status": "running",
+    "actual_registered_memory_live": true,
+    "new_matched_prefix_retained": 5,
+    "new_completed_trials": 2,
+    "registered_children_actual_same": {
+      "child": true,
+      "registered_engine": true
+    },
+    "all_six_successor_rebinding_completed": true,
+    "rebound_successors": {
+      "sdk": {
+        "status": "waiting-for-forty-and-eight",
+        "completed": 0,
+        "planned": 10,
+        "actual_registered_process_live": true
+      },
+      "image": {
+        "status": "waiting-for-forty-eight-and-ten",
+        "completed": 0,
+        "planned": 12,
+        "actual_registered_process_live": true
+      },
+      "thinking": {
+        "status": "waiting-for-image-twelve",
+        "completed": 0,
+        "planned": 4,
+        "actual_registered_process_live": true
+      },
+      "feedback": {
+        "status": "waiting-for-forty-eight-ten-twelve-four",
+        "completed": 0,
+        "planned": 8,
+        "actual_registered_process_live": true
+      },
+      "bounded": {
+        "status": "waiting-for-forty-eight-ten-twelve-four-eight",
+        "completed": 0,
+        "planned": 8,
+        "actual_registered_process_live": true
+      },
+      "query": {
+        "status": "waiting-for-complete-bounded-chain",
+        "completed": 0,
+        "planned": 4,
+        "actual_registered_process_live": true
+      }
+    },
+    "remaining_bindings": [],
+    "original_six_halted_queues_preserved": true
+  },
+  "completed_eight_same_quota_memory_report": {
+    "document": "/home/chaidi/qw3/docs/computer_use_kvmem_same_quota_results_20261005.json",
+    "source": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-eight-terminal-report-01/result.json",
+      "sha256": "aec9bb866dffc350cc0e6acb7004f36189fe1abf8b02eeacfbe4028b28845eb6"
+    },
+    "completed": 8,
+    "available_official_scores": 4,
+    "official_unavailable": 4,
+    "official_passes": 0,
+    "business_or_latency_gain_proven": false
+  },
+  "sdk_pre_task_engine_handoff_failure": {
+    "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-22.json",
+      "sha256": "ff9b0c7d96f93f6b61d88dddd41c9ec28c7d7d5dba9d5554d455ae8111e451e0"
+    },
+    "launcher_log": "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/queue-runtime-07/engine-launch.log",
+    "launcher_log_sha256": "13c5fb7fdb2a57346036bdeab36292de8101aabda8c1e906d3c4698bec4418ca",
+    "original_error": "SafetyHalt: New owned service exited before readiness",
+    "exact_port_failure_confirmed": true,
+    "engine_runtime_created": false,
+    "current_child": {
+      "pid": 3688851,
+      "uid": 1001,
+      "start_ticks": 374071617,
+      "command": [
+        "/home/chaidi/qw3/.venv/bin/python",
+        "/home/chaidi/qw3/apps/computer_use/run_engine.py",
+        "--run-dir",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/candidate51b-retest-20261004/engine-off",
+        "--method",
+        "dflash2",
+        "--kvmem",
+        "off",
+        "--prefix-reuse",
+        "off",
+        "--visual-history",
+        "pin-all",
+        "--guided-refresh",
+        "off",
+        "--context-tokens",
+        "524288",
+        "--gpu-sharing",
+        "spare-capacity",
+        "--min-free-mib",
+        "56000",
+        "--lock-timeout",
+        "5"
+      ],
+      "cwd": "/home/chaidi/qw3",
+      "state": "R"
+    },
+    "current_child_actual_retired": true,
+    "owned_memory_final_engine_retirement": {
+      "pid": 3657999,
+      "retired": true,
+      "new_instance_preserved": false
+    },
+    "new_task_dispatch_count": 0,
+    "original_port_available_at_audit": true,
+    "fresh_recovery_not_started": true
   }
 }
