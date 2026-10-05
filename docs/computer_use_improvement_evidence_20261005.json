@@ -1,0 +1,237 @@
+{
+  "kind": "computer_use_measured_improvement_scope_audit",
+  "checked_at": 1791182487.0377984,
+  "advisor_used": false,
+  "entries": [
+    {
+      "change": "显式归一化坐标与确定性换算",
+      "evidence_level": "fixed_target_model_diagnostic",
+      "metrics": {
+        "normalized_1000": {
+          "requests": 12,
+          "passed": 11
+        },
+        "pixels": {
+          "requests": 12,
+          "passed": 0
+        }
+      },
+      "scope": "12个目标；新目标6个但界面已见。不能代表陌生界面或完整任务成功率。",
+      "sources": [
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/coordinate-contract-p1-01/result.json",
+          "sha256": "42a96b0576852512cc995f4940bd7fc37d1df731a61d9020f5e438e2d20af5e3"
+        }
+      ]
+    },
+    {
+      "change": "修复真实Codex到本地模型的动作参数定义与解码",
+      "evidence_level": "matched_known_development_tasks",
+      "before": {
+        "status": "completed",
+        "termination_confirmed": true,
+        "finished_at": 1791091460.7308385,
+        "trials": 12,
+        "accepted": 0,
+        "all_retired": true
+      },
+      "after": {
+        "trials": 12,
+        "fully_accepted": 8,
+        "artifacts_correct": 11
+      },
+      "scope": "同模板、初始化、独立评分器及预算的12个开发任务；是工具传递修复后的整套流程结果，非复杂OSWorld或模型能力单独提升。",
+      "sources": [
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/schema-wire-regression-20261004-01.json",
+          "sha256": "bd3b1b4c20845b7bc3f3766b10bfe694b9f30c21c8b3e85e4cf65df3e6815992"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/xdev-candidate17-normal-01/batch/result.json",
+          "sha256": "c2c0e2bfc5d835c94e80d101cb3c850029aeab62a5eaaebaa7ab09419d90c2d8"
+        }
+      ]
+    },
+    {
+      "change": "开启真实thinking",
+      "evidence_level": "short_context_model_diagnostic",
+      "metrics": {
+        "text-thinking-true": {
+          "requests": 24,
+          "passed": 24,
+          "median_seconds": 3.2227612815331668
+        },
+        "screenshot-thinking-true": {
+          "requests": 24,
+          "passed": 24,
+          "median_seconds": 4.478708548471332
+        },
+        "text-thinking-false": {
+          "requests": 24,
+          "passed": 16,
+          "median_seconds": 0.3209480266086757
+        },
+        "screenshot-thinking-false": {
+          "requests": 24,
+          "passed": 14,
+          "median_seconds": 0.5746125406585634
+        }
+      },
+      "scope": "12道规则题，每种条件重复两次；单页材料，无导航或长程动作。准确性改善伴随单请求延迟增加。",
+      "sources": [
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/reasoning-p2-01/result.json",
+          "sha256": "e887e4aad62e94276348f8dc30bf5d993d0c91bf505a59d3c2e88a09a99a1b29"
+        }
+      ]
+    },
+    {
+      "change": "确认真实前台焦点并有界恢复",
+      "evidence_level": "real_windows_executor_without_model",
+      "before": {
+        "passed": 0,
+        "trials": 3
+      },
+      "after": {
+        "passed": 3,
+        "trials": 3,
+        "confirmed_startup_receipts": 9
+      },
+      "scope": "3次固定切窗，每次启动3个应用；未调用模型，不是模型任务成功率。",
+      "sources": [
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/local-diagnostic-p0-focus-audit-01/result.json",
+          "sha256": "1dada5ecd0efbaa27a26f21ced35663d3ed93008ca41e7061c0447095121d8c8"
+        }
+      ]
+    },
+    {
+      "change": "thinking用于Windows Calc完整任务",
+      "evidence_level": "single_exploratory_task_pair",
+      "metrics": [
+        {
+          "thinking": false,
+          "passed": true,
+          "task_seconds": 456.5089855,
+          "tool_calls": 38,
+          "requests": 39
+        },
+        {
+          "thinking": true,
+          "passed": true,
+          "task_seconds": 125.30317629999999,
+          "tool_calls": 15,
+          "requests": 16
+        }
+      ],
+      "scope": "两侧产物都正确、33项检查均通过；每侧仅一次，关闭先运行且对照未预注册，不声称稳定加速比例。",
+      "sources": [
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-thinking-pair-audit-20261003.json",
+          "sha256": "00fdff096c3a7e4017951e78b7d731ed41d87f774f3bbb44625ad7b24a9f5a94"
+        }
+      ]
+    },
+    {
+      "change": "Python修复任务优先选择软件作业工具",
+      "evidence_level": "single_exploratory_hybrid_task_pair",
+      "metrics": [
+        {
+          "attempt": "product-python-repair-03",
+          "passed": true,
+          "task_seconds": 142.40774941444397,
+          "tool_calls": 9,
+          "independent_checks_passed": true
+        },
+        {
+          "attempt": "product-python-repair-04",
+          "passed": true,
+          "task_seconds": 43.3271324634552,
+          "tool_calls": 4,
+          "independent_checks_passed": true
+        }
+      ],
+      "scope": "两侧8项产物检查均通过；混合工具路线、复用依赖缓存、每侧一次，不代表任意软件安装或纯GUI泛化。",
+      "sources": [
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/python-repair-routing-pair-20261003.json",
+          "sha256": "e06b24fb18a64f102f236ecc99ca2d5595811c2b10c89dd0670a9dc3c9e8ea8f"
+        }
+      ]
+    }
+  ],
+  "weak_or_unproven": [
+    {
+      "change": "四分块截图放大",
+      "before": "17/24",
+      "after": "18/24",
+      "median_seconds_before": 0.366,
+      "median_seconds_after": 1.162,
+      "conclusion": "收益小且成本增加；不采用为默认策略。",
+      "source": {
+        "path": "/home/chaidi/qw3/docs/computer_use_visual_diagnostic_p1_20261003.md",
+        "sha256": "61ace0689af67775315a2caced5b4a90ee9aa557679d209ca182ce96e7503327"
+      }
+    },
+    {
+      "change": "历史图像精简、思考预算、完成条件反馈、有限续轮、窗口/焦点证据补充",
+      "conclusion": "接口或局部资格已通过；尚无完整真实模型对照结果，不记为业务成功率改善。"
+    },
+    {
+      "change": "KVMem",
+      "conclusion": "对照未完成；目前已终止试次没有业务通过，已有ON日志存在窗口评分回退，查询检索收益未证明。"
+    }
+  ],
+  "complex_task_boundary": {
+    "matched_osworld_attempts": 40,
+    "available_official_scores": 36,
+    "official_passes": 0,
+    "official_unavailable": 4,
+    "unavailable_task": "035",
+    "conclusion": "复杂OSWorld端到端成功率尚未改善；不能将组件检查或安全暂停计为完成任务。",
+    "source": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/computer-use-improvement-audit-20261005-01/source/computer_use_cross_device_goal_20261003.md",
+      "sha256": "5a9b59507951ae039e7f7336d987f94d8bcbde651a0296577f5dabd8b537baea"
+    }
+  },
+  "next_priority": [
+    "修复有正向窗口与焦点证据支持的执行误拒绝，并做同材料预算复测。",
+    "区分动作送达、步骤证据与独立业务完成；保留原失败。",
+    "完成已冻结的SDK、图像历史、思考预算和反馈复测，之后再决定默认配置。"
+  ],
+  "current_retest_status": {
+    "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-19.json",
+      "sha256": "10f71121ba4bb9b526eac97c8b9a39665ef879179cba318a1c4c6a333bbaf18d"
+    },
+    "memory_completed": 5,
+    "memory_planned": 8,
+    "current": "quota1-035-kvmem-off-r2",
+    "rebound_four_stages": {
+      "sdk": {
+        "completed": 0,
+        "planned": 10,
+        "actual_registered_process_live": true
+      },
+      "image": {
+        "completed": 0,
+        "planned": 12,
+        "actual_registered_process_live": true
+      },
+      "thinking": {
+        "completed": 0,
+        "planned": 4,
+        "actual_registered_process_live": true
+      },
+      "feedback": {
+        "completed": 0,
+        "planned": 8,
+        "actual_registered_process_live": true
+      }
+    },
+    "remaining_bindings": [
+      "bounded-continuation",
+      "query-refresh"
+    ]
+  }
+}
