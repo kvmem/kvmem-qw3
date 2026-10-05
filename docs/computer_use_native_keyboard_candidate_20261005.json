@@ -83,7 +83,6 @@
     "business_success_improvement_proven": false
   },
   "remaining": [
-    "Actual keyboard/paste delivery and changing-focus recovery on an isolated input-owned VM.",
     "Matched QW3 GUI retests of Linux Calc and OSWorld080 with original task materials, budgets and scores.",
     "A separate action-specific control identity policy for the Save-button case; this keyboard candidate still rejects internal client changes.",
     "A separate adaptive thinking-budget experiment; inference time is not isolated thinking time."
@@ -95,9 +94,24 @@
     "Unknown delivery, administrative recovery, recorder collection and replay evidence."
   ],
   "current_sdk_terminal": {
+    "completed": 10,
+    "fully_accepted": 0,
+    "fault_response_passed": 4
+  },
+  "goal_status": "active",
+  "previous_current_sdk_terminal": {
     "completed": 8,
     "fully_accepted": 0,
     "fault_response_passed": 4
   },
-  "goal_status": "active"
+  "actual_keyboard_delivery_qualification": {
+    "document": "/home/chaidi/qw3/docs/computer_use_native_keyboard_delivery_20261005.json",
+    "checks": 13,
+    "delivered": 6,
+    "rejected": 2,
+    "delivery_unknowns": 0,
+    "real_vm": true,
+    "model_requests": 0,
+    "real_qw3_retest": false
+  }
 }

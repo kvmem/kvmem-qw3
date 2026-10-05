@@ -1,6 +1,6 @@
 {
   "kind": "computer_use_measured_improvement_scope_audit",
-  "checked_at": 1791188664.891803,
+  "checked_at": 1791197980.3372402,
   "advisor_used": false,
   "entries": [
     {
@@ -189,8 +189,11 @@
       "change": "独立Linux原生键盘核验与输入前窗口/进程/焦点保护",
       "qualification_checks": 44,
       "readonly_vm_gate_probes": 6,
-      "source": "/home/chaidi/qw3/docs/computer_use_native_keyboard_candidate_20261005.json",
-      "conclusion": "组件检查通过；真实VM探针只打印结果，没有键鼠输入或QW3任务。尚不能记为业务成功率改善。"
+      "source": "/home/chaidi/qw3/docs/computer_use_native_keyboard_delivery_20261005.json",
+      "conclusion": "受控真实VM输入、焦点与剪贴板故障保护和读回恢复通过。未调用QW3，尚不能记为复杂任务成功率改善。",
+      "actual_input_vm_checks": 13,
+      "actual_delivered_inputs": 6,
+      "actual_rejected_inputs": 2
     }
   ],
   "complex_task_boundary": {
@@ -213,69 +216,63 @@
   ],
   "current_retest_status": {
     "audit": {
-      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-25.json",
-      "sha256": "555f70472a4f2163438b7f97d3be22927af2749de84614770bec3e0296113875"
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-delivery-final-audit-03/result.json",
+      "sha256": "14cf9b1e64eda2e8ce310002f647172804fd5d352296e93e8352587af0c08ccf"
     },
     "memory_completed": 8,
     "memory_planned": 8,
-    "sdk_completed_at_snapshot": 8,
-    "four_new_successors": {
+    "sdk_completed": 10,
+    "sdk_planned": 10,
+    "sdk_fully_accepted": 0,
+    "sdk_fault_response_passed": 4,
+    "current": null,
+    "current_child_actual_live": false,
+    "stages": {
       "sdk": {
-        "status": "running",
-        "completed": 8,
-        "planned": 10,
-        "actual_live": true
+        "status": "completed",
+        "completed": 10,
+        "actual_live": false,
+        "actual_retired": true,
+        "error": null
       },
       "image": {
-        "status": "waiting-for-forty-eight-and-ten",
+        "status": "halted-no-further-dispatch",
         "completed": 0,
-        "planned": 12,
-        "actual_live": true
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Original OSWorld source admission or budget changed"
       },
       "thinking": {
-        "status": "waiting-for-image-twelve",
+        "status": "halted-no-further-dispatch",
         "completed": 0,
-        "planned": 4,
-        "actual_live": true
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
       },
       "feedback": {
-        "status": "waiting-for-forty-eight-ten-twelve-four",
+        "status": "halted-no-further-dispatch",
         "completed": 0,
-        "planned": 8,
-        "actual_live": true
-      }
-    },
-    "deferred_stages": {
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
+      },
       "bounded": {
-        "status": "waiting-for-forty-eight-ten-twelve-four-eight",
+        "status": "halted-no-further-dispatch",
         "completed": 0,
-        "planned": 8,
-        "actual_live": true
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
       },
       "query": {
-        "status": "waiting-for-complete-bounded-chain",
+        "status": "halted-no-further-dispatch",
         "completed": 0,
-        "planned": 4,
-        "actual_live": true
+        "actual_live": false,
+        "actual_retired": true,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed"
       }
     },
-    "staged_deployment_completed": true,
-    "all_six_successors_registered": true,
-    "current": "004-candidate51-r1",
-    "current_child_actual_live": true,
-    "sdk_terminal_summary": {
-      "completed": 8,
-      "fully_accepted": 0,
-      "fault_response_passed": 4,
-      "model_trials_not_replayed": true
-    },
-    "native_window_qualification_document": "/home/chaidi/qw3/docs/computer_use_native_window_evidence_20261005.json",
-    "business_gain_proven": false,
-    "latest_actual_state": {
-      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-final-audit-02/result.json",
-      "sha256": "305206febdd41152133b83314e587f6a6436e24448f16d9e21f3f328f57f06f5"
-    },
-    "sdk_completed_at_latest_live_check": 8
+    "native_keyboard_delivery_document": "/home/chaidi/qw3/docs/computer_use_native_keyboard_delivery_20261005.json",
+    "business_gain_proven": false
   },
   "previous_retest_status_snapshot": {
     "audit": {
@@ -608,5 +605,75 @@
     },
     "sdk_completed_at_latest_live_check": 4,
     "current": "xdev-linux-calc-09"
+  },
+  "previous_retest_status_before_sdk_terminal_and_image_halt": {
+    "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/shared-quota-current-progress-20261005-25.json",
+      "sha256": "555f70472a4f2163438b7f97d3be22927af2749de84614770bec3e0296113875"
+    },
+    "memory_completed": 8,
+    "memory_planned": 8,
+    "sdk_completed_at_snapshot": 8,
+    "four_new_successors": {
+      "sdk": {
+        "status": "running",
+        "completed": 8,
+        "planned": 10,
+        "actual_live": true
+      },
+      "image": {
+        "status": "waiting-for-forty-eight-and-ten",
+        "completed": 0,
+        "planned": 12,
+        "actual_live": true
+      },
+      "thinking": {
+        "status": "waiting-for-image-twelve",
+        "completed": 0,
+        "planned": 4,
+        "actual_live": true
+      },
+      "feedback": {
+        "status": "waiting-for-forty-eight-ten-twelve-four",
+        "completed": 0,
+        "planned": 8,
+        "actual_live": true
+      }
+    },
+    "deferred_stages": {
+      "bounded": {
+        "status": "waiting-for-forty-eight-ten-twelve-four-eight",
+        "completed": 0,
+        "planned": 8,
+        "actual_live": true
+      },
+      "query": {
+        "status": "waiting-for-complete-bounded-chain",
+        "completed": 0,
+        "planned": 4,
+        "actual_live": true
+      }
+    },
+    "staged_deployment_completed": true,
+    "all_six_successors_registered": true,
+    "current": "004-candidate51-r1",
+    "current_child_actual_live": true,
+    "sdk_terminal_summary": {
+      "completed": 8,
+      "fully_accepted": 0,
+      "fault_response_passed": 4,
+      "model_trials_not_replayed": true
+    },
+    "native_window_qualification_document": "/home/chaidi/qw3/docs/computer_use_native_window_evidence_20261005.json",
+    "business_gain_proven": false,
+    "latest_actual_state": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-final-audit-02/result.json",
+      "sha256": "305206febdd41152133b83314e587f6a6436e24448f16d9e21f3f328f57f06f5"
+    },
+    "sdk_completed_at_latest_live_check": 8
+  },
+  "latest_pipeline_halt_diagnostic": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/image-admission-terminal-diagnostic-01/result.json",
+    "sha256": "d97aec37de971d9d38ff9181bc06fcb31f28a7393e6e91dd206d0ea62b698a30"
   }
 }

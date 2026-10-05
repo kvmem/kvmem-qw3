@@ -1,0 +1,215 @@
+{
+  "kind": "actual_native_keyboard_delivery_qualification_and_terminal_pipeline_report",
+  "checked_at": 1791197980.336248,
+  "goal_status": "active",
+  "advisor_used": false,
+  "source_sha256": {
+    "native_keyboard_fixture.py": "9821e2bcb19978ca0c712223c939fe1fe38efdf27b02d173fee31fb15ddce06e",
+    "qualify_native_keyboard_delivery.py": "3aaa156c0c73b96d6e66705d74da3663230543ccf503dea04fc8a65b5a3c2aed"
+  },
+  "private_candidate_build": {
+    "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-candidate-20261005-02/build.json",
+    "sha256": "0314d1d331746c5cade72f44b8d5d0e74183a148c94a31a774fcae91e6cd8b72"
+  },
+  "attempts": [
+    {
+      "attempt": 1,
+      "result": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-delivery-live-01/result.json",
+        "sha256": "7755d05d2fda0697270893779a59f26f5837f6b69382d8b9bdf344309a710325"
+      },
+      "status": "failed",
+      "checks_passed": 0,
+      "delivered": 0,
+      "rejected": 0,
+      "error": "Owned fixture operation failed: Traceback (most recent call last):\n  File \"<string>\", line 15, in <module>\nAssertionError\n",
+      "model_requests": 0,
+      "dedicated_vm_retired": true,
+      "video_collection_passed": true
+    },
+    {
+      "attempt": 2,
+      "result": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-delivery-live-02/result.json",
+        "sha256": "be906aa104168adcd1e8716103c4fad106e10d521eeb28d9ddb8bae4d7b81a69"
+      },
+      "status": "failed",
+      "checks_passed": 0,
+      "delivered": 0,
+      "rejected": 0,
+      "error": "Owned fixture operation failed: Traceback (most recent call last):\n  File \"<string>\", line 15, in <module>\nAssertionError\n",
+      "model_requests": 0,
+      "dedicated_vm_retired": true,
+      "video_collection_passed": true
+    },
+    {
+      "attempt": 3,
+      "result": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-delivery-live-03/result.json",
+        "sha256": "e246896019f1ad843b1e011a7d4c642809d60d3afc978328cafd280f862a8073"
+      },
+      "status": "failed",
+      "checks_passed": 0,
+      "delivered": 0,
+      "rejected": 0,
+      "error": "500 Server Error: Internal Server Error for url: http://127.0.0.1:18960/execute",
+      "model_requests": 0,
+      "dedicated_vm_retired": true,
+      "video_collection_passed": true
+    },
+    {
+      "attempt": 4,
+      "result": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-delivery-live-04/result.json",
+        "sha256": "7b4f6f2afd9ee135a1554ed8737e00e94421a925049a53711789a13d4b3835ce"
+      },
+      "status": "failed",
+      "checks_passed": 0,
+      "delivered": 0,
+      "rejected": 0,
+      "error": "Owned fixture failed before input: Exception in Tkinter callback\nTraceback (most recent call last):\n  File \"/usr/lib/python3.10/tkinter/__init__.py\", line 1921, in __call__\n    return self.func(*args)\n  File \"/usr/lib/python3.10/tkinter/__init__.py\", line 839, in callit\n    func(*args)\n  File \"/home/user/.qw3-native-keyboard-60fae47d7396404f9b0c13378ab9dad4/fixture.py\", line 64, in ready\n    clients=desktop.get_full_property(connection.intern_atom('_NET_CLIENT_LIST',only_if_exists=True),Xatom.WINDOW)\n  File \"/home/user/.local/lib/python3.10/site-packages/Xlib/xobject/drawable.py\", line 472, in get_full_property\n    prop = self.get_property(property, property_type, 0, sizehint)\n  File \"/home/user/.local/lib/python3.10/site-packages/Xlib/xobject/drawable.py\", line 455, in get_property\n    r = request.GetProperty(display = self.display,\n  File \"/home/user/.local/lib/python3.10/site-packages/Xlib/protocol/rq.py\", line 1368, in __init__\n    self.reply()\n  File \"/home/user/.local/lib/python3.10/site-packages/Xlib/protocol/rq.py\", line 1388, in reply\n    raise self._error\nXlib.error.BadAtom: <class 'Xlib.error.BadAtom'>: code = 5, resource_id = 0, sequence_number = 19, major_opcode = 20, minor_opcode = 0\n",
+      "model_requests": 0,
+      "dedicated_vm_retired": true,
+      "video_collection_passed": true
+    },
+    {
+      "attempt": 5,
+      "result": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-delivery-live-05/result.json",
+        "sha256": "61b29b5deb9f2b3f850bed6297ae17c46ec59979367b0b1b49b859e9bbbc230f"
+      },
+      "status": "failed",
+      "checks_passed": 7,
+      "delivered": 4,
+      "rejected": 2,
+      "error": "Native entry values did not verify; no input retry",
+      "model_requests": 0,
+      "dedicated_vm_retired": true,
+      "video_collection_passed": true
+    },
+    {
+      "attempt": 6,
+      "result": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-delivery-live-06/result.json",
+        "sha256": "308fcfc80fa1344d89a3ea58ab7fad47d99bb0bdb51602c30fc7f5ea40f5ae6d"
+      },
+      "status": "failed",
+      "checks_passed": 8,
+      "delivered": 5,
+      "rejected": 2,
+      "error": "Native entry values did not verify; no input retry",
+      "model_requests": 0,
+      "dedicated_vm_retired": true,
+      "video_collection_passed": true
+    },
+    {
+      "attempt": 7,
+      "result": {
+        "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-delivery-live-07/result.json",
+        "sha256": "c175b859bca695c1aaba4d9f1bd98a057ff8187450e77d98ed595478c054a920"
+      },
+      "status": "passed",
+      "checks_passed": 13,
+      "delivered": 6,
+      "rejected": 2,
+      "error": null,
+      "model_requests": 0,
+      "dedicated_vm_retired": true,
+      "video_collection_passed": true
+    }
+  ],
+  "actual_vm_qualification": {
+    "passed": true,
+    "checks_passed": 13,
+    "checks": {
+      "aged_native_keyboard_path_exercised": true,
+      "whole_screenshot_changed": true,
+      "actual_unicode_paste_correct": true,
+      "duplicate_returns_saved_receipt_without_input": true,
+      "home_key_moves_native_entry_cursor": true,
+      "focus_fault_rejected_without_key_or_text": true,
+      "clipboard_focus_fault_prevents_paste": true,
+      "recovery_selection_verified_before_paste": true,
+      "recovery_empty_field_verified_before_paste": true,
+      "fresh_capture_recovers_and_pastes_correctly": true,
+      "delivery_unknowns_zero": true,
+      "durable_gateway_receipts_match_inputs": true,
+      "unobserved_completion_not_claimed": true
+    },
+    "delivered": 6,
+    "rejected": 2,
+    "delivery_unknowns": 0,
+    "model_requests": 0,
+    "real_qw3_retest": false,
+    "business_success_claimed": false,
+    "independent_field_values": [
+      "恢复正常 — QW3",
+      ""
+    ],
+    "baseline_rejected_clock_changed_screenshot": true,
+    "age_milliseconds": 63612.8212890625,
+    "baseline_scope": "Readonly exact historical admission using the same aged capture; no baseline input was delivered."
+  },
+  "independent_verification": [
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-delivery-live-07/source-provenance-all-seven.json",
+      "sha256": "e9b912d43f60874d0c55fbf7b75f3ccfbae8b187961539160fa957663c52e3e3"
+    },
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-delivery-live-07/independent-local-verification.json",
+      "sha256": "c0cdd3b6a2e90d56507eac0a77b2f7802a94b5bceb1b0b6091f0dc1ea984c805"
+    },
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-delivery-live-07/independent-video-and-retirement-verification.json",
+      "sha256": "e3d1353757758030fe11541eed67db2e2b4400c1a20d83a41adf53543b844131"
+    }
+  ],
+  "observations": [
+    "Attempts1-4 failed before keyboard input: native window identity and window-manager readiness in the fixture setup. All original records and exact source bytes are retained.",
+    "Attempt5 delivered Ctrl+A to the correct field but did not select all. Independent state showed the recovery text preceding the original text; full qualification remained failed.",
+    "Attempt6 verified HOME/SHIFT+END selection, but native paste inserted beside it. Independent state showed appended recovery text; full qualification remained failed.",
+    "Attempt7 explicitly verified the selection, delivered DELETE and read back an empty field before pasting and independently checking the final value. The private candidate framework remained byte-identical across these attempts."
+  ],
+  "recording": {
+    "video": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-delivery-live-07/continuous.mp4",
+    "seconds": 139.0,
+    "fps": 2,
+    "actual_decoded_frames": 278,
+    "video_sha256": "008251fdaed04d91b43812be126fe657aa7e05d8d503ea436696f7ab6b3c83ea",
+    "scope": "Sampled timeline; held frame intervals are stale, never new observations.",
+    "qualified_for_task_latency_comparison": false
+  },
+  "current_pipeline": {
+    "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/native-keyboard-delivery-final-audit-03/result.json",
+      "sha256": "14cf9b1e64eda2e8ce310002f647172804fd5d352296e93e8352587af0c08ccf"
+    },
+    "sdk_completed": 10,
+    "sdk_fully_accepted": 0,
+    "sdk_fault_response_passed": 4,
+    "sdk_video_collection_passed": 10,
+    "all_ten_result_hashes_verified": true,
+    "all_six_controller_instances_retired": true,
+    "image_trials": 0,
+    "other_successor_trials": 0,
+    "image_admission_diagnostic": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/image-admission-terminal-diagnostic-01/result.json",
+      "sha256": "d97aec37de971d9d38ff9181bc06fcb31f28a7393e6e91dd206d0ea62b698a30"
+    },
+    "image_halt_cause": "Nested terminal admission mixed the historical OFF engine declaration with the common-quota OFF declaration. The only command delta is --kvmem-gpu-memory-ratio 1.0. Static image admission passes; nested mixed admission reproduces the exact halt.",
+    "source_or_budget_changes_observed": false,
+    "other_stages_halted_on_predecessor": true
+  },
+  "limits": [
+    "Controlled fixture qualification is separate from model capability or OSWorld business completion.",
+    "The fixture explicitly publishes its own process property; this is not general toolkit provenance.",
+    "Whole-client pixel checks still reject internal changes and do not solve the Save-button freshness case.",
+    "Historical40 OSWorld results and eight KVMem results are unchanged.",
+    "No original frozen framework, protocol, controller or active helper was changed."
+  ],
+  "remaining": [
+    "Qualify a separate handoff adapter that preserves static source admission while explicitly binds the actual common-quota runtime; restart only zero-trial stages in fresh state directories.",
+    "Run matched QW3 Linux Calc and OSWorld080 tasks with this separately qualified keyboard candidate and original budgets/materials/grades.",
+    "Qualify action-specific Save-control evidence separately; test image history and adaptive thinking without conflating changes."
+  ]
+}
