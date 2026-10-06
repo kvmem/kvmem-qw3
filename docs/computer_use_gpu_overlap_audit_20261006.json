@@ -1,0 +1,218 @@
+{
+  "kind": "readonly_gpu_compute_process_overlap_audit",
+  "recorded_at": "2026-10-06T11:31:37.973894+08:00",
+  "prior_failure_audit": {
+    "path": "/home/chaidi/qw3/docs/computer_use_complex_failure_audit_20261006.json",
+    "sha256": "8dbf32bc5c072f4772a856f67136693874ea28f087ef403e2f5e72262c3b29e9"
+  },
+  "new_model_requests": 0,
+  "new_device_inputs": 0,
+  "signals_sent": 0,
+  "historical_results_changed": false,
+  "trials": [
+    {
+      "id": "004-full-retrievable-r1",
+      "sources": [
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/004-full-retrievable-r1/gpu.csv",
+          "sha256": "5e74fa24961bfa3dc1ef678895b809c36463601f8d683c8b35672c500a5ac433"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/004-full-retrievable-r1/gpu-processes.jsonl",
+          "sha256": "48881e0e9176f59b0baff21f5566bae3ebe01371350c59afd40f24769b03a38f"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/004-full-retrievable-r1/engine-manifest.json",
+          "sha256": "7786549330f1f6370e737fce0b7fe6806ed048175d616822c47b303470716375"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/004-full-retrievable-r1/manifest.json",
+          "sha256": "aa75d31ff3f8338142744e09fad706c4927f45d5c8a447c7225c7202b3131bf1"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/004-full-retrievable-r1/result.json",
+          "sha256": "19d22b3bfa4ae79fe2718d834e659aeede8324ffdfc73ca20d287df0e293f07e"
+        }
+      ],
+      "own_engine_pid": 16687,
+      "gpu_sharing": "spare-capacity",
+      "start_beijing": "2026-10-05T20:37:22.070327+08:00",
+      "end_beijing": "2026-10-05T21:07:23.922320+08:00",
+      "sample_count": 874,
+      "samples_with_other_compute_processes": 874,
+      "other_compute_sample_fraction": 1.0,
+      "maximum_sampling_gap_seconds": 2.303509473800659,
+      "compute_pid_residency": {
+        "3906950": {
+          "samples": 874,
+          "first_at": 1791203842.1266034,
+          "last_at": 1791205638.8585124,
+          "memory_mib_range": [
+            10670,
+            10670
+          ]
+        },
+        "16687": {
+          "samples": 874,
+          "first_at": 1791203842.1266034,
+          "last_at": 1791205638.8585124,
+          "memory_mib_range": [
+            33404,
+            52764
+          ]
+        }
+      },
+      "free_gpu_memory_mib_range": [
+        2941,
+        22301
+      ],
+      "median_total_gpu_util_percent": 100.0,
+      "task_model_requests_serial": true,
+      "model_elapsed_fraction": 0.9738308490898812,
+      "measured_parallel_slowdown": null
+    },
+    {
+      "id": "004-recent-observations-r1",
+      "sources": [
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/004-recent-observations-r1/gpu.csv",
+          "sha256": "9426927e62b6de70e65d3da9679b27634ed5484ad39d0440ebd6e32d84588f3a"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/004-recent-observations-r1/gpu-processes.jsonl",
+          "sha256": "38f6769d5200a1b5b6ac0858916ecd2d1e0e2eec48e262645e57a47b2c50fc05"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/004-recent-observations-r1/engine-manifest.json",
+          "sha256": "9120bfe2dd9473336287a1c1419b3cb38cba552438eed9090d7af4bb3433abf3"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/004-recent-observations-r1/manifest.json",
+          "sha256": "8c91c569f0ae8073f3a8bb25cb7118d7493db57864d54f4354cf5b4767d508a9"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/004-recent-observations-r1/result.json",
+          "sha256": "02a405254db26f1d5a663c26ce30914aa030c4c80a31c5499aff25db12df67dd"
+        }
+      ],
+      "own_engine_pid": 906830,
+      "gpu_sharing": "spare-capacity",
+      "start_beijing": "2026-10-06T09:54:57.461220+08:00",
+      "end_beijing": "2026-10-06T10:24:59.449968+08:00",
+      "sample_count": 868,
+      "samples_with_other_compute_processes": 0,
+      "other_compute_sample_fraction": 0.0,
+      "maximum_sampling_gap_seconds": 2.231773614883423,
+      "compute_pid_residency": {
+        "906830": {
+          "samples": 868,
+          "first_at": 1791251697.520598,
+          "last_at": 1791253494.3490386,
+          "memory_mib_range": [
+            33404,
+            52924
+          ]
+        }
+      },
+      "free_gpu_memory_mib_range": [
+        44305,
+        63825
+      ],
+      "median_total_gpu_util_percent": 100.0,
+      "task_model_requests_serial": true,
+      "model_elapsed_fraction": 0.9555750093760246,
+      "measured_parallel_slowdown": null
+    },
+    {
+      "id": "013-recent-observations-r1",
+      "sources": [
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/013-recent-observations-r1/gpu.csv",
+          "sha256": "43fa6872a0fd022ea49eafb7849885b961fbc58dc41d2fcdc9fcb6891b875f0d"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/013-recent-observations-r1/gpu-processes.jsonl",
+          "sha256": "17e0b8924cf282b76131cd6aab2a5a8c25957fb284fb74aeb9f2787ef3d9d702"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/013-recent-observations-r1/engine-manifest.json",
+          "sha256": "e528e7a7399853407724f6f4979146c9177abea56fa4a72547ee2e69eb14ceed"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/013-recent-observations-r1/manifest.json",
+          "sha256": "b88899487bf81109ed74f7b9f48e7d830113ec5386400dc4ca0e77aed7009ee5"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/013-recent-observations-r1/result.json",
+          "sha256": "42981c7ea4fdd41957faa77529ed906831d8e3e473ca81fc82422964a1a55e4b"
+        }
+      ],
+      "own_engine_pid": 969193,
+      "gpu_sharing": "spare-capacity",
+      "start_beijing": "2026-10-06T10:27:52.851964+08:00",
+      "end_beijing": "2026-10-06T10:57:56.281139+08:00",
+      "sample_count": 870,
+      "samples_with_other_compute_processes": 544,
+      "other_compute_sample_fraction": 0.6252873563218391,
+      "maximum_sampling_gap_seconds": 2.5054779052734375,
+      "compute_pid_residency": {
+        "969193": {
+          "samples": 870,
+          "first_at": 1791253672.9017274,
+          "last_at": 1791255470.982181,
+          "memory_mib_range": [
+            33404,
+            52944
+          ]
+        },
+        "984264": {
+          "samples": 84,
+          "first_at": 1791254049.1925778,
+          "last_at": 1791254220.4772751,
+          "memory_mib_range": [
+            602,
+            7572
+          ]
+        },
+        "999640": {
+          "samples": 460,
+          "first_at": 1791254520.1486764,
+          "last_at": 1791255470.982181,
+          "memory_mib_range": [
+            708,
+            8138
+          ]
+        }
+      },
+      "free_gpu_memory_mib_range": [
+        7759,
+        63825
+      ],
+      "median_total_gpu_util_percent": 100.0,
+      "task_model_requests_serial": true,
+      "model_elapsed_fraction": 0.9389909114652176,
+      "measured_parallel_slowdown": null
+    }
+  ],
+  "independent_benchmark_identity": {
+    "pid": 999640,
+    "source": {
+      "path": "/home/chaidi/qw3/benchmark/qw3_memory_recall_20261006/server-identity.json",
+      "sha256": "967333977712c58bca98f565764a94073efe97bdbf5cb9356763c957260b4f2e"
+    },
+    "benchmark_directory": "/home/chaidi/qw3/benchmark/qw3_memory_recall_20261006",
+    "historical_record_at": "2026-10-06T10:43:19.761713+08:00",
+    "known_identity_for_other_pids": false
+  },
+  "limits": [
+    "GPU compute process residency records establish simultaneous GPU context/memory usage, not per-process GPU activity or a measured throughput loss.",
+    "GPU samples are approximately two seconds apart; short or unreported graphics/CPU activity is not excluded.",
+    "Input sizes, generated outputs, actions and image policies differ; the three task latencies are not an isolated contention comparison.",
+    "Own seven computer-use cohort controllers serialize model trials; waiting controllers do not imply seven concurrent model workloads.",
+    "The launcher admits spare GPU memory and serializes owned computer-use engines; this does not reserve GPU compute capacity against independent benchmarks.",
+    "The previous backend-time fractions remain valid observations, but cannot attribute slow requests exclusively to thinking or context processing.",
+    "Functional field-name, step-state and coordinate errors remain directly observed independently of GPU competition."
+  ],
+  "recommended_latency_evaluation": "Run the same retained short/medium/long requests under a quiet GPU window and a documented shared window, keeping model, context, image and cache settings fixed; measure first output, output rate and total request time separately. Preserve current frozen trials and tag shared-resource samples.",
+  "passed": true
+}
