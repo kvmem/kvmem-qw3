@@ -5,8 +5,17 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import time
 
 PINNED_VERSION = "0.159.2"
+RPC_MESSAGE_LIMIT = 16 * 1024 * 1024
+
+
+class CodexTransportError(RuntimeError):
+    def __init__(self, code, message):
+        self.code = code
+        super().__init__(message)
+
 INSTRUCTIONS = """You are a local desktop assistant. Operate only the selected
 desktop using the computer tools. Observe before acting and verify the resulting
 screen. Use the latest observation ID and the exact displayed desktop ID.
@@ -41,12 +50,17 @@ than repeating actions without progress. Host shell tools are unavailable.
 """
 
 
-def write_config(runtime, bridge_url, mcp_command=None, mcp_args=(), *, thinking=False, software=False, workflow=False, context_window=1048576):
+def write_config(runtime, bridge_url, mcp_command=None, mcp_args=(), *, thinking=False, software=False, workflow=False, targets=False, context_window=1048576):
     if type(context_window) is not int or not 4096<=context_window<=16777216:
         raise ValueError('Invalid backend context window')
     runtime = Path(runtime).resolve()
     runtime.mkdir(parents=True, exist_ok=True)
     instructions = INSTRUCTIONS
+    if targets:
+        instructions += ("\nFor an intended application transition prefer computer target operation=ensure_app with an advertised app alias "
+            "and a fresh transition_id. The tool sends at most one launch and performs bounded foreground checks. "
+            "It does not select a particular document or verify field focus. After a state_only reply, observe before input. Inspect its current target facts before typing. "
+            "A failed transition needs diagnosis, not another launch with a different ID. Unsupported target operations are unavailable.\n")
     if workflow:
         instructions += ("\nVerified execution mode: for a desktop action supply step={goal,conditions} alongside action, "
             "using the current observation IDs. This performs input and records the expected result in ONE call. "
@@ -145,7 +159,7 @@ command = {json.dumps(str(mcp_command))}
 args = {json.dumps(list(mcp_args))}
 startup_timeout_sec = 20
 tool_timeout_sec = 30
-enabled_tools = {json.dumps(["observe", "act"] + (["software"] if software else []) + (["workflow"] if workflow else []))}
+enabled_tools = {json.dumps(["observe", "act"] + (["target"] if targets else []) + (["software"] if software else []) + (["workflow"] if workflow else []))}
 default_tools_approval_mode = "approve"
 '''
     (runtime / "config.toml").write_text(config, encoding="utf-8")
@@ -160,6 +174,8 @@ class CodexClient:
         self.next_id = 0
         self.pending = {}
         self.events = asyncio.Queue()
+        self.reader_error = None
+        self.last_message_bytes = 0
 
     async def start(self):
         check = await asyncio.create_subprocess_exec(self.binary, "--version",
@@ -179,19 +195,22 @@ class CodexClient:
         self.proc = await asyncio.create_subprocess_exec(
             self.binary, "app-server", "--listen", "stdio://", env=env, cwd=self.runtime,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=self.log,
-            limit=16 * 1024 * 1024)
+            limit=RPC_MESSAGE_LIMIT)
         self.reader = asyncio.create_task(self._read())
         await self.rpc("initialize", {"clientInfo": {"name": "qw3_computer", "version": "0.1.0"}})
         await self._send({"method": "initialized"})
         return self
 
     async def _send(self, message):
+        if self.reader_error:
+            raise self.reader_error
         self.proc.stdin.write((json.dumps(message) + "\n").encode())
         await self.proc.stdin.drain()
 
     async def _read(self):
         try:
             async for line in self.proc.stdout:
+                self.last_message_bytes = len(line)
                 message = json.loads(line)
                 if "id" in message and "method" not in message:
                     pending = self.pending.pop(message["id"], None)
@@ -208,12 +227,28 @@ class CodexClient:
                     await self.events.put(message)
                 else:
                     await self.events.put(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            code = ("message_too_large" if isinstance(exc, ValueError) and "exceed the limit" in str(exc)
+                    else "invalid_json" if isinstance(exc, json.JSONDecodeError) else "reader_failed")
+            self.reader_error = CodexTransportError(code, "Codex transport failed: " + code)
+            # Record transport facts only, never screenshot bytes or model text.
+            record = {"code": code, "exception_type": type(exc).__name__,
+                      "message_limit_bytes": RPC_MESSAGE_LIMIT,
+                      "last_complete_message_bytes": self.last_message_bytes, "at": time.time()}
+            path = self.runtime / "transport-errors.jsonl"
+            with contextlib.suppress(OSError):
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                with os.fdopen(fd, "a") as out:
+                    out.write(json.dumps(record) + "\n")
         finally:
+            error = self.reader_error or CodexTransportError("disconnected", "Codex app-server disconnected")
             for future in self.pending.values():
                 if not future.done():
-                    future.set_exception(RuntimeError("Codex app-server disconnected"))
+                    future.set_exception(error)
             self.pending.clear()
-            await self.events.put({"method": "app/disconnected"})
+            await self.events.put({"method": "app/disconnected", "params": {"code": error.code}})
 
     async def rpc(self, method, params, timeout=30):
         self.next_id += 1

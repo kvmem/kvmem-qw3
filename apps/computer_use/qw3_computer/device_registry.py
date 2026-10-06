@@ -20,8 +20,8 @@ def load_registry(path):
         id = item["id"]
         if not isinstance(id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", id) or id in devices:
             raise ValueError("Device identity is invalid or repeated")
-        if item["platform"] not in {"windows", "linux", "android"}:
-            raise ValueError("This release supports Windows, Linux and Android adapters")
+        if item["platform"] not in {"windows", "linux", "android", "macos"}:
+            raise ValueError("Supported adapters are Windows, Linux, Android and the opt-in macOS gateway")
         if not isinstance(item["label"], str) or not 1 <= len(item["label"]) <= 100:
             raise ValueError("Device label must contain 1..100 characters")
         url = urlparse(item["endpoint"])

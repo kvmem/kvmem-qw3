@@ -71,6 +71,20 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(second['duplicate'])
         self.assertIsNone(first['verification']['passed'])
 
+    async def test_receipt_only_dispatch_is_confirmed_before_an_expensive_or_failed_observation(self):
+        self.driver.mode='invalid_observation'
+        request=self.action()
+        result=await self.gateway.act(request,capture_after_input=False)
+        self.assertTrue(result['observation_pending'])
+        self.assertEqual(result['delivery'],'delivered')
+        self.assertNotIn('observation',result)
+        self.assertIsNone(self.gateway.latest)
+        self.assertEqual(self.gateway.receipt(request['action_id'])['status'],'completed')
+        with self.assertRaises(ValueError):await self.gateway.observe()
+        duplicate=await self.gateway.act(request,capture_after_input=False)
+        self.assertTrue(duplicate['duplicate']);self.assertEqual(self.driver.effects,1)
+
+
     async def test_bad_post_input_capture_keeps_uncertain_not_rejected(self):
         self.driver.mode = 'invalid_observation'
         request = self.action()

@@ -46,6 +46,18 @@ func axRect(_ element: AXUIElement) -> CGRect? {
     return CGRect(origin: position, size: size)
 }
 
+func scopedForeground(_ foreground: Object, apps: Set<String>, prefixes: [String], expiresAt: Double? = nil) -> Bool {
+    if let deadline = expiresAt, Date().timeIntervalSince1970 >= deadline { return false }
+    guard let app = foreground["process"] as? String, apps.contains(app),
+          let title = foreground["title"] as? String else { return false }
+    if prefixes.contains(where: { title.hasPrefix($0) }) { return true }
+    guard title.isEmpty, let parent = foreground["scope_parent"] as? Object,
+          ["AXParent", "AXWindow", "AXSheets"].contains(parent["relation"] as? String ?? ""),
+          integer(parent["pid"]) == integer(foreground["pid"]), integer(parent["pid"]) != nil,
+          let parentTitle = parent["title"] as? String, !parentTitle.isEmpty else { return false }
+    return prefixes.contains { parentTitle.hasPrefix($0) }
+}
+
 struct Display {
     let id: CGDirectDisplayID
     let bounds: CGRect
@@ -62,12 +74,14 @@ struct Capture {
     let display: Display
     let foreground: Object
     let timestamp: Date
+    let focusedIdentity: String?
 }
 
 final class Agent: NSObject, NSApplicationDelegate {
     let root: URL; let token: String; let port: UInt16
     let session = UUID().uuidString
     let permittedApps: Set<String>; let windowPrefixes: [String]
+    let scopeExpiresAt: Double?
     var paused = true
     var owner: String?; var heartbeat = Date.distantPast
     var latest: Capture?
@@ -78,10 +92,14 @@ final class Agent: NSObject, NSApplicationDelegate {
     var timer: Timer?
     var listenerReady = false
     var inputInFlight = false
+    var windowTargets: [String: (AXUIElement, pid_t, String)] = [:]
+    var controlTargets: [String: (AXUIElement, pid_t, String)] = [:]
+    let appAliases = ["notepad": "com.apple.TextEdit", "terminal": "com.apple.Terminal", "installer": "com.apple.installer"]
 
-    init(root: URL, token: String, port: UInt16, permittedApps: [String], prefixes: [String]) {
+    init(root: URL, token: String, port: UInt16, permittedApps: [String], prefixes: [String], expiresAt: Double? = nil) {
         self.root = root; self.token = token; self.port = port
         self.permittedApps = Set(permittedApps); self.windowPrefixes = prefixes
+        self.scopeExpiresAt = expiresAt
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
         do {
@@ -130,6 +148,9 @@ final class Agent: NSObject, NSApplicationDelegate {
         if lockFD >= 0 { Darwin.close(lockFD) }
     }
     func expireOwner() {
+        if let deadline = scopeExpiresAt, Date().timeIntervalSince1970 >= deadline {
+            paused = true; latest = nil
+        }
         if owner != nil && Date().timeIntervalSince(heartbeat) > 120 {
             paused = true; owner = nil; latest = nil
         }
@@ -142,12 +163,57 @@ final class Agent: NSObject, NSApplicationDelegate {
             "listener_ready": listenerReady,
             "ax_trusted": AXIsProcessTrusted(), "screen_capture_allowed": CGPreflightScreenCaptureAccess(),
             "synthetic_actions": inputs, "captures": captures, "timestamp": Date().timeIntervalSince1970,
-            "pointer": ["x": point.x, "y": point.y], "supported_actions": ["click", "type", "key", "scroll", "open_app"],
-            "allowed_apps": Array(permittedApps).sorted(), "allowed_window_prefixes": windowPrefixes]
+            "pointer": ["x": point.x, "y": point.y], "supported_actions": ["click", "type", "key", "scroll", "open_app", "activate_window", "focus_control"],
+            "native_features": ["lightweight_state", "native_app_activation", "observation_window_refs", "focused_control_identity"],
+            "allowed_apps": Array(permittedApps).sorted(), "allowed_window_prefixes": windowPrefixes,
+            "scope_expires_at": scopeExpiresAt.map { $0 as Any } ?? NSNull()]
     }
     func writeStatus() throws {
         statusItem?.button?.title = paused ? "QW3 ∥" : "QW3 ▶"
         try atomicJSON(status(), root.appendingPathComponent("status.json"))
+    }
+    func appIdentity(_ app: NSRunningApplication) -> String {
+        "\(session):\(app.processIdentifier):\(app.launchDate?.timeIntervalSince1970 ?? -1)"
+    }
+    func elementIdentity(_ element: AXUIElement, _ app: NSRunningApplication) -> String {
+        appIdentity(app) + ":" + String(CFHash(element))
+    }
+    func focusedControl(_ fg: Object) -> Object? {
+        guard inScope(fg), let pid = integer(fg["pid"]),
+              let running = NSRunningApplication(processIdentifier: pid_t(pid)) else { return nil }
+        let app = AXUIElementCreateApplication(pid_t(pid)); AXUIElementSetMessagingTimeout(app, 0.2)
+        guard let raw = attribute(app, kAXFocusedUIElementAttribute), CFGetTypeID(raw) == AXUIElementGetTypeID() else { return nil }
+        let element = unsafeBitCast(raw, to: AXUIElement.self)
+        let role = attribute(element, kAXRoleAttribute) as? String ?? ""
+        let subrole = attribute(element, kAXSubroleAttribute) as? String ?? ""
+        let secure = role.lowercased().contains("secure") || subrole.lowercased().contains("secure")
+        return ["identity": elementIdentity(element, running), "kind": role, "secure": secure]
+    }
+    func currentState() throws -> Object {
+        expireOwner()
+        guard AXIsProcessTrusted() else { try reject("Mac accessibility permission is unavailable") }
+        let fg = foreground()
+        return status().merging(["foreground": fg, "focused_control": focusedControl(fg) as Any? ?? NSNull(),
+                                "foreground_in_scope": inScope(fg)]) { _, value in value }
+    }
+    func scopedWindows() -> [Object] {
+        windowTargets = [:]
+        var result: [Object] = []
+        for running in NSWorkspace.shared.runningApplications where permittedApps.contains(running.bundleIdentifier ?? "") {
+            let app = AXUIElementCreateApplication(running.processIdentifier); AXUIElementSetMessagingTimeout(app, 0.2)
+            guard let windows = attribute(app, kAXWindowsAttribute) as? [AXUIElement] else { continue }
+            for window in windows.prefix(24) {
+                let title = attribute(window, kAXTitleAttribute) as? String ?? ""
+                guard !title.isEmpty, windowPrefixes.contains(where: { title.hasPrefix($0) }) else { continue }
+                let reference = "win_" + UUID().uuidString
+                windowTargets[reference] = (window, running.processIdentifier, appIdentity(running))
+                result.append(["window_ref": reference, "identity": elementIdentity(window, running),
+                    "application_identity": appIdentity(running), "process": running.bundleIdentifier ?? "",
+                    "pid": Int(running.processIdentifier), "title": title,
+                    "minimized": attribute(window, kAXMinimizedAttribute) as? Bool ?? false])
+            }
+        }
+        return result
     }
     func foreground() -> Object {
         guard let app = NSWorkspace.shared.frontmostApplication else { return ["process": "", "title": "", "pid": 0] }
@@ -157,6 +223,8 @@ final class Agent: NSObject, NSApplicationDelegate {
         let window = raw.flatMap { CFGetTypeID($0) == AXUIElementGetTypeID() ? unsafeBitCast($0, to: AXUIElement.self) : nil }
         let title = window.flatMap { attribute($0, kAXTitleAttribute) as? String } ?? ""
         var result: Object = ["process": app.bundleIdentifier ?? "", "title": title, "pid": Int(app.processIdentifier)]
+        result["instance_id"] = appIdentity(app)
+        if let window = window { result["window_identity"] = elementIdentity(window, app) }
         if let rect = window.flatMap(axRect) {
             result["bounds"] = ["x": rect.minX, "y": rect.minY, "width": rect.width, "height": rect.height]
             if let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [Object] {
@@ -171,13 +239,52 @@ final class Agent: NSObject, NSApplicationDelegate {
                 result["handle"] = match?[kCGWindowNumber as String]
             }
         }
+        if title.isEmpty, let focused = window, permittedApps.contains(app.bundleIdentifier ?? ""),
+           let parent = scopeParent(focused, application: element, pid: app.processIdentifier) {
+            result["scope_parent"] = parent
+        }
         return result
     }
+    func scopeParent(_ focused: AXUIElement, application: AXUIElement, pid: pid_t) -> Object? {
+        func evidence(_ candidate: AXUIElement, relation: String) -> Object? {
+            var candidatePID: pid_t = 0
+            guard !CFEqual(candidate, focused), AXUIElementGetPid(candidate, &candidatePID) == .success,
+                  candidatePID == pid, attribute(candidate, kAXRoleAttribute) as? String == kAXWindowRole,
+                  let title = attribute(candidate, kAXTitleAttribute) as? String, !title.isEmpty,
+                  windowPrefixes.contains(where: { title.hasPrefix($0) }) else { return nil }
+            var result: Object = ["title": title, "pid": Int(pid), "relation": relation]
+            if let running = NSRunningApplication(processIdentifier: pid) {
+                result["window_identity"] = elementIdentity(candidate, running)
+            }
+            return result
+        }
+        let role = attribute(focused, kAXRoleAttribute) as? String ?? ""
+        let subrole = attribute(focused, kAXSubroleAttribute) as? String ?? ""
+        guard role == kAXSheetRole || subrole == kAXDialogSubrole else { return nil }
+        if let raw = attribute(focused, kAXWindowAttribute), CFGetTypeID(raw) == AXUIElementGetTypeID(),
+           let result = evidence(unsafeBitCast(raw, to: AXUIElement.self), relation: "AXWindow") { return result }
+        var ancestor = focused
+        for _ in 0..<6 {
+            guard let raw = attribute(ancestor, kAXParentAttribute), CFGetTypeID(raw) == AXUIElementGetTypeID() else { break }
+            ancestor = unsafeBitCast(raw, to: AXUIElement.self)
+            if let result = evidence(ancestor, relation: "AXParent") { return result }
+        }
+        // A focused sheet may not report its enclosing window via AXParent.
+        // Require the application to declare that exact sheet on a scoped window.
+        if let windows = attribute(application, kAXWindowsAttribute) as? [AXUIElement] {
+            for candidate in windows.prefix(24) {
+                guard let sheets = attribute(candidate, "AXSheets") as? [AXUIElement],
+                      sheets.contains(where: { CFEqual($0, focused) }) else { continue }
+                if let result = evidence(candidate, relation: "AXSheets") { return result }
+            }
+        }
+        return nil
+    }
     func inScope(_ fg: Object) -> Bool {
-        guard let app = fg["process"] as? String, let title = fg["title"] as? String else { return false }
-        return permittedApps.contains(app) && windowPrefixes.contains { title.hasPrefix($0) }
+        scopedForeground(fg, apps: permittedApps, prefixes: windowPrefixes, expiresAt: scopeExpiresAt)
     }
     func accessibility(_ fg: Object, _ display: Display) -> Object {
+        controlTargets = [:]
         guard AXIsProcessTrusted(), inScope(fg), let pid = integer(fg["pid"]) else {
             return ["status": "outside_task_scope", "controls": [Object](), "scope": "foreground_window"]
         }
@@ -204,12 +311,20 @@ final class Agent: NSObject, NSApplicationDelegate {
                     let name = (attribute(element, kAXTitleAttribute) as? String)
                         ?? (attribute(element, kAXDescriptionAttribute) as? String) ?? role
                     let value = attribute(element, kAXValueAttribute) as? String ?? ""
-                    controls.append(["kind": role, "name": String(name.prefix(1024)), "value": String(value.prefix(4096)),
+                    var control: Object = ["kind": role, "name": String(name.prefix(1024)), "value": String(value.prefix(4096)),
                         "x": Int((rect.minX - display.bounds.minX) * CGFloat(display.width) / display.bounds.width),
                         "y": Int((rect.minY - display.bounds.minY) * CGFloat(display.height) / display.bounds.height),
                         "width": Int(rect.width * CGFloat(display.width) / display.bounds.width),
                         "height": Int(rect.height * CGFloat(display.height) / display.bounds.height),
-                        "center_x": Int(x), "center_y": Int(y)])
+                        "center_x": Int(x), "center_y": Int(y)]
+                    if let running = NSRunningApplication(processIdentifier: pid_t(pid)) {
+                        let reference = "ax_" + UUID().uuidString
+                        control["native_ref"] = reference
+                        control["native_identity"] = elementIdentity(element, running)
+                        control["states"] = ["focused": attribute(element, kAXFocusedAttribute) as? Bool ?? false]
+                        controlTargets[reference] = (element, pid_t(pid), appIdentity(running))
+                    }
+                    controls.append(control)
                 }
             }
             if depth < 12, let children = attribute(element, kAXChildrenAttribute) as? [AXUIElement] {
@@ -244,10 +359,13 @@ final class Agent: NSObject, NSApplicationDelegate {
         guard AXIsProcessTrusted() else { try reject("Mac accessibility permission is not granted to the executor") }
         let before = foreground(); let (data, display) = try captureImage()
         let ax = accessibility(before, display); let after = foreground()
+        let windows = scopedWindows()
+        let focused = focusedControl(after)
         let idCapture = UUID().uuidString
-        latest = Capture(id: idCapture, display: display, foreground: after, timestamp: Date())
+        latest = Capture(id: idCapture, display: display, foreground: after, timestamp: Date(), focusedIdentity: focused?["identity"] as? String)
         return ["png": data.base64EncodedString(), "foreground": after, "geometry": display.metadata,
             "native_capture_id": idCapture, "native_session_id": session, "device_paused": paused,
+            "windows": windows, "focused_control": focused as Any? ?? NSNull(),
             "accessibility": NSDictionary(dictionary: before).isEqual(to: after) ? ax : ["status": "foreground_changed", "controls": [Object]()]]
     }
     func assertOwner(_ body: Object) throws {
@@ -267,13 +385,45 @@ final class Agent: NSObject, NSApplicationDelegate {
               CGDisplayCopyDisplayMode(capture.display.id)?.pixelWidth == capture.display.modeWidth,
               CGDisplayCopyDisplayMode(capture.display.id)?.pixelHeight == capture.display.modeHeight,
               CGDisplayRotation(capture.display.id) == 0 else { try reject("Display geometry changed") }
-        if action["kind"] as? String != "open_app" {
+        if !["open_app", "activate_window"].contains(action["kind"] as? String ?? "") {
             let now = foreground()
             guard NSDictionary(dictionary: now).isEqual(to: capture.foreground) else { try reject("Foreground changed; no input sent") }
             guard inScope(now) else { try reject("Foreground application or window is outside the allowed task scope") }
             guard integer(now["handle"]) != nil else { try reject("Focused window identity is unavailable") }
+            if ["type", "key"].contains(action["kind"] as? String ?? ""), let pid = integer(now["pid"]) {
+                if let expected = capture.focusedIdentity, focusedControl(now)?["identity"] as? String != expected {
+                    try reject("Focused control changed; no keyboard input sent")
+                }
+                let app = AXUIElementCreateApplication(pid_t(pid))
+                if let raw = attribute(app, kAXFocusedUIElementAttribute), CFGetTypeID(raw) == AXUIElementGetTypeID() {
+                    let focused = unsafeBitCast(raw, to: AXUIElement.self)
+                    let role = attribute(focused, kAXRoleAttribute) as? String ?? ""
+                    let subrole = attribute(focused, kAXSubroleAttribute) as? String ?? ""
+                    if role.lowercased().contains("secure") || subrole.lowercased().contains("secure") {
+                        try reject("Human authentication required; no synthetic keyboard input sent")
+                    }
+                }
+            }
         }
         return capture
+    }
+    func checkedTarget(_ action: Object) throws -> (AXUIElement, NSRunningApplication) {
+        let isWindow = action["kind"] as? String == "activate_window"
+        let reference = action[isWindow ? "window_ref" : "control_ref"] as? String ?? ""
+        guard let target = (isWindow ? windowTargets : controlTargets)[reference],
+              let running = NSRunningApplication(processIdentifier: target.1), appIdentity(running) == target.2,
+              permittedApps.contains(running.bundleIdentifier ?? "") else { try reject("Native target identity is stale") }
+        if isWindow {
+            guard let title = attribute(target.0, kAXTitleAttribute) as? String,
+                  windowPrefixes.contains(where: { title.hasPrefix($0) }) else { try reject("Target window left the task scope") }
+        } else {
+            let role = attribute(target.0, kAXRoleAttribute) as? String ?? ""
+            guard [kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole].contains(role) else { try reject("Only editable nonsecure controls support explicit focus") }
+            var settable = DarwinBoolean(false)
+            guard AXUIElementIsAttributeSettable(target.0, kAXFocusedAttribute as CFString, &settable) == .success,
+                  settable.boolValue else { try reject("Control focus is not settable") }
+        }
+        return (target.0, running)
     }
     func events(_ action: Object, _ capture: Capture) throws -> [CGEvent] {
         let source = CGEventSource(stateID: .hidSystemState)
@@ -344,24 +494,41 @@ final class Agent: NSObject, NSApplicationDelegate {
         let capture = try checkCapture(body, action)
         let kind = action["kind"] as? String
         var app: NSRunningApplication?
+        var nativeTarget: (AXUIElement, NSRunningApplication)?
         var plan: [CGEvent] = []
         if kind == "open_app" {
-            guard action["app"] as? String == "notepad", permittedApps.contains("com.apple.TextEdit"),
-                  let running = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.TextEdit" }) else {
-                try reject("Only the prepared TextEdit test application can be activated")
+            guard let alias = action["app"] as? String, let bundle = appAliases[alias], permittedApps.contains(bundle),
+                  let running = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundle }) else {
+                try reject("The declared task application is not running; reviewed launch preparation is required")
             }
             app = running
-        } else { plan = try events(action, capture) }
+        } else if kind == "activate_window" || kind == "focus_control" { nativeTarget = try checkedTarget(action) }
+        else { plan = try events(action, capture) }
         // All checks and event allocation finish before a durable reservation.
         try atomicJSON(["request_id": id, "status": "dispatching", "session_id": session, "action": action,
             "capture_id": capture.id, "reserved_at": Date().timeIntervalSince1970], receipt)
         inputInFlight = true
         defer { inputInFlight = false }
-        do { _ = try checkCapture(body, action) } catch {
+        do {
+            _ = try checkCapture(body, action)
+            if nativeTarget != nil { nativeTarget = try checkedTarget(action) }
+        } catch {
             try atomicJSON(["request_id": id, "status": "rejected", "delivery": "rejected", "reason": String(describing: error)], receipt)
             throw error
         }
-        if let application = app {
+        if let target = nativeTarget {
+            let success: Bool
+            if kind == "activate_window" {
+                success = target.1.activate(options: [.activateIgnoringOtherApps])
+                    && AXUIElementPerformAction(target.0, kAXRaiseAction as CFString) == .success
+            } else {
+                success = AXUIElementSetAttributeValue(target.0, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success
+            }
+            if !success {
+                let result: Object = ["request_id": id, "status": "uncertain", "delivery": "uncertain", "reason": "Native target transition result unknown"]
+                paused = true; latest = nil; try atomicJSON(result, receipt); return result
+            }
+        } else if let application = app {
             guard application.activate(options: [.activateIgnoringOtherApps]) else {
                 let result: Object = ["request_id": id, "status": "uncertain", "delivery": "uncertain", "reason": "App activation result unknown"]
                 paused = true; try atomicJSON(result, receipt); return result
@@ -374,7 +541,9 @@ final class Agent: NSObject, NSApplicationDelegate {
                     let now = foreground()
                     if paused || integer(now["handle"]) != integer(capture.foreground["handle"])
                         || integer(now["pid"]) != integer(capture.foreground["pid"]) || !inScope(now)
-                        || CGDisplayBounds(capture.display.id) != capture.display.bounds {
+                        || CGDisplayBounds(capture.display.id) != capture.display.bounds
+                        || (["type", "key"].contains(kind ?? "") && capture.focusedIdentity != nil
+                            && focusedControl(now)?["identity"] as? String != capture.focusedIdentity) {
                         if index == 0 {
                             try atomicJSON(["request_id": id, "status": "rejected", "delivery": "rejected"], receipt)
                             try reject("Paused or focused window changed immediately before input")
@@ -396,6 +565,7 @@ final class Agent: NSObject, NSApplicationDelegate {
     func route(_ method: String, _ path: String, _ body: Object) throws -> Object {
         switch (method, path) {
         case ("GET", "/status"): expireOwner(); return status()
+        case ("GET", "/state"): return try currentState()
         case ("GET", "/observe"): return try observe()
         case ("GET", "/frame"): return try frame()
         case ("POST", "/request_permissions"):
@@ -418,7 +588,8 @@ final class Agent: NSObject, NSApplicationDelegate {
             guard !inputInFlight else { try reject("Input is in progress") }
             try assertOwner(body); guard let action = body["action"] as? Object else { try reject("Missing action") }
             let capture = try checkCapture(body, action)
-            if action["kind"] as? String != "open_app" { _ = try events(action, capture) }
+            if ["activate_window", "focus_control"].contains(action["kind"] as? String ?? "") { _ = try checkedTarget(action) }
+            else if action["kind"] as? String != "open_app" { _ = try events(action, capture) }
             return ["delivery": "not_sent", "ready": true]
         case ("POST", "/act"): return try act(body)
         default:
@@ -517,6 +688,14 @@ if CommandLine.arguments.contains("--self-test") {
     checks["fractional-coordinate-rejected"] = integer(1.5) == nil
     checks["ctrl-is-command"] = (try? keySpec("CTRL+S").1) == .maskCommand
     checks["android-key-rejected"] = (try? keySpec("ANDROID_BACK")) == nil
+    let blank: Object = ["process": "com.apple.installer", "title": "", "pid": 17]
+    let apps: Set<String> = ["com.apple.installer"]
+    let prefixes = ["Install Python"]
+    let parent: Object = ["title": "Install Python", "pid": 17, "relation": "AXSheets"]
+    checks["blank-unrelated-dialog-rejected"] = !scopedForeground(blank, apps: apps, prefixes: prefixes)
+    checks["declared-sheet-inherits-parent-scope"] = scopedForeground(blank.merging(["scope_parent": parent]) { _,v in v }, apps: apps, prefixes: prefixes)
+    checks["other-process-parent-rejected"] = !scopedForeground(blank.merging(["scope_parent": parent.merging(["pid": 18]) { _,v in v }]) { _,v in v }, apps: apps, prefixes: prefixes)
+    checks["expired-task-scope-rejected"] = !scopedForeground(["process": "com.apple.installer", "title": "Install Python", "pid": 17], apps: apps, prefixes: prefixes, expiresAt: 1)
     print(String(data: try jsonData(["checks": checks, "passed": checks.values.allSatisfy { $0 }, "posted_events": 0]), encoding: .utf8)!)
     exit(checks.values.allSatisfy { $0 } ? 0 : 1)
 }
@@ -531,7 +710,14 @@ do {
     guard token.count >= 32, let port = integer(config["port"]), let value = UInt16(exactly: port),
           let allowed = config["allowed_apps"] as? [String], let prefixes = config["window_prefixes"] as? [String],
           !allowed.isEmpty, !prefixes.isEmpty, prefixes.allSatisfy({ !$0.isEmpty }) else { try reject("Invalid Mac test configuration") }
-    let delegate = Agent(root: root, token: token, port: value, permittedApps: allowed, prefixes: prefixes)
+    var deadline: Double?
+    if let raw = config["scope_expires_at"] {
+        guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite else {
+            try reject("Invalid task scope expiry")
+        }
+        deadline = number.doubleValue
+    }
+    let delegate = Agent(root: root, token: token, port: value, permittedApps: allowed, prefixes: prefixes, expiresAt: deadline)
     app.delegate = delegate
     withExtendedLifetime(delegate) { app.run() }
 } catch { fputs("QW3 native configuration unavailable: \(error)\n", stderr); exit(1) }

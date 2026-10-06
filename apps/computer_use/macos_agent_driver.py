@@ -11,6 +11,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import time
 from urllib.parse import urlparse
 import uuid
@@ -23,7 +24,7 @@ from qw3_computer.device_protocol import capabilities
 
 
 class MacDriver:
-    def __init__(self, endpoint, device_id, token_path, runtime):
+    def __init__(self, endpoint, device_id, token_path, runtime, *, activation_connection=None):
         parsed = urlparse(endpoint)
         if parsed.scheme != 'http' or parsed.hostname not in {'127.0.0.1', 'localhost'} or parsed.username:
             raise ValueError('The Mac API must use a local SSH-forwarded HTTP endpoint')
@@ -41,6 +42,19 @@ class MacDriver:
         self.session = None
         self.heartbeat_task = None
         self.lease_error = None
+        self.activation = None
+        self.native_features = set()
+        self.launch_apps = {
+            'terminal': ('com.apple.Terminal', '/System/Applications/Utilities/Terminal.app'),
+            'installer': ('com.apple.installer', '/System/Library/CoreServices/Installer.app'),
+        }
+        if activation_connection is not None:
+            connection = json.loads(Path(activation_connection).read_text())
+            if connection['endpoint'].rstrip('/') != self.endpoint or connection['device_id'] != device_id:
+                raise ValueError('Mac activation metadata must identify the same native device and endpoint')
+            if not re.fullmatch(r'[a-z_][a-z0-9_-]*', connection['user']) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.:-]*', connection['host']):
+                raise ValueError('Invalid owner SSH target')
+            self.activation = connection
         self.capabilities = capabilities('macos') | {
             'implemented': True, 'actions': ['click', 'type', 'key', 'scroll', 'open_app'],
             'accessibility': 'AXUIElement', 'transport': 'native-macos-ssh-forwarded-loopback',
@@ -74,6 +88,27 @@ class MacDriver:
             if status.get('protocol') != 'qw3-macos-native/1' or not status.get('paused'):
                 raise RuntimeError('Unexpected native protocol or unpaused claim')
             self.native_session = status['session_id']
+            self.native_features = set(status.get('native_features', []))
+            allowed = status.get('allowed_apps', ['com.apple.TextEdit'])
+            aliases = ['notepad'] if 'com.apple.TextEdit' in allowed else []
+            processes = {'notepad': ['com.apple.TextEdit']} if aliases else {}
+            if self.activation or 'native_app_activation' in self.native_features:
+                for alias, (bundle, _) in self.launch_apps.items():
+                    if bundle in allowed:
+                        aliases.append(alias); processes[alias] = [bundle]
+            permissions = [status.get('ax_trusted'), status.get('screen_capture_allowed')]
+            self.capabilities.update(open_apps=aliases, app_processes=processes,
+                available_now=all(permissions) if all(type(p) is bool for p in permissions) else None,
+                allowed_window_prefixes=status.get('allowed_window_prefixes', []),
+                scope_expires_at=status.get('scope_expires_at'),
+                limitations=['Named app activation does not select an arbitrary document window',
+                             'Control focus and multiple displays are not qualified'])
+            self.capabilities['lightweight_state'] = 'lightweight_state' in self.native_features
+            if 'observation_window_refs' in self.native_features:
+                self.capabilities['actions'].append('activate_window')
+            if 'focused_control_identity' in self.native_features:
+                self.capabilities['actions'].append('focus_control')
+            self.capabilities['owned_modal_evidence'] = 'observation_window_refs' in self.native_features
             self.heartbeat_task = asyncio.create_task(self.heartbeat())
         except BaseException:
             await self.session.close()
@@ -103,6 +138,18 @@ class MacDriver:
         status = await self.request('POST', '/control', {'owner': self.owner, 'command': command})
         self.ensure_session(status)
         return status
+
+    async def state(self):
+        if 'lightweight_state' not in self.native_features:
+            raise DeviceRejected('Lightweight state is unavailable on this native version')
+        raw = await self.request('GET', '/state')
+        self.ensure_session(raw)
+        permissions = [raw.get('ax_trusted'), raw.get('screen_capture_allowed')]
+        self.capabilities['available_now'] = all(permissions) if all(type(p) is bool for p in permissions) else None
+        self.capabilities['allowed_window_prefixes'] = raw.get('allowed_window_prefixes', [])
+        self.capabilities['scope_expires_at'] = raw.get('scope_expires_at')
+        return {k: raw.get(k) for k in ('foreground', 'focused_control', 'foreground_in_scope', 'timestamp', 'native_session_id')} | {
+            'native_session_id': self.native_session, 'device_paused': raw.get('paused')}
 
     async def observe(self):
         raw = await self.request('GET', '/observe')
@@ -142,7 +189,40 @@ class MacDriver:
     async def preflight(self, action, observation):
         if observation.get('native_capture_id') != (self.capture or {}).get('id'):
             raise DeviceRejected('The host and native capture identities differ')
+        if action['kind'] == 'open_app' and action.get('app') not in self.capabilities['open_apps']:
+            raise DeviceRejected('App activation is not enabled for this Mac task')
         await self.request('POST', '/preflight', self.native_arguments(action))
+
+    async def activate_system_app(self, action, request_id):
+        alias = action['app']
+        if not self.activation or alias not in self.capabilities['open_apps']:
+            raise DeviceRejected('App activation is not enabled for this Mac task')
+        bundle, path = self.launch_apps[alias]
+        # Refresh owner, pause and expiry evidence immediately before the one launch.
+        status = await self.request('POST', '/heartbeat', {'owner': self.owner})
+        self.ensure_session(status)
+        if status.get('paused') or bundle not in status.get('allowed_apps', []):
+            raise DeviceRejected('App activation rejected by the current native task scope')
+        deadline = status.get('scope_expires_at')
+        if deadline is not None and deadline <= status.get('timestamp', time.time()) + 20:
+            raise DeviceRejected('Task scope is expiring; no app activation sent')
+        c = self.activation
+        process = await asyncio.create_subprocess_exec('ssh', '-F', '/dev/null', '-i', c['identity_file'],
+            '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=10',
+            '-o', 'UserKnownHostsFile=' + c['known_hosts'], c['user'] + '@' + c['host'],
+            '/usr/bin/open -a ' + path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            await asyncio.wait_for(process.communicate(), timeout=15)
+        except BaseException:
+            if process.returncode is None:
+                process.kill()
+                with contextlib.suppress(Exception): await process.wait()
+            raise
+        if process.returncode:
+            raise RuntimeError('Fixed Mac app activation was not confirmed; do not resend automatically')
+        return {'delivery': 'delivered', 'request_id': request_id, 'status': 'completed',
+                'transport': 'fixed-system-app-activation-ssh', 'action': action,
+                'verification': 'Launch delivery only; verify the resulting foreground', 'native_session_id': self.native_session}
 
     async def dispatch(self, action):
         arguments = self.native_arguments(action) | {'request_id': str(uuid.uuid4())}
@@ -154,7 +234,11 @@ class MacDriver:
             handle.flush()
             os.fsync(handle.fileno())
         try:
-            result = await self.request('POST', '/act', arguments)
+            if (action['kind'] == 'open_app' and action.get('app') in self.launch_apps
+                    and 'native_app_activation' not in self.native_features):
+                result = await self.activate_system_app(action, arguments['request_id'])
+            else:
+                result = await self.request('POST', '/act', arguments)
             if result.get('delivery') != 'delivered' or result.get('request_id') != arguments['request_id']:
                 raise RuntimeError('Native Mac receipt does not confirm this input identity')
         except BaseException:

@@ -25,15 +25,25 @@ Important boundaries:
   recovery reads the receipt, rather than resending the action.
 - `/frame` records native screenshots without replacing `/observe`'s action
   capture. Recording therefore cannot continually invalidate the model's
-  observation IDs. Secure AX fields and their children are omitted.
-- The initial named-app action activates prepared TextEdit using the public
-  `notepad` alias. Public `CTRL` shortcuts map to Mac Command; ALT maps to
-  Option. Drag, mobile operation, general software installation, and a
-  complete Mac model task are outside this first qualification.
+observation IDs. Secure AX fields and their children are omitted.
+- Named-app activation uses `NSRunningApplication` for already prepared,
+  running TextEdit (`notepad`), Terminal and Installer when the task permits
+  them. It does not launch arbitrary programs or select a document. Public
+  `CTRL` shortcuts map to Mac Command; ALT maps to Option. Drag and rotated
+  or secondary-display input remain unsupported.
+- `/state` reads live foreground, owned-sheet and focused-control facts
+  without encoding a PNG or invalidating the action capture. The shared
+  `target` tool dispatches once and performs bounded foreground checks.
+  Its state-only reply requires a fresh `observe` before another input.
+- `activate_window` and `focus_control` use native references from the latest
+  observation, bound to the native session and application instance. Keyboard
+  dispatch checks the observed focused element again before input. These are
+  candidate features with explicit platform qualification, not a universal
+  atomic focus-and-input guarantee.
 
 Build on the target Mac using `build.sh SOURCE.swift NEW_APPLICATION.app`.
 The script uses installed Command Line Tools, signs the candidate locally,
-verifies its signature, and runs eight checks without posting input. The app
+verifies its signature, and runs twelve checks without posting input. The app
 reads its private configuration and token from
 `~/Library/Application Support/QW3ComputerUseTest/native/`. Configuration has
 `port`, `allowed_apps`, and `window_prefixes`; keep that directory mode 0700
@@ -58,9 +68,15 @@ native restart, failed resume, and unauthorized control.
 The first video is timestamped native screenshot sampling (19 frames,
 median interval 2.20 seconds), rather than a fixed-rate continuous screen
 recording. Neither this scripted tool qualification nor its CPU checks prove
-autonomous QW3 task success. Mac device selection and its MCP tool schema
-still need a separate opt-in integration before model business evaluation;
-do not claim the default application already supports Mac end to end.
+autonomous QW3 task success. Mac device selection and its MCP schema are now
+available through the opt-in native gateway. The additional transition
+qualifier (`qualify_mac_transitions.py`) passes 18 physical checks, including
+Terminal/Installer activation, actual titleless sheet ownership, choosing A/B
+windows, explicit control focus, exact Unicode save and foreground-change
+refusal. It never advances Installer. The local-model qualifier
+(`qualify_mac_qw3.py`) is a separate autonomous TextEdit task with independent
+disk verification. None of these counts is the 48-scenario platform gate;
+see the desktop-contract coverage and progress JSON files in `docs`.
 
 Primary references: [Apple Command Line Tools](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools/),
 [Quartz Event Services](https://developer.apple.com/documentation/coregraphics/quartz-event-services),

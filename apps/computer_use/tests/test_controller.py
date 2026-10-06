@@ -51,6 +51,23 @@ class FixtureCodex:
 
 
 class ControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_required_feature_loss_is_checked_before_new_task_and_before_resume_input(self):
+        good={'platform':'macos','implemented':True,'actions':['open_app'],
+              'open_apps':['notepad'],'app_processes':{'notepad':['com.apple.TextEdit']},'available_now':True}
+        self.desktop.observe.return_value=self.desktop.latest|{'image':'fixture','capabilities':good}
+        controller=Controller(self.temp.name,self.desktop,'unused',1,
+                              required_features=['ensure_app'],qualification_mode=True,device_platform='macos')
+        controller.ready=True;controller.client=FixtureCodex()
+        await controller.start_task('Foundation qualification')
+        controller.state['status']='paused';self.desktop.paused=True
+        self.desktop.observe.return_value=self.desktop.latest|{'image':'fixture','capabilities':good|{'available_now':False}}
+        with self.assertRaisesRegex(DesktopError,'unavailable'):await controller.control('resume')
+        self.assertEqual(controller.state['status'],'paused');self.assertTrue(self.desktop.paused)
+        controller.state['status']='stopped'
+        with self.assertRaisesRegex(DesktopError,'unavailable'):await controller.start_task('Another task')
+        self.assertTrue(self.desktop.paused)
+        await controller.close()
+
     async def test_configured_output_budget_reaches_the_backend_and_respects_explicit_smaller_limits(self):
         import tomllib
         seen=[]
@@ -447,7 +464,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["tool_call_limit"], 50)
         self.assertEqual(result["messages"], ["Initial review finished."])
         self.controller.client.new_thread.assert_not_awaited()
-        self.controller.client.rpc.assert_awaited_once_with("thread/resume", {"threadId": "same-history"})
+        self.controller.client.rpc.assert_awaited_once_with("thread/resume", {"threadId": "same-history", "excludeTurns": True})
         self.assertEqual(result["followups"][0]["delivery"], "accepted")
         self.assertEqual(json.loads(self.controller.state_path.read_text())["tool_calls_used"], 17)
 

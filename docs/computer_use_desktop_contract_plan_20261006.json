@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-06",
+  "status": "design_and_qualification_plan_not_implementation_completion",
+  "purpose": "先定义跨平台桌面操作契约及验收，再继续真实产品任务，避免用单个应用补丁代替基础能力设计。",
+  "scope": {
+    "platforms": ["windows", "linux", "macos", "android"],
+    "linux_initial_backend": "现有 OSWorld X11 VM；Wayland 单独作为后续能力，不默认支持",
+    "android_initial_backend": "现有 Appium/UiAutomator2/ADB 模拟器；应用、Activity、弹窗、控件映射到统一目标关系",
+    "ios": "保留接口，不纳入本轮支持声明",
+    "model": "本地 QW3 继续决定用户任务的计划及执行意图",
+    "advisor": "本轮基础验收关闭；不能用于掩盖工具或恢复协议缺陷",
+    "benchmark_policy": "保留旧基线、失败、累计预算和全部历史；未通过基础验收不启动复杂任务对照"
+  },
+  "original_design": {
+    "sources": [
+      "docs/computer_use_cross_device_goal_20261003.md",
+      "docs/computer_use_cross_device_foundation_20261003.md",
+      "docs/computer_use_product_delivery_20261002.md",
+      "docs/computer_use_macos_native_qualification_20261006.md"
+    ],
+    "already_planned": [
+      "统一任务核心和设备驱动，Codex 是一种 agent runtime",
+      "观察身份、坐标换算、单输入所有者、操作回执及不确定动作不重发",
+      "步骤预期结果、有界等待、重复意图保护、持久检查点和独立业务验收",
+      "三平台基础合约先于真实任务，macOS 在最初目标中仅预留接口",
+      "受控安装工具和 GUI 工具分工，不以测试报告替代产品交付"
+    ],
+    "underspecified_or_not_gated": [
+      "open_app 混合了启动应用与切到已有应用；没有完整的窗口选择与切换结果契约",
+      "应用、窗口、所属弹窗及焦点控件的关系尚未成为统一且可验证的目标模型",
+      "工具已实现、当前允许、通过验收和运行时可用没有统一的逐项能力清单",
+      "Mac TextEdit 验收没有覆盖安装器、无标题 sheet、系统授权中断及跨应用恢复",
+      "真实任务缺少强制检查：每种目标转换是否已经通过该平台的实机验收",
+      "没有统一覆盖历史体积、恢复 RPC 体积、模型 token、时限及工具次数的独立预算"
+    ],
+    "assessment": "原设计有总体分层和若干正确约束；不足是桌面状态转换契约及验收门禁不完整，Mac 产品试次推进早于其基础资格。"
+  },
+  "reuse_existing_components": [
+    {"component": "QW3 + Codex", "role": "生成计划、解释观察、选择动作意图；不承担不可观测的成功判定"},
+    {"component": "Execution / Desktop / DeviceGateway", "role": "扩展现有检查点、观察凭据、步骤核验、输入账本及设备锁，保持冻结测试包不变"},
+    {"component": "Windows UIA / Win32", "role": "提供窗口、控件、输入及前景证据"},
+    {"component": "Linux OSWorld PyAutoGUI / AT-SPI", "role": "提供 X11 桌面观察和操作，已有窗口证据策略需纳入共同验收"},
+    {"component": "macOS AXUIElement / NSWorkspace", "role": "提供原生应用、窗口、sheet、焦点、输入和权限证据；现有固定 SSH 启动仅为候选桥接"},
+    {"component": "Android Appium / UiAutomator2 / ADB", "role": "提供应用、Activity、弹窗、焦点和输入证据"}
+  ],
+  "target_contract": {
+    "hierarchy": ["device_session", "application_instance", "task_window_or_activity", "owned_modal", "focused_control"],
+    "identity": "平台对象 ID 与设备会话/对象代次绑定；PID、窗口句柄和标题均不能单独证明目标身份。标题是辅助证据。",
+    "application_operations": [
+      {"intent": "ensure_app", "result": "目标应用实例存在；启动许可与启动回执明确，不等于目标窗口已经聚焦"},
+      {"intent": "activate_window", "result": "指定窗口或 Activity 成为可操作目标；多窗口时必须消除歧义"},
+      {"intent": "resolve_modal", "result": "获得真实所属关系或明确返回阻挡/接管；不通过空标题或相同 PID 猜测归属"},
+      {"intent": "focus_control", "result": "当前目标控件获得焦点；下一次输入前仍重新确认有效性"}
+    ],
+    "public_tool_strategy": "先在共享执行层实现有界 ensure_target 意图，底层区分上述操作；保留低层 act 兼容接口。正式名称与 schema 在第一阶段冻结，不能把本文件当作已可调用工具。",
+    "transition": ["声明目标及预期结果", "读取当前事实及权限", "检查目标身份与阻挡关系", "发送一次有账本的动作", "有界等待结果", "返回已验证/仍等待/需要授权/需要接管/送达不确定", "保存检查点"],
+    "preconditions": ["设备及原生会话未变化", "拥有唯一输入租约", "目标属于当前任务范围", "观察及目标身份仍有效", "所需权限当前有效", "动作与等待均在剩余预算内"],
+    "delivery_vs_result": "delivered 只表示动作已送达；verified 表示指定可观察条件成立；任务成功仍要求独立业务验收。",
+    "modal_rule": "只有原生证据证明与已允许任务窗口的所属关系，才继承目标范围；系统权限/密码弹窗转为人工处理。",
+    "focus_race_rule": "输入前重新核验焦点；聚焦到输入之间的竞态需平台能力处理或明确标为限制，不能声称所有平台都有原子输入保证。",
+    "out_of_scope_rule": "其他应用在前景时只允许选择已声明目标的切换意图，不向无关前景发送鼠标或键盘输入。",
+    "fallback_rule": "控件证据优先；缺少控件时返回诚实的证据范围并使用现有规范化视觉定位。窗口或弹窗身份未证明时不能用视觉点击绕过范围约束。"
+  },
+  "capability_and_admission_contract": {
+    "feature_fields": ["implemented", "enabled_for_task", "available_now", "qualified_on_platform", "qualification_evidence", "limitations", "capability_version"],
+    "tool_schema": "工具定义从设备真实能力与本次任务允许范围生成，不能仅由平台名称或通用应用列表猜测。",
+    "capability_change": "权限、范围、显示或原生会话变化后使相关凭据失效，保持暂停并更新工具配置；不沿用旧能力声明继续输入。",
+    "product_admission": "任务预先声明所需基础能力；所有必需转换均有该平台证据才进入常规产品验收。未通过资格的探索试次单独标注，禁止声称平台整体支持。",
+    "permission_lifecycle": "启动时检查读屏、控制权限及应用签名身份；权限变更/签名更新要有明确暂停、重新授权和恢复流程。实机授权仍由用户在设备完成。"
+  },
+  "recovery_and_budget_contract": {
+    "checkpoint_fields": ["original_goal", "task_and_device_identity", "application_and_window_refs", "verified_steps", "pending_step", "pending_action_receipts", "remaining_work", "remaining_budgets", "capability_version", "artifact_refs"],
+    "resume": "核对持久动作账本和当前现场，再继续同一任务；不重置调用额度、不盲目重发、不假称恢复已完成。",
+    "failure_categories": ["not_started", "loading", "focus_lost", "modal_blocked", "permission_required", "target_ambiguous", "target_stale", "delivery_uncertain", "session_changed", "history_transport_failed", "reasoning_output_exhausted"],
+    "deterministic_recovery": "执行器在原意图和原预算内处理等待、已声明目标的切换及可证明的焦点恢复；需要更换目标或策略时返回事实给 QW3 决策。",
+    "budgets": ["task_wall_time", "tool_calls", "per_operation_wait", "recovery_attempts", "model_input_tokens", "model_output_tokens", "rpc_message_bytes", "artifact_storage_bytes"],
+    "media_transport": "截图、视频和原始证据独立存储；控制状态使用引用和精简事实。实际 Codex 恢复协议及兼容路径需要验证，不能只增大缓冲区后宣称长任务恢复解决。",
+    "reasoning_truncation": "检测输出停止原因，保存未完成步骤并在原累计预算内采用已资格通过的续跑；没有可靠续跑时明确暂停。"
+  },
+  "qualification_matrix": [
+    {"id": "T01", "family": "应用启动与切换", "cases": ["应用未运行", "应用在后台", "应用窗口已最小化", "应用启动慢或失败"], "required_evidence": "目标应用实例、真实前景、投递账本及有界停止；不能只有系统启动命令退出码"},
+    {"id": "T02", "family": "窗口和 Activity 身份", "cases": ["单窗口", "同名多窗口", "窗口标题变化", "窗口关闭后 ID 重用"], "required_evidence": "唯一目标及代次；歧义和失效不得误选"},
+    {"id": "T03", "family": "模态与所属关系", "cases": ["有标题所属弹窗", "无标题所属 sheet", "相同应用的无关弹窗", "嵌套弹窗或跨进程系统弹窗"], "required_evidence": "可追溯原生所属关系；允许案例可继续，不能证明或需要系统授权时正确暂停"},
+    {"id": "T04", "family": "控件焦点与文本输入", "cases": ["目标字段当前未聚焦", "聚焦后焦点被抢", "中英文及换行精确输入", "密码或安全字段"], "required_evidence": "正确字段获得指定内容；其他字段不变；安全字段进入接管流程"},
+    {"id": "T05", "family": "观察和几何", "cases": ["普通 DPI", "Retina 或高 DPI", "观察后布局变化", "显示尺寸或旋转变化"], "required_evidence": "坐标映射正确；变化时旧目标失效；不支持项明确拒绝"},
+    {"id": "T06", "family": "权限与任务范围", "cases": ["权限齐全", "权限缺失或运行中撤销", "签名更新后权限失效", "任务范围到期或无关前景"], "required_evidence": "正确暂停与重新资格检查，零越界输入；不静默扩大任务范围"},
+    {"id": "T07", "family": "等待与无进度", "cases": ["正常异步完成", "处理时间超过一次轮询", "持续无进度", "动画或光标变化但业务无进度"], "required_evidence": "等待不重复输入；停止有界；仅图像变化不能作为业务完成"},
+    {"id": "T08", "family": "动作和设备生命周期", "cases": ["重复 action_id", "输入送达后回执丢失", "原生端或网关重启", "第二输入所有者竞争"], "required_evidence": "不重复发送；未知状态可核对；旧会话失效；只有一个输入所有者"},
+    {"id": "T09", "family": "任务恢复", "cases": ["用户暂停后继续", "授权中断后继续", "待核验步骤恢复", "不确定动作恢复"], "required_evidence": "原任务/额度/已验证步骤保留；先核对现场，不盲目重放"},
+    {"id": "T10", "family": "历史与资源边界", "cases": ["短历史恢复", "截图历史超过单消息预算", "模型输出被截断", "GPU 压力或后端响应慢"], "required_evidence": "给出具体错误分类；受限恢复或可恢复暂停；区分模型失败与基础设施失败"},
+    {"id": "T11", "family": "实际工具协议", "cases": ["设备能力生成的 schema", "实际 Codex 工具往返", "合法操作字段无损传递", "权限或能力版本变化后工具重建"], "required_evidence": "模型侧收到与执行器相符的定义；不得以 JSON Schema 合法代替真实往返验证"},
+    {"id": "T12", "family": "完成判定与证据", "cases": ["动作已送达但未达成结果", "可见状态正确但磁盘产物错误", "完成后新进程重复验证", "录像或验收证据缺失"], "required_evidence": "分别报告送达、步骤、业务、证据完整性；不能报假成功"}
+  ],
+  "matrix_execution_policy": {
+    "logical_cases": 48,
+    "status": "计划项，未把它们计作新增通过的测试；已有证据需逐项登记，缺项不能默认通过",
+    "platform_mapping": "逐项映射到 Windows、Linux、Mac、Android。不可适用项必须说明替代场景或原因；不得通过删除高风险样本制造通过率。",
+    "layers": ["主机协议和故障注入", "真实设备脚本化基础操作", "本地 QW3 自主任务", "独立业务验收及综合 benchmark"],
+    "critical_gate": "身份、范围、焦点、投递和恢复关键项必须达到预期结果；安全拒绝只能通过对应拒绝测试，不能算完成正常任务。",
+    "coverage_limit": "矩阵降低系统性漏项，不声称穷尽现实环境。新发现映射到契约类别和回归项，不能只增加单个应用特例。"
+  },
+  "implementation_stages": [
+    {"stage": "A", "work": "盘点四平台能力与现有证据；冻结目标关系、转换结果、失败分类、能力版本和预算协议", "exit": "每项能力有明确实现状态、限制和验收入口；缺失项不得对模型宣称支持"},
+    {"stage": "B", "work": "在现有共享执行层增加目标切换/确认和结构化恢复；驱动映射原生窗口、Activity、弹窗、焦点及权限证据", "exit": "共享合约与实际 Codex 工具往返通过；各平台必需基础案例通过，完整记录不支持项"},
+    {"stage": "C", "work": "先做 Mac Terminal↔Installer、无标题 sheet、权限恢复、长历史恢复的小任务；再对 Windows/Linux/Android 做对应小任务", "exit": "QW3 自主运行、故障分类符合证据、累计预算不重置、无误投递或未知重发；与脚本工具验收分开计数"},
+    {"stage": "D", "work": "恢复原 Mac Python 安装任务和原检查点；新增各平台明确范围的产品任务，独立核验 Python/venv/pip 或实际产物", "exit": "报告真实完成率、接管、重复运行可用性和视频；不把下载通过或安装器出现算作安装成功"},
+    {"stage": "E", "work": "基础及产品资格通过后冻结版本，恢复 Linux OSWorld 同条件对照，再开展 KVMem 和可选顾问对照", "exit": "原失败分母、模型/材料/权限/预算一致；性能与业务质量分别分析，不事先承诺成功率必然提高"}
+  ],
+  "current_mac_pilot": {
+    "task_id": "74b03e10891a415380d4e11aa7e0df1d",
+    "status": "paused",
+    "model_tool_calls_used": 23,
+    "tool_call_limit": 80,
+    "assistant_native_input_calls": 0,
+    "execution_mode": "legacy",
+    "installed": false,
+    "achieved": "QW3 自主下载并检查安装包，打开安装器并进入许可确认阶段；不等于 Python 已安装",
+    "observed_issues": [
+      "终端引号状态需要额外恢复；具体来源尚未确定",
+      "原标题前缀范围拒绝安装器无标题许可 sheet",
+      "更新原生二进制导致权限失效；删除旧授权条目后已实际确认两项权限有效",
+      "原 Mac schema 没有覆盖 Terminal/Installer 切换；候选固定激活桥接已加入主机检查，尚未实机资格通过",
+      "thread/resume 返回期间本地连接断开；大截图历史与 16 MiB 消息读取限制是待验证线索，不能当作已证实根因"
+    ],
+    "not_yet_proven": ["新 sheet 规则在实际许可弹窗上有效", "新应用激活能选中正确任务窗口", "大历史下任务恢复稳定", "完整 Python 安装及新进程环境验证"],
+    "next_action": "保持暂停，先落实 A/B/C 中该任务必需的契约与基础资格；不得由外层助手手工替代 QW3 安装"
+  }
+}

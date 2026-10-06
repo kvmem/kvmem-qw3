@@ -18,9 +18,12 @@ async def main():
     parser.add_argument("--token-file", required=True, type=Path)
     parser.add_argument("--software", action="store_true")
     parser.add_argument("--workflow", action="store_true")
-    parser.add_argument("--platform", choices=("windows", "linux", "android"), default="windows")
+    parser.add_argument("--platform", choices=("windows", "linux", "android", "macos"), default="windows")
+    parser.add_argument("--macos-apps", nargs="*", choices=("notepad", "terminal", "installer"))
+    parser.add_argument("--capabilities-file", type=Path, help="Owner-written observed device capabilities")
     args = parser.parse_args()
     token = args.token_file.read_text().strip()
+    capabilities = json.loads(args.capabilities_file.read_text()) if args.capabilities_file else None
     active = {}
 
     def send(message):
@@ -36,7 +39,7 @@ async def main():
                     result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
                               "serverInfo": {"name": "qw3-computer", "version": "0.1.0"}}
                 elif method == "tools/list":
-                    result = {"tools": tools_for_platform(args.platform, args.workflow) + (SOFTWARE_TOOLS if args.software else []) + (WORKFLOW_TOOLS if args.workflow else [])}
+                    result = {"tools": tools_for_platform(args.platform, args.workflow, macos_apps=args.macos_apps, device_capabilities=capabilities) + (SOFTWARE_TOOLS if args.software else []) + (WORKFLOW_TOOLS if args.workflow else [])}
                 elif method == "ping":
                     result = {}
                 elif method == "tools/call":

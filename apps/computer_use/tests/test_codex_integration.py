@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import os
+import random
 from pathlib import Path
 import sys
 import tempfile
@@ -16,13 +17,129 @@ from PIL import Image
 
 from qw3_computer.bridge import create_app
 from qw3_computer.app import Controller, web_app
-from qw3_computer.codex import CodexClient, write_config
+from qw3_computer.codex import CodexClient, write_config, RPC_MESSAGE_LIMIT
 from test_bridge import chunk, serve
 from test_controller import FixtureDesktop
+from qw3_computer.desktop import Desktop
+from qw3_computer.device_gateway import Gateway, create_app as gateway_app
+import test_device_gateway as gateway_fixture
 
 
 @unittest.skipUnless(os.environ.get("QW3_TEST_CODEX") == "1", "set QW3_TEST_CODEX=1 for real Codex")
 class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_observed_target_tool_executes_and_returns_its_scope_through_real_codex(self):
+        driver = gateway_fixture.FakeDriver()
+        driver.capabilities.update(actions=['open_app'], open_apps=['notepad'],
+                                   app_processes={'notepad':['Gedit']}, available_now=True)
+        original_observe = driver.observe
+        async def observe():
+            result = await original_observe()
+            result['foreground']['process'] = 'Gedit' if driver.effects else 'other'
+            return result
+        driver.observe = observe
+        calls = []
+        async def backend(request):
+            body = await request.json(); calls.append(body)
+            response = web.StreamResponse(headers={'Content-Type':'text/event-stream'})
+            await response.prepare(request)
+            if len(calls) == 1:
+                tool = next(t['function'] for t in body['tools'] if t['function']['name'].endswith('__target'))
+                self.assertIn('operation', tool['parameters']['properties'])
+                self.assertEqual(tool['parameters']['properties']['app']['enum'], ['notepad'])
+                await chunk(response, {'tool_calls':[{'index':0,'id':'wire-target-call','type':'function',
+                    'function':{'name':tool['name'],'arguments':json.dumps({'operation':'ensure_app','app':'notepad',
+                                                        'transition_id':'wire-target-one','timeout_seconds':2})}}]})
+                await chunk(response, finish='tool_calls')
+            else:
+                await chunk(response, {'content':'Application foreground confirmed; business completion is untested.'})
+                await chunk(response, finish='stop')
+            await response.write(b'data: [DONE]\n\n')
+            return response
+        backend_app=web.Application();backend_app.router.add_post('/v1/chat/completions',backend)
+        backend_runner,url=await serve(backend_app)
+        with tempfile.TemporaryDirectory(prefix='qw3-target-wire-') as runtime:
+            root=Path(runtime); gateway=Gateway(driver,root/'gateway')
+            gateway_runner,gateway_url=await serve(gateway_app(gateway,'test-gateway-token'))
+            desktop=Desktop(gateway_url,'test-gateway-token',root/'desktop')
+            controller=Controller(root/'app',desktop,url+'/v1',0,device_platform='linux')
+            app_runner,app_url=await serve(web_app(controller));controller.port=int(app_url.rsplit(':',1)[1])
+            try:
+                await controller.start();await controller.start_task('Qualify one bounded application transition.')
+                async with asyncio.timeout(40):
+                    while controller.state['status'] in ('starting','running','verifying'):await asyncio.sleep(.02)
+                self.assertEqual(controller.state['status'],'completed',controller.state)
+                self.assertEqual(driver.effects,1)
+                self.assertEqual(controller.state['tool_calls_used'],1)
+                output=next(m for m in calls[1]['messages'] if m['role']=='tool')
+                text='\n'.join(c['text'] for c in output['content'] if c['type']=='text')
+                self.assertIn('"verified": true',text)
+                self.assertIn('business completion are not verified',text)
+                self.assertIn('"process": "Gedit"',text)
+            finally:
+                await controller.close();await app_runner.cleanup();await gateway_runner.cleanup()
+                await gateway.close();await backend_runner.cleanup()
+
+    async def test_metadata_only_resume_preserves_large_image_history_for_the_next_turn(self):
+        requests = []
+
+        async def backend(request):
+            body = await request.json()
+            # Keep proof markers only; no large image request copies in memory.
+            text = json.dumps(body['messages'])
+            requests.append({'original_marker': 'original-history-marker-0' in text,
+                             'previous_response': 'saved-response-1' in text,
+                             'image_count': text.count('image_url')})
+            response = web.StreamResponse(headers={'Content-Type': 'text/event-stream'})
+            await response.prepare(request)
+            await chunk(response, {'content': 'saved-response-' + str(len(requests))})
+            await chunk(response, finish='stop')
+            await response.write(b'data: [DONE]\n\n')
+            return response
+
+        backend_app = web.Application(client_max_size=128 * 1024 * 1024)
+        backend_app.router.add_post('/v1/chat/completions', backend)
+        backend_runner, url = await serve(backend_app)
+        bridge_runner, bridge_url = await serve(create_app(url + '/v1'))
+        with tempfile.TemporaryDirectory(prefix='qw3-large-history-') as runtime:
+            write_config(runtime, bridge_url + '/v1', sys.executable,
+                         [str(Path(__file__).with_name('fixture_mcp.py').resolve())])
+            image = io.BytesIO()
+            Image.frombytes('RGB', (1024, 1024), random.Random(3).randbytes(1024 * 1024 * 3)).save(image, format='PNG')
+            data_url = 'data:image/png;base64,' + base64.b64encode(image.getvalue()).decode()
+            client = CodexClient(runtime)
+
+            async def completed(turn):
+                async with asyncio.timeout(60):
+                    while True:
+                        event = await client.events.get()
+                        self.assertNotEqual(event.get('method'), 'app/disconnected', event)
+                        if event.get('method') == 'turn/completed' and event['params']['turn']['id'] == turn:
+                            self.assertEqual(event['params']['turn']['status'], 'completed')
+                            return
+            try:
+                await client.start()
+                thread = await client.new_thread()
+                for index in range(4):
+                    await completed(await client.turn(thread, 'original-history-marker-' + str(index), [data_url]))
+                total = sum(path.stat().st_size for path in Path(runtime, 'sessions').rglob('*.jsonl'))
+                self.assertGreater(total, RPC_MESSAGE_LIMIT)
+                await client.close()
+                client = CodexClient(runtime)
+                await client.start()
+                resumed = await client.rpc('thread/resume', {'threadId': thread, 'excludeTurns': True})
+                self.assertEqual(resumed['thread']['id'], thread)
+                self.assertFalse(resumed['thread']['turns'])
+                self.assertLess(len(json.dumps(resumed)), 65536)
+                await completed(await client.turn(thread, 'after_resume_probe'))
+                self.assertTrue(requests[-1]['original_marker'])
+                self.assertTrue(requests[-1]['previous_response'])
+                self.assertGreaterEqual(requests[-1]['image_count'], 4)
+                self.assertIsNone(client.reader_error)
+            finally:
+                await client.close()
+                await bridge_runner.cleanup()
+                await backend_runner.cleanup()
+
     async def test_verified_action_schema_reaches_backend_through_actual_codex_mcp(self):
         calls=[]
         async def backend(request):

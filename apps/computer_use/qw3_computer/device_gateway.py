@@ -53,10 +53,19 @@ class Gateway:
             "session_id": self.session_id, "display_id": "primary", "rotation": raw.get("rotation", 0),
             "observation_id": uuid.uuid4().hex, "captured_at": int(time.time()*1000),
             "width": width, "height": height, "sha256": digest, "image": base64.b64encode(image).decode(),
-            "mime_type": "image/png", "paused": self.paused, "capabilities": self.driver.capabilities}
+            "mime_type": "image/png", "paused": self.paused,
+            "capabilities": self.driver.capabilities | {"receipt_only_dispatch": True}}
         return self.latest
 
-    async def act(self, arguments):
+    async def state(self):
+        if not self.driver.capabilities.get('lightweight_state'):
+            raise DeviceRejected('This driver has no independent lightweight state reader')
+        raw = await self.driver.state()
+        return raw | {'desktop_id': self.desktop_id, 'device_id': self.driver.device_id,
+                      'session_id': self.session_id, 'paused': self.paused, 'state_only': True,
+                      'capabilities': self.driver.capabilities | {'receipt_only_dispatch': True}}
+
+    async def act(self, arguments, *, capture_after_input=True):
         validate_action(arguments)
         request = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
         action_id = arguments["action_id"]
@@ -89,6 +98,15 @@ class Gateway:
         try:
             # Exactly one driver call. Network timeouts are not automatically retried.
             delivery = await self.driver.dispatch(action)
+            if not capture_after_input:
+                self.latest = None
+                result = {"action_id": action_id, "desktop_id": self.desktop_id,
+                          "status": "completed", "delivery": "delivered", "driver_receipt": delivery,
+                          "observation_pending": True,
+                          "verification": {"passed": None, "scope": "Input delivery only; observe and verify the resulting target separately."}}
+                self.db.execute("UPDATE actions SET status='completed',result=? WHERE id=?", (json.dumps(result), action_id))
+                self.db.commit()
+                return result
             await asyncio.sleep(0.25)
             observation = await self.observe()
             captures = 1
@@ -146,10 +164,19 @@ def create_app(gateway, token):
         async with gateway.lock:
             return web.json_response(await gateway.observe())
 
+    async def state(request):
+        async with gateway.lock:
+            return web.json_response(await gateway.state())
+
     async def act(request):
         arguments = await request.json()
         async with gateway.lock:
             return web.json_response(await gateway.act(arguments))
+
+    async def dispatch(request):
+        arguments = await request.json()
+        async with gateway.lock:
+            return web.json_response(await gateway.act(arguments, capture_after_input=False))
 
     async def control(request):
         command = (await request.json()).get("command")
@@ -167,7 +194,9 @@ def create_app(gateway, token):
         return web.json_response({"files": []})
 
     app.router.add_get("/observe", observe)
+    app.router.add_get("/state", state)
     app.router.add_post("/act", act)
+    app.router.add_post("/dispatch", dispatch)
     app.router.add_post("/control", control)
     app.router.add_get("/actions/{action_id}", receipt)
     app.router.add_get("/files", files)

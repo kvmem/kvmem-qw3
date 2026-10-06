@@ -86,6 +86,8 @@ class Desktop:
         if not path.exists():
             path.write_bytes(image)
         metadata = identify_controls({k: v for k, v in observation.items() if k != "image"})
+        from .desktop_contract import target_facts
+        metadata["target_context"] = target_facts(metadata)
         self.db.execute("INSERT OR IGNORE INTO observations VALUES (?, ?, ?, ?)",
                         (metadata["observation_id"], self.task_id, json.dumps(metadata), time.time()))
         self.db.commit()
@@ -104,6 +106,14 @@ class Desktop:
             if self.execution:
                 result["step_check"] = self.execution.after_delivery(metadata)
             return result
+
+    async def state(self):
+        """Read live target facts without changing the image-bound action capture."""
+        async with self.lock:
+            value = await self.request('GET', '/state')
+            if value.get('state_only') is not True or 'image' in value:
+                raise DesktopError('Invalid lightweight state response')
+            return value
 
     def matched_foreground_bounds(self, old, fresh):
         """Positive window evidence for Linux; never infer it from absence."""
@@ -212,8 +222,10 @@ class Desktop:
         return action_id if legacy and legacy[0] == self.task_id else key
 
     def checked_receipt(self, result, receipt_id, request):
+        observed_desktop = (result.get("desktop_id") if result.get("observation_pending") is True
+                            and result.get("delivery") == "delivered" else result.get("observation", {}).get("desktop_id"))
         if (result.get("action_id") != receipt_id or result.get("status") != "completed"
-                or result.get("observation", {}).get("desktop_id") != request["desktop_id"]):
+                or observed_desktop != request["desktop_id"]):
             raise DesktopError("Executor receipt does not match the saved action and desktop; reconcile before continuing")
         return result | {"action_id": request["action_id"], "receipt_id": receipt_id}
 
@@ -228,7 +240,8 @@ class Desktop:
                                       (action['receipt_id'],)).fetchone()
             if mapping:
                 result = result | {'coordinate_mapping': json.loads(mapping[0])}
-            result = result | {'observation': self.remember(result['observation'])}
+            if not result.get('observation_pending'):
+                result = result | {'observation': self.remember(result['observation'])}
             self.db.execute("UPDATE actions SET status='completed', result=? WHERE id=?",
                             (json.dumps(result), action['receipt_id']))
             self.db.commit()
@@ -260,7 +273,7 @@ class Desktop:
         self.paused = result["paused"]
         return result
 
-    async def act(self, arguments):
+    async def act(self, arguments, *, capture_after_input=True):
         async with self.lock:
             if self.paused:
                 raise DesktopError("Desktop is paused; wait for the user to resume")
@@ -277,6 +290,8 @@ class Desktop:
                     raise DesktopError("action_id reused with different arguments")
                 if prior[1] == "completed":
                     result = json.loads(prior[2])
+                    if result.get("observation_pending"):
+                        return result | {"duplicate": True}
                     return result | {"observation": self.with_image(result["observation"]), "duplicate": True}
                 raise DesktopError(f"Previous action is {prior[1]}; observe/reconcile, do not retry it")
             if self.latest is None or arguments.get("desktop_id") != self.latest["desktop_id"]:
@@ -285,6 +300,16 @@ class Desktop:
             if arguments.get("observation_id") != self.latest["observation_id"]:
                 raise DesktopValidationError({"code": "stale_observation", "path": "$.observation_id",
                     "message": "Stale observation; observe again", "hint": "Use the latest observation_id and reassess the current screen."})
+            kind = arguments['action']['kind']
+            if kind in {'activate_window', 'focus_control'}:
+                if kind not in self.latest.get('capabilities', {}).get('actions', []):
+                    raise DesktopError('Native target operation is not available on this device')
+                window = kind == 'activate_window'
+                reference = arguments['action']['window_ref' if window else 'control_ref']
+                candidates = self.latest.get('windows', []) if window else self.latest.get('accessibility', {}).get('controls', [])
+                matches = [c for c in candidates if c.get('window_ref' if window else 'native_ref') == reference]
+                if len(matches) != 1 or not matches[0].get('identity' if window else 'native_identity'):
+                    raise DesktopError('Native target reference is not uniquely present in the current observation; no input sent')
             if (self.execution and arguments["action"]["kind"] in {"click", "drag", "scroll"}
                     and arguments.get("coordinate_space") != "normalized_1000"):
                 raise DesktopValidationError({"code": "normalized_coordinates_required", "path": "$.coordinate_space",
@@ -309,16 +334,16 @@ class Desktop:
                 same_device=all(old.get(k)==fresh.get(k) for k in identity)
                 def controls(observation):
                     a11y=observation.get('accessibility',{})
-                    return {k:a11y.get(k) for k in ('status','truncated')} | {'controls':[{k:v for k,v in c.items() if k!='control_id'}
+                    return {k:a11y.get(k) for k in ('status','truncated')} | {'controls':[{k:v for k,v in c.items() if k not in {'control_id','native_ref'}}
                         for c in a11y.get('controls',[])]}
                 same_view=(old.get('sha256')==fresh.get('sha256') and old.get('foreground')==fresh.get('foreground')
                            and controls(old)==controls(fresh))
                 target_valid=False
                 if guarded_control and same_device:
                     target=mapping['control']
-                    signature={k:v for k,v in target.items() if k!='control_id'}
+                    signature={k:v for k,v in target.items() if k not in {'control_id','native_ref'}}
                     matches=[c for c in fresh.get('accessibility',{}).get('controls',[])
-                             if {k:v for k,v in c.items() if k!='control_id'}==signature]
+                             if {k:v for k,v in c.items() if k not in {'control_id','native_ref'}}==signature]
                     if fresh.get('accessibility',{}).get('status')=='ok' and len(matches)==1 and old.get('foreground')==fresh.get('foreground'):
                         from PIL import Image
                         bounds=(max(0,target['x']),max(0,target['y']),
@@ -375,12 +400,18 @@ class Desktop:
                 self.db.execute("INSERT INTO coordinate_dispatches VALUES (?, ?)", (receipt_id, json.dumps(mapping)))
             self.db.commit()
             try:
-                result = await self.request("POST", "/act", dispatched | {"action_id": receipt_id})
+                result = await self.request("POST", "/act" if capture_after_input else "/dispatch", dispatched | {"action_id": receipt_id})
                 result = self.checked_receipt(result, receipt_id, arguments)
                 if mapping:
                     result = result | {"coordinate_mapping": mapping}
                 if revalidation:
                     result=result | {'observation_revalidation':revalidation | {'input_sent':True}}
+                if result.get("observation_pending"):
+                    if capture_after_input:
+                        raise DesktopError("Executor omitted the requested post-input observation")
+                    self.db.execute("UPDATE actions SET status='completed', result=? WHERE id=?", (json.dumps(result), receipt_id))
+                    self.db.commit()
+                    return result
                 metadata = self.remember(result["observation"])
                 result = result | {"observation": metadata | {"image": result["observation"]["image"]}}
                 self.db.execute("UPDATE actions SET status='completed', result=? WHERE id=?",
@@ -445,5 +476,7 @@ def mcp_observation(observation, result=None):
     text = {"observation": metadata}
     if result:
         text.update({k: v for k, v in result.items() if k != "observation"})
-    return {"content": [{"type": "text", "text": json.dumps(text, ensure_ascii=False)},
-                        {"type": "image", "data": observation["image"], "mimeType": "image/png"}]}
+    content = [{"type": "text", "text": json.dumps(text, ensure_ascii=False)}]
+    if "image" in observation:
+        content.append({"type": "image", "data": observation["image"], "mimeType": "image/png"})
+    return {"content": content}

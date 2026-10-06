@@ -29,7 +29,7 @@ def save(path, value):
 
 
 async def ssh(connection, command, content=None):
-    argv = ['ssh', '-i', connection['identity_file'], '-o', 'BatchMode=yes',
+    argv = ['ssh', '-F', '/dev/null', '-i', connection['identity_file'], '-o', 'BatchMode=yes',
             '-o', 'ConnectTimeout=15', '-o', 'StrictHostKeyChecking=yes',
             '-o', 'UserKnownHostsFile=' + connection['known_hosts'],
             connection['user'] + '@' + connection['host'], command]

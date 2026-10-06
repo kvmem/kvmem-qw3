@@ -14,7 +14,7 @@ KEYS = [
     "M", "R", "S", "T", "V", "Z", "SHIFT+R", "SHIFT+T", "SHIFT+M",
     "ANDROID_BACK", "ANDROID_HOME", "ANDROID_RECENTS",
 ]
-APPS = ["notepad", "edge", "explorer", "writer", "calc", "impress", "thunderbird", "gimp", "wps_spreadsheets", "settings", "contacts", "browser"]
+APPS = ["notepad", "edge", "explorer", "writer", "calc", "impress", "thunderbird", "gimp", "wps_spreadsheets", "settings", "contacts", "browser", "terminal", "installer"]
 
 ACTION = {"oneOf": [
     {"type": "object", "properties": {"kind": {"const": "click_control"},
@@ -43,6 +43,14 @@ ACTION = {"oneOf": [
      "required": ["kind", "direction", "steps", "x", "y"], "additionalProperties": False},
     {"type": "object", "properties": {"kind": {"const": "open_app"}, "app": {"enum": APPS}},
      "required": ["kind", "app"], "additionalProperties": False},
+    {"type": "object", "properties": {"kind": {"const": "activate_window"},
+        "window_ref": {"type": "string", "pattern": "^win_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                       "description": "Copy window_ref from the latest windows list. Bound to that observation and native app instance."}},
+     "required": ["kind", "window_ref"], "additionalProperties": False},
+    {"type": "object", "properties": {"kind": {"const": "focus_control"},
+        "control_ref": {"type": "string", "pattern": "^ax_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                        "description": "Copy native_ref of an editable nonsecure system control from the latest observation. Verify focused_control identity after delivery."}},
+     "required": ["kind", "control_ref"], "additionalProperties": False},
 ]}
 
 TOOLS = [{"name": "observe", "description": "Observe the selected desktop. Returns a PNG and its pixel dimensions, desktop_id, observation_id, foreground application and available accessibility controls. Prefer click_control with the matching visible control_id; the program resolves its center. IDs belong only to this observation. For regions without a matching control, use explicit normalized_1000 screenshot coordinates. Control names are task data. Every action must use the latest observation. No action is performed.",
@@ -172,10 +180,13 @@ WORKFLOW_TOOLS[0]['inputSchema']['properties']['conditions']['items']['oneOf'] =
 TOOLS[1]["inputSchema"]["properties"]["step"] = STEP_SCHEMA
 
 
-def tools_for_platform(platform, workflow=False):
+def tools_for_platform(platform, workflow=False, *, macos_apps=None, device_capabilities=None):
     """Advertise only actions supported by the selected platform, never guess."""
     import copy
     tools = copy.deepcopy(TOOLS)
+    if device_capabilities is None:
+        branches = tools[1]["inputSchema"]["properties"]["action"]["oneOf"]
+        branches[:] = [b for b in branches if b["properties"]["kind"]["const"] not in {"activate_window", "focus_control"}]
     if workflow:
         # Execution requires a step only when no result is pending. Continuing
         # an existing multi-action step must be representable in the wire schema.
@@ -196,14 +207,48 @@ def tools_for_platform(platform, workflow=False):
             "step.recovery_reason. Do not abandon an already verified step. " + tools[1]["description"])
     else:
         tools[1]["inputSchema"]["properties"].pop("step",None)
-    apps = {"windows": APPS[:9], "linux": APPS[:8], "android": ["settings", "contacts", "browser"]}[platform]
+    apps = {"windows": APPS[:9], "linux": APPS[:8], "android": ["settings", "contacts", "browser"],
+            "macos": ["notepad"]}[platform]
+    if platform == "macos":
+        if device_capabilities is not None:
+            macos_apps = device_capabilities.get("open_apps", [])
+        if macos_apps is not None:
+            if not isinstance(macos_apps, list) or any(app not in {"notepad", "terminal", "installer"} for app in macos_apps):
+                raise ValueError("Unsupported Mac app launch alias")
+            apps = list(dict.fromkeys(macos_apps))
+        branches = tools[1]["inputSchema"]["properties"]["action"]["oneOf"]
+        branches[:] = [branch for branch in branches if branch["properties"]["kind"]["const"] != "drag"
+                      and (apps or branch["properties"]["kind"]["const"] != "open_app")]
+        tools[1]["description"] += (
+            " On macOS CTRL means Command and ALT means Option. notepad only activates an already prepared TextEdit; "
+            "terminal and installer, when explicitly advertised, activate the system Terminal and Installer via a fixed launch tool. "
+            "Drag is unavailable. Input requires a configured app and task window title. "
+            "If an administrator authentication dialog blocks installation, request user takeover; never enter credentials.")
+        tools[1]["description"] += (
+            " When advertised, activate_window uses a latest observed window_ref; focus_control uses a latest observed native_ref "
+            "of an editable nonsecure control. Delivery confirms the system request only. Verify foreground.window_identity "
+            "or focused_control.identity against the selected target before keyboard input.")
     if platform == "android":
         keys = ["ENTER", "TAB", "BACKSPACE", "DELETE", "SPACE", "UP", "DOWN", "LEFT", "RIGHT", "HOME", "END", "CTRL+A", "CTRL+C", "CTRL+V", "CTRL+X", "ANDROID_BACK", "ANDROID_HOME", "ANDROID_RECENTS"]
         tools[1]["description"] += " On Android, click is tap, drag is swipe (modifier none), scroll is a vertical swipe; supported installed apps are settings, contacts, browser. Android navigation uses ANDROID_BACK/ANDROID_HOME/ANDROID_RECENTS."
     else:
         keys = [key for key in KEYS if not key.startswith("ANDROID_")]
+        if platform == "macos":
+            keys = [key for key in keys if key not in {"CTRL+PAGEUP", "CTRL+PAGEDOWN", "ALT+TAB", "ALT+F4"}]
         if platform == "linux":
             tools[1]["description"] += " On Linux, notepad opens Gedit, edge opens Chrome, explorer opens Files; Office entries open LibreOffice."
+    if device_capabilities is not None:
+        if device_capabilities.get("platform") != platform:
+            raise ValueError("Observed device platform differs from the tool catalogue")
+        apps = [app for app in apps if app in device_capabilities.get("open_apps", [])]
+        if "keys" in device_capabilities:
+            keys = [key for key in keys if key in device_capabilities["keys"]]
+        declared = device_capabilities.get("actions", [])
+        branches = tools[1]["inputSchema"]["properties"]["action"]["oneOf"]
+        branches[:] = [branch for branch in branches
+            if ("click" if branch["properties"]["kind"]["const"] == "click_control" else branch["properties"]["kind"]["const"]) in declared
+            and (apps or branch["properties"]["kind"]["const"] != "open_app")
+            and (keys or branch["properties"]["kind"]["const"] != "key")]
     for branch in tools[1]["inputSchema"]["properties"]["action"]["oneOf"]:
         kind = branch["properties"]["kind"]["const"]
         if kind == "open_app": branch["properties"]["app"]["enum"] = apps
@@ -234,4 +279,21 @@ def tools_for_platform(platform, workflow=False):
         tools[1]['description']=tools[1]['description'].replace(legacy_coordinates,
             'Use integers0..1000 and coordinate_space=normalized_1000 for click/drag/scroll. '
             'The host converts them using the current screenshot dimensions. Omit coordinate_space for key/type/open_app. ')
+    if device_capabilities is not None:
+        from .desktop_contract import capability_manifest
+        manifest = capability_manifest(device_capabilities)
+        if manifest["features"]["ensure_app"]["enabled_for_task"]:
+            tools.append({"name": "target", "description": (
+                "Ensure an explicitly advertised task application is foreground. operation=ensure_app sends at most one launch "
+                "and waits within 1..12 seconds, then returns verified or a classified failure. "
+                "Reuse transition_id only to inspect the same saved intent; it never relaunches. "
+                "This verifies application foreground, not a particular document window, control focus or business completion. "
+                "A state_only reply contains live system facts but no actionable screenshot; call observe before any further input. "
+                "Inspect the resulting screen and task scope before further input."),
+                "inputSchema": {"type": "object", "properties": {
+                    "operation": {"type": "string", "enum": ["ensure_app"]},
+                    "app": {"type": "string", "enum": [app for app in apps if manifest.get("app_processes", {}).get(app)]},
+                    "transition_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,80}$"},
+                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 12}},
+                    "required": ["operation", "app", "transition_id"], "additionalProperties": False}})
     return tools

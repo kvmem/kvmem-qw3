@@ -23,13 +23,16 @@ from .software import Software
 from .execution import Execution
 from .device_protocol import capabilities
 from .device_registry import RegisteredDesktop
+from .desktop_contract import capability_manifest, admit_task, FEATURES
+from .target_execution import TargetExecution
 
 
 class Controller:
     def __init__(self, runtime, desktop, backend, port, backend_token=None, trace_backend=False,
                  tool_call_limit=100, output_policy="outputs", *, backend_timeout_seconds=600,
                  backend_read_timeout_seconds=180, heartbeat_seconds=30, thinking=False, software=None,
-                 workflow=False, device_platform="windows", model_output_tokens=4096):
+                 workflow=False, device_platform="windows", model_output_tokens=4096,
+                 required_features=(), qualification_mode=False):
         if type(thinking) is not bool:
             raise ValueError("Thinking mode must be a boolean")
         self.thinking = thinking
@@ -56,6 +59,9 @@ class Controller:
         self.workflow = Execution(desktop, self.runtime) if workflow else None
         self.device_platform = device_platform
         self.device_capabilities = capabilities(device_platform)
+        self.required_features = list(required_features)
+        self.qualification_mode = qualification_mode
+        self.targets = None
         if self.workflow:
             desktop.execution = self.workflow
         self.backend = backend
@@ -112,6 +118,8 @@ class Controller:
         return limit - used
 
     def require_saved_inference_mode(self):
+        if self.state.get("required_features", []) != self.required_features or self.state.get("qualification_mode", False) != self.qualification_mode:
+            raise DesktopError("任务的基础能力验收要求发生变化，请使用原要求继续。")
         if self.state.get('model_output_tokens',4096)!=self.model_output_tokens:
             raise DesktopError('当前模型输出预算与任务检查点不一致，请使用原预算继续或新建任务。')
         if self.state.get('model_context_window',1048576)!=self.model_context_window:
@@ -133,7 +141,15 @@ class Controller:
         await self.discover_backend_context()
         observation = await self.desktop.start()
         if isinstance(observation, dict) and observation.get("capabilities"):
-            self.device_capabilities = observation["capabilities"]
+            self.device_capabilities = capability_manifest(observation["capabilities"])
+            path = self.runtime / "device-capabilities.json"
+            path.write_text(json.dumps(self.device_capabilities))
+            path.chmod(0o600)
+            if hasattr(self.desktop, "db") and self.device_capabilities["features"]["ensure_app"]["enabled_for_task"]:
+                self.targets = TargetExecution(self.desktop)
+        if self.required_features:
+            admit_task(capability_manifest(self.device_capabilities), self.required_features,
+                       qualification_mode=self.qualification_mode)
         self.bridge = web.AppRunner(bridge_app(self.backend, trace_dir=self.runtime / "inference",
                                               backend_token=self.backend_token, trace_backend=self.trace_backend,
                                               backend_timeout_seconds=self.backend_timeout_seconds,
@@ -142,6 +158,7 @@ class Controller:
                                               allow_thinking=self.thinking,
                                               max_tokens=self.model_output_tokens,
                                               allowed_tools={"mcp__computer__observe", "mcp__computer__act"}
+                                              | ({"mcp__computer__target"} if self.targets else set())
                                               | ({"mcp__computer__workflow"} if self.workflow else set())
                                               | ({"mcp__computer__software"} if self.software else set())),
                                     handler_cancellation=True)
@@ -151,12 +168,17 @@ class Controller:
         bridge_port = site._server.sockets[0].getsockname()[1]
         proxy_args = [str(Path(__file__).with_name("mcp_proxy.py")), "--endpoint", f"http://127.0.0.1:{self.port}",
                       "--token-file", str(self.runtime / "mcp-token.txt"), "--platform", self.device_platform]
+        if self.device_platform == "macos":
+            proxy_args += ["--macos-apps"] + self.device_capabilities.get("open_apps", [])
+        if isinstance(observation, dict) and observation.get("capabilities"):
+            proxy_args += ["--capabilities-file", str(self.runtime / "device-capabilities.json")]
         if self.software:
             proxy_args.append("--software")
         if self.workflow:
             proxy_args.append("--workflow")
         write_config(self.runtime / "codex", f"http://127.0.0.1:{bridge_port}/v1", sys.executable,
                      proxy_args, thinking=self.thinking, software=self.software is not None, workflow=self.workflow is not None,
+                     targets=self.targets is not None,
                      context_window=self.model_context_window)
         self.client = CodexClient(self.runtime / "codex")
         await self.client.start()
@@ -192,6 +214,7 @@ class Controller:
                     self.ready = False
                     if self.state["status"] in ("starting", "running", "verifying", "paused"):
                         self.state.update(status="paused", notice="Codex 连接已断开。重启应用后可核对桌面并继续。")
+                        self.state["transport_error"] = {"code": params.get("code", "disconnected"), "at": time.time()}
                     with contextlib.suppress(DesktopError):
                         await self.desktop.control("pause")
                     if self.software:
@@ -258,6 +281,20 @@ class Controller:
                     self.state["finished_at"] = time.time()
                 self.save()
 
+    async def check_feature_admission(self):
+        if not self.required_features:
+            return
+        observation = await self.desktop.observe()
+        raw = observation.get('capabilities')
+        if not isinstance(raw, dict):
+            raise DesktopError('当前设备未提供任务所需的能力证据。')
+        try:
+            manifest = capability_manifest(raw)
+            admit_task(manifest, self.required_features, qualification_mode=self.qualification_mode)
+        except ValueError as exc:
+            raise DesktopError(str(exc)) from exc
+        self.device_capabilities = manifest
+
     async def start_task(self, prompt, acknowledge_uncertain=False):
         async with self.control_lock:
             if not self.ready:
@@ -266,6 +303,7 @@ class Controller:
                 raise DesktopError("请先停止或继续当前任务。")
             if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 12000:
                 raise DesktopError("请输入 1–12000 字的任务描述。")
+            await self.check_feature_admission()
             if self.desktop.unresolved():
                 await self.desktop.control("resume", acknowledge_uncertain)
                 await self.desktop.control("pause")
@@ -278,6 +316,9 @@ class Controller:
             self.state['model_context_window'] = self.model_context_window
             self.state['model_output_tokens']=self.model_output_tokens
             self.state["device_platform"] = self.device_platform
+            self.state["required_features"] = self.required_features
+            self.state["qualification_mode"] = self.qualification_mode
+            self.state["capability_version"] = self.device_capabilities.get("capability_version")
             self.state["device_identity"] = self.desktop.selected if isinstance(self.desktop, RegisteredDesktop) else getattr(self.desktop, "endpoint", None)
             self.state["software_root"] = str(self.software.root) if self.software else None
             self.desktop.task_id = self.state["id"]
@@ -380,7 +421,7 @@ class Controller:
                 await self.desktop.control("resume")
                 observation = await self.desktop.observe()
                 self.desktop.task_id = task_id
-                await self.client.rpc("thread/resume", {"threadId": self.state["thread_id"]})
+                await self.client.rpc("thread/resume", {"threadId": self.state["thread_id"], "excludeTurns": True})
                 description = json.dumps(model_observation(observation), ensure_ascii=False)
                 text = prompt + "\nContinue the same task using its existing history. Current desktop observation:\n" + description
                 turn_id = await self.client.turn(self.state["thread_id"], text,
@@ -410,11 +451,14 @@ class Controller:
                     raise DesktopError("任务调用额度已用尽；暂停或重启不会重置额度。")
                 self.require_saved_inference_mode()
                 try:
+                    await self.check_feature_admission()
                     await self.desktop.control("resume", acknowledge_uncertain)
                     observation = await self.desktop.observe()
                     self.desktop.task_id = self.state["id"]
                     # App-server restart requires loading the persisted Codex thread.
-                    await self.client.rpc("thread/resume", {"threadId": self.state["thread_id"]})
+                    # Resume the model's saved history without hydrating all
+                    # screenshot turns into one client RPC message.
+                    await self.client.rpc("thread/resume", {"threadId": self.state["thread_id"], "excludeTurns": True})
                     text = "The user resumed the task. Reconcile the current desktop against the task history. "
                     text += "Do not blindly repeat any interrupted action. Current observation:\n"
                     text += json.dumps(model_observation(observation))
@@ -545,7 +589,7 @@ class Controller:
             return await self._tool(name, arguments)
 
     async def _tool(self, name, arguments):
-        if name not in ("observe", "act") and not (name == "software" and self.software) and not (name == "workflow" and self.workflow):
+        if name not in ("observe", "act") and not (name == "software" and self.software) and not (name == "workflow" and self.workflow) and not (name == "target" and self.targets):
             raise DesktopError("Unknown desktop tool")
         exhausted = False
         async with self.control_lock:
@@ -568,6 +612,14 @@ class Controller:
             return mcp_observation(observation, recovery) | ({"isError": True} if recovery else {})
         if self.state["status"] != "running":
             raise DesktopError("Task is not running; wait for user resume")
+        if name == "target":
+            try:
+                result = await self.targets.invoke(arguments)
+            except BaseException:
+                if self.desktop.paused or self.desktop.unresolved():
+                    await self.control("pause")
+                raise
+            return mcp_observation(result["observation"], result) | ({"isError": True} if not result.get("verified") else {})
         if name == "workflow":
             result = await self.workflow.invoke(arguments)
             if result.get("status") == "takeover_requested":
@@ -833,6 +885,8 @@ async def run(args):
                             software=Software(software_root) if software_root else None,
                             workflow=getattr(args, "execution_mode", "legacy") == "verified",
                             model_output_tokens=getattr(args,'model_output_tokens',4096),
+                            required_features=getattr(args, 'require_features', ()),
+                            qualification_mode=getattr(args, 'qualification_mode', False),
                             device_platform=getattr(args, "device_platform", "windows"))
     runner = web.AppRunner(web_app(controller), handler_cancellation=True)
     try:
@@ -861,10 +915,12 @@ def main():
     parser.add_argument("--desktop-token", type=Path)
     parser.add_argument("--device-registry", type=Path, help="Owner-created local device catalogue; includes token file references")
     parser.add_argument("--selected-device", help="Initial registry device identity")
-    parser.add_argument("--device-platform", choices=("windows", "linux", "android"), default="windows")
+    parser.add_argument("--device-platform", choices=("windows", "linux", "android", "macos"), default="windows")
     parser.add_argument("--execution-mode", choices=("legacy", "verified"), default="legacy",
                         help="Verified mode adds conditions, bounded waits and durable steps; legacy retains old execution")
     parser.add_argument("--runtime", type=Path, required=True)
+    parser.add_argument("--require-features", nargs="*", choices=FEATURES, default=[])
+    parser.add_argument("--qualification-mode", action="store_true", help="Exercise unqualified candidates, not a product acceptance run")
     parser.add_argument("--trace-backend", action="store_true", help="Tag QW3 requests for retrieval diagnostics")
     parser.add_argument("--thinking", action="store_true", help="Enable local thinking for new tasks; defaults to off")
     parser.add_argument('--model-output-tokens',type=int,default=4096,

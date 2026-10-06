@@ -68,6 +68,9 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
                 return web.json_response({"delivery": "rejected", "error": "Foreground changed"}, status=409)
             self.effects += 1
             result = {"action_id": body["action_id"], "status": "completed", "observation": self.observation()}
+            if request.path == '/dispatch':
+                result = {'action_id':body['action_id'],'desktop_id':body['desktop_id'],
+                          'status':'completed','delivery':'delivered','observation_pending':True}
             if self.mode != "unknown":
                 self.receipts[body["action_id"]] = {"status": "completed", "result": result}
             self.entered.set()
@@ -182,6 +185,34 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result['observation_revalidation']['same_view'])
         self.assertEqual(self.effects,1)
         self.execution.close()
+
+    async def test_refreshed_native_reference_preserves_stable_control_identity_but_not_changed_identity(self):
+        await self.observed_controls()
+        for index,control in enumerate(self.controls):
+            control.update(native_ref='ax_old_'+str(index),native_identity='native-instance-control-'+str(index))
+        controls=(await self.desktop.observe())['accessibility']['controls']
+        step=await self.enable_expired_step()
+        request=self.action(step=step,action={'kind':'click_control','control_id':controls[0]['control_id']})
+        for index,control in enumerate(self.controls):control['native_ref']='ax_new_'+str(index)
+        result=await self.desktop.act(request)
+        self.assertTrue(result['observation_revalidation']['target_control_valid']);self.assertEqual(self.effects,1)
+        fresh=self.desktop.latest['accessibility']['controls']
+        second=self.action('different-native-control',action={'kind':'click_control','control_id':fresh[0]['control_id']})
+        self.controls[0]['native_identity']='a-different-control-instance'
+        with self.assertRaises(DesktopRejected):await self.desktop.act(second)
+        self.assertEqual(self.effects,1)
+        self.execution.close()
+
+    async def test_native_window_reference_must_be_unique_in_the_current_capture(self):
+        reference='win_00000000-0000-0000-0000-000000000001'
+        self.observation_extra={'capabilities':{'actions':['activate_window']},
+            'windows':[{'window_ref':reference,'identity':'session-app-window-A'}]}
+        await self.desktop.observe()
+        action={'kind':'activate_window','window_ref':reference}
+        await self.desktop.act(self.action('valid-native-window',action=action))
+        self.observation_extra['windows']=[];await self.desktop.observe()
+        with self.assertRaisesRegex(DesktopError,'not uniquely present'):await self.desktop.act(self.action('stale-native-window',action=action))
+        self.assertEqual(self.effects,1)
 
     async def aged_context_control(self, region=True, target_index=0):
         self.observation_extra={'foreground':{'handle':'0x12','process':'editor','title':'Document'},
@@ -636,6 +667,21 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.desktop.unresolved(), [])
         self.assertTrue((await self.desktop.act(request))["duplicate"])
         self.assertEqual(self.effects, 1)
+
+    async def test_receipt_only_lost_response_reconciles_without_replaying_or_inventing_image(self):
+        self.mode='lost_response';request=self.action()
+        with self.assertRaises(DesktopError):await self.desktop.act(request,capture_after_input=False)
+        self.assertTrue(self.desktop.paused)
+        await self.desktop.close()
+        self.desktop=Desktop(self.url,'fixture-token',self.temp.name)
+        await self.desktop.start()
+        reconciliation=await self.desktop.reconcile_pending()
+        self.assertEqual(reconciliation['remaining'],[])
+        self.assertTrue(self.desktop.paused)
+        await self.desktop.control('resume')
+        result=await self.desktop.act(request,capture_after_input=False)
+        self.assertTrue(result['duplicate']);self.assertTrue(result['observation_pending'])
+        self.assertNotIn('observation',result);self.assertEqual(self.effects,1)
 
     async def test_receipts_can_be_reconciled_after_restart_while_input_stays_paused(self):
         self.mode = 'lost_response'

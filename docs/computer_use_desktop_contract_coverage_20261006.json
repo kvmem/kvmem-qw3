@@ -1,0 +1,1834 @@
+{
+  "schema_version": 1,
+  "plan": "docs/computer_use_desktop_contract_plan_20261006.json",
+  "updated_at": 1791278667.9945543,
+  "logical_cases": 48,
+  "host_checks_are_not_platform_cases": true,
+  "platforms_not_globally_qualified": true,
+  "complex_experiments": "paused",
+  "cases": [
+    {
+      "id": "T01-01",
+      "family": "应用启动与切换",
+      "scenario": "应用未运行",
+      "required_evidence": "目标应用实例、真实前景、投递账本及有界停止；不能只有系统启动命令退出码",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T01-02",
+      "family": "应用启动与切换",
+      "scenario": "应用在后台",
+      "required_evidence": "目标应用实例、真实前景、投递账本及有界停止；不能只有系统启动命令退出码",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "live_passed",
+          "evidence": [
+            "apps/computer_use/.runtime/desktop-contract-20261006-01/mac-transition-live-03/result.json"
+          ],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T01-03",
+      "family": "应用启动与切换",
+      "scenario": "应用窗口已最小化",
+      "required_evidence": "目标应用实例、真实前景、投递账本及有界停止；不能只有系统启动命令退出码",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T01-04",
+      "family": "应用启动与切换",
+      "scenario": "应用启动慢或失败",
+      "required_evidence": "目标应用实例、真实前景、投递账本及有界停止；不能只有系统启动命令退出码",
+      "host": {
+        "status": "partial_host_evidence",
+        "test_ids": [
+          "test_target_execution.TargetExecutionTests.test_launch_delivery_is_not_foreground_success_and_duplicate_never_relaunches"
+        ],
+        "report": "apps/computer_use/.runtime/desktop-contract-20261006-01/host-qualification.json"
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T02-01",
+      "family": "窗口和 Activity 身份",
+      "scenario": "单窗口",
+      "required_evidence": "唯一目标及代次；歧义和失效不得误选",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "live_passed",
+          "evidence": [
+            "apps/computer_use/.runtime/desktop-contract-20261006-01/mac-transition-live-03/result.json"
+          ],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "partial_agent_evidence",
+        "evidence": [
+          "/home/chaidi/qw3/apps/computer_use/.runtime/desktop-contract-20261006-01/mac-qw3-agent-03/independent-audit.json"
+        ],
+        "note": "一个双文档任务已独立通过；不能覆盖该家族全部前置条件或负例"
+      }
+    },
+    {
+      "id": "T02-02",
+      "family": "窗口和 Activity 身份",
+      "scenario": "同名多窗口",
+      "required_evidence": "唯一目标及代次；歧义和失效不得误选",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T02-03",
+      "family": "窗口和 Activity 身份",
+      "scenario": "窗口标题变化",
+      "required_evidence": "唯一目标及代次；歧义和失效不得误选",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T02-04",
+      "family": "窗口和 Activity 身份",
+      "scenario": "窗口关闭后 ID 重用",
+      "required_evidence": "唯一目标及代次；歧义和失效不得误选",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T03-01",
+      "family": "模态与所属关系",
+      "scenario": "有标题所属弹窗",
+      "required_evidence": "可追溯原生所属关系；允许案例可继续，不能证明或需要系统授权时正确暂停",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T03-02",
+      "family": "模态与所属关系",
+      "scenario": "无标题所属 sheet",
+      "required_evidence": "可追溯原生所属关系；允许案例可继续，不能证明或需要系统授权时正确暂停",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "partial_live",
+          "evidence": [
+            "apps/computer_use/.runtime/desktop-contract-20261006-01/mac-transition-live-03/result.json"
+          ],
+          "remaining": "实机确认了许可 sheet 的原生归属和控件；尚未让 QW3 在该弹窗继续安装。"
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T03-03",
+      "family": "模态与所属关系",
+      "scenario": "相同应用的无关弹窗",
+      "required_evidence": "可追溯原生所属关系；允许案例可继续，不能证明或需要系统授权时正确暂停",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T03-04",
+      "family": "模态与所属关系",
+      "scenario": "嵌套弹窗或跨进程系统弹窗",
+      "required_evidence": "可追溯原生所属关系；允许案例可继续，不能证明或需要系统授权时正确暂停",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T04-01",
+      "family": "控件焦点与文本输入",
+      "scenario": "目标字段当前未聚焦",
+      "required_evidence": "正确字段获得指定内容；其他字段不变；安全字段进入接管流程",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "partial_live",
+          "evidence": [
+            "apps/computer_use/.runtime/desktop-contract-20261006-01/mac-transition-live-03/result.json"
+          ],
+          "remaining": "实机聚焦后身份一致；当前字段未聚焦的前置条件还需补测。"
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T04-02",
+      "family": "控件焦点与文本输入",
+      "scenario": "聚焦后焦点被抢",
+      "required_evidence": "正确字段获得指定内容；其他字段不变；安全字段进入接管流程",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "live_passed",
+          "evidence": [
+            "apps/computer_use/.runtime/desktop-contract-20261006-01/mac-transition-live-03/result.json"
+          ],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T04-03",
+      "family": "控件焦点与文本输入",
+      "scenario": "中英文及换行精确输入",
+      "required_evidence": "正确字段获得指定内容；其他字段不变；安全字段进入接管流程",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "live_passed",
+          "evidence": [
+            "apps/computer_use/.runtime/desktop-contract-20261006-01/mac-transition-live-03/result.json"
+          ],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "partial_agent_evidence",
+        "evidence": [
+          "/home/chaidi/qw3/apps/computer_use/.runtime/desktop-contract-20261006-01/mac-qw3-agent-03/independent-audit.json"
+        ],
+        "note": "一个双文档任务已独立通过；不能覆盖该家族全部前置条件或负例"
+      }
+    },
+    {
+      "id": "T04-04",
+      "family": "控件焦点与文本输入",
+      "scenario": "密码或安全字段",
+      "required_evidence": "正确字段获得指定内容；其他字段不变；安全字段进入接管流程",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T05-01",
+      "family": "观察和几何",
+      "scenario": "普通 DPI",
+      "required_evidence": "坐标映射正确；变化时旧目标失效；不支持项明确拒绝",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T05-02",
+      "family": "观察和几何",
+      "scenario": "Retina 或高 DPI",
+      "required_evidence": "坐标映射正确；变化时旧目标失效；不支持项明确拒绝",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T05-03",
+      "family": "观察和几何",
+      "scenario": "观察后布局变化",
+      "required_evidence": "坐标映射正确；变化时旧目标失效；不支持项明确拒绝",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T05-04",
+      "family": "观察和几何",
+      "scenario": "显示尺寸或旋转变化",
+      "required_evidence": "坐标映射正确；变化时旧目标失效；不支持项明确拒绝",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T06-01",
+      "family": "权限与任务范围",
+      "scenario": "权限齐全",
+      "required_evidence": "正确暂停与重新资格检查，零越界输入；不静默扩大任务范围",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "live_passed",
+          "evidence": [
+            "apps/computer_use/.runtime/desktop-contract-20261006-01/mac-transition-live-03/result.json"
+          ],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T06-02",
+      "family": "权限与任务范围",
+      "scenario": "权限缺失或运行中撤销",
+      "required_evidence": "正确暂停与重新资格检查，零越界输入；不静默扩大任务范围",
+      "host": {
+        "status": "partial_host_evidence",
+        "test_ids": [
+          "test_controller.ControllerTests.test_required_feature_loss_is_checked_before_new_task_and_before_resume_input"
+        ],
+        "report": "apps/computer_use/.runtime/desktop-contract-20261006-01/host-qualification.json"
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T06-03",
+      "family": "权限与任务范围",
+      "scenario": "签名更新后权限失效",
+      "required_evidence": "正确暂停与重新资格检查，零越界输入；不静默扩大任务范围",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T06-04",
+      "family": "权限与任务范围",
+      "scenario": "任务范围到期或无关前景",
+      "required_evidence": "正确暂停与重新资格检查，零越界输入；不静默扩大任务范围",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T07-01",
+      "family": "等待与无进度",
+      "scenario": "正常异步完成",
+      "required_evidence": "等待不重复输入；停止有界；仅图像变化不能作为业务完成",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T07-02",
+      "family": "等待与无进度",
+      "scenario": "处理时间超过一次轮询",
+      "required_evidence": "等待不重复输入；停止有界；仅图像变化不能作为业务完成",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T07-03",
+      "family": "等待与无进度",
+      "scenario": "持续无进度",
+      "required_evidence": "等待不重复输入；停止有界；仅图像变化不能作为业务完成",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T07-04",
+      "family": "等待与无进度",
+      "scenario": "动画或光标变化但业务无进度",
+      "required_evidence": "等待不重复输入；停止有界；仅图像变化不能作为业务完成",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T08-01",
+      "family": "动作和设备生命周期",
+      "scenario": "重复 action_id",
+      "required_evidence": "不重复发送；未知状态可核对；旧会话失效；只有一个输入所有者",
+      "host": {
+        "status": "partial_host_evidence",
+        "test_ids": [
+          "test_macos_agent_driver.MacBoundaryTests.test_completed_duplicate_reuses_receipt_without_native_resend"
+        ],
+        "report": "apps/computer_use/.runtime/desktop-contract-20261006-01/host-qualification.json"
+      },
+      "platforms": {
+        "macos": {
+          "status": "partial_live",
+          "evidence": [
+            "apps/computer_use/.runtime/desktop-contract-20261006-01/mac-transition-live-03/result.json"
+          ],
+          "remaining": "实机重复目标意图不重发；重复底层 action_id 的实机案例需补测。"
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T08-02",
+      "family": "动作和设备生命周期",
+      "scenario": "输入送达后回执丢失",
+      "required_evidence": "不重复发送；未知状态可核对；旧会话失效；只有一个输入所有者",
+      "host": {
+        "status": "partial_host_evidence",
+        "test_ids": [
+          "test_desktop.DesktopTests.test_receipt_only_lost_response_reconciles_without_replaying_or_inventing_image"
+        ],
+        "report": "apps/computer_use/.runtime/desktop-contract-20261006-01/host-qualification.json"
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T08-03",
+      "family": "动作和设备生命周期",
+      "scenario": "原生端或网关重启",
+      "required_evidence": "不重复发送；未知状态可核对；旧会话失效；只有一个输入所有者",
+      "host": {
+        "status": "partial_host_evidence",
+        "test_ids": [
+          "test_macos_agent_driver.MacBoundaryTests.test_lightweight_state_restart_invalidates_capture_without_input"
+        ],
+        "report": "apps/computer_use/.runtime/desktop-contract-20261006-01/host-qualification.json"
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T08-04",
+      "family": "动作和设备生命周期",
+      "scenario": "第二输入所有者竞争",
+      "required_evidence": "不重复发送；未知状态可核对；旧会话失效；只有一个输入所有者",
+      "host": {
+        "status": "partial_host_evidence",
+        "test_ids": [
+          "test_macos_agent_driver.MacBoundaryTests.test_second_native_owner_is_rejected"
+        ],
+        "report": "apps/computer_use/.runtime/desktop-contract-20261006-01/host-qualification.json"
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T09-01",
+      "family": "任务恢复",
+      "scenario": "用户暂停后继续",
+      "required_evidence": "原任务/额度/已验证步骤保留；先核对现场，不盲目重放",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T09-02",
+      "family": "任务恢复",
+      "scenario": "授权中断后继续",
+      "required_evidence": "原任务/额度/已验证步骤保留；先核对现场，不盲目重放",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T09-03",
+      "family": "任务恢复",
+      "scenario": "待核验步骤恢复",
+      "required_evidence": "原任务/额度/已验证步骤保留；先核对现场，不盲目重放",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T09-04",
+      "family": "任务恢复",
+      "scenario": "不确定动作恢复",
+      "required_evidence": "原任务/额度/已验证步骤保留；先核对现场，不盲目重放",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T10-01",
+      "family": "历史与资源边界",
+      "scenario": "短历史恢复",
+      "required_evidence": "给出具体错误分类；受限恢复或可恢复暂停；区分模型失败与基础设施失败",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T10-02",
+      "family": "历史与资源边界",
+      "scenario": "截图历史超过单消息预算",
+      "required_evidence": "给出具体错误分类；受限恢复或可恢复暂停；区分模型失败与基础设施失败",
+      "host": {
+        "status": "partial_host_evidence",
+        "test_ids": [
+          "test_codex_integration.CodexIntegrationTests.test_metadata_only_resume_preserves_large_image_history_for_the_next_turn"
+        ],
+        "report": "apps/computer_use/.runtime/desktop-contract-20261006-01/host-qualification.json"
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T10-03",
+      "family": "历史与资源边界",
+      "scenario": "模型输出被截断",
+      "required_evidence": "给出具体错误分类；受限恢复或可恢复暂停；区分模型失败与基础设施失败",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T10-04",
+      "family": "历史与资源边界",
+      "scenario": "GPU 压力或后端响应慢",
+      "required_evidence": "给出具体错误分类；受限恢复或可恢复暂停；区分模型失败与基础设施失败",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T11-01",
+      "family": "实际工具协议",
+      "scenario": "设备能力生成的 schema",
+      "required_evidence": "模型侧收到与执行器相符的定义；不得以 JSON Schema 合法代替真实往返验证",
+      "host": {
+        "status": "partial_host_evidence",
+        "test_ids": [
+          "test_desktop_contract.DesktopContractTests.test_tool_actions_and_launches_follow_observed_capabilities"
+        ],
+        "report": "apps/computer_use/.runtime/desktop-contract-20261006-01/host-qualification.json"
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T11-02",
+      "family": "实际工具协议",
+      "scenario": "实际 Codex 工具往返",
+      "required_evidence": "模型侧收到与执行器相符的定义；不得以 JSON Schema 合法代替真实往返验证",
+      "host": {
+        "status": "partial_host_evidence",
+        "test_ids": [
+          "test_codex_integration.CodexIntegrationTests.test_observed_target_tool_executes_and_returns_its_scope_through_real_codex"
+        ],
+        "report": "apps/computer_use/.runtime/desktop-contract-20261006-01/host-qualification.json"
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T11-03",
+      "family": "实际工具协议",
+      "scenario": "合法操作字段无损传递",
+      "required_evidence": "模型侧收到与执行器相符的定义；不得以 JSON Schema 合法代替真实往返验证",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T11-04",
+      "family": "实际工具协议",
+      "scenario": "权限或能力版本变化后工具重建",
+      "required_evidence": "模型侧收到与执行器相符的定义；不得以 JSON Schema 合法代替真实往返验证",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T12-01",
+      "family": "完成判定与证据",
+      "scenario": "动作已送达但未达成结果",
+      "required_evidence": "分别报告送达、步骤、业务、证据完整性；不能报假成功",
+      "host": {
+        "status": "partial_host_evidence",
+        "test_ids": [
+          "test_target_execution.TargetExecutionTests.test_launch_delivery_is_not_foreground_success_and_duplicate_never_relaunches"
+        ],
+        "report": "apps/computer_use/.runtime/desktop-contract-20261006-01/host-qualification.json"
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T12-02",
+      "family": "完成判定与证据",
+      "scenario": "可见状态正确但磁盘产物错误",
+      "required_evidence": "分别报告送达、步骤、业务、证据完整性；不能报假成功",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "partial_live",
+          "evidence": [
+            "apps/computer_use/.runtime/desktop-contract-20261006-01/mac-transition-live-03/result.json"
+          ],
+          "remaining": "实机已精确核对磁盘与另一文件不变；刻意制造错误磁盘产物的负例尚未完成。"
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    },
+    {
+      "id": "T12-03",
+      "family": "完成判定与证据",
+      "scenario": "完成后新进程重复验证",
+      "required_evidence": "分别报告送达、步骤、业务、证据完整性；不能报假成功",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "partial_agent_evidence",
+        "evidence": [
+          "/home/chaidi/qw3/apps/computer_use/.runtime/desktop-contract-20261006-01/mac-qw3-agent-03/independent-audit.json"
+        ],
+        "note": "一个双文档任务已独立通过；不能覆盖该家族全部前置条件或负例"
+      }
+    },
+    {
+      "id": "T12-04",
+      "family": "完成判定与证据",
+      "scenario": "录像或验收证据缺失",
+      "required_evidence": "分别报告送达、步骤、业务、证据完整性；不能报假成功",
+      "host": {
+        "status": "planned",
+        "test_ids": [],
+        "report": null
+      },
+      "platforms": {
+        "macos": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": null
+        },
+        "windows": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "linux": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        },
+        "android": {
+          "status": "planned",
+          "evidence": [],
+          "remaining": "本轮尚未部署和执行该平台的新协议场景"
+        }
+      },
+      "agent": {
+        "status": "planned",
+        "evidence": []
+      }
+    }
+  ]
+}

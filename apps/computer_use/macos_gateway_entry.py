@@ -41,7 +41,8 @@ async def run(args):
     if not token_path.exists():
         token_path.write_text(secrets.token_hex(32))
         token_path.chmod(0o600)
-    driver = MacDriver(args.driver_endpoint, args.device_id, args.native_token, args.runtime / 'native-receipts')
+    driver = MacDriver(args.driver_endpoint, args.device_id, args.native_token, args.runtime / 'native-receipts',
+                       activation_connection=getattr(args, 'activation_connection', None))
     # Tunnel ports can change; lease identity follows the concrete Mac.
     lease = DeviceLease('macos:' + args.device_id).acquire()
     gateway = runner = None
@@ -74,6 +75,8 @@ def parser():
     result.add_argument('--native-token', type=Path, required=True)
     result.add_argument('--runtime', type=Path, required=True)
     result.add_argument('--port', type=int, required=True)
+    result.add_argument('--activation-connection', type=Path,
+                        help='Opt-in owner connection metadata for fixed system Terminal/Installer activation')
     return result
 
 
