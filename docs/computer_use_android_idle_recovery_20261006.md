@@ -12,6 +12,8 @@
 
 最新模型测试状态已变化：原七个控制器均达到停止状态且实际退出。图像组保留 1/12，其余为 0/4、0/8、0/8、0/4、0/8、0/8；图像组因原六小时显存等待期限到达而停止，其余按前序保护停止。实际可用显存 55711 MiB，低于冻结的 56000 MiB 连续三十秒门槛，没有干预用户 GPU 进程。下一步需取得可用测试窗口，再资格验证保留完成前缀的续跑与新部署，不重放首个已完成样本。
 
+状态补充：提交后再次只读核对，GPU 已空闲，可用显存 97237 MiB，连续三十秒采样满足原资源门槛。原七个进程仍全部退出，未启动新的模型任务。资源窗口恢复不等于队列自动恢复；保留完成前缀的续跑仍需资格验证。[最新资源观察](/home/chaidi/qw3/apps/computer_use/.runtime/development-progress-gpu-window-20261006-01.json)。
+
 此轮证明连接和读屏恢复能力，没有新增 QW3 业务任务，没有复杂 OSWorld 或 KVMem 成功率改善的结论。目标保持 active。
 
 证据：[完整报告](/home/chaidi/qw3/docs/computer_use_android_idle_recovery_20261006.json)、[最终实际独立核验](/home/chaidi/qw3/apps/computer_use/.runtime/android-idle-recovery-live-independent-audit-02/result.json)、[最终十四项资格](/home/chaidi/qw3/apps/computer_use/.runtime/android-idle-recovery-cpu-02/result.json)、[私有候选清单](/home/chaidi/qw3/apps/computer_use/.runtime/android-idle-recovery-candidate-20261006-01/build.json)、[最终实时回放](/home/chaidi/qw3/apps/computer_use/.runtime/android-idle-recovery-live-05/continuous.mp4)与[七个原代次的停止核验](/home/chaidi/qw3/apps/computer_use/.runtime/android-idle-final-seven-controller-status-01.json)。

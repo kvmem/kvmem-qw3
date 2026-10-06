@@ -1805,5 +1805,20 @@
     },
     "new_condition_trials": 0,
     "business_gain_proven": false
+  },
+  "latest_gpu_window_after_controller_stop_20261006": {
+    "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/development-progress-gpu-window-20261006-01.json",
+      "sha256": "4879758e1f88015a67774668fa89b2eb8329808cb26056647fcc3b367f43d997"
+    },
+    "checked_at": 1791250342.241237,
+    "free_mib": 97237,
+    "gpu_percent": 0,
+    "headroom_met_for_sampled_window": true,
+    "sampled_window_seconds": 30.178243876900524,
+    "original_controllers_retired": true,
+    "new_controller_started": false,
+    "new_model_tasks": 0,
+    "scope": "Resource window is available now; original halted controllers do not automatically resume. Preserved-prefix continuation qualification is still required."
   }
 }
