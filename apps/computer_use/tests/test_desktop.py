@@ -214,6 +214,32 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(DesktopError,'not uniquely present'):await self.desktop.act(self.action('stale-native-window',action=action))
         self.assertEqual(self.effects,1)
 
+    async def test_legacy_cold_native_window_intent_refreshes_only_same_identity_without_replay(self):
+        reference='win_00000000-0000-0000-0000-000000000001'
+        updated='win_00000000-0000-0000-0000-000000000002'
+        self.observation_extra={'capabilities':{'actions':['activate_window']},
+            'windows':[{'window_ref':reference,'identity':'session-app-window-A'}]}
+        await self.desktop.observe();self.desktop.latest['captured_at']=int(time.time()*1000)-65000
+        request=self.action('cold-native-window',action={'kind':'activate_window','window_ref':reference})
+        self.observation_extra['windows'][0]['window_ref']=updated
+        result=await self.desktop.act(request)
+        self.assertEqual(self.last_dispatched['action']['window_ref'],updated)
+        self.assertTrue(result['observation_revalidation']['native_target_identity_valid'])
+        await self.desktop.act(request);self.assertEqual(self.effects,1)
+        self.desktop.latest['captured_at']=int(time.time()*1000)-65000
+        second=self.action('cold-different-window',action={'kind':'activate_window','window_ref':updated})
+        self.observation_extra['windows'][0]['identity']='another-window-instance'
+        with self.assertRaises(DesktopRejected):await self.desktop.act(second)
+        self.assertEqual(self.effects,1)
+
+    async def test_aged_keyboard_refuses_changed_native_focus_even_with_identical_image(self):
+        self.observation_extra={'focused_control':{'identity':'field-A','kind':'AXTextArea'}}
+        await self.desktop.observe();self.desktop.latest['captured_at']=int(time.time()*1000)-65000
+        request=self.action('cold-keyboard-focus',action={'kind':'type','text':'MUST-NOT-BE-TYPED'})
+        self.observation_extra['focused_control']['identity']='field-B'
+        with self.assertRaises(DesktopRejected):await self.desktop.act(request)
+        self.assertEqual(self.effects,0)
+
     async def aged_context_control(self, region=True, target_index=0):
         self.observation_extra={'foreground':{'handle':'0x12','process':'editor','title':'Document'},
                                 'capabilities':{'platform':'linux'}}

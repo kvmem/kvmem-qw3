@@ -81,6 +81,12 @@ def intent_fingerprint(action, observation):
         control = next((c for c in controls if c.get("control_id") == action.get("control_id")), None)
         if control:
             action = {"kind": "click", "x": control["center_x"], "y": control["center_y"], "button": "left", "clicks": 1}
+    elif action.get('kind') in {'activate_window','focus_control'}:
+        window=action['kind']=='activate_window'
+        candidates=observation.get('windows',[]) if window else observation.get('accessibility',{}).get('controls',[])
+        control=next((c for c in candidates if c.get('window_ref' if window else 'native_ref')==action.get('window_ref' if window else 'control_ref')),None)
+        if control and control.get('identity' if window else 'native_identity'):
+            action={'kind':action['kind'],'target_identity':control['identity' if window else 'native_identity']}
     return hashlib.sha256(json.dumps(action, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 

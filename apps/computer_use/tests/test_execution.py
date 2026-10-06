@@ -70,6 +70,32 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.device.latest["progress_sha256"] = "next-page"
         self.execution.before_dispatch({}, {"action": action}, "fourth")
 
+    async def test_rotating_native_refs_cannot_bypass_repeat_guard(self):
+        await self.begin()
+        for kind in ("activate_window", "focus_control"):
+            with self.subTest(kind=kind):
+                window = kind == "activate_window"
+
+                def target(reference, identity):
+                    if window:
+                        self.device.latest["windows"] = [{"window_ref": reference, "identity": identity}]
+                        return {"kind": kind, "window_ref": reference}
+                    self.device.latest["accessibility"]["controls"] = [
+                        {"native_ref": reference, "native_identity": identity}]
+                    return {"kind": kind, "control_ref": reference}
+
+                for number in range(2):
+                    action = target(f"observation-{number}", "same-native-object")
+                    self.execution.before_dispatch({}, {"action": action}, f"{kind}-{number}")
+                    await self.device.observe()
+                action = target("observation-2", "same-native-object")
+                with self.assertRaises(DesktopValidationError) as raised:
+                    self.execution.before_dispatch({}, {"action": action}, f"{kind}-blocked")
+                self.assertEqual(raised.exception.problem["code"], "repeated_intent")
+                # A different native object remains a distinct recovery target.
+                action = target("observation-3", "different-native-object")
+                self.execution.before_dispatch({}, {"action": action}, f"{kind}-new-target")
+
     async def test_wait_current_step_defaults_without_guessing_verified_or_missing_step(self):
         with self.assertRaisesRegex(DesktopError, 'No unique pending'):
             await self.execution.invoke({'operation':'wait'})

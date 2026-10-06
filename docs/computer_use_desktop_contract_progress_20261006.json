@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "updated_at": 1791278667.9936063,
-  "status": "stage_B_partial_stage_C_autonomous_TextEdit_passed_original_Python_resuming",
+  "updated_at": 1791279221.3882082,
+  "status": "stage_B_partial_stage_C_autonomous_TextEdit_passed_original_Python_verifying_after_user_auth",
   "plan": "docs/computer_use_desktop_contract_plan_20261006.json",
   "coverage": "docs/computer_use_desktop_contract_coverage_20261006.json",
   "implemented": [
@@ -12,7 +12,9 @@
     "Mac observation-bound native window refs, native control focus and pre-keyboard focus identity check",
     "Mac owned-titleless-sheet evidence, scope expiry and secure-field refusal",
     "Same-thread Codex resume excludes hydrated screenshot turns; original model history remains",
-    "Classified JSON transport failure records without screenshot/model payload logging"
+    "Classified JSON transport failure records without screenshot/model payload logging",
+    "Cold observation revalidation also in legacy mode; native references remap only on unique same native identity",
+    "Keyboard cold revalidation checks observed focused control; semantic repeat guard tracks native identity across rotating references"
   ],
   "confirmed_causes": [
     {
@@ -29,11 +31,16 @@
       "problem": "Titleless license sheet rejected",
       "cause": "The old title-only scope rule lacked positive native parent evidence",
       "proof": "Actual Installer sheet reports AXWindow parent 安装Python with matching PID and native window identity"
+    },
+    {
+      "problem": "Original cold legacy turn used expired native capture",
+      "cause": "Cold history inference outlasted observation lifetime; automatic safe refresh was gated on verified mode",
+      "proof": "Actual original turn was refused before input and recovered after observe; host regression proves same-object refresh and changed-focus refusal"
     }
   ],
   "host_validation": {
     "passed": true,
-    "tests": 198,
+    "tests": 201,
     "skipped": 0,
     "actual_pinned_codex": true,
     "QW3_inference_used": false,
@@ -76,11 +83,14 @@
   ],
   "original_python_task": {
     "id": "74b03e10891a415380d4e11aa7e0df1d",
-    "status": "resuming_original_thread_for_recovery_and_installation_pilot",
+    "status": "same_task_followup_running_after_local_system_auth",
     "calls_preserved": 23,
     "limit_preserved": 80,
     "installed": false,
-    "root_installer_inputs": 0
+    "root_installer_inputs": 0,
+    "calls_before_followup": 28,
+    "installation_page_observed_by_QW3": true,
+    "independent_environment_verification_pending": true
   },
   "not_complete": [
     "48 logical scenarios across each platform",
@@ -95,7 +105,8 @@
     "No universal atomic focus-and-input guarantee",
     "Observed app foreground does not prove selected window, field value or business completion",
     "Native focus/window primitives still require independently checked results",
-    "No claim of complex task success-rate or isolated KVMem improvement"
+    "No claim of complex task success-rate or isolated KVMem improvement",
+    "DFlash2 configured, but observed multimodal requests dispatch plain; no speculative acceleration claim"
   ],
   "mac_local_QW3": {
     "raw_report_unchanged": true,

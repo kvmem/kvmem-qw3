@@ -301,6 +301,7 @@ class Desktop:
                 raise DesktopValidationError({"code": "stale_observation", "path": "$.observation_id",
                     "message": "Stale observation; observe again", "hint": "Use the latest observation_id and reassess the current screen."})
             kind = arguments['action']['kind']
+            native_target = None
             if kind in {'activate_window', 'focus_control'}:
                 if kind not in self.latest.get('capabilities', {}).get('actions', []):
                     raise DesktopError('Native target operation is not available on this device')
@@ -310,6 +311,7 @@ class Desktop:
                 matches = [c for c in candidates if c.get('window_ref' if window else 'native_ref') == reference]
                 if len(matches) != 1 or not matches[0].get('identity' if window else 'native_identity'):
                     raise DesktopError('Native target reference is not uniquely present in the current observation; no input sent')
+                native_target = matches[0]
             if (self.execution and arguments["action"]["kind"] in {"click", "drag", "scroll"}
                     and arguments.get("coordinate_space") != "normalized_1000"):
                 raise DesktopValidationError({"code": "normalized_coordinates_required", "path": "$.coordinate_space",
@@ -327,7 +329,7 @@ class Desktop:
             captured=self.latest.get('captured_at')
             aged=type(captured) in (int,float) and time.time()*1000-captured>=50000
             guarded_control=self.execution and arguments['action']['kind']=='click_control'
-            if self.execution and (aged or guarded_control):
+            if aged or guarded_control:
                 old=self.latest
                 fresh=self.remember(await self.request('GET','/observe'))
                 identity=('desktop_id','device_id','session_id','display_id','width','height','rotation')
@@ -338,6 +340,8 @@ class Desktop:
                         for c in a11y.get('controls',[])]}
                 same_view=(old.get('sha256')==fresh.get('sha256') and old.get('foreground')==fresh.get('foreground')
                            and controls(old)==controls(fresh))
+                keyboard_focus_unchanged=(kind not in {'key','type'} or old.get('focused_control')==fresh.get('focused_control'))
+                same_view=same_view and keyboard_focus_unchanged
                 target_valid=False
                 if guarded_control and same_device:
                     target=mapping['control']
@@ -362,7 +366,19 @@ class Desktop:
                         {'x':x,'y':y,'width':1,'height':1}) for x,y in points)
                     context_valid=context_valid or visual_context_valid
                 independent_app_intent=arguments['action']['kind']=='open_app'
+                native_target_valid=False
+                native_refreshed=None
+                if native_target:
+                    window=kind=='activate_window'
+                    key='identity' if window else 'native_identity'
+                    candidates=fresh.get('windows',[]) if window else fresh.get('accessibility',{}).get('controls',[])
+                    matches=[c for c in candidates if c.get(key)==native_target.get(key)]
+                    native_target_valid=(len(matches)==1 and (window or
+                        fresh.get('accessibility',{}).get('status')=='ok' and old.get('foreground')==fresh.get('foreground')))
+                    if native_target_valid:
+                        native_refreshed=matches[0]
                 keyboard_context_valid = (aged and arguments['action']['kind'] in {'key', 'type'}
+                    and keyboard_focus_unchanged
                     and old.get('accessibility', {}).get('status') == 'ok'
                     and fresh.get('accessibility', {}).get('status') == 'ok'
                     and controls(old) == controls(fresh) and self.unchanged_foreground_window(old, fresh))
@@ -371,6 +387,7 @@ class Desktop:
                     'same_device':same_device,'same_view':same_view,'target_control_valid':target_valid if guarded_control else None,
                     'target_context_unchanged':bool(context_valid),
                     'foreground_context_unchanged':bool(keyboard_context_valid),
+                    'native_target_identity_valid':native_target_valid if native_target else None,
                     'scope':('Explicit allowed app intent' if independent_app_intent else
                              'Exact full foreground window pixels, identity and semantic evidence' if keyboard_context_valid else
                              'Exact unchanged content and semantic evidence; visual points inside content region' if visual_context_valid else
@@ -381,6 +398,8 @@ class Desktop:
                 self.db.execute('INSERT INTO revalidations VALUES (?,?,?)',(receipt_id,old['observation_id'],json.dumps(revalidation)))
                 self.db.commit()
                 allowed=same_view or independent_app_intent or visual_context_valid or keyboard_context_valid
+                if native_target:
+                    allowed=native_target_valid
                 if guarded_control:
                     allowed=target_valid and ((same_view or context_valid) if aged else True)
                 if not same_device or not allowed:
@@ -388,6 +407,13 @@ class Desktop:
                         'No input was sent. Retain the existing plan; reassess its next target against this current observation.',
                         observation=self.with_image(fresh),evidence_refreshed=same_device)
                 dispatched=dispatched | {'desktop_id':fresh['desktop_id'],'observation_id':fresh['observation_id']}
+                if native_refreshed:
+                    key='window_ref' if kind=='activate_window' else 'control_ref'
+                    value=native_refreshed['window_ref' if kind=='activate_window' else 'native_ref']
+                    dispatched=dispatched|{'action':dispatched['action']|{key:value}}
+                    mapping={'source':'native_target_identity_refresh','source_observation_id':old['observation_id'],
+                             'fresh_observation_id':fresh['observation_id'],'native_identity':native_target.get('identity',native_target.get('native_identity')),
+                             'input_action':arguments['action'],'dispatched_action':dispatched['action']}
             if self.execution:
                 self.execution.before_dispatch(arguments, dispatched, receipt_id)
             elif "step" in arguments:

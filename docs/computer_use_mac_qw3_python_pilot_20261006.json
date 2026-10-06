@@ -1,6 +1,6 @@
 {
   "task_id": "74b03e10891a415380d4e11aa7e0df1d",
-  "status": "paused_for_foundation_qualification",
+  "status": "same_task_followup_running_after_user_authorized_installer",
   "model": "local QW3",
   "kvmem": "on",
   "dflash2": true,
@@ -8,7 +8,7 @@
   "execution_mode": "legacy",
   "no_cloud_advisor": true,
   "assistant_native_input_calls": 0,
-  "model_tools_used": 23,
+  "model_tools_used": 28,
   "installed": false,
   "observed_blockers": [
     "Shell quote state required autonomous recovery",
@@ -18,7 +18,7 @@
   ],
   "native_modal_fix": "Actual titleless Installer sheet parent/control read qualified; original installation remains paused",
   "prior_experiments_resumed": false,
-  "updated_at": 1791278538.844225,
+  "updated_at": 1791279221.3885343,
   "permission_regrant_reported_by_user": true,
   "permission_checks_after_restart": {
     "ax_trusted": false,
@@ -28,7 +28,7 @@
     "python_http_and_schema_cases_passed": 18,
     "actual_codex_transport_case_passed": 1,
     "native_compiled_zero_input_checks_passed": 12,
-    "desktop_contract_host_tests": 198,
+    "desktop_contract_host_tests": 201,
     "desktop_contract_mac_live_checks": 18
   },
   "native_permissions_requested": true,
@@ -65,5 +65,16 @@
     "after_candidate_regrant": true
   },
   "new_model_foundation_task": "6dc231dcd0444157a60d763d7a6616cc",
-  "historical_blockers_note": "observed_blockers/resume_failure_hypothesis retain the earlier unconfirmed snapshot; confirmed cause and repairs are recorded above"
+  "historical_blockers_note": "observed_blockers/resume_failure_hypothesis retain the earlier unconfirmed snapshot; confirmed cause and repairs are recorded above",
+  "model_tools_used_note": "Snapshot before user-auth followup; runtime task.json is current until independent final audit",
+  "original_same_thread_resume": {
+    "passed": true,
+    "calls_before": 23,
+    "calls_after": 28,
+    "limit": 80,
+    "stopped_for_local_auth": true,
+    "report": "/home/chaidi/qw3/apps/computer_use/.runtime/desktop-contract-20261006-01/original-python-resume-01/result.json",
+    "raw_resume_reply_bytes_not_a_resumption_payload_measurement": true
+  },
+  "actual_speculative_dispatch": "plain for observed multimodal requests despite configured DFlash2"
 }
