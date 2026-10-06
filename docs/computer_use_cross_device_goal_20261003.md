@@ -340,3 +340,8 @@ KVMem八次对照已预声明，控制器已实际运行并等待49b的全部40�
 本轮末的最新真实宿主核验显示七个原控制器都已停止并实际退出。图像保留 1/12，其余 0/4、0/8、0/8、0/4、0/8、0/8；图像原 21600 秒显存等待期限到达，其余按前序保护停止。可用 55711 MiB 仍低于冻结 56000 MiB 连续三十秒门槛。工具观察句柄曾丢失时，只核对同一登记 PID/UID/start_ticks/argv/cwd 和原结果，没有据此重启。应将旧状态记录为 terminal，而非继续称存活等待。
 
 目标 active；这轮是连接层恢复资格，不是完整 QW3 检查点恢复、复杂 OSWorld 或 KVMem 业务收益。下一步取得可用 GPU 窗口后资格保留已完成前缀的续跑，不重放首个样本；在新部署中验证恢复后的模型任务，再完成原冻结对照与全平台业务验收。证据：[恢复说明](computer_use_android_idle_recovery_20261006.md)、[报告](computer_use_android_idle_recovery_20261006.json)、`.runtime/android-idle-recovery-live-independent-audit-02/result.json`及`.runtime/android-idle-final-seven-controller-status-01.json`。
+
+
+2026-10-06 资源窗口恢复：七组原控制器退出后，保留已完成的首个图像样本，创建新的运行目录和实际前序绑定。49 项 CPU 队列检查通过，独立核验确认七个新代次均实际存活；图像组已启动 `004-recent-observations-r1`，后续 thinking、反馈、有界续跑、只读查询、原生控件和完成条件组串行等待。总计划 52 个样本，其中保留 1 个，剩余 51 个；任务材料、模型配置、预算及评分方式均未改变。
+
+本轮完成的是测试恢复，没有新增成功率改善结论。Mac 已确认与当前主机有 VPN／Tailscale 互通，待连接信息后再进行执行端适配和实机验收。详见 [恢复报告](/home/chaidi/qw3/docs/computer_use_resource_window_resume_20261006.json)。

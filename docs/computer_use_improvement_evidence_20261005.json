@@ -286,225 +286,217 @@
   ],
   "current_retest_status": {
     "audit": {
-      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/android-idle-final-seven-controller-status-01.json",
-      "sha256": "758af20982558ff69c5501eee6d86c6a0665b5e2351fa6e3c515f0a897017ea9"
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/resource-window-resume-live-audit-20261006-01.json",
+      "sha256": "237129914249e69391660d76af927624185e47c5700a359d6ab243ed41b5c633"
     },
-    "checked_at": 1791249798.2512338,
+    "checked_at": 1791252320.4124424,
     "stages": {
       "image": {
+        "registration": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261006-02/image-registration.json",
+          "sha256": "5b70e2c4585c0534a9b22ab08363931e21784ea8b717519fae9cc7f0049ff64c"
+        },
         "identity": {
-          "pid": 149945,
+          "pid": 901647,
           "uid": 1001,
-          "start_ticks": 376597548,
+          "start_ticks": 380721725,
           "command": [
             "/home/chaidi/qw3/.venv/bin/python",
             "-m",
             "stable_resource_handoff",
             "--declaration",
-            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/successors.json",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261006-02/successors.json",
             "--stage",
             "image"
           ],
           "cwd": "/home/chaidi/qw3",
           "state": "R"
         },
-        "actual_same_process_live": false,
-        "actual_registered_generation_retired": true,
-        "status": "halted-no-further-dispatch",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261006-02/image-queue/queue.json",
+        "status": "running",
         "completed": 1,
         "planned": 12,
         "current_trial": "004-recent-observations-r1",
-        "current_child": null,
-        "error": "SafetyHalt: Shared GPU headroom unavailable; other workloads preserved",
-        "last_gpu_snapshot": {
-          "at": 1791231956.0875108,
-          "free_mib": 55711,
-          "used_mib": 41540,
-          "gpu_percent": 100,
-          "compute_pids": [
-            "3906950"
-          ]
-        },
-        "last_checkpoint_at": null
+        "same_actual_registered_process_live": true
       },
       "thinking": {
+        "registration": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261006-02/thinking-registration.json",
+          "sha256": "49aafac5a627701ca171619d770f06953d395a8eca76a88eb0e2e58b8eb03f80"
+        },
         "identity": {
-          "pid": 155219,
+          "pid": 908902,
           "uid": 1001,
-          "start_ticks": 376616251,
+          "start_ticks": 380754074,
           "command": [
             "/home/chaidi/qw3/.venv/bin/python",
             "-m",
             "stable_resource_handoff",
             "--declaration",
-            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/successors.json",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261006-02/successors.json",
             "--stage",
             "thinking"
           ],
           "cwd": "/home/chaidi/qw3",
           "state": "R"
         },
-        "actual_same_process_live": false,
-        "actual_registered_generation_retired": true,
-        "status": "halted-no-further-dispatch",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261006-02/thinking-queue/queue.json",
+        "status": "waiting-for-image-twelve",
         "completed": 0,
         "planned": 4,
         "current_trial": null,
-        "current_child": null,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
-        "last_gpu_snapshot": null,
-        "last_checkpoint_at": null
+        "same_actual_registered_process_live": true
       },
       "feedback": {
+        "registration": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261006-02/feedback-registration.json",
+          "sha256": "1f5a02fb44b5256b402dc2629e6774214f21a340e497b23cbb536c0eb307dd0f"
+        },
         "identity": {
-          "pid": 157910,
+          "pid": 911114,
           "uid": 1001,
-          "start_ticks": 376636620,
+          "start_ticks": 380761179,
           "command": [
             "/home/chaidi/qw3/.venv/bin/python",
             "-m",
             "stable_resource_handoff",
             "--declaration",
-            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/successors.json",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261006-02/successors.json",
             "--stage",
             "feedback"
           ],
           "cwd": "/home/chaidi/qw3",
           "state": "R"
         },
-        "actual_same_process_live": false,
-        "actual_registered_generation_retired": true,
-        "status": "halted-no-further-dispatch",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261006-02/feedback-queue/queue.json",
+        "status": "waiting-for-forty-eight-ten-twelve-four",
         "completed": 0,
         "planned": 8,
         "current_trial": null,
-        "current_child": null,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
-        "last_gpu_snapshot": null,
-        "last_checkpoint_at": null
+        "same_actual_registered_process_live": true
       },
       "bounded": {
+        "registration": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/resource-window-bounded-20261006-01/registration.json",
+          "sha256": "8abcabd872837aa48f91546f18adcfcd4a097eacd38c7cb364ef0dd468d7c2f4"
+        },
         "identity": {
-          "pid": 163217,
+          "pid": 915745,
           "uid": 1001,
-          "start_ticks": 376671224,
+          "start_ticks": 380776573,
           "command": [
             "/home/chaidi/qw3/.venv/bin/python",
             "-m",
-            "stable_resource_deferred",
+            "resource_window_deferred",
             "--declaration",
-            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-bounded-20261005-01/declaration.json",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/resource-window-bounded-20261006-01/declaration.json",
             "--stage",
             "bounded"
           ],
           "cwd": "/home/chaidi/qw3",
           "state": "R"
         },
-        "actual_same_process_live": false,
-        "actual_registered_generation_retired": true,
-        "status": "halted-no-further-dispatch",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/resource-window-bounded-20261006-01/queue-runtime-01/queue.json",
+        "status": "waiting-for-forty-eight-ten-twelve-four-eight",
         "completed": 0,
         "planned": 8,
         "current_trial": null,
-        "current_child": null,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
-        "last_gpu_snapshot": null,
-        "last_checkpoint_at": null
+        "same_actual_registered_process_live": true
       },
       "query": {
+        "registration": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/resource-window-query-20261006-01/registration.json",
+          "sha256": "b93e135c080ab81be1d547117a06b26204737fb9f442ee0547ca7a4b9a63faba"
+        },
         "identity": {
-          "pid": 173846,
+          "pid": 920731,
           "uid": 1001,
-          "start_ticks": 376701528,
+          "start_ticks": 380786575,
           "command": [
             "/home/chaidi/qw3/.venv/bin/python",
             "-m",
-            "stable_resource_deferred",
+            "resource_window_deferred",
             "--declaration",
-            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-query-20261005-01/declaration.json",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/resource-window-query-20261006-01/declaration.json",
             "--stage",
             "query"
           ],
           "cwd": "/home/chaidi/qw3",
           "state": "R"
         },
-        "actual_same_process_live": false,
-        "actual_registered_generation_retired": true,
-        "status": "halted-no-further-dispatch",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/resource-window-query-20261006-01/queue-runtime-01/queue.json",
+        "status": "waiting-for-complete-bounded-chain",
         "completed": 0,
         "planned": 4,
         "current_trial": null,
-        "current_child": null,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
-        "last_gpu_snapshot": null,
-        "last_checkpoint_at": null
+        "same_actual_registered_process_live": true
       },
       "native": {
+        "registration": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/resource-window-native-20261006-01/registration.json",
+          "sha256": "de0a17568f3749c4cea4d4c76922d8680171396460da710883b6fff2ea006ced"
+        },
         "identity": {
-          "pid": 354765,
+          "pid": 924628,
           "uid": 1001,
-          "start_ticks": 377284282,
+          "start_ticks": 380793668,
           "command": [
             "/home/chaidi/qw3/.venv/bin/python",
             "-m",
-            "native_control_model_queue",
+            "resource_window_native",
             "run",
             "--declaration",
-            "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-model-queue-20261006-01/declaration.json"
+            "/home/chaidi/qw3/apps/computer_use/.runtime/resource-window-native-20261006-01/declaration.json"
           ],
           "cwd": "/home/chaidi/qw3",
           "state": "R"
         },
-        "actual_same_process_live": false,
-        "actual_registered_generation_retired": true,
-        "status": "halted-no-further-dispatch",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/resource-window-native-20261006-01/queue-runtime-01/queue.json",
+        "status": "waiting-for-complete-original-query-chain",
         "completed": 0,
         "planned": 8,
         "current_trial": null,
-        "current_child": null,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
-        "last_gpu_snapshot": null,
-        "last_checkpoint_at": 1791231962.842012
+        "same_actual_registered_process_live": true
       },
       "condition_schema": {
+        "registration": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/resource-window-condition-20261006-01/registration.json",
+          "sha256": "5f9d0ad700de1edde2ea0b8b199cdb9bf623a42038f4f50a330838dd29d29fb6"
+        },
         "identity": {
-          "pid": 565205,
+          "pid": 924812,
           "uid": 1001,
-          "start_ticks": 377964847,
+          "start_ticks": 380793977,
           "command": [
             "/home/chaidi/qw3/.venv/bin/python",
             "-m",
-            "condition_schema_model_queue",
+            "resource_window_condition",
             "run",
             "--declaration",
-            "/home/chaidi/qw3/apps/computer_use/.runtime/condition-schema-model-queue-20261006-01/declaration.json"
+            "/home/chaidi/qw3/apps/computer_use/.runtime/resource-window-condition-20261006-01/declaration.json"
           ],
           "cwd": "/home/chaidi/qw3",
           "state": "R"
         },
-        "actual_same_process_live": false,
-        "actual_registered_generation_retired": true,
-        "status": "halted-no-further-dispatch",
+        "queue": "/home/chaidi/qw3/apps/computer_use/.runtime/resource-window-condition-20261006-01/queue-runtime-01/queue.json",
+        "status": "waiting-for-complete-original-native-eight",
         "completed": 0,
         "planned": 8,
         "current_trial": null,
-        "current_child": null,
-        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
-        "last_gpu_snapshot": null,
-        "last_checkpoint_at": 1791231961.6059577
+        "same_actual_registered_process_live": true
       }
     },
     "gpu": {
-      "at": 1791249798.2996802,
-      "free_mib": 55711,
-      "used_mib": 41540,
+      "at": 1791252320.4615557,
+      "free_mib": 45605,
+      "used_mib": 51646,
       "gpu_percent": 100,
       "compute_pids": [
-        "3906950"
+        "906830"
       ]
     },
-    "status": "seven-original-registered-generations-actually-retired-after-resource-deadline",
-    "current_model_trial_started": false,
+    "status": "seven-restored-generations-active-serial",
+    "current_model_trial_started": true,
     "business_gain_proven": false
   },
   "previous_retest_status_snapshot": {
@@ -1820,5 +1812,239 @@
     "new_controller_started": false,
     "new_model_tasks": 0,
     "scope": "Resource window is available now; original halted controllers do not automatically resume. Preserved-prefix continuation qualification is still required."
+  },
+  "previous_retest_status_before_resource_window_resume_20261006": {
+    "audit": {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/android-idle-final-seven-controller-status-01.json",
+      "sha256": "758af20982558ff69c5501eee6d86c6a0665b5e2351fa6e3c515f0a897017ea9"
+    },
+    "checked_at": 1791249798.2512338,
+    "stages": {
+      "image": {
+        "identity": {
+          "pid": 149945,
+          "uid": 1001,
+          "start_ticks": 376597548,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "stable_resource_handoff",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/successors.json",
+            "--stage",
+            "image"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "actual_same_process_live": false,
+        "actual_registered_generation_retired": true,
+        "status": "halted-no-further-dispatch",
+        "completed": 1,
+        "planned": 12,
+        "current_trial": "004-recent-observations-r1",
+        "current_child": null,
+        "error": "SafetyHalt: Shared GPU headroom unavailable; other workloads preserved",
+        "last_gpu_snapshot": {
+          "at": 1791231956.0875108,
+          "free_mib": 55711,
+          "used_mib": 41540,
+          "gpu_percent": 100,
+          "compute_pids": [
+            "3906950"
+          ]
+        },
+        "last_checkpoint_at": null
+      },
+      "thinking": {
+        "identity": {
+          "pid": 155219,
+          "uid": 1001,
+          "start_ticks": 376616251,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "stable_resource_handoff",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/successors.json",
+            "--stage",
+            "thinking"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "actual_same_process_live": false,
+        "actual_registered_generation_retired": true,
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 4,
+        "current_trial": null,
+        "current_child": null,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "last_gpu_snapshot": null,
+        "last_checkpoint_at": null
+      },
+      "feedback": {
+        "identity": {
+          "pid": 157910,
+          "uid": 1001,
+          "start_ticks": 376636620,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "stable_resource_handoff",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-successors-20261005-01/successors.json",
+            "--stage",
+            "feedback"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "actual_same_process_live": false,
+        "actual_registered_generation_retired": true,
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 8,
+        "current_trial": null,
+        "current_child": null,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "last_gpu_snapshot": null,
+        "last_checkpoint_at": null
+      },
+      "bounded": {
+        "identity": {
+          "pid": 163217,
+          "uid": 1001,
+          "start_ticks": 376671224,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "stable_resource_deferred",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-bounded-20261005-01/declaration.json",
+            "--stage",
+            "bounded"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "actual_same_process_live": false,
+        "actual_registered_generation_retired": true,
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 8,
+        "current_trial": null,
+        "current_child": null,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "last_gpu_snapshot": null,
+        "last_checkpoint_at": null
+      },
+      "query": {
+        "identity": {
+          "pid": 173846,
+          "uid": 1001,
+          "start_ticks": 376701528,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "stable_resource_deferred",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/stable-resource-handoff-query-20261005-01/declaration.json",
+            "--stage",
+            "query"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "actual_same_process_live": false,
+        "actual_registered_generation_retired": true,
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 4,
+        "current_trial": null,
+        "current_child": null,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "last_gpu_snapshot": null,
+        "last_checkpoint_at": null
+      },
+      "native": {
+        "identity": {
+          "pid": 354765,
+          "uid": 1001,
+          "start_ticks": 377284282,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "native_control_model_queue",
+            "run",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/native-control-model-queue-20261006-01/declaration.json"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "actual_same_process_live": false,
+        "actual_registered_generation_retired": true,
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 8,
+        "current_trial": null,
+        "current_child": null,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "last_gpu_snapshot": null,
+        "last_checkpoint_at": 1791231962.842012
+      },
+      "condition_schema": {
+        "identity": {
+          "pid": 565205,
+          "uid": 1001,
+          "start_ticks": 377964847,
+          "command": [
+            "/home/chaidi/qw3/.venv/bin/python",
+            "-m",
+            "condition_schema_model_queue",
+            "run",
+            "--declaration",
+            "/home/chaidi/qw3/apps/computer_use/.runtime/condition-schema-model-queue-20261006-01/declaration.json"
+          ],
+          "cwd": "/home/chaidi/qw3",
+          "state": "R"
+        },
+        "actual_same_process_live": false,
+        "actual_registered_generation_retired": true,
+        "status": "halted-no-further-dispatch",
+        "completed": 0,
+        "planned": 8,
+        "current_trial": null,
+        "current_child": null,
+        "error": "SafetyHalt: Predecessor halted or its declaration/process identity changed",
+        "last_gpu_snapshot": null,
+        "last_checkpoint_at": 1791231961.6059577
+      }
+    },
+    "gpu": {
+      "at": 1791249798.2996802,
+      "free_mib": 55711,
+      "used_mib": 41540,
+      "gpu_percent": 100,
+      "compute_pids": [
+        "3906950"
+      ]
+    },
+    "status": "seven-original-registered-generations-actually-retired-after-resource-deadline",
+    "current_model_trial_started": false,
+    "business_gain_proven": false
+  },
+  "resource_window_resume_qualification_20261006": {
+    "report": {
+      "path": "/home/chaidi/qw3/docs/computer_use_resource_window_resume_20261006.json",
+      "sha256": "d1d73dd403be5505768ed1b72c1652f852c855eee4caae23eb236899b30f0742"
+    },
+    "cpu_checks": 49,
+    "actual_registered_live_controllers": 7,
+    "retained_prefix_unchanged": true,
+    "remaining_after_prefix": 51,
+    "scope": "Queue restoration only, not a model business improvement."
   }
 }
