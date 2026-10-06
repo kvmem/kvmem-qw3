@@ -328,3 +328,15 @@ KVMem八次对照已预声明，控制器已实际运行并等待49b的全部40�
 新控制器 PID565205、UID1001、start_ticks377964847、完整命令和工作目录已独立核验，同代次存活，0/8，等待原生八次及全部前序。原六个控制器仍是同一实例，图像 1/12、其他五组 0/4、0/8、0/8、0/4、0/8；当前可用 55711 MiB 低于原 56000 MiB 连续三十秒门槛，没有用户 GPU 信号、模型请求或桌面输入。原复杂 OSWorld 和 KVMem 效果结论不改；目标 active。
 
 证据：[入口与队列说明](computer_use_condition_schema_model_queue_20261006.md)、[报告](computer_use_condition_schema_model_queue_20261006.json)、`.runtime/condition-schema-model-queue-cpu-04/result.json`、`.runtime/condition-schema-model-queue-preflight-01/result.json`及`.runtime/condition-schema-model-queue-independent-audit-01/result.json`。下一步轮询七个实际句柄，在原完整终止与退役交接后绑定原引擎，核验上下文并执行八次 QW3 同条件对照，保留业务成绩、耗时、动作错误和连续录像。
+
+## 2026-10-06 Android 空闲会话恢复与模型队列期限停止
+
+上一轮已提交 d0c334f，实际登记完成条件对照与保留原失败的入口，归为 progress。本轮为 progress：在显存等待期间补齐可单独启用的 Android 空闲恢复组件，并用独立模拟器完成实际故障验证。只在读屏明确返回 invalid-session-id、输入已暂停且无未决动作或创建时，核验自有 Appium 实例和模拟器启动代次后预留一次创建。恢复前让旧截图失效，恢复后保持暂停；不重放输入、不自动继续模型任务。复用原驱动、网关、租约及公开接口，私有包完整清单只新增一个模块，原文件和冻结部署不改。
+
+最终十四项 CPU/本机 HTTP 检查通过，包括创建超时后不重试、租约后再次核验启动身份及收尾异常仍关闭回执库。最终私有包实际导入八个正确私有模块，十一项真实模拟器检查通过：活动设备不重连、暂停后一次恢复、重新读屏、旧截图拒绝、全部四十三项设置和前台应用不变、显式本地未确认回执阻止恢复。独立核验实际 Appium 只有初始与恢复两次会话 POST，零输入命令；连续采样录像完整解码十六帧，生产者、驱动客户端、录屏及精确容器退出，两个端口拒绝连接。采用已缓存镜像、静态 AVD 种子与软件渲染，零 QW3 请求、零 GPU 干预；五秒 idle 只是故障注入，默认 3600 秒不改。
+
+首次缺少种子文件、第二次新容器缺 KVM 数字组及第三次完整设置检查失败均保留；新容器沿用原模拟器的数字组，未改变宿主权限。第三次观察到初始化期间新增默认声音项，随后先等待明确初始化标记和全部配置稳定，再开始恢复测试，仍核验所有键值。旧十二项 CPU 和未打包版本的十七帧通过录像不累加为最终覆盖或模型任务；四个早期代次和所有已创建容器独立确认退役。
+
+本轮末的最新真实宿主核验显示七个原控制器都已停止并实际退出。图像保留 1/12，其余 0/4、0/8、0/8、0/4、0/8、0/8；图像原 21600 秒显存等待期限到达，其余按前序保护停止。可用 55711 MiB 仍低于冻结 56000 MiB 连续三十秒门槛。工具观察句柄曾丢失时，只核对同一登记 PID/UID/start_ticks/argv/cwd 和原结果，没有据此重启。应将旧状态记录为 terminal，而非继续称存活等待。
+
+目标 active；这轮是连接层恢复资格，不是完整 QW3 检查点恢复、复杂 OSWorld 或 KVMem 业务收益。下一步取得可用 GPU 窗口后资格保留已完成前缀的续跑，不重放首个样本；在新部署中验证恢复后的模型任务，再完成原冻结对照与全平台业务验收。证据：[恢复说明](computer_use_android_idle_recovery_20261006.md)、[报告](computer_use_android_idle_recovery_20261006.json)、`.runtime/android-idle-recovery-live-independent-audit-02/result.json`及`.runtime/android-idle-final-seven-controller-status-01.json`。
