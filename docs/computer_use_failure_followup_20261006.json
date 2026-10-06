@@ -1,0 +1,289 @@
+{
+  "kind": "readonly_complex_failure_followup_with_first_browser_pair_success",
+  "recorded_at": "2026-10-06T12:25:56.192282+08:00",
+  "queue_snapshot_sha256": "9eb13e83322dc56299a5712e37dab600a83dd1e5f58f76207be9fdd0139d5843",
+  "image_progress": {
+    "completed": 7,
+    "planned": 12,
+    "current": "004-full-retrievable-r2",
+    "status": "running"
+  },
+  "new_model_requests": 0,
+  "new_device_inputs": 0,
+  "original_scores_changed": false,
+  "results": [
+    {
+      "id": "013-full-retrievable-r1",
+      "sources": [
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/013-full-retrievable-r1/result.json",
+          "sha256": "334fe55803f13c2fbfd3f0d3766fdaa76abc4333b8cdefa82a1599912d7ab84b"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/013-full-retrievable-r1/app/codex-events.jsonl",
+          "sha256": "c0d0523b8912b8f05c7c1c48493a7207b7a656043b39856f11a2178050efe9d9"
+        }
+      ],
+      "result": {
+        "status": "scored",
+        "score": 0.0,
+        "passed": false,
+        "agent_status": "failed",
+        "seconds": 949.0212991470471,
+        "tool_calls": 15,
+        "uncertain_actions": 0,
+        "turn_error": {
+          "message": "stream disconnected before completion: Incomplete response returned, reason: max_output_tokens",
+          "codexErrorInfo": "other",
+          "additionalDetails": null,
+          "misalignment": null
+        },
+        "notice": null,
+        "video_bytes": 2429294,
+        "original_evaluation": 0.0,
+        "unassisted_passed": false,
+        "finished_at": 1791256583.4472506,
+        "candidate_harness": true,
+        "video_collection_passed": true,
+        "video_collection_errors": [],
+        "unassisted_business_passed": false,
+        "accepted": false,
+        "image_history": "full-retrievable",
+        "comparison_protocol_sha256": "ac297f6d8a062fb9e27465beedd89fbadb85c566899d23373ad5e7902cbd49c2",
+        "comparison": "Matched image presentation; original materials, initializer, grader and budgets retained"
+      },
+      "model_requests": 16,
+      "model_time_fraction": 0.9612577655147281,
+      "input_token_range": [
+        8636,
+        67373
+      ],
+      "problem_counts": {
+        "step_required": 1,
+        "pending_step": 1,
+        "normalized_coordinates_required": 1,
+        "evidence_refreshed": 3,
+        "invalid_coordinates": 1
+      },
+      "delivered_from_tool_results": 8,
+      "terminal_generation": {
+        "metrics": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/013-full-retrievable-r1/app/inference/389122e920454085a8630717975e8181/metrics.json",
+          "sha256": "9a211d2ddaba662f50fa47befab6660131531afe21e929d776491d107280150d"
+        },
+        "backend": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/013-full-retrievable-r1/app/inference/389122e920454085a8630717975e8181/backend.jsonl",
+          "sha256": "1d5aff9fe230ba75fd6c84596a4ec00d79ef70b1881832cf735b097f620c5393"
+        },
+        "elapsed_seconds": 444.1118161273189,
+        "input_tokens": 67373,
+        "output_tokens": 16384,
+        "stream_character_counts": {
+          "reasoning_content_characters": 43133
+        },
+        "finish_reasons": {
+          "length": 1
+        },
+        "generated_tool_calls": 0,
+        "visible_answer_characters": 0,
+        "raw_reasoning_text_exported": false
+      },
+      "maximum_reported_output_tokens": 16384
+    },
+    {
+      "id": "linux-browser-full-retrievable-r1",
+      "sources": [
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/linux-browser-full-retrievable-r1/integration-result.json",
+          "sha256": "3559309a79953683a6a61f011ee3d73752b8a26b9f603bcd56a9d5806aeb5c10"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/linux-browser-full-retrievable-r1/codex-events.jsonl",
+          "sha256": "5c42e0ce12a3908a5400adeb56de56789c9415fe2b19c6f4190e04795d4a01cd"
+        }
+      ],
+      "result": {
+        "kind": "integration-pilot-not-formal",
+        "app_status": "stopped",
+        "seconds": 902.9465077491477,
+        "tool_calls": 19,
+        "turn_error": null,
+        "uncertain_actions": 0,
+        "artifact_passed": false,
+        "video_collection_passed": true,
+        "unassisted_passed": false,
+        "accepted": false,
+        "video_bytes": 1004189,
+        "owned_task_retired": true
+      },
+      "model_requests": 20,
+      "model_time_fraction": 0.9442841997710396,
+      "input_token_range": [
+        10273,
+        115009
+      ],
+      "problem_counts": {
+        "step_required": 1,
+        "invalid_coordinates": 1,
+        "evidence_refreshed": 4
+      },
+      "delivered_from_tool_results": 13,
+      "independent_submission_check": {
+        "source": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/linux-browser-full-retrievable-r1/independent-browser.json",
+          "sha256": "993b929210046cf7481a65d77f89676b8560df12301c7faf0ffd2e06fa04a9ad"
+        },
+        "passed": false,
+        "checks": {
+          "name": false,
+          "email": false,
+          "topic": false,
+          "delivery": false,
+          "notes": false,
+          "consent": false,
+          "exactly_one_submission": false,
+          "exact_fields": false
+        },
+        "submission_count": 0
+      },
+      "maximum_reported_output_tokens": 459
+    },
+    {
+      "id": "linux-browser-recent-observations-r1",
+      "sources": [
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/linux-browser-recent-observations-r1/integration-result.json",
+          "sha256": "50a51d4c182a8b84eef1f6a007bbe3fa0e381130ef8109bfd4dca89eec3247e9"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/linux-browser-recent-observations-r1/codex-events.jsonl",
+          "sha256": "c3c2b0e0721a772f55315ffc066766835e313166ecbd8a3080e3415a1c3fef25"
+        }
+      ],
+      "result": {
+        "kind": "integration-pilot-not-formal",
+        "app_status": "completed",
+        "seconds": 840.4272883166559,
+        "tool_calls": 19,
+        "turn_error": null,
+        "uncertain_actions": 0,
+        "artifact_passed": true,
+        "video_collection_passed": true,
+        "unassisted_passed": true,
+        "accepted": true,
+        "video_bytes": 896783,
+        "owned_task_retired": true
+      },
+      "model_requests": 20,
+      "model_time_fraction": 0.9355499005748462,
+      "input_token_range": [
+        10282,
+        100261
+      ],
+      "problem_counts": {
+        "step_required": 2,
+        "invalid_coordinates": 1,
+        "evidence_refreshed": 1
+      },
+      "delivered_from_tool_results": 13,
+      "independent_submission_check": {
+        "source": {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/linux-browser-recent-observations-r1/independent-browser.json",
+          "sha256": "50e374c07376bcc480f470791cc91ea7262a64df8dcbbcb6e67694f921e7970c"
+        },
+        "passed": true,
+        "checks": {
+          "name": true,
+          "email": true,
+          "topic": true,
+          "delivery": true,
+          "notes": true,
+          "consent": true,
+          "exactly_one_submission": true,
+          "exact_fields": true
+        },
+        "submission_count": 1
+      },
+      "maximum_reported_output_tokens": 447
+    },
+    {
+      "id": "004-recent-observations-r2",
+      "sources": [
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/004-recent-observations-r2/result.json",
+          "sha256": "af6edc01c6656cf355d83cd6cd297eaeeb1bfa412db9ca86e31939fed2870cc9"
+        },
+        {
+          "path": "/home/chaidi/qw3/apps/computer_use/.runtime/visual-context-retest-20261004/attempts/004-recent-observations-r2/app/codex-events.jsonl",
+          "sha256": "3777efc4ec27687446dc37fb1dafbf8f3f5d5c57096e59e09e4bb62101eeeabf"
+        }
+      ],
+      "result": {
+        "status": "scored",
+        "score": 0.0,
+        "passed": false,
+        "stop_reason": "deadline",
+        "agent_status": "stopped",
+        "seconds": 1803.369339180179,
+        "tool_calls": 21,
+        "uncertain_actions": 0,
+        "turn_error": null,
+        "notice": null,
+        "video_bytes": 3305155,
+        "original_evaluation": 0.0,
+        "unassisted_passed": false,
+        "finished_at": 1791260533.6389325,
+        "candidate_harness": true,
+        "video_collection_passed": true,
+        "video_collection_errors": [],
+        "unassisted_business_passed": false,
+        "accepted": false,
+        "image_history": "recent-observations",
+        "comparison_protocol_sha256": "ac297f6d8a062fb9e27465beedd89fbadb85c566899d23373ad5e7902cbd49c2",
+        "comparison": "Matched image presentation; original materials, initializer, grader and budgets retained"
+      },
+      "model_requests": 22,
+      "model_time_fraction": 0.9737686517214899,
+      "input_token_range": [
+        13803,
+        167967
+      ],
+      "problem_counts": {
+        "step_required": 1,
+        "evidence_refreshed": 7,
+        "pending_step": 1
+      },
+      "delivered_from_tool_results": 9,
+      "maximum_reported_output_tokens": 638
+    }
+  ],
+  "counts": {
+    "ended_osworld_attempts": 5,
+    "passed_osworld_attempts": 0,
+    "ended_development_browser_attempts": 2,
+    "passed_development_browser_attempts": 1
+  },
+  "prior_diagnostics": [
+    {
+      "path": "/home/chaidi/qw3/docs/computer_use_complex_failure_audit_20261006.json",
+      "sha256": "8dbf32bc5c072f4772a856f67136693874ea28f087ef403e2f5e72262c3b29e9"
+    },
+    {
+      "path": "/home/chaidi/qw3/docs/computer_use_gpu_overlap_audit_20261006.json",
+      "sha256": "afa9af8c23b2ecbb33d61f91897c009c744b6d1a0ac305b3c2d1e45705dfe078"
+    },
+    {
+      "path": "/home/chaidi/qw3/docs/computer_use_condition_schema_model_queue_20261006.json",
+      "sha256": "629e1369dbcfefa62dc7b3df3045ade1bee5c3d18705d7581ba596383d533b6e"
+    }
+  ],
+  "limits": [
+    "One paired known browser task is a positive result, not proof of a general success-rate or latency gain.",
+    "A timed-out failure and a completed task have different stopping points; their elapsed times do not isolate image-policy speed.",
+    "Shared GPU context residency is a confound; no isolated shared-versus-quiet throughput comparison has completed.",
+    "The image cohort keeps its frozen harness; schema, native-input, budget and continuation candidates remain queued separately.",
+    "Backend time includes context/image processing, generation and resource waiting.",
+    "Token exhaustion is directly observed; the cause of prolonged generation is not separately attributed to model reasoning, history presentation or resource latency."
+  ],
+  "passed": true
+}
