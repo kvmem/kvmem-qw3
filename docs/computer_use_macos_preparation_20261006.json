@@ -1,0 +1,163 @@
+{
+  "kind": "actual_mac_ssh_and_read_only_gui_permissions_preparation",
+  "recorded_at": "2026-10-06T02:32:32.572019+00:00",
+  "status": "ssh-and-actual-gui-process-permissions-verified-mac-executor-not-yet-implemented",
+  "ssh": {
+    "public_key_authentication_verified": true,
+    "private_key_committed": false,
+    "private_key_contents_read_or_printed": false,
+    "connection_details_location": "Git-ignored task runtime only"
+  },
+  "device": {
+    "platform": "macos",
+    "version": "13.7.7",
+    "architecture": "x86_64",
+    "gui_account": "sunny",
+    "uid": 501,
+    "command_line_developer_tools_available": false
+  },
+  "application": {
+    "bundle_id": "org.qw3.computeruse.mac-test",
+    "remote_path": "/Users/sunny/Applications/QW3 Mac Test.app",
+    "source_path": "/home/chaidi/qw3/apps/computer_use/macos_probe/permissions.js",
+    "source_sha256": "2c64f7ac0aeac5beb975f28afe22c95ab108f927d2f997658f3761fd5cef4f1d",
+    "package_and_signature_verified": true,
+    "actual_gui_launch_verified": true,
+    "first_verified_pid": 1509,
+    "first_process": " 1509   501 Tue Oct  6 10:26:54 2026     /Users/sunny/Applications/QW3 Mac Test.app/Contents/MacOS/applet\n",
+    "currently_running": true,
+    "stale_snapshot_treated_as_current_permission_or_liveness_proof": false,
+    "previous_snapshot_before_relaunch": {
+      "protocol": "qw3-macos-permissions/1",
+      "timestamp": "2026-10-06T02:28:35.976Z",
+      "state": "running",
+      "paused": true,
+      "read_only": true,
+      "bundle_id": "org.qw3.computeruse.mac-test",
+      "bundle_path": "/Users/sunny/Applications/QW3 Mac Test.app",
+      "pid": 1509,
+      "macos_version": "版本13.7.7（版号22H722）",
+      "ax_trusted": false,
+      "screen_capture_allowed": false,
+      "main_screen": {
+        "points": {
+          "origin": {
+            "x": 0,
+            "y": 0
+          },
+          "size": {
+            "width": 1680,
+            "height": 1050
+          }
+        },
+        "backing_scale_factor": 2
+      },
+      "captures": 0,
+      "inputs": 0,
+      "model_calls": 0,
+      "scope": "Permission and display metadata only; not a desktop executor qualification."
+    },
+    "previous_actual_process_query_before_relaunch": [],
+    "previous_process_query_at_before_relaunch": "2026-10-06T02:29:23.281981+00:00",
+    "last_snapshot": {
+      "protocol": "qw3-macos-permissions/1",
+      "timestamp": "2026-10-06T02:30:47.978Z",
+      "state": "running",
+      "paused": true,
+      "read_only": true,
+      "bundle_id": "org.qw3.computeruse.mac-test",
+      "bundle_path": "/Users/sunny/Applications/QW3 Mac Test.app",
+      "pid": 1635,
+      "macos_version": "版本13.7.7（版号22H722）",
+      "ax_trusted": true,
+      "screen_capture_allowed": true,
+      "main_screen": {
+        "points": {
+          "origin": {
+            "x": 0,
+            "y": 0
+          },
+          "size": {
+            "width": 1680,
+            "height": 1050
+          }
+        },
+        "backing_scale_factor": 2
+      },
+      "captures": 0,
+      "inputs": 0,
+      "model_calls": 0,
+      "scope": "Permission and display metadata only; not a desktop executor qualification."
+    },
+    "last_verified_process": " 1635   501 Tue Oct  6 10:30:47 2026     /Users/sunny/Applications/QW3 Mac Test.app/Contents/MacOS/applet\n",
+    "last_live_check_at": "2026-10-06T02:30:50.354096+00:00",
+    "previous_exit_cause_known": false
+  },
+  "qualification_scope": {
+    "permissions_granted_and_live_verified": true,
+    "actual_screenshot_tested": false,
+    "retina_pixel_to_point_mapping_tested": false,
+    "accessibility_controls_tested": false,
+    "desktop_input_tested": false,
+    "gateway_action_receipts_tested": false,
+    "model_business_tasks_tested": false,
+    "model_calls": 0,
+    "synthetic_inputs": 0,
+    "screen_captures": 0
+  },
+  "preserved_preparation_failures": [
+    {
+      "operation": "First JXA preflight",
+      "cause": "CGPreflightScreenCaptureAccess absent from JXA metadata until explicitly bound",
+      "corrected": true
+    },
+    {
+      "operation": "First app packaging",
+      "cause": "Generated applet plist lacked CFBundleIdentifier; stop before launch",
+      "corrected": true
+    },
+    {
+      "operation": "Second live process audit",
+      "cause": "Snapshot was present but the process had exited; no false liveness claim",
+      "corrected": "Separate bundle-identity query confirms no process; relaunch pending"
+    }
+  ],
+  "evidence": [
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/mac-test-connection-20261006-01/jxa-preflight.json",
+      "sha256": "62c75094de0884a6df61149b6cb62cad4cee1536b1fd460cf75fbca4877e25e0"
+    },
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/mac-test-connection-20261006-01/jxa-preflight-02.json",
+      "sha256": "c34447bf6a1e342511fd2a0fe25cddf023bc9869316c35ad0724b54af2e16340"
+    },
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/mac-test-connection-20261006-01/permissions-app-deployment.json",
+      "sha256": "6c1377832d8e787dccb79f74ae94b3e7296759d51bc101ab25129e4d3b7ebacd"
+    },
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/mac-test-connection-20261006-01/permissions-app-deployment-02.json",
+      "sha256": "dfa5b23440ecd3ddf669a035b903305af3f499ea9e0436691c0d2fd881f2f056"
+    },
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/mac-test-connection-20261006-01/permissions-app-live-01.json",
+      "sha256": "4bbed4d26296338175c555667e00b2c1c6875950a247bc2a36dee95560a6d99a"
+    },
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/mac-test-connection-20261006-01/permissions-app-live-02-diagnostic.json",
+      "sha256": "f47c9a8ef5e2224e7e932b412663235413f4128d6bc5f67cdbcd8365918df0f1"
+    },
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/mac-test-connection-20261006-01/permissions-app-live-03.json",
+      "sha256": "5b1c8c508d4024bedb86b14f2b0f8b0655141358939af9d70a98e619fcd03b75"
+    }
+  ],
+  "existing_frozen_retest_sources_modified": false,
+  "mac_desktop_support_claimed_complete": false,
+  "remaining": [
+    "Implement Mac executor; verify actual final application identity and permissions before screenshots and any input",
+    "Qualify the Mac screenshot/accessibility/input driver without changing frozen retest sources",
+    "Verify actual Retina mapping, foreground guards, leases, paused state, durable receipts and no automatic resend",
+    "Run artifact-verified tasks and sampled native video with current Linux-hosted local QW3 model"
+  ]
+}
