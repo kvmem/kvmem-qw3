@@ -125,12 +125,104 @@ void test_meta_message_detection() {
             "mixed real user content was incorrectly classified as meta-only");
 }
 
+const std::string clock_reading =
+    "Time sampled while preparing turn 8, step 12: "
+    "2026-10-12T01:02:03+08:00[Asia/Shanghai]\n"
+    "Browser time zone for this request: Asia/Shanghai. "
+    "Interpret otherwise-unqualified dates and times in this zone.\n"
+    "Elapsed since the preceding step context: 1m 2s.";
+
+void test_dsh_clock_is_not_a_task() {
+    for (HarnessKind kind : {HarnessKind::DeepSeekHarness,
+                             HarnessKind::GenericToolClient}) {
+        require(harness_message_is_meta_only(kind, clock_reading),
+                "DSH clock snapshot displaced the real task");
+        for (const std::string &non_clock : {
+                 "Explain this clock:\n" + clock_reading,
+                 clock_reading + "\nNow implement the parser.",
+                 "<tool_response>" + clock_reading + "</tool_response>",
+                 std::string("Time sampled while preparing turn 8, step 12: question"),
+                 clock_reading.substr(0, clock_reading.find("\nElapsed"))}) {
+            require(!harness_message_is_meta_only(kind, non_clock),
+                    "mixed, quoted, or partial clock hid a user task");
+        }
+    }
+    for (HarnessKind kind : {HarnessKind::None, HarnessKind::ClaudeCode,
+                             HarnessKind::OpenCode, HarnessKind::MiniSweAgent}) {
+        require(!harness_message_is_meta_only(kind, clock_reading),
+                "DSH clock heuristic leaked into another harness");
+    }
+    // The request can have no browser zone or multiple browser zones. Step 1
+    // uses a different elapsed baseline and the initial reading is unavailable.
+    const std::string first_clock =
+        "Time sampled while preparing turn 1, step 1: "
+        "2026-10-12T00:00:00+00:00[UTC]\r\n"
+        "Browser time zone for this request: unavailable. "
+        "Ask the user to clarify otherwise-unqualified dates and times.\r\n"
+        "Elapsed since the preceding model-visible message: unavailable.";
+    require(harness_message_is_meta_only(HarnessKind::DeepSeekHarness, first_clock),
+            "initial/missing-zone/CRLF clock was not recognized");
+    const std::string mixed_clock =
+        "Time sampled while preparing turn 8, step 12: "
+        "2026-10-12T01:02:03+08:00[Asia/Shanghai]\n"
+        "Browser time zone for this request: mixed [\"Asia/Shanghai\",\"UTC\"]. "
+        "Ask the user to clarify otherwise-unqualified dates and times.\n"
+        "Elapsed since the preceding step context: 1d 2h 3m 4s.";
+    require(harness_message_is_meta_only(HarnessKind::GenericToolClient, mixed_clock),
+            "mixed-zone clock was not recognized after proxy attribution loss");
+}
+
 const HarnessByteSpan *find_reason(const HarnessSemanticPlan &plan,
                                    HarnessSpanReason reason) {
     for (const HarnessByteSpan &span : plan.spans) {
         if (span.reason == reason) return &span;
     }
     return nullptr;
+}
+
+void test_long_tool_history_with_clock_snapshots() {
+    for (HarnessKind kind : {HarnessKind::DeepSeekHarness,
+                             HarnessKind::GenericToolClient}) {
+        for (const size_t history_bytes : {117800U, 146100U}) {
+            std::string prompt = "CONTROL\n";
+            const size_t control_end = prompt.size();
+            std::vector<HarnessRenderedMessageSpan> spans;
+            spans.push_back(append_message(prompt, 0, "user", clock_reading));
+            spans.push_back(append_message(prompt, 1, "user", "old task A"));
+            spans.push_back(append_message(prompt, 2, "assistant", "answer A"));
+            spans.push_back(append_message(prompt, 3, "tool", std::string(history_bytes, 'x')));
+            spans.push_back(append_message(prompt, 4, "user", "current task B"));
+            spans.push_back(append_message(prompt, 5, "user", clock_reading));
+            spans.push_back(append_message(prompt, 6, "assistant", "parallel tool calls"));
+            spans.push_back(append_message(prompt, 7, "tool", std::string(17000, 'y')));
+            spans.push_back(append_message(prompt, 8, "user", clock_reading));
+            spans.push_back(append_message(prompt, 9, "tool", std::string(26000, 'z')));
+            spans.push_back(append_message(prompt, 10, "user", clock_reading));
+            const auto plan = derive_harness_semantic_plan(kind, prompt, control_end, spans);
+            require(plan.root_task_message_index == 1 &&
+                        plan.current_query_message_index == 4,
+                    "clock replaced root/current task in long tool continuation");
+            const auto *query = find_reason(plan, HarnessSpanReason::CurrentQuery);
+            const auto *root = find_reason(plan, HarnessSpanReason::RootTask);
+            require(root && root->begin == spans[1].segment_begin &&
+                        root->end == spans[1].segment_end &&
+                        count_reason(plan, HarnessSpanReason::RootTask) == 1,
+                    "root task was not retained byte-exactly after clock filtering");
+            require(query && query->begin == spans[4].segment_begin &&
+                        query->end == spans[4].segment_end,
+                    "current task was not retained byte-exactly");
+            require(plan.live_suffix_message_begin_index == 6 &&
+                        plan.live_suffix_span &&
+                        plan.live_suffix_span->begin == spans[6].segment_begin &&
+                        plan.live_suffix_span->end == prompt.size(),
+                    "clock lost the unfinished parallel tool transaction");
+            spans.push_back(append_message(prompt, 11, "user", "current task C"));
+            const auto next = derive_harness_semantic_plan(kind, prompt, control_end, spans);
+            require(next.current_query_message_index == 11 &&
+                        next.live_suffix_message_begin_index == 11,
+                    "real user follow-up was ignored after clock filtering");
+        }
+    }
 }
 
 void test_bounded_query_and_live_tool_suffix() {
@@ -337,11 +429,25 @@ void test_missing_control_prefix_does_not_invent_system_pin() {
             "unidentified client unexpectedly gained a mandatory span");
 }
 
+
+void test_dsh_clock_long_near_matches_are_safe() {
+    for (const auto kind : {HarnessKind::DeepSeekHarness, HarnessKind::GenericToolClient}) {
+        require(!harness_message_is_meta_only(kind, "Time sampled while preparing turn " + std::string(50000, '9')),
+                "unterminated long turn became a clock");
+        require(!harness_message_is_meta_only(kind,
+                "Time sampled while preparing turn 8, step 1: 2026-10-12T12:00:00+08:00[" + std::string(50000,'a') + "]"),
+                "unterminated long zone became a clock");
+    }
+}
+
 } // namespace
 
 int main() {
     test_harness_classification();
     test_meta_message_detection();
+    test_dsh_clock_is_not_a_task();
+    test_dsh_clock_long_near_matches_are_safe();
+    test_long_tool_history_with_clock_snapshots();
     test_bounded_query_and_live_tool_suffix();
     test_mini_swe_agent_native_tool_lifetimes();
     test_claude_user_role_tool_response_and_parallel_results();

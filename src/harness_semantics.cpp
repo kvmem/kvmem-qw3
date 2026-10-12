@@ -44,6 +44,98 @@ std::string_view trim_ascii(std::string_view value) {
     return value;
 }
 
+struct DshClockCursor {
+    std::string_view remaining;
+
+    bool take(std::string_view literal) {
+        if (remaining.substr(0, literal.size()) != literal) return false;
+        remaining.remove_prefix(literal.size());
+        return true;
+    }
+    bool number(bool positive = false) {
+        if (remaining.empty() || (positive && (remaining.front() < '1' || remaining.front() > '9')))
+            return false;
+        const auto before = remaining.size();
+        while (!remaining.empty() && remaining.front() >= '0' && remaining.front() <= '9')
+            remaining.remove_prefix(1);
+        return remaining.size() != before;
+    }
+    bool digits(size_t count) {
+        if (remaining.size() < count) return false;
+        for (size_t i = 0; i < count; ++i)
+            if (remaining[i] < '0' || remaining[i] > '9') return false;
+        remaining.remove_prefix(count);
+        return true;
+    }
+    bool zone() {
+        const auto before = remaining.size();
+        while (!remaining.empty()) {
+            const char c = remaining.front();
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') || c == '_' || c == '+' || c == '.' || c == '/' || c == '-'))
+                break;
+            remaining.remove_prefix(1);
+        }
+        return remaining.size() != before;
+    }
+    bool newline() {
+        (void)take("\r");
+        return take("\n");
+    }
+};
+
+bool is_dsh_clock_snapshot(HarnessKind kind, std::string_view content) {
+    if (kind != HarnessKind::DeepSeekHarness && kind != HarnessKind::GenericToolClient)
+        return false;
+    DshClockCursor clock{trim_ascii(content)};
+    // Consume the same complete wire format without recursive regex matching.
+    // User text with an arbitrarily long near-match remains safe to inspect.
+    if (!clock.take("Time sampled while preparing turn ") || !clock.number() ||
+        !clock.take(", step ") || !clock.number(true) || !clock.take(": ") ||
+        !clock.digits(4) || !clock.take("-") || !clock.digits(2) || !clock.take("-") ||
+        !clock.digits(2) || !clock.take("T") || !clock.digits(2) || !clock.take(":") ||
+        !clock.digits(2) || !clock.take(":") || !clock.digits(2) ||
+        !(clock.take("+") || clock.take("-")) || !clock.digits(2) || !clock.take(":") ||
+        !clock.digits(2) || !clock.take("[") || !clock.zone() || !clock.take("]") ||
+        !clock.newline() || !clock.take("Browser time zone for this request: ")) return false;
+
+    constexpr std::string_view clarify =
+        ". Ask the user to clarify otherwise-unqualified dates and times.";
+    if (clock.take("unavailable. Ask the user to clarify otherwise-unqualified dates and times.")) {
+    } else if (clock.take("mixed [")) {
+        if (!clock.take("\"") || !clock.zone() || !clock.take("\"") || !clock.take(","))
+            return false;
+        do {
+            if (!clock.take("\"") || !clock.zone() || !clock.take("\"")) return false;
+        } while (clock.take(","));
+        if (!clock.take("]") || !clock.take(clarify)) return false;
+    } else {
+        constexpr std::string_view suffix =
+            ". Interpret otherwise-unqualified dates and times in this zone.";
+        const auto separator = clock.remaining.find(suffix);
+        if (separator == std::string_view::npos) return false;
+        DshClockCursor name{clock.remaining.substr(0, separator)};
+        if (!name.zone() || !name.remaining.empty()) return false;
+        clock.remaining.remove_prefix(separator);
+        if (!clock.take(suffix)) return false;
+    }
+    if (!clock.newline() || !clock.take("Elapsed since the preceding ") ||
+        !(clock.take("model-visible message: ") || clock.take("step context: "))) return false;
+    if (clock.take("unavailable.")) return clock.remaining.empty();
+    unsigned previous = 0;
+    while (clock.number()) {
+        if (clock.remaining.empty()) return false;
+        const char unit = clock.remaining.front();
+        const unsigned order = unit == 'd' ? 1U : unit == 'h' ? 2U : unit == 'm' ? 3U : unit == 's' ? 4U : 0U;
+        if (order <= previous) return false;
+        clock.remaining.remove_prefix(1);
+        previous = order;
+        if (unit == 's') return clock.take(".") && clock.remaining.empty();
+        if (!clock.take(" ")) return false;
+    }
+    return false;
+}
+
 struct ReminderFrame {
     size_t begin = 0;
     size_t end = 0;
@@ -235,6 +327,7 @@ const char *harness_kind_name(HarnessKind kind) {
 
 bool harness_message_is_meta_only(HarnessKind kind,
                                   std::string_view content) {
+    if (is_dsh_clock_snapshot(kind, content)) return true;
     const std::vector<ReminderFrame> frames = reminder_frames(content);
     if (frames.empty()) return false;
     size_t cursor = 0;

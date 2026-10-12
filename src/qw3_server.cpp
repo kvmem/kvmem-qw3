@@ -6,6 +6,9 @@
 #include "native_message_preparation.hpp"
 #include "env_flags.hpp"
 #include "harness_semantics.hpp"
+#ifdef QW3_SERVER_RENDER_TEST_ACCESS
+#include "server_render_test_access.hpp"
+#endif
 #include "kvmem_request_plan.hpp"
 #include "kvmem_refresh_policy.hpp"
 #include "multimodal_prefix_cache.hpp"
@@ -1735,6 +1738,17 @@ std::vector<std::string> parse_stops(const json &req) {
 }
 
 } // namespace
+
+#ifdef QW3_SERVER_RENDER_TEST_ACCESS
+detail::ServerRenderTestResult detail::inspect_server_render(const nlohmann::json& messages,
+    HarnessKind kind, bool stable_reasoning, bool add_generation_prompt) {
+    ServerRenderTestResult result;
+    result.query_index = last_query_index_for_template(messages, kind);
+    result.prompt = render_messages(messages, nullptr, true, "",
+        &result.messages, add_generation_prompt, false, kind, stable_reasoning, &result.control_end);
+    return result;
+}
+#endif
 
 int run_server(EngineOptions engine, ServerConfig cfg) {
     engine.native_heavy = true;
