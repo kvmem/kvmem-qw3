@@ -88,7 +88,9 @@ struct HarnessSemanticPlan {
 // True only when the whole message is composed of harness-owned reminder
 // frames and whitespace. Generic OpenAI-compatible clients require a known
 // persistent-policy signature; recognized harnesses may also send turn-local
-// reminder frames.
+// reminder frames. DeepSeek Harness and the compatible-tool fallback also
+// recognize complete DSH time-context snapshots (ordinary user-role messages
+// on the wire). Recognition changes semantic attribution, not prompt bytes.
 bool harness_message_is_meta_only(HarnessKind kind,
                                   std::string_view content);
 

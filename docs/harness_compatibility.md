@@ -33,6 +33,12 @@ does not assume a fixed token count or pin everything after the first query.
   it is the same message as `CurrentQuery`.
 - `CurrentQuery` is exactly the newest real user instruction. User-role tool results
   and reminder-only messages do not replace it.
+  Complete three-line DeepSeek Harness `time-context` readings also do not
+  replace the task. This applies to explicit DSH detection and the compatible-tool
+  fallback when a proxy strips product headers. The readings remain in the prompt
+  and live tool suffix; no timestamps or messages are deleted. A quoted reading,
+  a reading followed by a user instruction, or an unrecognized format remains
+  user content. Other harness kinds do not use this DSH-specific recognizer.
 - `ProjectPolicy` contains only the latest applicable `AGENTS.md`, `CLAUDE.md`,
   or complete workspace-policy frames. Later copies supersede older copies for
   the same path, so policy cost does not grow once per tool round.

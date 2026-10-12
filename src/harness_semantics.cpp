@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <regex>
 #include <unordered_map>
 #include <utility>
 
@@ -42,6 +43,28 @@ std::string_view trim_ascii(std::string_view value) {
         value.remove_suffix(1);
     }
     return value;
+}
+
+bool is_dsh_clock_snapshot(HarnessKind kind, std::string_view content) {
+    // DSH exports its time-context source as an ordinary OpenAI user message.
+    // A proxy can remove product headers, leaving the compatible-tool fallback.
+    // Match the complete three-line reading, never just its introductory phrase:
+    // quoted clocks, mixed tasks and unknown future formats remain real users.
+    if (kind != HarnessKind::DeepSeekHarness &&
+        kind != HarnessKind::GenericToolClient) return false;
+    content = trim_ascii(content);
+    constexpr std::string_view prefix = "Time sampled while preparing turn ";
+    if (content.compare(0, prefix.size(), prefix) != 0) return false;
+    static const std::regex clock(
+        R"(Time sampled while preparing turn [0-9]+, step [1-9][0-9]*: )"
+        R"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}\[[A-Za-z0-9_+./-]+\]\r?\n)"
+        R"(Browser time zone for this request: ()"
+        R"([A-Za-z0-9_+./-]+\. Interpret otherwise-unqualified dates and times in this zone\.)"
+        R"(|unavailable\. Ask the user to clarify otherwise-unqualified dates and times\.)"
+        R"(|mixed \["[A-Za-z0-9_+./-]+"(,"[A-Za-z0-9_+./-]+")+\]\. Ask the user to clarify otherwise-unqualified dates and times\.))"
+        R"(\r?\nElapsed since the preceding (model-visible message|step context): )"
+        R"((unavailable|([0-9]+d )?([0-9]+h )?([0-9]+m )?[0-9]+s)\.)");
+    return std::regex_match(content.begin(), content.end(), clock);
 }
 
 struct ReminderFrame {
@@ -235,6 +258,7 @@ const char *harness_kind_name(HarnessKind kind) {
 
 bool harness_message_is_meta_only(HarnessKind kind,
                                   std::string_view content) {
+    if (is_dsh_clock_snapshot(kind, content)) return true;
     const std::vector<ReminderFrame> frames = reminder_frames(content);
     if (frames.empty()) return false;
     size_t cursor = 0;
