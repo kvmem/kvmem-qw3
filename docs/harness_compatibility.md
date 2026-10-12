@@ -162,3 +162,11 @@ combination retains the existing compact-history rendering.
 Codex is not included in this compatibility layer because its custom provider
 path uses the OpenAI Responses wire API. `qw3 serve` does not currently expose
 `/v1/responses`.
+
+
+DSH clock snapshots are recognized only as complete messages. Without source
+provenance a human-written message identical to this wire format is also treated
+as metadata. Clock text is retained. In compact generation rendering, correcting
+the current-query boundary may retain live Assistant reasoning that a clock
+previously cut off, increasing input tokens and prefill cost. The new real-server
+renderer regression checks this behavior and stable/prefill-only rendering.

@@ -275,8 +275,11 @@ add_executable(qw3-inspect src/qw3_inspect.cpp)
 target_link_libraries(qw3-inspect PRIVATE qw3_core)
 
 if(QW3_BUILD_TESTS)
-    add_executable(qw3-prompt-render tests/prompt_render_test.cpp)
-    target_link_libraries(qw3-prompt-render PRIVATE qw3_core)
+    add_executable(qw3-prompt-render tests/prompt_render_test.cpp src/qw3_server.cpp)
+    target_compile_definitions(qw3-prompt-render PRIVATE QW3_SERVER_RENDER_TEST_ACCESS=1
+        QW3_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    target_include_directories(qw3-prompt-render PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(qw3-prompt-render PRIVATE qw3_core qw3_request_json)
     enable_testing()
     add_test(NAME qw3-flashinfer-sync-overlay COMMAND ${CMAKE_COMMAND}
         -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/flashinfer-sync-overlay-test

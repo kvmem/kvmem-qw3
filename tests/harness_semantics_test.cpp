@@ -429,12 +429,24 @@ void test_missing_control_prefix_does_not_invent_system_pin() {
             "unidentified client unexpectedly gained a mandatory span");
 }
 
+
+void test_dsh_clock_long_near_matches_are_safe() {
+    for (const auto kind : {HarnessKind::DeepSeekHarness, HarnessKind::GenericToolClient}) {
+        require(!harness_message_is_meta_only(kind, "Time sampled while preparing turn " + std::string(50000, '9')),
+                "unterminated long turn became a clock");
+        require(!harness_message_is_meta_only(kind,
+                "Time sampled while preparing turn 8, step 1: 2026-10-12T12:00:00+08:00[" + std::string(50000,'a') + "]"),
+                "unterminated long zone became a clock");
+    }
+}
+
 } // namespace
 
 int main() {
     test_harness_classification();
     test_meta_message_detection();
     test_dsh_clock_is_not_a_task();
+    test_dsh_clock_long_near_matches_are_safe();
     test_long_tool_history_with_clock_snapshots();
     test_bounded_query_and_live_tool_suffix();
     test_mini_swe_agent_native_tool_lifetimes();

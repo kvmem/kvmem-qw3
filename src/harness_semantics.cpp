@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <regex>
 #include <unordered_map>
 #include <utility>
 
@@ -45,26 +44,96 @@ std::string_view trim_ascii(std::string_view value) {
     return value;
 }
 
+struct DshClockCursor {
+    std::string_view remaining;
+
+    bool take(std::string_view literal) {
+        if (remaining.substr(0, literal.size()) != literal) return false;
+        remaining.remove_prefix(literal.size());
+        return true;
+    }
+    bool number(bool positive = false) {
+        if (remaining.empty() || (positive && (remaining.front() < '1' || remaining.front() > '9')))
+            return false;
+        const auto before = remaining.size();
+        while (!remaining.empty() && remaining.front() >= '0' && remaining.front() <= '9')
+            remaining.remove_prefix(1);
+        return remaining.size() != before;
+    }
+    bool digits(size_t count) {
+        if (remaining.size() < count) return false;
+        for (size_t i = 0; i < count; ++i)
+            if (remaining[i] < '0' || remaining[i] > '9') return false;
+        remaining.remove_prefix(count);
+        return true;
+    }
+    bool zone() {
+        const auto before = remaining.size();
+        while (!remaining.empty()) {
+            const char c = remaining.front();
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') || c == '_' || c == '+' || c == '.' || c == '/' || c == '-'))
+                break;
+            remaining.remove_prefix(1);
+        }
+        return remaining.size() != before;
+    }
+    bool newline() {
+        (void)take("\r");
+        return take("\n");
+    }
+};
+
 bool is_dsh_clock_snapshot(HarnessKind kind, std::string_view content) {
-    // DSH exports its time-context source as an ordinary OpenAI user message.
-    // A proxy can remove product headers, leaving the compatible-tool fallback.
-    // Match the complete three-line reading, never just its introductory phrase:
-    // quoted clocks, mixed tasks and unknown future formats remain real users.
-    if (kind != HarnessKind::DeepSeekHarness &&
-        kind != HarnessKind::GenericToolClient) return false;
-    content = trim_ascii(content);
-    constexpr std::string_view prefix = "Time sampled while preparing turn ";
-    if (content.compare(0, prefix.size(), prefix) != 0) return false;
-    static const std::regex clock(
-        R"(Time sampled while preparing turn [0-9]+, step [1-9][0-9]*: )"
-        R"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}\[[A-Za-z0-9_+./-]+\]\r?\n)"
-        R"(Browser time zone for this request: ()"
-        R"([A-Za-z0-9_+./-]+\. Interpret otherwise-unqualified dates and times in this zone\.)"
-        R"(|unavailable\. Ask the user to clarify otherwise-unqualified dates and times\.)"
-        R"(|mixed \["[A-Za-z0-9_+./-]+"(,"[A-Za-z0-9_+./-]+")+\]\. Ask the user to clarify otherwise-unqualified dates and times\.))"
-        R"(\r?\nElapsed since the preceding (model-visible message|step context): )"
-        R"((unavailable|([0-9]+d )?([0-9]+h )?([0-9]+m )?[0-9]+s)\.)");
-    return std::regex_match(content.begin(), content.end(), clock);
+    if (kind != HarnessKind::DeepSeekHarness && kind != HarnessKind::GenericToolClient)
+        return false;
+    DshClockCursor clock{trim_ascii(content)};
+    // Consume the same complete wire format without recursive regex matching.
+    // User text with an arbitrarily long near-match remains safe to inspect.
+    if (!clock.take("Time sampled while preparing turn ") || !clock.number() ||
+        !clock.take(", step ") || !clock.number(true) || !clock.take(": ") ||
+        !clock.digits(4) || !clock.take("-") || !clock.digits(2) || !clock.take("-") ||
+        !clock.digits(2) || !clock.take("T") || !clock.digits(2) || !clock.take(":") ||
+        !clock.digits(2) || !clock.take(":") || !clock.digits(2) ||
+        !(clock.take("+") || clock.take("-")) || !clock.digits(2) || !clock.take(":") ||
+        !clock.digits(2) || !clock.take("[") || !clock.zone() || !clock.take("]") ||
+        !clock.newline() || !clock.take("Browser time zone for this request: ")) return false;
+
+    constexpr std::string_view clarify =
+        ". Ask the user to clarify otherwise-unqualified dates and times.";
+    if (clock.take("unavailable. Ask the user to clarify otherwise-unqualified dates and times.")) {
+    } else if (clock.take("mixed [")) {
+        if (!clock.take("\"") || !clock.zone() || !clock.take("\"") || !clock.take(","))
+            return false;
+        do {
+            if (!clock.take("\"") || !clock.zone() || !clock.take("\"")) return false;
+        } while (clock.take(","));
+        if (!clock.take("]") || !clock.take(clarify)) return false;
+    } else {
+        constexpr std::string_view suffix =
+            ". Interpret otherwise-unqualified dates and times in this zone.";
+        const auto separator = clock.remaining.find(suffix);
+        if (separator == std::string_view::npos) return false;
+        DshClockCursor name{clock.remaining.substr(0, separator)};
+        if (!name.zone() || !name.remaining.empty()) return false;
+        clock.remaining.remove_prefix(separator);
+        if (!clock.take(suffix)) return false;
+    }
+    if (!clock.newline() || !clock.take("Elapsed since the preceding ") ||
+        !(clock.take("model-visible message: ") || clock.take("step context: "))) return false;
+    if (clock.take("unavailable.")) return clock.remaining.empty();
+    unsigned previous = 0;
+    while (clock.number()) {
+        if (clock.remaining.empty()) return false;
+        const char unit = clock.remaining.front();
+        const unsigned order = unit == 'd' ? 1U : unit == 'h' ? 2U : unit == 'm' ? 3U : unit == 's' ? 4U : 0U;
+        if (order <= previous) return false;
+        clock.remaining.remove_prefix(1);
+        previous = order;
+        if (unit == 's') return clock.take(".") && clock.remaining.empty();
+        if (!clock.take(" ")) return false;
+    }
+    return false;
 }
 
 struct ReminderFrame {
