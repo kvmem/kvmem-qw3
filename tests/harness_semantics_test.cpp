@@ -203,6 +203,11 @@ void test_long_tool_history_with_clock_snapshots() {
                         plan.current_query_message_index == 4,
                     "clock replaced root/current task in long tool continuation");
             const auto *query = find_reason(plan, HarnessSpanReason::CurrentQuery);
+            const auto *root = find_reason(plan, HarnessSpanReason::RootTask);
+            require(root && root->begin == spans[1].segment_begin &&
+                        root->end == spans[1].segment_end &&
+                        count_reason(plan, HarnessSpanReason::RootTask) == 1,
+                    "root task was not retained byte-exactly after clock filtering");
             require(query && query->begin == spans[4].segment_begin &&
                         query->end == spans[4].segment_end,
                     "current task was not retained byte-exactly");
