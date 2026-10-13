@@ -95,6 +95,11 @@ struct KvMemArchiveStateEntry {
         MtpPrefixHidden = 1,
         Recurrent = 2,
         Conv = 3,
+        // Optional bounded draft cache. It does not alter the target KV layout
+        // and may be ignored by readers which run the target without a draft.
+        DFlashMetadata = 4,
+        DFlashRawK = 5,
+        DFlashV = 6,
     };
     uint32_t kind = Hidden;
     uint32_t index = 0;  // layer index for Recurrent/Conv, 0 otherwise

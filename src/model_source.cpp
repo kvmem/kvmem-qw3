@@ -220,13 +220,15 @@ public:
             const std::vector<uint64_t> offsets =
                 desc.at("data_offsets").get<std::vector<uint64_t>>();
             if (offsets.size() != 2 || offsets[1] < offsets[0] ||
-                payload_offset + offsets[1] > file_.size()) {
+                offsets[1] > file_.size() - payload_offset) {
                 throw std::runtime_error("invalid safetensors data offsets: " + entry.key());
             }
             tensor.data = file_.data() + payload_offset + offsets[0];
             tensor.bytes = offsets[1] - offsets[0];
             const uint32_t item_bytes = dtype_bytes(tensor.type);
-            if (item_bytes != 0 && checked_product(tensor.shape) * item_bytes != tensor.bytes) {
+            const uint64_t elements = checked_product(tensor.shape);
+            if (item_bytes != 0 &&
+                (tensor.bytes % item_bytes != 0 || elements != tensor.bytes / item_bytes)) {
                 throw std::runtime_error("safetensors shape/byte mismatch: " + entry.key());
             }
             tensors_.emplace(entry.key(), std::move(tensor));
@@ -238,9 +240,66 @@ public:
         return it == tensors_.end() ? nullptr : &it->second;
     }
 
+    const std::unordered_map<std::string, RawSafetensor> &tensors() const {
+        return tensors_;
+    }
+
 private:
     MappedFile file_;
     std::unordered_map<std::string, RawSafetensor> tensors_;
+};
+
+class RawSafetensorsModelSource final : public ModelSource {
+public:
+    explicit RawSafetensorsModelSource(const std::filesystem::path &directory)
+        : directory_(std::filesystem::canonical(directory).string()) {
+        info_.format = "safetensors/raw";
+        const auto index_path = directory / "model.safetensors.index.json";
+        if (std::filesystem::exists(index_path)) {
+            const auto index = read_json(index_path);
+            const auto map = index.at("weight_map")
+                .get<std::unordered_map<std::string, std::string>>();
+            for (const auto &[name, file] : map) {
+                auto &shard = shards_[file];
+                if (!shard) shard = std::make_unique<SafetensorsShard>(directory / file);
+                const auto *tensor = shard->find(name);
+                if (!tensor) throw std::runtime_error("tensor missing from indexed shard: " + name);
+                add(name, *tensor);
+            }
+        } else {
+            auto shard = std::make_unique<SafetensorsShard>(directory / "model.safetensors");
+            for (const auto &[name, tensor] : shard->tensors()) add(name, tensor);
+            shards_.emplace("model.safetensors", std::move(shard));
+        }
+        info_.tensor_count = tensors_.size();
+        if (tensors_.empty()) throw std::runtime_error("empty safetensors model: " + directory_);
+    }
+
+    const ModelTensorInfo *find_tensor(const std::string &name) const override {
+        const auto it = tensors_.find(name);
+        return it == tensors_.end() ? nullptr : &it->second;
+    }
+    const ModelSourceInfo &info() const override { return info_; }
+    const std::string &model_directory() const override { return directory_; }
+
+private:
+    void add(const std::string &name, const RawSafetensor &raw) {
+        ModelTensorInfo tensor;
+        tensor.name = tensor.source_name = name;
+        tensor.type = raw.type;
+        tensor.dims = reversed_shape(raw.shape);
+        tensor.data = raw.data;
+        tensor.bytes = raw.bytes;
+        if (tensor.bytes > std::numeric_limits<uint64_t>::max() - info_.tensor_bytes)
+            throw std::runtime_error("safetensors total bytes overflow");
+        info_.tensor_bytes += tensor.bytes;
+        tensors_.emplace(name, std::move(tensor));
+    }
+
+    std::string directory_;
+    ModelSourceInfo info_;
+    std::unordered_map<std::string, std::unique_ptr<SafetensorsShard>> shards_;
+    std::unordered_map<std::string, ModelTensorInfo> tensors_;
 };
 
 std::string replace_suffix(const std::string &value, const std::string &old_suffix,
@@ -544,6 +603,10 @@ std::unique_ptr<ModelSource> open_model_source(const std::string &path) {
         return std::make_unique<HfSafetensorsModelSource>(model_path);
     }
     return make_gguf_model_source(std::make_unique<GgufFile>(path));
+}
+
+std::unique_ptr<ModelSource> open_raw_safetensors_source(const std::string &directory) {
+    return std::make_unique<RawSafetensorsModelSource>(directory);
 }
 
 } // namespace qw3

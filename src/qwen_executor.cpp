@@ -1,4 +1,7 @@
+#include <cinttypes>
 #include "qwen_executor.hpp"
+#include "local_kv_page_pool.hpp"
+#include "shared_kv_page_pool.hpp"
 #include "vision_embedding_storage.hpp"
 #include "kvmem_prefix_reuse_policy.hpp"
 #include "kvmem_refresh_policy.hpp"
@@ -35,6 +38,30 @@
 namespace qw3 {
 
 namespace {
+
+struct RawCaptureChunkGuard {
+    std::vector<uint32_t> &chunks;
+    RawCaptureChunkGuard(std::vector<uint32_t> &target,
+                         const std::vector<KvMemStorageSpan> &spans, uint32_t chunk_tokens)
+        : chunks(target) {
+        if (!chunks.empty()) throw std::logic_error("nested raw-K capture protection");
+        for (const auto &span : spans) {
+            if (!chunk_tokens || !span.token_count) throw std::logic_error("invalid raw capture chunk");
+            const uint32_t end = (span.storage_begin + span.token_count - 1) / chunk_tokens;
+            for (uint32_t chunk = span.storage_begin / chunk_tokens; chunk <= end; ++chunk)
+                chunks.push_back(chunk);
+        }
+        std::sort(chunks.begin(), chunks.end());
+        chunks.erase(std::unique(chunks.begin(), chunks.end()), chunks.end());
+    }
+    ~RawCaptureChunkGuard() { chunks.clear(); }
+};
+
+const KvMemStorageSpan *repository_raw_span(const KvMemStorageRead &view, uint32_t id) {
+    const auto it = std::lower_bound(view.spans.begin(), view.spans.end(), id,
+        [](const auto &span, uint32_t slot) { return span.handle.slot < slot; });
+    return it != view.spans.end() && it->handle.slot == id ? &*it : nullptr;
+}
 
 std::string kvmem_read_first_line(const std::string &path) {
     std::ifstream in(path);
@@ -532,14 +559,14 @@ struct QuerySpanOverlap {
 // prefill and the restored checkpoint position on a warm suffix-only prefill.
 // Keeping the overlap calculation in this one helper prevents cold/warm paths
 // from accidentally mixing prompt-absolute and suffix-relative coordinates.
-constexpr QuerySpanOverlap query_span_overlap(uint32_t chunk_begin,
+constexpr QuerySpanOverlap query_span_overlap(uint64_t chunk_begin,
                                                uint32_t chunk_tokens,
-                                               uint32_t query_begin,
-                                               uint32_t query_end) {
-    const uint32_t chunk_end = chunk_begin + chunk_tokens;
-    const uint32_t lo = chunk_begin > query_begin ? chunk_begin : query_begin;
-    const uint32_t hi = chunk_end < query_end ? chunk_end : query_end;
-    return hi > lo ? QuerySpanOverlap{lo - chunk_begin, hi - lo}
+                                               uint64_t query_begin,
+                                               uint64_t query_end) {
+    const uint64_t chunk_end = chunk_begin + chunk_tokens;
+    const uint64_t lo = chunk_begin > query_begin ? chunk_begin : query_begin;
+    const uint64_t hi = chunk_end < query_end ? chunk_end : query_end;
+    return hi > lo ? QuerySpanOverlap{static_cast<uint32_t>(lo - chunk_begin), static_cast<uint32_t>(hi - lo)}
                    : QuerySpanOverlap{};
 }
 
@@ -551,65 +578,11 @@ static_assert(query_span_overlap(0, 256, 104, 151).count == 47);
 static_assert(query_span_overlap(109888, 68, 109902, 109949).row_offset == 14);
 static_assert(query_span_overlap(109888, 68, 109902, 109949).count == 47);
 static_assert(query_span_overlap(100, 16, 200, 220).count == 0);
+static_assert(query_span_overlap((1ull << 36) + 100, 68, (1ull << 36) + 114,
+                                (1ull << 36) + 161).row_offset == 14);
+static_assert(query_span_overlap((1ull << 36) + 100, 68, (1ull << 36) + 114,
+                                (1ull << 36) + 161).count == 47);
 
-class LocalKvPagePool final : public KvPhysicalPageAllocator {
-public:
-    LocalKvPagePool(uint32_t total_pages, uint32_t page_size,
-                    const char *label)
-        : total_pages_(std::max<uint32_t>(1, total_pages)),
-          page_size_(std::max<uint32_t>(1, page_size)),
-          label_(label ? label : "unknown"),
-          in_free_(total_pages_, true) {
-        free_pages_.reserve(total_pages_);
-        for (uint32_t i = 0; i < total_pages_; ++i) {
-            free_pages_.push_back(static_cast<int32_t>(total_pages_ - 1U - i));
-        }
-    }
-
-    int32_t allocate_physical_page() override {
-        if (free_pages_.empty()) {
-            throw std::runtime_error(
-                "local KVMem GPU page pool exhausted: pool=" + label_ +
-                " free=0 total=" +
-                std::to_string(total_pages_) +
-                " page_size=" + std::to_string(page_size_));
-        }
-        const int32_t page = free_pages_.back();
-        free_pages_.pop_back();
-        if (page >= 0 && static_cast<uint32_t>(page) < in_free_.size()) {
-            in_free_[page] = false;
-        }
-        ++used_pages_;
-        return page;
-    }
-
-    void release_physical_pages(const std::vector<int32_t> &pages) override {
-        for (int32_t page : pages) {
-            if (page < 0 || static_cast<uint32_t>(page) >= total_pages_) {
-                continue;
-            }
-            if (in_free_[page]) continue;
-            in_free_[page] = true;
-            free_pages_.push_back(page);
-            if (used_pages_ > 0) --used_pages_;
-        }
-    }
-
-    uint32_t free_pages() const override {
-        return static_cast<uint32_t>(free_pages_.size());
-    }
-
-    uint32_t used_pages() const override { return used_pages_; }
-    uint32_t total_pages() const override { return total_pages_; }
-
-private:
-    uint32_t total_pages_ = 0;
-    uint32_t page_size_ = 0;
-    std::string label_;
-    std::vector<int32_t> free_pages_;
-    std::vector<bool> in_free_;
-    uint32_t used_pages_ = 0;
-};
 
 bool kvmem_tier_trace_enabled() {
     return env_flag_enabled("QW3_KVMEM_TIER_TRACE");
@@ -790,8 +763,7 @@ QwenExecutor::KvMemTierUsage QwenExecutor::kvmem_tier_usage() const {
         const uint64_t used_blk =
             kvmem_gpu_page_pool_->used_pages() / pages_per_block;
         const uint64_t cap_blk =
-            (static_cast<uint64_t>(kvmem_gpu_page_pool_->used_pages()) +
-             kvmem_gpu_page_pool_->free_pages()) / pages_per_block;
+            kvmem_gpu_page_pool_->total_pages() / pages_per_block;
         u.gpu_used_bytes = used_blk * u.gpu_block_bytes;
         u.gpu_capacity_bytes = cap_blk * u.gpu_block_bytes;
     } else {
@@ -968,6 +940,8 @@ QwenExecutor::QwenExecutor(const QwenNativeModel &model,
       external_kv_cache_(external_kv_cache),
       external_mtp_kv_cache_(external_mtp_kv_cache),
       kv_ctx_size_(kv_ctx_size) {
+    external_kv_page_allocator_ = external_kv_cache ? kv_page_allocator : nullptr;
+    external_mtp_page_allocator_ = external_mtp_kv_cache ? mtp_kv_page_allocator : nullptr;
     const bool bf16_weight_path =
         (weights_.uses_nvfp4() &&
          env_flag_enabled("QW3_NVFP4_BF16_MAIN", true)) ||
@@ -982,8 +956,11 @@ QwenExecutor::QwenExecutor(const QwenNativeModel &model,
 }
 
 QwenExecutor::~QwenExecutor() {
+    if (kvmem_repository_gc_) kvmem_repository_gc_->stop();
     if (kvmem_gc_) kvmem_gc_->stop();
     try {
+        kvmem_blend_restore();
+        kvmem_discard_repository_prefetch();
         kvmem_drain_mean_index_capture();
         kvmem_finish_proactive_d2h(/*wait_all=*/true);
         kvmem_reap_pending_writes(/*wait_all=*/true);
@@ -1058,8 +1035,12 @@ void QwenExecutor::set_input_embedding_overrides(
     const auto visual_indexed = visual_now();
     input_multimodal_prompt_tokens_ = prompt_tokens;
     input_mrope_positions_ = mrope_positions;
-    input_compact_mrope_positions_.resize(prompt_tokens.size());
-    input_compact_mrope_valid_.assign(prompt_tokens.size(), 0);
+    // Compact positions are attached to the current generation of a physical
+    // repository slot. Full source positions are only request-local input.
+    const size_t compact_rows = block_store_ && block_store_->has_repository()
+        ? kv_ctx_size_ : prompt_tokens.size();
+    input_compact_mrope_positions_.resize(compact_rows);
+    input_compact_mrope_valid_.assign(compact_rows, 0);
     const auto &last = input_mrope_positions_.back();
     const uint32_t next = std::max({last[0], last[1], last[2]}) + 1u;
     input_mrope_decode_delta_ = static_cast<int64_t>(next) -
@@ -1075,6 +1056,16 @@ void QwenExecutor::set_input_embedding_overrides(
             ms(visual_copied, visual_indexed), ms(visual_indexed, finished),
             ms(visual_start, finished));
     }
+}
+
+void QwenExecutor::release_bounded_input_metadata() noexcept {
+    if (!block_store_ || !block_store_->has_repository()) return;
+    decltype(input_embedding_overrides_){}.swap(input_embedding_overrides_);
+    input_embedding_override_index_ = {};
+    decltype(input_multimodal_prompt_tokens_){}.swap(input_multimodal_prompt_tokens_);
+    decltype(input_mrope_positions_){}.swap(input_mrope_positions_);
+    // Preserve bounded compact coordinates and checkpoint/window state. Their
+    // validity is reset on the next request and on physical slot reuse.
 }
 
 uint32_t QwenExecutor::resolve_input_token(uint32_t token_id) const {
@@ -1195,7 +1186,7 @@ void QwenExecutor::overwrite_input_embeddings_batch(DeviceTensor &dst,
 
 bool QwenExecutor::prepare_input_mrope_batch(const uint32_t *tokens,
                                             uint32_t batch,
-                                            uint32_t logical_base) {
+                                            uint64_t logical_base) {
     if (input_mrope_positions_.empty() || batch == 0) return false;
     if (static_cast<uint64_t>(logical_base) + batch >
         input_multimodal_prompt_tokens_.size()) {
@@ -1234,10 +1225,27 @@ bool QwenExecutor::prepare_input_mrope_batch(const uint32_t *tokens,
         input_mrope_positions_capacity_ = batch;
     }
     input_mrope_positions_host_.resize(3ULL * batch);
+    KvMemStorageRead physical;
+    std::vector<uint32_t> compact_rows;
+    if (block_store_ && block_store_->has_repository()) {
+        physical = kvmem_repository_storage(logical_base, batch);
+        compact_rows.reserve(batch);
+        for (const auto &span : physical.spans) {
+            if (uint64_t(span.storage_begin) + span.token_count > input_compact_mrope_valid_.size())
+                throw std::logic_error("multimodal compact coordinates exceed repository arena");
+            for (uint32_t i = 0; i < span.token_count; ++i)
+                compact_rows.push_back(span.storage_begin + i);
+        }
+        if (compact_rows.size() != batch)
+            throw std::logic_error("multimodal compact coordinate mapping lost rows");
+    }
+    const auto compact_row = [&](uint32_t i) -> size_t {
+        return compact_rows.empty() ? logical_base + i : compact_rows[i];
+    };
     bool compact_positions_ready = kvmem_active_;
     if (compact_positions_ready) {
         for (uint32_t i = 0; i < batch; ++i) {
-            if (!input_compact_mrope_valid_[logical_base + i]) {
+            if (!input_compact_mrope_valid_[compact_row(i)]) {
                 compact_positions_ready = false;
                 break;
             }
@@ -1269,8 +1277,8 @@ bool QwenExecutor::prepare_input_mrope_batch(const uint32_t *tokens,
                 compact[axis] = static_cast<uint32_t>(value);
                 next = std::max(next, compact[axis] + 1u);
             }
-            input_compact_mrope_positions_[logical_base + i] = compact;
-            input_compact_mrope_valid_[logical_base + i] = 1;
+            input_compact_mrope_positions_[compact_row(i)] = compact;
+            input_compact_mrope_valid_[compact_row(i)] = 1;
         }
         window_mrope_append_source_next_ = logical_base + batch;
         window_mrope_next_ = next;
@@ -1278,7 +1286,7 @@ bool QwenExecutor::prepare_input_mrope_batch(const uint32_t *tokens,
     for (uint32_t axis = 0; axis < 3; ++axis) {
         for (uint32_t i = 0; i < batch; ++i) {
             const auto &position = kvmem_active_
-                ? input_compact_mrope_positions_[logical_base + i]
+                ? input_compact_mrope_positions_[compact_row(i)]
                 : input_mrope_positions_[logical_base + i];
             input_mrope_positions_host_[static_cast<size_t>(axis) * batch + i] =
                 static_cast<int32_t>(position[axis]);
@@ -1298,10 +1306,14 @@ bool QwenExecutor::prepare_input_mrope_batch(const uint32_t *tokens,
 }
 
 std::array<uint32_t, 3> QwenExecutor::source_multimodal_rope_position(
-        uint32_t pos) const {
+        uint64_t pos) const {
     if (pos < input_mrope_positions_.size()) {
         return input_mrope_positions_[pos];
     }
+    if (pos > uint64_t(std::numeric_limits<int64_t>::max()) ||
+        (input_mrope_decode_delta_ > 0 &&
+         pos > uint64_t(std::numeric_limits<int64_t>::max() - input_mrope_decode_delta_)))
+        throw std::overflow_error("multimodal source history position overflow");
     const int64_t adjusted =
         static_cast<int64_t>(pos) + input_mrope_decode_delta_;
     if (adjusted < 0 || adjusted > std::numeric_limits<int32_t>::max()) {
@@ -1389,30 +1401,335 @@ QwenExecutor::MtpPrefixStateView QwenExecutor::mtp_prefix_state_view() {
     return view;
 }
 
+QwenExecutor::MtpPrefixStateView QwenExecutor::prepare_continuous_mtp_draft(
+        uint64_t logical_position) {
+    if (!input_mrope_positions_.empty() || !input_embedding_overrides_.empty()) return {};
+    if (logical_position < position_ || logical_position - position_ >= kv_ctx_size_)
+        throw std::invalid_argument("continuous MTP draft position outside request");
+    ensure_mtp_kv_pages(logical_position, 1, true);
+    auto view = mtp_prefix_state_view();
+    if (position_ > view.prefix_len) { view.ready = false; return view; }
+    view.window_frame = kvmem_active_;
+    if (view.window_frame) {
+        const auto depth = static_cast<uint32_t>(logical_position - position_);
+        kvmem_extend_mtp_window_for_decode_n(depth + 1, position_);
+        view.page_count = mtp_window_page_count_;
+        view.page_indices_host = mtp_window_pages_host_.data();
+        view.page_indices_device = mtp_window_pages_device_.get();
+        view.write_position = checked_local_position(uint64_t(window_query_pos_) + depth);
+    } else {
+        view.write_position = checked_local_position(logical_position);
+    }
+    view.rope_position = view.write_position;
+    view.sequence_length = checked_local_position(uint64_t(view.write_position) + 1);
+    return view;
+}
+
+void QwenExecutor::finish_continuous_mtp_draft(uint32_t previous_window_pages) noexcept {
+    if (!kvmem_active_) return;
+    mtp_window_pages_host_.resize(std::min<size_t>(previous_window_pages, mtp_window_pages_host_.size()));
+    mtp_window_page_count_ = static_cast<uint32_t>(mtp_window_pages_host_.size());
+}
+
+NativeExecutorReport QwenExecutor::forward_continuous_mtp_draft_step(
+        uint32_t token, uint64_t logical_position, bool first_depth) {
+    const auto previous = continuous_mtp_window_pages();
+    struct Restore {
+        QwenExecutor *executor; uint32_t pages;
+        ~Restore() { executor->finish_continuous_mtp_draft(pages); }
+    } restore{this, previous};
+    const auto view = prepare_continuous_mtp_draft(logical_position);
+    if (!view.ready) {
+        NativeExecutorReport report;
+        report.missing_kernels.push_back("continuous MTP prefix is unavailable");
+        return report;
+    }
+    auto report = forward_mtp_draft_from(token,
+        first_depth ? *view.current_hidden : *view.draft_hidden,
+        view.rope_position, view.write_position, view.sequence_length,
+        true, nullptr, 0, nullptr, 0, view.window_frame);
+    if (report.ok && !view.window_frame && first_depth)
+        mtp_prefix_len_ = std::max<uint64_t>(mtp_prefix_len_, logical_position + 1);
+    return report;
+}
+
 void QwenExecutor::prepare_decode_token_pages(uint32_t count) {
     ensure_kv_pages(position_, count);
+}
+
+bool QwenExecutor::supports_continuous_body_batch() const {
+    // These diagnostic/private paths have additional per-layer side effects.
+    return dflash_layers_.empty() && !kvmem_query_probe_guard_active() &&
+           !kvmem_attn_trace_enabled() && !global_attn_trace_enabled() &&
+           (!h_ || h_->elem_size == sizeof(float)) &&
+           input_mrope_positions_.empty() && input_embedding_overrides_.empty() &&
+           (!block_store_ || !block_store_->has_repository());
+}
+
+bool QwenExecutor::supports_continuous_verify_batch() const {
+    // Ragged verification captures DFlash taps per request after every layer.
+    // The separate body-decode path still excludes draft feature capture.
+    return !kvmem_query_probe_guard_active() && !kvmem_attn_trace_enabled() &&
+           !global_attn_trace_enabled() && (!h_ || h_->elem_size == sizeof(float)) &&
+           input_mrope_positions_.empty() && input_embedding_overrides_.empty() &&
+           (!block_store_ || !block_store_->has_repository() ||
+            env_flag_enabled("QW3_EXPERIMENTAL_BOUNDED_CONTINUOUS", false)) && !kvmem_no_rerope_;
+}
+
+bool QwenExecutor::supports_continuous_prefill_batch() const {
+    return supports_continuous_verify_batch() && !kvmem_provisional_prefill_ &&
+           !kvmem_qc_deltanet_ && !kvmem_guided_query_probe_active_ &&
+           (!block_store_ || !block_store_->has_repository());
+}
+
+void QwenExecutor::prepare_continuous_prefill(uint32_t count) {
+    if (!count || !supports_continuous_prefill_batch())
+        throw std::runtime_error("unsupported continuous prefill state");
+    ensure_scratch();
+    // Match forward_n_tokens: pressure recovery precedes page allocation and
+    // metadata construction, after the previous chunk's MTP prefix is primed.
+    if (kvmem_gpu_page_pool_)
+        kvmem_maybe_prefill_offload(count);
+    prepare_continuous_verify(count);
+}
+
+void QwenExecutor::capture_continuous_prefill_qk(
+        uint32_t layer, const DeviceTensor &queries, const DeviceTensor &keys,
+        uint64_t query_offset, uint64_t key_offset, uint32_t count, uint32_t rope_base) {
+    if (!kvmem_qc_capture_active_ ||
+        layer >= std_layer_slot_.size() || std_layer_slot_[layer] < 0) return;
+    const uint32_t slot = static_cast<uint32_t>(std_layer_slot_[layer]);
+    const auto &cfg = model_.config();
+    if (kvmem_query_end_ > kvmem_query_begin_) {
+        const uint32_t width = 2 * cfg.n_heads * cfg.head_dim;
+        require_status(backend_.copy_d2d(*q_batch_, queries, query_offset, uint64_t(count) * width));
+        kvmem_capture_query_multi(slot, 0, count, position_, rope_base, width, nullptr, 0);
+    }
+    const uint32_t width = cfg.n_kv_heads * cfg.head_dim;
+    require_status(backend_.copy_d2d(*k_batch_, keys, key_offset, uint64_t(count) * width));
+    kvmem_capture_kbar_multi(slot, count, position_, rope_base, width);
+}
+
+void QwenExecutor::finish_continuous_prefill(
+        const DeviceTensor &hidden, uint64_t offset, uint32_t count,
+        uint32_t rope_base) {
+    const uint64_t base = position_;
+    const bool window = kvmem_active_;
+    finish_continuous_verify(hidden, offset, count, rope_base);
+    if (window) kvmem_advance_window(count);
+    if (!kvmem_gpu_page_pool_) return;
+    kvmem_register_until(base + count);
+    if (window && (kvmem_fix_bakedpos_ || kvmem_immutable_source_k_)) {
+        const int64_t delta = int64_t(rope_base) - int64_t(base);
+        if (delta) {
+            const auto &blocks = block_store_->blocks();
+            for (uint32_t i = static_cast<uint32_t>(blocks.size()); i-- > 0;) {
+                const auto &block = blocks[i];
+                if (block.orig_pos_start + block.n_tokens <= base) break;
+                block_store_->set_block_baked_pos(i, int64_t(block.orig_pos_start) + delta,
+                                                 block_store_->repository_handle(i).generation);
+            }
+        }
+    }
+    if (!kvmem_mtp_tiered_) kvmem_prefill_writeback(base + count);
+}
+
+void QwenExecutor::capture_continuous_verify_features(
+        uint32_t layer, const DeviceTensor &hidden, uint64_t row_offset,
+        uint32_t rows, uint32_t stride) {
+    if (std::find(dflash_layers_.begin(), dflash_layers_.end(), layer) == dflash_layers_.end()) return;
+    auto view = backend_.tensor_view(const_cast<DeviceTensor &>(hidden),
+        row_offset * stride * sizeof(float), uint64_t(rows) * stride,
+        sizeof(float), DeviceTensorDType::F32, "dflash-ragged-hidden");
+    if (!view) throw std::runtime_error("DFlash ragged hidden view unavailable");
+    capture_dflash_layer(layer, *view, rows, stride);
+}
+
+void QwenExecutor::copy_continuous_last_logits(const DeviceTensor &source, uint64_t row) {
+    const uint64_t vocab = model_.config().vocab_size;
+    if (!logits_ || row > UINT64_MAX / vocab)
+        throw std::logic_error("continuous final logit row unavailable");
+    require_status(backend_.copy_d2d(*logits_, source, row * vocab, vocab));
+}
+
+uint32_t QwenExecutor::continuous_decode_rope_position() const {
+    return checked_local_position(kvmem_active_ && !kvmem_no_rerope_
+        ? window_query_pos_ : position_);
+}
+
+void QwenExecutor::prepare_continuous_decode() {
+    if (!supports_continuous_body_batch())
+        throw std::runtime_error("unsupported continuous decode state");
+    if (position_ == UINT64_MAX)
+        throw std::overflow_error("historical token position overflow");
+    ensure_scratch();
+    ensure_kv_pages(position_, 1);
+    if (kvmem_active_) kvmem_extend_window_for_decode();
+    if (kvmem_immutable_source_k_) {
+        const uint32_t bt = block_store_->config().block_tokens;
+        kvmem_ensure_raw_capture_capacity(bt);
+        const uint64_t start = (position_ / bt) * bt;
+        if (kvmem_raw_decode_block_start_ != UINT64_MAX &&
+            kvmem_raw_decode_block_start_ != start)
+            kvmem_flush_raw_k_decode();
+        if (kvmem_raw_decode_block_start_ == UINT64_MAX) {
+            kvmem_raw_decode_block_start_ = start;
+            kvmem_raw_decode_first_row_ = position_ % bt;
+            kvmem_raw_decode_rows_ = 0;
+        }
+    }
+}
+
+void QwenExecutor::capture_continuous_decode_k(
+        uint32_t layer, const DeviceTensor &keys, uint64_t offset, bool before_rope) {
+    if (before_rope ? !kvmem_immutable_source_k_
+                    : !(kvmem_active_ && kvmem_decode_capture_on_)) return;
+    const auto &cfg = model_.config();
+    require_status(backend_.copy_d2d(*k_, keys, offset,
+        uint64_t(cfg.n_kv_heads) * cfg.head_dim));
+    if (before_rope)
+        kvmem_capture_raw_k_decode(layer, *k_, position_ % block_store_->config().block_tokens);
+    else
+        kvmem_decode_capture_stage(layer, continuous_decode_rope_position());
+}
+
+void QwenExecutor::finish_continuous_decode() {
+    if (kvmem_immutable_source_k_) {
+        const uint32_t bt = block_store_->config().block_tokens;
+        const uint32_t row = position_ % bt;
+        if (kvmem_raw_decode_rows_ == 0) kvmem_raw_decode_first_row_ = row;
+        kvmem_raw_decode_rows_ = row - kvmem_raw_decode_first_row_ + 1;
+        if (row + 1 == bt) kvmem_flush_raw_k_decode();
+    }
+    advance_position();
+    kvmem_advance_window(1);
+}
+
+void QwenExecutor::prepare_continuous_verify(uint32_t count) {
+    if (!supports_continuous_verify_batch())
+        throw std::runtime_error("unsupported continuous verify state");
+    ensure_batch_scratch(count);
+    prepare_dflash_features(count);
+    if (kvmem_immutable_source_k_) {
+        kvmem_flush_raw_k_decode();
+        kvmem_ensure_raw_capture_capacity(count);
+    }
+}
+
+void QwenExecutor::capture_continuous_verify_k(
+        uint32_t layer, const DeviceTensor &keys, uint64_t offset,
+        uint32_t count, uint32_t rope_base, bool before_rope) {
+    if (!kvmem_enabled_ || !block_store_) return;
+    if (before_rope && !kvmem_immutable_source_k_) return;
+    if (!before_rope && (!kvmem_qc_capture_active_ || g_kbar_multi_ready_ ||
+                        position_ >= kvmem_qc_prompt_tokens_)) return;
+    const uint32_t width = model_.config().n_kv_heads * model_.config().head_dim;
+    require_status(backend_.copy_d2d(*k_batch_, keys, offset, uint64_t(count) * width));
+    if (before_rope) {
+        kvmem_capture_raw_k_batch(layer, *k_batch_, count);
+    } else if (layer < std_layer_slot_.size() && std_layer_slot_[layer] >= 0) {
+        kvmem_capture_kbar_multi(static_cast<uint32_t>(std_layer_slot_[layer]),
+                                count, position_, rope_base, width);
+    }
+}
+
+void QwenExecutor::finish_continuous_verify(
+        const DeviceTensor &hidden, uint64_t offset, uint32_t count,
+        uint32_t rope_base) {
+    // MTP prefix rebuilding must read this request's actual target hidden rows,
+    // not h_batch_ left over from its previous prompt prefill.
+    require_status(backend_.copy_d2d(*h_batch_, hidden, offset,
+        uint64_t(count) * model_.config().n_embd));
+    if (kvmem_immutable_source_k_) kvmem_flush_raw_k_capture(position_, 0, count);
+    last_forward_logical_base_ = position_;
+    last_forward_rope_base_ = rope_base;
+    last_forward_rows_ = count;
+    if (!dflash_layers_.empty())
+        dflash_feature_view_ = {dflash_features_.get(), position_, rope_base, count};
+    advance_position(count);
 }
 
 void QwenExecutor::prepare_runtime_state() {
     ensure_scratch();
 }
 
-void QwenExecutor::prepare_kv_pages(uint32_t logical_pos, uint32_t count) {
+void QwenExecutor::set_dflash_layers(const std::vector<uint32_t> &layers) {
+    for (size_t i = 0; i < layers.size(); ++i) {
+        if (layers[i] >= weights_.n_layers() ||
+            std::find(layers.begin(), layers.begin() + i, layers[i]) != layers.begin() + i)
+            throw std::invalid_argument("invalid or duplicate DFlash target layer");
+    }
+    dflash_layers_ = layers;
+    dflash_feature_view_ = {};
+    dflash_features_.reset();
+}
+
+void QwenExecutor::attach_dflash(DFlashExecutor *executor) {
+    if (executor) executor->config().validate_target(
+        model_.config().n_layers, model_.config().n_embd, model_.config().vocab_size);
+    set_dflash_layers(executor ? executor->config().target_layer_ids : std::vector<uint32_t>{});
+    dflash_executor_ = executor;
+}
+
+DFlashExecutor &QwenExecutor::enable_dflash(const DFlashWeights &weights) {
+    if (!owned_dflash_executor_) {
+        weights.config().validate_target(model_.config().n_layers, model_.config().n_embd, model_.config().vocab_size);
+        owned_dflash_executor_ = std::make_unique<DFlashExecutor>(weights, backend_);
+        owned_dflash_executor_->reset(position_);
+    }
+    if (dflash_executor_ != owned_dflash_executor_.get())
+        attach_dflash(owned_dflash_executor_.get());
+    return *owned_dflash_executor_;
+}
+
+void QwenExecutor::prepare_dflash_features(uint32_t rows) {
+    dflash_feature_view_ = {};
+    if (dflash_layers_.empty()) return;
+    const uint64_t count = uint64_t(rows) * model_.config().n_embd * dflash_layers_.size();
+    const uint64_t row_elems = uint64_t(model_.config().n_embd) * dflash_layers_.size();
+    const bool trim = rows <= 8 && dflash_features_ &&
+        dflash_features_->count > 128 * row_elems &&
+        env_flag_enabled("QW3_EXPERIMENTAL_DFLASH_TRIM_TRANSIENTS", false);
+    if (trim) {
+        // The previous feature view was invalidated above. Its accepted rows
+        // have already been appended to the draft before this next forward.
+        std::fprintf(stderr, "[dflash-transient-trim] kind=features from_bytes=%llu to_rows=8\n",
+            static_cast<unsigned long long>(dflash_features_->count * dflash_features_->elem_size));
+        dflash_features_.reset();
+    }
+    if (!dflash_features_ || dflash_features_->count < count)
+        dflash_features_ = backend_.scratch_f32(trim ? 8 * row_elems : count, "dflash-target-features");
+}
+
+void QwenExecutor::restore_dflash_state(const StateSnapshot &snapshot) {
+    dflash_feature_view_ = {};
+    if (!dflash_executor_) return;
+    if (snapshot.dflash && snapshot.dflash->next_position == position_)
+        dflash_executor_->restore(*snapshot.dflash);
+    else dflash_executor_->reset(position_);
+}
+
+void QwenExecutor::capture_dflash_layer(uint32_t layer, const DeviceTensor &hidden,
+                                       uint32_t rows, uint32_t stride) {
+    const auto it = std::find(dflash_layers_.begin(), dflash_layers_.end(), layer);
+    if (it == dflash_layers_.end()) return;
+    require_status(backend_.dflash_capture_features(*dflash_features_, hidden, rows,
+        model_.config().n_embd, stride, dflash_layers_.size(), it - dflash_layers_.begin()));
+}
+
+void QwenExecutor::prepare_kv_pages(uint64_t logical_pos, uint32_t count) {
     ensure_kv_pages(logical_pos, count);
 }
 
-void QwenExecutor::prepare_mtp_prefix_pages(uint32_t logical_pos,
+void QwenExecutor::prepare_mtp_prefix_pages(uint64_t logical_pos,
                                             uint32_t count) {
     ensure_mtp_scratch();
-    mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, logical_pos, count);
-    if (external_mtp_kv_cache_) {
-        mtp_kv_pages_.validate_physical_capacity(
-            external_mtp_kv_cache_->physical_slots, "external MTP");
-    }
+    ensure_mtp_kv_pages(logical_pos, count, true);
 }
 
-void QwenExecutor::set_mtp_prefix_len(uint32_t prefix_len) {
-    mtp_prefix_len_ = std::min<uint32_t>(prefix_len, kv_ctx_size_);
+void QwenExecutor::set_mtp_prefix_len(uint64_t prefix_len) {
+    mtp_prefix_len_ = block_store_ && block_store_->has_repository()
+        ? prefix_len : std::min<uint64_t>(prefix_len, kv_ctx_size_);
 }
 
 DeviceTensor &QwenExecutor::k_cache(uint32_t layer) {
@@ -1490,7 +1807,15 @@ QwenExecutor::KvStateSnapshot QwenExecutor::kv_state_snapshot() const {
 }
 
 void QwenExecutor::reset_state() {
+    kvmem_blend_restore();
+    kvmem_blend_tokens_.clear();
+    kvmem_blend_pending_ = false;
+    kvmem_blend_active_ = false;
+    dflash_feature_view_ = {};
+    if (dflash_executor_) dflash_executor_->reset();
     const uint64_t cold_reset_start_ns = kvmem_steady_ns();
+    if (kvmem_repository_gc_) kvmem_repository_gc_->stop();
+    kvmem_discard_repository_prefetch();
     kvmem_drain_mean_index_capture();
     kvmem_finish_proactive_d2h(/*wait_all=*/true);
     const uint64_t cold_reset_after_proactive_ns = kvmem_steady_ns();
@@ -1509,15 +1834,25 @@ void QwenExecutor::reset_state() {
     position_ = 0;
     kv_pages_.reset();
     mtp_kv_pages_.reset();
+    kvmem_repository_append_.reset();
+    kvmem_repository_score_frame_ = {};
+    kvmem_repository_mandatory_leases_.clear();
+    kvmem_repository_index_.clear();
+    kvmem_repository_storage_generation_.clear();
+    kvmem_repository_score_history_end_ = 0;
     mtp_prefix_len_ = 0;
     kvmem_mtp_payload_valid_through_ =
-        std::numeric_limits<uint32_t>::max();
+        std::numeric_limits<uint64_t>::max();
     decode_graph_warmup_pending_ = true;
     const uint64_t cold_reset_after_page_reset_ns = kvmem_steady_ns();
     // Block-sparse runtime state is per-session: drop the working set + window
     // table. The block store itself (configured selection params) is kept; a
     // fresh register_append sequence rebuilds the block table for the new run.
-    kvmem_active_ = false;
+    // Bounded storage slots are not historical positions, even before the
+    // first sparse selection: rejected MTP reservations can leave holes in
+    // the slot directory. Keep an identity attention window from token zero
+    // so every append resolves history through repository spans.
+    kvmem_active_ = block_store_ && block_store_->has_repository();
     kvmem_selection_generation_ = 0;
     kvmem_registered_pos_ = 0;
     kvmem_query_replay_active_ = false;
@@ -1639,7 +1974,7 @@ void QwenExecutor::reset_state() {
     const int cold_reset_trimmed = -1;
 #endif
     const uint64_t cold_reset_after_host_release_ns = kvmem_steady_ns();
-    kvmem_raw_decode_block_start_ = -1;
+    kvmem_raw_decode_block_start_ = UINT64_MAX;
     kvmem_raw_decode_first_row_ = 0;
     kvmem_raw_decode_rows_ = 0;
     kvmem_prefill_reselect_suppressed_ = false;
@@ -1763,13 +2098,21 @@ void QwenExecutor::reset_state() {
     // reset_state before PASS B restores it, so clearing the count would lose the
     // stash. It is instead overwritten by the next PASS-A stash and only ever read
     // after a stash within the same request.
-    kvmem_qc_pin_from_block_ = 0xffffffffu;
+    kvmem_qc_pin_from_block_ = UINT64_MAX;
     kvmem_oracle_token_spans_.clear();
     kvmem_oracle_only_ = false;
     kvmem_trace_event_index_ = 0;
     kvmem_trace_event_count_ = 0;
     if (block_store_) {
-        *block_store_ = KvMemStore(block_store_->config());
+        const auto cfg = block_store_->config();
+        kvmem_repository_gc_.reset();
+        if (cfg.repository_blocks) {
+            *block_store_ = KvMemStore(cfg, std::make_shared<KvMemRepository>(
+                KvMemRepository::Config{cfg.repository_blocks, cfg.block_tokens}));
+            kvmem_start_repository_gc();
+        } else {
+            *block_store_ = KvMemStore(cfg);
+        }
         if (kvmem_gc_) block_store_->attach_gc(kvmem_gc_);
     }
     kvmem_attn_trace_seen_tokens_ = 0;
@@ -1810,6 +2153,7 @@ void QwenExecutor::reset_state() {
 
 void QwenExecutor::KvPageTable::configure(uint32_t ctx_size,
                                           KvPhysicalPageAllocator *page_allocator) {
+    bounded_slots = false;
     page_size = std::max<uint32_t>(1, env_uint32_or("QW3_PAGED_KV_PAGE_SIZE", 16));
     max_pages = (ctx_size + page_size - 1) / page_size;
     allocator = page_allocator;
@@ -1824,9 +2168,20 @@ void QwenExecutor::KvPageTable::configure(uint32_t ctx_size,
     reset();
 }
 
+void QwenExecutor::KvPageTable::configure_bounded(
+        uint32_t storage_tokens, KvPhysicalPageAllocator *page_allocator) {
+    if (std::any_of(pages.begin(), pages.end(), [](int32_t p) { return p >= 0; }))
+        throw std::logic_error("cannot replace a populated KV page directory");
+    configure(storage_tokens, page_allocator);
+    bounded_slots = true;
+    pages.assign(max_pages, -1);
+    owned.assign(max_pages, false);
+}
+
 void QwenExecutor::KvPageTable::set_allocator(
         KvPhysicalPageAllocator *page_allocator) {
-    if (!pages.empty()) {
+    if ((!bounded_slots && !pages.empty()) ||
+        std::any_of(pages.begin(), pages.end(), [](int32_t p) { return p >= 0; })) {
         throw std::runtime_error(
             "cannot change KV page allocator after pages have been allocated");
     }
@@ -1848,6 +2203,10 @@ void QwenExecutor::KvPageTable::reset() {
     pages.clear();
     owned.clear();
     device_synced = 0;
+    if (bounded_slots) {
+        pages.assign(max_pages, -1);
+        owned.assign(max_pages, false);
+    }
 }
 
 void QwenExecutor::KvPageTable::ensure_pages(DeviceBackend &backend,
@@ -1866,6 +2225,11 @@ void QwenExecutor::KvPageTable::ensure_pages(DeviceBackend &backend,
         throw std::runtime_error("KV page table full: increase --ctx (current=" +
                                  std::to_string(ctx_size) + ")");
     }
+    if (bounded_slots) {
+        const uint32_t first = logical_pos / page_size;
+        ensure_logical_page_ranges_resident(backend, {{first, need_pages - first}});
+        return;
+    }
     while (pages.size() < need_pages) {
         const uint32_t logical_page = static_cast<uint32_t>(pages.size());
         const int32_t physical_page =
@@ -1873,7 +2237,7 @@ void QwenExecutor::KvPageTable::ensure_pages(DeviceBackend &backend,
                       : allocate_physical_page(logical_page);
         if (physical_page < 0 ||
             static_cast<uint32_t>(physical_page) >=
-                (allocator ? allocator->total_pages() : max_pages)) {
+                (allocator ? allocator->physical_page_capacity() : max_pages)) {
             if (allocator) {
                 allocator->release_physical_pages(std::vector<int32_t>{physical_page});
             }
@@ -1923,6 +2287,8 @@ void QwenExecutor::KvPageTable::validate_physical_capacity(
 }
 
 void QwenExecutor::KvPageTable::truncate_to_logical_pages(uint32_t logical_pages) {
+    if (bounded_slots && logical_pages < max_pages)
+        throw std::logic_error("bounded KV rewind requires versioned block/page release");
     if (logical_pages >= pages.size()) return;
     std::vector<int32_t> released;
     released.reserve(pages.size() - logical_pages);
@@ -2140,16 +2506,244 @@ int32_t QwenExecutor::KvPageTable::allocate_physical_page(uint32_t logical_page)
     throw std::runtime_error("invalid QW3_PAGED_KV_ALLOC: " + alloc_mode);
 }
 
+std::vector<int32_t> QwenExecutor::KvPageTable::batch_storage_indices(
+        const std::vector<KvMemStorageSpan> &spans) const {
+    std::vector<int32_t> out;
+    if (spans.empty()) return out;
+    const auto aliases = kvmem_storage_page_spans(
+        spans, page_size, static_cast<uint32_t>(spans.front().history_begin % page_size));
+    for (const auto &alias : aliases) {
+        if (alias.window_page != out.size() ||
+            uint64_t(alias.storage_page) + alias.page_count > pages.size())
+            throw std::runtime_error("KVMem batch page alias outside resident directory");
+        for (uint32_t i = 0; i < alias.page_count; ++i) {
+            const auto page = pages[alias.storage_page + i];
+            if (page < 0) throw std::runtime_error("KVMem batch page alias is not resident");
+            out.push_back(page);
+        }
+    }
+    return out;
+}
+
 uint64_t QwenExecutor::KvPageTable::physical_slots() const {
     return static_cast<uint64_t>(std::max<uint32_t>(max_pages, 1)) * page_size;
 }
 
-void QwenExecutor::ensure_kv_pages(uint32_t logical_pos, uint32_t count) {
-    kv_pages_.ensure_pages(backend_, kv_ctx_size_, logical_pos, count);
+void QwenExecutor::ensure_kv_pages(uint64_t logical_pos, uint32_t count) {
+    if (block_store_ && block_store_->has_repository()) {
+        kvmem_prepare_repository_range(logical_pos, count,
+            kvmem_active_ ? window_query_pos_ : checked_local_position(logical_pos));
+        kvmem_ensure_repository_pages(kv_pages_, logical_pos, count);
+    } else kv_pages_.ensure_pages(backend_, kv_ctx_size_, checked_local_position(logical_pos), count);
     if (external_kv_cache_) {
         kv_pages_.validate_physical_capacity(external_kv_cache_->physical_slots,
                                              "external");
     }
+}
+
+void QwenExecutor::ensure_mtp_kv_pages(uint64_t logical_pos, uint32_t count, bool validate_external) {
+    if (block_store_ && block_store_->has_repository()) {
+        uint32_t local = 0;
+        if (logical_pos < position_) {
+            // Priming already computed target rows never creates a new append.
+            // Their current reservation/committed spans supply the page mapping.
+            if (count > position_ - logical_pos)
+                throw std::logic_error("MTP prefix write crosses the target boundary");
+            kvmem_ensure_repository_pages(mtp_kv_pages_, logical_pos, count);
+            return;
+        }
+        if (kvmem_active_) {
+            const uint64_t local64 = uint64_t(window_query_pos_) + logical_pos - position_;
+            if (local64 > INT32_MAX) throw std::overflow_error("MTP local window position overflow");
+            local = static_cast<uint32_t>(local64);
+        } else local = checked_local_position(logical_pos);
+        kvmem_prepare_repository_range(logical_pos, count, local);
+        kvmem_ensure_repository_pages(mtp_kv_pages_, logical_pos, count);
+    } else mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, checked_local_position(logical_pos), count);
+    if (validate_external && external_mtp_kv_cache_)
+        mtp_kv_pages_.validate_physical_capacity(external_mtp_kv_cache_->physical_slots, "external MTP");
+}
+
+void QwenExecutor::kvmem_prepare_repository_range(uint64_t begin, uint32_t count, uint32_t local) {
+    if (!count) return;
+    if (begin > UINT64_MAX - count) throw std::overflow_error("KVMem history interval overflow");
+    const uint64_t committed = block_store_->history_end(), end = begin + count;
+    if (end <= committed) return;
+    if (end - committed > UINT32_MAX)
+        throw std::overflow_error("KVMem forward reservation exceeds batch range");
+    if (kvmem_repository_append_) {
+        const size_t first_new_span = kvmem_repository_append_->spans().size();
+        if (!kvmem_repository_append_->extend(static_cast<uint32_t>(end - committed)))
+            throw std::runtime_error("KVMem repository admission: ready capacity exhausted");
+        kvmem_initialize_repository_slots(first_new_span);
+        return;
+    }
+    if (begin != committed)
+        throw std::logic_error("KVMem append must start at the committed history boundary");
+    if (kvmem_repository_append_serial_ == UINT64_MAX)
+        throw std::overflow_error("KVMem append identity exhausted");
+    kvmem_repository_append_ = block_store_->prepare_repository_append(count, local);
+    if (!kvmem_repository_append_)
+        throw std::runtime_error("KVMem repository admission: ready capacity exhausted");
+    ++kvmem_repository_append_serial_;
+    kvmem_initialize_repository_slots(0);
+}
+
+void QwenExecutor::kvmem_initialize_repository_slots(size_t first_span) {
+    const uint32_t B = block_store_->config().block_tokens;
+    const auto &spans = kvmem_repository_append_->spans();
+    for (size_t i = first_span; i < spans.size(); ++i) {
+        const auto h = spans[i].handle;
+        auto &generation = kvmem_repository_storage_generation_.at(h.slot);
+        if (generation == h.generation) continue; // accepted partial tail
+        const uint32_t begin = h.slot * B, end = begin + B;
+        // The CPU worker never releases GPU pages. A recycled slot must have
+        // been removed by normal stage-out/rejected-suffix cleanup beforehand.
+        for (const auto *table : {&kv_pages_, &mtp_kv_pages_}) {
+            if (!table->bounded_slots) continue;
+            for (uint32_t p = begin / table->page_size; p < end / table->page_size; ++p)
+                if (table->pages.at(p) >= 0)
+                    throw std::logic_error("KVMem ready slot still has resident GPU pages");
+        }
+        if (kvmem_cpu_tier_) {
+            const int32_t slot = kvmem_cpu_tier_->block_slot(h.slot);
+            kvmem_cpu_tier_->forget_block(h.slot);
+            kvmem_release_cpu_slot(slot);
+        }
+        for (auto *valid : {&kvmem_raw_k_valid_tokens_, &kvmem_raw_mtp_k_valid_tokens_}) {
+            if (!valid->empty()) {
+                if (end > valid->size()) throw std::logic_error("KVMem raw validity arena is undersized");
+                std::fill(valid->begin() + begin, valid->begin() + end, uint8_t{0});
+            }
+        }
+        for (auto *backed : {&kvmem_raw_k_nvme_block_backed_, &kvmem_raw_mtp_k_nvme_block_backed_})
+            if (h.slot < backed->size()) (*backed)[h.slot] = 0;
+        if (kvmem_raw_k_chunk_tokens_) {
+            const auto chunk = begin / kvmem_raw_k_chunk_tokens_;
+            for (auto *backed : {&kvmem_raw_k_nvme_backed_, &kvmem_raw_mtp_k_nvme_backed_})
+                if (chunk < backed->size()) (*backed)[chunk] = 0;
+        }
+        if (h.slot < kvmem_raw_k_gpu_block_to_slot_.size()) {
+            const int32_t slot = kvmem_raw_k_gpu_block_to_slot_[h.slot];
+            if (slot >= 0) kvmem_raw_k_gpu_slot_to_block_.at(slot) = -1;
+            kvmem_raw_k_gpu_block_to_slot_[h.slot] = -1;
+        }
+        if (!input_compact_mrope_valid_.empty()) {
+            if (end > input_compact_mrope_valid_.size())
+                throw std::logic_error("multimodal validity arena is undersized");
+            std::fill(input_compact_mrope_valid_.begin() + begin,
+                      input_compact_mrope_valid_.begin() + end, uint8_t{0});
+        }
+        if (h.slot < mtp_baked_pos_.size()) mtp_baked_pos_[h.slot] = 0;
+        kvmem_repository_index_.at(h.slot) = {};
+        generation = h.generation;
+    }
+}
+
+std::vector<QwenExecutor::RepositoryIoLease> QwenExecutor::kvmem_repository_pin_blocks(
+        const std::vector<uint32_t> &ids) const {
+    std::vector<RepositoryIoLease> leases;
+    if (!block_store_ || !block_store_->has_repository()) return leases;
+    leases.reserve(ids.size());
+    for (auto id : ids) {
+        const auto h = block_store_->repository_handle(id);
+        auto lease = block_store_->repository()->try_pin(h);
+        if (!lease) throw std::runtime_error("KVMem IO attempted to pin deleted history");
+        leases.push_back({std::move(lease), block_store_->blocks()[id].n_tokens});
+    }
+    std::sort(leases.begin(), leases.end(), [](const auto &a, const auto &b) {
+        return a.handle().slot < b.handle().slot;
+    });
+    return leases;
+}
+
+KvMemRepository::Lease QwenExecutor::kvmem_repository_pin_current(uint32_t id) const {
+    if (!block_store_->has_repository()) return {};
+    if (id >= block_store_->block_count()) throw std::out_of_range("KVMem cache victim outside directory");
+    return block_store_->repository()->try_pin(block_store_->repository_handle(id));
+}
+
+uint64_t QwenExecutor::kvmem_repository_io_generation(
+        const std::vector<RepositoryIoLease> &leases, uint32_t id) const {
+    if (!block_store_->has_repository()) return 0;
+    const auto it = std::lower_bound(leases.begin(), leases.end(), id,
+        [](const auto &l, uint32_t slot) { return l.handle().slot < slot; });
+    if (it == leases.end() || it->handle().slot != id)
+        throw std::logic_error("KVMem IO completion has no generation-bound lease");
+    if (block_store_->repository_handle(id) != it->handle() ||
+        block_store_->blocks()[id].n_tokens != it->valid_tokens)
+        throw std::logic_error("KVMem IO completion token coverage changed while in flight");
+    return it->handle().generation;
+}
+
+KvMemStorageRead QwenExecutor::kvmem_repository_storage(uint64_t begin, uint32_t count) const {
+    if (begin > UINT64_MAX - count) throw std::overflow_error("KVMem storage interval overflow");
+    const uint64_t committed = block_store_->history_end(), end = begin + count;
+    if (end <= committed) return block_store_->repository_storage_read(begin, count);
+    if (!kvmem_repository_append_)
+        throw std::logic_error("KVMem storage address has no prepared append");
+    if (begin >= committed) return kvmem_repository_append_->storage_write(begin, count);
+    auto result = block_store_->repository_storage_read(begin, static_cast<uint32_t>(committed - begin));
+    auto tail = kvmem_repository_append_->storage_write(committed, static_cast<uint32_t>(end - committed));
+    for (size_t i = 0; i < tail.spans.size(); ++i) {
+        const auto &span = tail.spans[i];
+        if (!result.spans.empty() && result.spans.back().handle == span.handle &&
+            result.spans.back().storage_begin + result.spans.back().token_count == span.storage_begin)
+            result.spans.back().token_count += span.token_count;
+        else {
+            result.spans.push_back(span);
+            result.leases.push_back(std::move(tail.leases[i]));
+        }
+    }
+    return result;
+}
+
+void QwenExecutor::kvmem_ensure_repository_pages(KvPageTable &table, uint64_t begin, uint32_t count) {
+    if (!count) return;
+    if (!table.bounded_slots) throw std::logic_error("KVMem repository needs a bounded page directory");
+    auto view = kvmem_repository_storage(begin, count);
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
+    ranges.reserve(view.spans.size());
+    for (const auto &span : view.spans) {
+        const uint32_t first = span.storage_begin / table.page_size;
+        const uint32_t end = static_cast<uint32_t>(
+            (uint64_t(span.storage_begin) + span.token_count + table.page_size - 1) / table.page_size);
+        ranges.emplace_back(first, end - first);
+    }
+    table.ensure_logical_page_ranges_resident(backend_, ranges);
+}
+
+void QwenExecutor::kvmem_append_repository_window(KvPageTable &table, std::vector<int32_t> &window,
+                                                  uint64_t begin, uint32_t count, uint32_t window_begin) {
+    auto view = kvmem_repository_storage(begin, count);
+    const auto spans = kvmem_storage_page_spans(view.spans, table.page_size, window_begin);
+    for (const auto &span : spans) for (uint32_t i = 0; i < span.page_count; ++i) {
+        const uint32_t storage_page = span.storage_page + i, win_page = span.window_page + i;
+        if (storage_page >= table.pages.size() || table.pages[storage_page] < 0)
+            throw std::runtime_error("KVMem repository page is not resident before window append");
+        const int32_t physical = table.pages[storage_page];
+        if (win_page < window.size()) {
+            if (window[win_page] != physical)
+                throw std::runtime_error("KVMem partial tail aliases the wrong physical page");
+        } else {
+            if (win_page != window.size()) throw std::runtime_error("KVMem window append left a page gap");
+            window.push_back(physical);
+        }
+    }
+}
+
+uint32_t QwenExecutor::kvmem_prepare_mtp_repository_write(uint64_t begin, uint32_t count) {
+    auto view = kvmem_repository_storage(begin, count);
+    mtp_repository_write_pages_host_ = mtp_kv_pages_.batch_storage_indices(view.spans);
+    const uint32_t pages = static_cast<uint32_t>(mtp_repository_write_pages_host_.size());
+    if (pages > mtp_repository_write_pages_capacity_) {
+        mtp_repository_write_pages_device_ = backend_.tensor_f32(
+            pages, "kvmem_mtp_repository_write_pages");
+        mtp_repository_write_pages_capacity_ = pages;
+    }
+    if (pages) require_status(backend_.copy_i32_from_host(
+        *mtp_repository_write_pages_device_, 0, mtp_repository_write_pages_host_.data(), pages));
+    return static_cast<uint32_t>(begin % mtp_kv_pages_.page_size);
 }
 
 void QwenExecutor::begin_record_timing(bool enabled) const {
@@ -2249,7 +2843,15 @@ void QwenExecutor::ensure_scratch() {
                 conv_dim * (cfg.ssm_conv_kernel - 1), clbl.c_str());
         }
     }
-    scores_ = backend_.tensor_f32(static_cast<uint64_t>(cfg.n_heads) * std::max<uint32_t>(kv_ctx_size_, 1), "attn_scores");
+    if (!env_flag_enabled("QW3_EXPERIMENTAL_LAZY_ATTN_SCORES", false)) {
+        scores_ = backend_.tensor_f32(static_cast<uint64_t>(cfg.n_heads) * std::max<uint32_t>(kv_ctx_size_, 1), "attn_scores");
+    } else {
+        // Paged attention does not use the legacy dense score workspace.
+        // Allocate the unchanged full-size workspace if a dense path is used.
+        std::fprintf(stderr, "[attention-scores] allocation=deferred bytes=%llu\n",
+            static_cast<unsigned long long>(uint64_t(cfg.n_heads) *
+                std::max<uint32_t>(kv_ctx_size_, 1) * sizeof(float)));
+    }
 
     // Per-layer KV cache for the standard-attention layers only.
     const uint64_t kv_per_pos = static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
@@ -2508,6 +3110,14 @@ void QwenExecutor::kvmem_prepare_cpu_mean_index(
         g_kbar_multi_host_capacity_bytes_ < bytes ||
         g_kbar_multi_host_layer_bytes_ != canonical_layer_bytes) {
         kvmem_clear_cpu_mean_index_storage();
+        if (block_store_->has_repository()) {
+            // The stamps certify bytes in this authority. Reallocating it
+            // invalidates every certificate, even if the slot identities did
+            // not change. Reconstruction can then use the retained raw K.
+            kvmem_repository_index_.assign(block_store_->block_count(), {});
+            for (const auto &lease : block_store_->repository_read_leases())
+                kvmem_sync_repository_index_flag(lease.handle());
+        }
         g_kbar_multi_host_layer_bytes_ = canonical_layer_bytes;
         const bool request_pinned = env_flag_enabled(
             "QW3_KVMEM_MEAN_PINNED_INDEX", true);
@@ -2634,6 +3244,192 @@ void QwenExecutor::kvmem_prepare_cpu_mean_index(
     }
 }
 
+void QwenExecutor::kvmem_sync_repository_backing_flags(KvMemBlockHandle h) {
+    if (!block_store_ || !block_store_->has_repository() ||
+        block_store_->repository_handle(h.slot) != h) return; // Writing, not committed
+    auto lease = block_store_->repository()->try_pin(h);
+    if (!lease) return;
+    const auto &b = block_store_->blocks()[h.slot];
+    const auto covered = [&](const auto &valid) {
+        const uint64_t end = uint64_t(b.orig_pos_start) + b.n_tokens;
+        return b.n_tokens && end <= valid.size() &&
+            std::all_of(valid.begin() + b.orig_pos_start, valid.begin() + end,
+                        [](uint8_t v) { return v != 0; });
+    };
+    const bool mtp = block_store_->config().mtp_enabled;
+    const bool raw = kvmem_raw_k_nvme_tier_
+        ? h.slot < kvmem_raw_k_nvme_block_backed_.size() && kvmem_raw_k_nvme_block_backed_[h.slot] &&
+          covered(kvmem_raw_k_valid_tokens_) && (!mtp || covered(kvmem_raw_mtp_k_valid_tokens_)) &&
+          (!mtp || (h.slot < kvmem_raw_mtp_k_nvme_block_backed_.size() && kvmem_raw_mtp_k_nvme_block_backed_[h.slot]))
+        : covered(kvmem_raw_k_valid_tokens_) && (!mtp || covered(kvmem_raw_mtp_k_valid_tokens_));
+    const bool value = !b.in_flight && !b.dirty_gpu &&
+        (kvmem_nvme_tier_ ? b.ssd_clean && b.nvme_slot >= 0 : b.cpu_slot >= 0);
+    block_store_->set_repository_gc_flags(h, KvMemGc::RawBacked | KvMemGc::ValueBacked,
+        (raw ? KvMemGc::RawBacked : 0u) | (value ? KvMemGc::ValueBacked : 0u));
+}
+
+void QwenExecutor::kvmem_sync_repository_index_flag(KvMemBlockHandle h) {
+    if (!h.generation || h.slot >= kvmem_repository_index_.size() ||
+        h != block_store_->repository_handle(h.slot)) return;
+    const auto &stamp = kvmem_repository_index_[h.slot];
+    const auto &b = block_store_->blocks()[h.slot];
+    const bool valid = stamp.handle == h && stamp.tokens == b.n_tokens;
+    block_store_->set_repository_gc_flags(h, KvMemRepositoryGc::Indexed,
+        valid ? KvMemRepositoryGc::Indexed : 0u);
+}
+
+bool QwenExecutor::kvmem_repository_index_covers(uint64_t tokens, bool allow_partial_repair) const {
+    if (tokens > block_store_->history_end()) return false;
+    auto leases = block_store_->repository_read_leases();
+    for (const auto &lease : leases) {
+        const auto &b = block_store_->blocks()[lease.handle().slot];
+        if (b.history_pos_start >= tokens) continue;
+        const auto expected = static_cast<uint32_t>(std::min<uint64_t>(b.n_tokens, tokens - b.history_pos_start));
+        const auto &stamp = kvmem_repository_index_.at(b.block_id);
+        if (stamp.handle == lease.handle() && stamp.tokens == expected) continue;
+        // Warm admission can precede the actual rewind. The current mean may
+        // cover a longer tail than an older partial checkpoint: it cannot be
+        // scored as that checkpoint's prefix, but the retained raw prefix can
+        // repair it after rewind. Do not turn this repairable tail into a cold
+        // prefill, and never advertise it as already-exact scoring authority.
+        if (!allow_partial_repair ||
+            stamp.handle != lease.handle() || stamp.tokens < expected || expected == b.n_tokens)
+            return false;
+        const auto raw = block_store_->repository_storage_read(b.history_pos_start, expected);
+        if (!kvmem_repository_raw_complete(raw, false)) return false;
+    }
+    return true;
+}
+
+void QwenExecutor::kvmem_rebuild_repository_mean(KvMemStorageRead capture) {
+    const uint32_t B = block_store_->config().block_tokens;
+    const uint32_t count = static_cast<uint32_t>(capture.spans.size());
+    if (!count || count > g_kbar_stream_tile_blocks_ || capture.leases.size() != count ||
+        !kvmem_mean_index_cpu())
+        throw std::logic_error("KVMem raw Mean-K repair has an unsupported tile");
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto &span = capture.spans[i];
+        if (span.handle != capture.leases[i].handle() || span.storage_begin % B ||
+            !span.token_count || span.token_count > B || (i + 1 < count && span.token_count != B))
+            throw std::logic_error("KVMem raw Mean-K repair has inconsistent block coverage");
+    }
+    // Pack only invalid blocks, regardless of their historical or physical
+    // distance. Every non-final block is full; the last block may be partial.
+    // The existing Mean-K kernel therefore keeps its exact reduction layout.
+    const auto &cfg = model_.config();
+    const uint32_t layers = kvmem_qc_num_layers_;
+    if (!layers || layers != kvmem_raw_layers_.size())
+        throw std::logic_error("KVMem raw Mean-K repair layer layout mismatch");
+    const uint32_t rows = (count - 1) * B + capture.spans.back().token_count;
+    const uint64_t row_elems = uint64_t(cfg.n_kv_heads) * cfg.head_dim;
+    const uint64_t elems = uint64_t(rows) * row_elems, bytes = uint64_t(rows) * kvmem_raw_k_row_bytes_;
+    if (!kvmem_index_rebuild_raw_dev_ || kvmem_index_rebuild_raw_dev_->count < elems) {
+        kvmem_index_rebuild_raw_dev_ = kvmem_alloc_raw_k_tensor(elems, "repository_index_raw");
+        kvmem_index_rebuild_f32_dev_ = backend_.tensor_f32(elems, "repository_index_f32");
+    }
+    if (!kvmem_index_rebuild_host_ || kvmem_index_rebuild_host_->bytes < bytes)
+        kvmem_index_rebuild_host_ = backend_.host_buffer(bytes, "repository_index_host");
+    const uint32_t which = g_kbar_capture_next_slot_++ % g_kbar_stream_slots_.size();
+    kvmem_drain_mean_index_capture_slot(which);
+    auto &stage = g_kbar_stream_slots_[which];
+    if (stage.transfer_done) require_status(backend_.wait_kv_transfer_fence(stage.transfer_done));
+    stage.repository_capture = std::move(capture);
+    try {
+        if (!kvmem_adaptive_prototypes() && kvmem_qc_n_subblocks_ > 1)
+            require_status(backend_.zero_tensor(*stage.device));
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+            for (uint32_t i = 0; i < count; ++i) {
+                const auto &span = stage.repository_capture.spans[i];
+                kvmem_read_raw_k(layer, span.storage_begin,
+                    static_cast<uint8_t *>(kvmem_index_rebuild_host_->data) + uint64_t(i) * B * kvmem_raw_k_row_bytes_,
+                    span.token_count, false);
+            }
+            require_status(backend_.copy_bytes_from_host(*kvmem_index_rebuild_raw_dev_, 0,
+                kvmem_index_rebuild_host_->data, bytes));
+            require_status(backend_.widen_raw_k_to_f32_device(*kvmem_index_rebuild_raw_dev_,
+                *kvmem_index_rebuild_f32_dev_, rows, static_cast<uint32_t>(row_elems)));
+            if (kvmem_adaptive_prototypes()) {
+                const auto *previous = kvmem_index_rebuild_source_;
+                kvmem_index_rebuild_source_ = kvmem_index_rebuild_f32_dev_.get();
+                try {
+                    kvmem_capture_adaptive_layer(layer, 0, count, rows,
+                        static_cast<uint32_t>(row_elems), 0, &stage.repository_capture);
+                } catch (...) {
+                    kvmem_index_rebuild_source_ = previous;
+                    throw;
+                }
+                kvmem_index_rebuild_source_ = previous;
+            } else if (block_store_->config().prototype_mode == KvMemPrototypeMode::KeyDirectionFixed4) {
+                require_status(backend_.block_kdirection_fixed4_batch_device(*kvmem_index_rebuild_f32_dev_,
+                    *stage.device, uint64_t(layer) * count, count, static_cast<uint32_t>(row_elems), rows,
+                    B, cfg.n_kv_heads, cfg.head_dim, /*rope_dim=*/0, /*rope_base=*/0, cfg.rope_theta,
+                    /*src_row_off=*/0));
+            } else {
+                require_status(backend_.block_kmean_content_batch_device(*kvmem_index_rebuild_f32_dev_,
+                    *stage.device, uint64_t(layer) * count, count, static_cast<uint32_t>(row_elems), rows,
+                    B, cfg.n_kv_heads, cfg.head_dim, /*rope_dim=*/0, /*rope_base=*/0, cfg.rope_theta,
+                    /*src_row_off=*/0, kvmem_qc_n_subblocks_));
+            }
+        }
+        if (kvmem_adaptive_prototypes()) {
+            for (const auto &span : stage.repository_capture.spans) {
+                kvmem_repository_index_[span.handle.slot] = {span.handle, span.token_count};
+                kvmem_sync_repository_index_flag(span.handle);
+            }
+            stage.repository_capture = {};
+        } else {
+            kvmem_finish_mean_index_capture(which, /*unused historical block offset=*/0, count);
+            kvmem_drain_mean_index_capture_slot(which);
+        }
+    } catch (...) {
+        // A failed fence publication may follow an already queued D2H. Only
+        // release the captured payload/staging ownership after both streams
+        // drained successfully; otherwise keep the members for reset/teardown.
+        if (backend_.synchronize().ok) {
+            stage.capture_pending = false;
+            stage.repository_capture = {};
+            stage.transfer_done.reset();
+        }
+        throw;
+    }
+}
+
+bool QwenExecutor::kvmem_finalize_repository_index(uint64_t tokens) {
+    if (!kvmem_qc_capture_active_ || !kvmem_mean_index_available() || !kvmem_mean_index_cpu() ||
+        kvmem_qc_pertoken_ || kvmem_qc_deltanet_ ||
+        tokens > block_store_->history_end()) return false;
+    kvmem_drain_mean_index_capture();
+    g_content_ready_ = g_kbar_multi_ready_ = false;
+    auto leases = block_store_->repository_read_leases();
+    KvMemStorageRead tile;
+    for (auto &lease : leases) {
+        const auto &b = block_store_->blocks()[lease.handle().slot];
+        if (b.history_pos_start >= tokens) continue;
+        const auto n = static_cast<uint32_t>(std::min<uint64_t>(b.n_tokens, tokens - b.history_pos_start));
+        const auto &stamp = kvmem_repository_index_.at(b.block_id);
+        if (stamp.handle == lease.handle() && stamp.tokens == n) continue;
+        const uint64_t end = uint64_t(b.orig_pos_start) + n;
+        if (end > kvmem_raw_k_valid_tokens_.size() ||
+            !std::all_of(kvmem_raw_k_valid_tokens_.begin() + b.orig_pos_start,
+                         kvmem_raw_k_valid_tokens_.begin() + end, [](uint8_t v) { return v != 0; })) return false;
+        tile.spans.push_back({b.history_pos_start, b.orig_pos_start, n, lease.handle()});
+        tile.leases.push_back(std::move(lease));
+        if (tile.spans.size() == g_kbar_stream_tile_blocks_ || n != block_store_->config().block_tokens) {
+            kvmem_rebuild_repository_mean(std::move(tile));
+            tile = {};
+        }
+    }
+    if (!tile.spans.empty()) kvmem_rebuild_repository_mean(std::move(tile));
+    if (!kvmem_repository_index_covers(tokens)) return false;
+    kvmem_qc_total_blocks_ = block_store_->block_count();
+    kvmem_qc_prompt_tokens_ = kvmem_qc_captured_tokens_ = tokens;
+    kvmem_qc_captured_blocks_ = kvmem_qc_total_blocks_;
+    kvmem_repository_score_history_end_ = tokens;
+    g_content_ready_ = g_kbar_multi_ready_ = true;
+    g_indexed_blocks_ = g_kbar_multi_blocks_ = kvmem_qc_total_blocks_;
+    return true;
+}
+
 void QwenExecutor::kvmem_drain_mean_index_capture_slot(uint32_t slot_index) {
     if (slot_index >= g_kbar_stream_slots_.size()) return;
     MeanIndexStageSlot &slot = g_kbar_stream_slots_[slot_index];
@@ -2664,23 +3460,36 @@ void QwenExecutor::kvmem_drain_mean_index_capture_slot(uint32_t slot_index) {
             throw std::runtime_error(
                 "KVMem CPU mean-index layer destination unavailable");
         }
-        const uint64_t dst_byte =
-            static_cast<uint64_t>(slot.capture_first_block) *
-            per_block_bytes;
         const uint64_t src_byte =
             static_cast<uint64_t>(layer) * layer_bytes;
-        std::memcpy(
-            dst + dst_byte,
-            src + src_byte,
-            static_cast<size_t>(
-                static_cast<uint64_t>(slot.capture_blocks) *
-                per_block_bytes));
+        if (block_store_->has_repository()) {
+            if (slot.repository_capture.spans.size() != slot.capture_blocks)
+                throw std::logic_error("KVMem Mean-K capture lost its generation-bound destinations");
+            for (uint32_t i = 0; i < slot.capture_blocks; ++i) {
+                const uint32_t physical = slot.repository_capture.spans[i].handle.slot;
+                std::memcpy(dst + uint64_t(physical) * per_block_bytes,
+                            src + src_byte + uint64_t(i) * per_block_bytes,
+                            static_cast<size_t>(per_block_bytes));
+            }
+        } else {
+            std::memcpy(dst + uint64_t(slot.capture_first_block) * per_block_bytes,
+                        src + src_byte, static_cast<size_t>(uint64_t(slot.capture_blocks) * per_block_bytes));
+        }
+    }
+    if (block_store_->has_repository()) {
+        if (kvmem_repository_index_.size() != block_store_->block_count())
+            kvmem_repository_index_.assign(block_store_->block_count(), {});
+        for (const auto &span : slot.repository_capture.spans) {
+            kvmem_repository_index_[span.handle.slot] = {span.handle, span.token_count};
+            kvmem_sync_repository_index_flag(span.handle);
+        }
     }
     slot.capture_pending = false;
     slot.capture_first_block = 0;
     slot.capture_blocks = 0;
     slot.capture_layer_stride = 0;
     slot.capture_bytes = 0;
+    slot.repository_capture = {};
 }
 
 void QwenExecutor::kvmem_drain_mean_index_capture() {
@@ -2691,11 +3500,23 @@ void QwenExecutor::kvmem_drain_mean_index_capture() {
 }
 
 uint32_t QwenExecutor::kvmem_begin_mean_index_capture(
-        uint32_t first_block, uint32_t n_blocks, bool seed_partial) {
+        uint64_t first_block, uint32_t n_blocks, bool seed_partial, uint64_t capture_end) {
     if (!kvmem_mean_index_cpu() || !kvmem_mean_index_available() ||
         n_blocks == 0 || n_blocks > g_kbar_stream_tile_blocks_) {
         throw std::runtime_error(
             "KVMem CPU mean-index capture exceeds fixed staging");
+    }
+    if (seed_partial && block_store_->has_repository()) {
+        kvmem_drain_mean_index_capture(); // the previous partial mean is a true data dependency
+        const uint32_t B = block_store_->config().block_tokens;
+        const uint32_t previous = kvmem_qc_captured_tokens_ % B;
+        auto prefix = kvmem_repository_storage(uint64_t(first_block) * B, previous);
+        if (prefix.spans.size() != 1 || !previous)
+            throw std::logic_error("KVMem partial Mean-K repair lost its source block");
+        const auto h = prefix.spans[0].handle;
+        const auto &stamp = kvmem_repository_index_.at(h.slot);
+        if (stamp.handle != h || stamp.tokens != previous)
+            kvmem_rebuild_repository_mean(std::move(prefix));
     }
     const uint32_t slot_index =
         g_kbar_capture_next_slot_++ %
@@ -2718,6 +3539,29 @@ uint32_t QwenExecutor::kvmem_begin_mean_index_capture(
         static_cast<uint64_t>(n_blocks) * per_block_bytes;
     const uint64_t bytes =
         static_cast<uint64_t>(layers) * layer_bytes;
+    slot.repository_capture = {};
+    uint32_t seed_block = block_store_->has_repository() ? 0 : checked_local_position(first_block);
+    if (block_store_ && block_store_->has_repository()) {
+        const uint32_t B = block_store_->config().block_tokens;
+        const uint64_t begin = uint64_t(first_block) * B;
+        const uint64_t available = kvmem_repository_append_ ?
+            kvmem_repository_append_->end() : block_store_->history_end();
+        const uint64_t end = std::min({available, capture_end, (uint64_t(first_block) + n_blocks) * B});
+        if (end <= begin || end - begin > UINT32_MAX)
+            throw std::logic_error("KVMem Mean-K capture interval is not prepared");
+        slot.repository_capture = kvmem_repository_storage(begin, static_cast<uint32_t>(end - begin));
+        if (slot.repository_capture.spans.size() != n_blocks)
+            throw std::logic_error("KVMem Mean-K capture block mapping is incomplete");
+        seed_block = slot.repository_capture.spans.front().handle.slot;
+        if (seed_partial) {
+            const auto h = slot.repository_capture.spans.front().handle;
+            const uint32_t previous = kvmem_qc_captured_tokens_ % B;
+            if (h.slot >= kvmem_repository_index_.size() ||
+                kvmem_repository_index_[h.slot].handle != h ||
+                kvmem_repository_index_[h.slot].tokens != previous)
+                throw std::runtime_error("KVMem partial Mean-K seed generation/length mismatch");
+        }
+    }
     if (seed_partial) {
         std::memset(slot.host->data, 0, static_cast<size_t>(bytes));
         auto *dst = static_cast<uint8_t *>(slot.host->data);
@@ -2730,7 +3574,7 @@ uint32_t QwenExecutor::kvmem_begin_mean_index_capture(
             }
             std::memcpy(
                 dst + static_cast<uint64_t>(layer) * layer_bytes,
-                src + static_cast<uint64_t>(first_block) *
+                src + static_cast<uint64_t>(seed_block) *
                     per_block_bytes,
                 static_cast<size_t>(per_block_bytes));
         }
@@ -2745,6 +3589,10 @@ uint32_t QwenExecutor::kvmem_begin_mean_index_capture(
         require_status(
             backend_.execution_wait_for_kv_transfer(
                 slot.transfer_done));
+    } else if (block_store_->has_repository() && ns > 1) {
+        // A partial block has unpopulated subblocks. Do not retain bytes from
+        // another capture or an earlier generation in those unused rows.
+        require_status(backend_.zero_tensor(*slot.device));
     }
     g_kbar_capture_active_slot_ =
         static_cast<int32_t>(slot_index);
@@ -2752,7 +3600,7 @@ uint32_t QwenExecutor::kvmem_begin_mean_index_capture(
 }
 
 void QwenExecutor::kvmem_finish_mean_index_capture(
-        uint32_t slot_index, uint32_t first_block,
+        uint32_t slot_index, uint64_t first_block,
         uint32_t n_blocks) {
     if (slot_index >= g_kbar_stream_slots_.size()) {
         throw std::runtime_error(
@@ -2921,7 +3769,7 @@ void QwenExecutor::kvmem_release_cpu_slot(int32_t slot) {
         kvmem_cpu_sparse_slabs_[slab_index];
     kvmem_cpu_sparse_slot_live_[i] = 0;
     if (slab.live_slots > 0) --slab.live_slots;
-    if (slab.live_slots == 0 && slab.data) {
+    if (slab.live_slots == 0 && slab.data && !block_store_->has_repository()) {
         const uint64_t slab_bytes =
             static_cast<uint64_t>(slab.capacity_slots) *
             kvmem_cpu_sparse_slot_bytes_;
@@ -2990,7 +3838,7 @@ void QwenExecutor::kvmem_evict_cpu_for_raw(
             if (redundant != UINT32_MAX) {
                 kvmem_cpu_tier_->release_block(redundant);
                 kvmem_release_cpu_slot(redundant_slot);
-                block_store_->set_block_cpu_copy(redundant, -1);
+                block_store_->set_block_cpu_copy(redundant, -1, block_store_->repository_handle(redundant).generation);
                 continue;
             }
         }
@@ -3008,6 +3856,12 @@ void QwenExecutor::kvmem_evict_cpu_for_raw(
         }
         const uint32_t victim = static_cast<uint32_t>(victim_i);
         const int32_t slot = kvmem_cpu_tier_->block_slot(victim);
+        const auto victim_lease = kvmem_repository_pin_current(victim);
+        if (block_store_->has_repository() && !victim_lease) {
+            kvmem_cpu_tier_->forget_block(victim);
+            kvmem_release_cpu_slot(slot);
+            continue; // retired CPU cache entry is no longer an authority
+        }
         const uint8_t *src = kvmem_cpu_slot_data(slot);
         if (slot < 0 || !src ||
             victim >= block_store_->blocks().size()) {
@@ -3029,22 +3883,22 @@ void QwenExecutor::kvmem_evict_cpu_for_raw(
             kvmem_nvme_tier_->write_block(victim, src, victim_bytes);
             if (inclusive) {
                 block_store_->set_block_ssd_backing(
-                    victim, kvmem_nvme_tier_->block_slot(victim), true);
+                    victim, kvmem_nvme_tier_->block_slot(victim), true, block_store_->repository_handle(victim).generation);
             }
         }
         kvmem_cpu_tier_->release_block(victim);
         kvmem_release_cpu_slot(slot);
         if (inclusive) {
-            block_store_->set_block_cpu_copy(victim, -1);
+            block_store_->set_block_cpu_copy(victim, -1, block_store_->repository_handle(victim).generation);
             if (!kvmem_block_pages_resident(victim_block)) {
                 block_store_->set_block_tier(
                     victim, KvTier::SSD, -1,
-                    kvmem_nvme_tier_->block_slot(victim));
+                    kvmem_nvme_tier_->block_slot(victim), block_store_->repository_handle(victim).generation);
             }
         } else {
             block_store_->set_block_tier(
                 victim, KvTier::SSD, -1,
-                kvmem_nvme_tier_->block_slot(victim));
+                kvmem_nvme_tier_->block_slot(victim), block_store_->repository_handle(victim).generation);
         }
         if (kvmem_tier_trace_enabled()) {
             std::fprintf(
@@ -3064,6 +3918,8 @@ void QwenExecutor::kvmem_evict_cpu_for_raw(
 
 bool QwenExecutor::kvmem_raw_k_chunk_complete(
         uint32_t chunk, bool mtp) const {
+    if (block_store_ && block_store_->has_repository())
+        return kvmem_repository_raw_complete(kvmem_repository_raw_chunk_read(chunk), mtp);
     const auto &valid =
         mtp ? kvmem_raw_mtp_k_valid_tokens_
             : kvmem_raw_k_valid_tokens_;
@@ -3080,8 +3936,59 @@ bool QwenExecutor::kvmem_raw_k_chunk_complete(
         [](uint8_t v) { return v != 0; });
 }
 
+KvMemStorageRead QwenExecutor::kvmem_repository_raw_chunk_read(uint32_t chunk) const {
+    const uint32_t B = block_store_->config().block_tokens;
+    const uint32_t n = kvmem_raw_k_chunk_tokens_ / B;
+    const uint64_t first = uint64_t(chunk) * n;
+    if (!n || first >= block_store_->block_count())
+        throw std::out_of_range("KVMem physical raw chunk outside repository");
+    return block_store_->repository_slot_read(static_cast<uint32_t>(first),
+        std::min(n, block_store_->block_count() - static_cast<uint32_t>(first)),
+        kvmem_repository_append_.get());
+}
+
+bool QwenExecutor::kvmem_repository_raw_complete(const KvMemStorageRead &view, bool mtp) const {
+    if (view.spans.empty()) return false;
+    const auto &valid = mtp ? kvmem_raw_mtp_k_valid_tokens_ : kvmem_raw_k_valid_tokens_;
+    for (const auto &span : view.spans) {
+        const uint64_t end = uint64_t(span.storage_begin) + span.token_count;
+        if (end > valid.size() || !std::all_of(valid.begin() + span.storage_begin,
+                valid.begin() + end, [](uint8_t v) { return v != 0; })) return false;
+    }
+    return true;
+}
+
+KvMemStorageRead QwenExecutor::kvmem_repository_raw_range(uint32_t base, uint32_t rows, bool mtp) const {
+    if (!block_store_ || !block_store_->has_repository() || !rows) return {};
+    const uint32_t B = block_store_->config().block_tokens;
+    const uint64_t end = uint64_t(base) + rows;
+    if (end > kv_ctx_size_) throw std::out_of_range("KVMem raw read exceeds physical capacity");
+    const uint32_t first = base / B, count = static_cast<uint32_t>((end - 1) / B + 1 - first);
+    auto view = block_store_->repository_slot_read(first, count, kvmem_repository_append_.get());
+    if (view.spans.size() != count) throw std::runtime_error("KVMem raw read references deleted history");
+    const auto &valid = mtp ? kvmem_raw_mtp_k_valid_tokens_ : kvmem_raw_k_valid_tokens_;
+    for (const auto &span : view.spans) {
+        const auto read_end = std::min(end, uint64_t(span.storage_begin) + B);
+        if (read_end > uint64_t(span.storage_begin) + span.token_count)
+            throw std::runtime_error("KVMem raw read exceeds the block's valid token extent");
+    }
+    if (end > valid.size() || !std::all_of(valid.begin() + base, valid.begin() + end,
+            [](uint8_t v) { return v != 0; }))
+        throw std::runtime_error("KVMem raw read includes uncaptured main/MTP tokens");
+    return view;
+}
+
 void QwenExecutor::kvmem_gc_raw_chunk_state(uint32_t chunk, bool durable) {
-    if (!kvmem_gc_ || !block_store_ || !kvmem_raw_k_chunk_tokens_) return;
+    if (!block_store_ || !kvmem_raw_k_chunk_tokens_) return;
+    if (block_store_->has_repository()) {
+        auto view = kvmem_repository_raw_chunk_read(chunk);
+        for (const auto &span : view.spans) {
+            if (block_store_->repository_handle(span.handle.slot) != span.handle) continue;
+            kvmem_sync_repository_backing_flags(span.handle);
+        }
+        return;
+    }
+    if (!kvmem_gc_) return;
     const uint32_t bt = block_store_->config().block_tokens;
     const uint32_t begin = chunk * (kvmem_raw_k_chunk_tokens_ / bt);
     const uint32_t end = std::min(block_store_->block_count(), begin + kvmem_raw_k_chunk_tokens_ / bt);
@@ -3114,6 +4021,9 @@ void QwenExecutor::kvmem_persist_raw_k_chunk(
         throw std::runtime_error(
             "KVMem raw-K NVMe chunk metadata is out of range");
     }
+    const bool bounded = block_store_ && block_store_->has_repository();
+    KvMemStorageRead repository_read;
+    if (bounded) repository_read = kvmem_repository_raw_chunk_read(chunk);
     kvmem_wait_raw_k_chunk_write(chunk);
     if (backed[chunk] && !dirty[chunk]) return;
     if (!chunks[chunk]) {
@@ -3152,6 +4062,8 @@ void QwenExecutor::kvmem_persist_raw_k_chunk(
         for (uint32_t b = 0; b < blocks; ++b) {
             const uint32_t block_id =
                 static_cast<uint32_t>(first_block + b);
+            if (bounded && !repository_raw_span(repository_read, block_id)) continue;
+            if (bounded && block_id < block_backed.size() && block_backed[block_id]) continue;
             if (kvmem_gc_ && block_id < block_store_->block_count() && !block_store_->is_live(block_id)) continue;
             const size_t token_begin = std::min<size_t>(
                 valid_tokens.size(),
@@ -3183,7 +4095,8 @@ void QwenExecutor::kvmem_persist_raw_k_chunk(
         }
         backed[chunk] = 1;
         dirty[chunk] = 0;
-        if (!mtp) kvmem_gc_raw_chunk_state(chunk, true);
+        if (bounded) kvmem_update_repository_raw_chunk_backed(chunk);
+        if (bounded || !mtp) kvmem_gc_raw_chunk_state(chunk, true);
         kvmem_raw_k_nvme_write_bytes_ +=
             static_cast<uint64_t>(written_blocks) * block_bytes;
         if (kvmem_tier_trace_enabled()) {
@@ -3241,6 +4154,7 @@ void QwenExecutor::kvmem_reap_raw_k_writes(bool wait_all) {
         kvmem_raw_k_nvme_write_bytes_ += stats.bytes;
         kvmem_raw_k_nvme_write_syscalls_ += stats.syscalls;
         kvmem_raw_k_nvme_write_ns_ += stats.duration_ns;
+        const bool bounded = block_store_ && block_store_->has_repository();
         for (uint32_t chunk : slot.chunks) {
             const uint64_t record_offset =
                 chunk < kvmem_raw_writeback_chunk_offset_.size()
@@ -3254,7 +4168,11 @@ void QwenExecutor::kvmem_reap_raw_k_writes(bool wait_all) {
             // generation. The completed future proves both the transfer fence
             // and positional write are done, so this is the last safe point to
             // populate the CPU cache before the slot can be recycled.
-            if (kvmem_raw_k_nvme_block_slots_) {
+            if (bounded) {
+                // Bounded capture already scattered into the CPU authority.
+                // A slab contains only the captured generations; copying an
+                // entire chunk would overwrite holes newly reserved meanwhile.
+            } else if (kvmem_raw_k_nvme_block_slots_) {
                 const uint32_t bt = block_store_
                     ? std::max<uint32_t>(
                           1, block_store_->config().block_tokens)
@@ -3327,6 +4245,12 @@ void QwenExecutor::kvmem_reap_raw_k_writes(bool wait_all) {
                 for (uint32_t b = 0; b < blocks; ++b) {
                     const size_t block_id =
                         static_cast<size_t>(first_block + b);
+                    if (bounded) {
+                        const auto *captured = repository_raw_span(slot.repository_capture, static_cast<uint32_t>(block_id));
+                        if (!captured) continue;
+                        if (kvmem_repository_storage_generation_.at(block_id) != captured->handle.generation)
+                            throw std::logic_error("KVMem raw writeback outlived its storage generation");
+                    }
                     if (block_id <
                         kvmem_raw_k_nvme_block_backed_.size()) {
                         kvmem_raw_k_nvme_block_backed_[block_id] = 1;
@@ -3347,6 +4271,7 @@ void QwenExecutor::kvmem_reap_raw_k_writes(bool wait_all) {
             if (chunk < kvmem_raw_k_write_pending_.size()) {
                 kvmem_raw_k_write_pending_[chunk] = 0;
             }
+            if (bounded) kvmem_update_repository_raw_chunk_backed(chunk);
             kvmem_gc_raw_chunk_state(chunk, true);
             if (chunk < kvmem_raw_writeback_chunk_slot_.size() &&
                 kvmem_raw_writeback_chunk_slot_[chunk] ==
@@ -3375,6 +4300,7 @@ void QwenExecutor::kvmem_reap_raw_k_writes(bool wait_all) {
         slot.spans.clear();
         slot.in_flight = false;
         slot.gc_view.reset();
+        slot.repository_capture = {};
         slot.d2h_done.reset();
         slot.submit_ns = 0;
     }
@@ -3406,8 +4332,10 @@ void QwenExecutor::kvmem_submit_raw_k_writeback_slot(
             "KVMem raw-K writeback slot is incomplete");
     }
     NvmeKvTier *tier = kvmem_raw_k_nvme_tier_.get();
-    require_status(
-        backend_.record_kv_transfer_fence(slot.d2h_done));
+    const bool cpu_capture = block_store_ && block_store_->has_repository();
+    // The bounded path packs authoritative CPU buffers after capture finished;
+    // it has no pending D2H to fence, and needs no extra CUDA calls here.
+    if (!cpu_capture) require_status(backend_.record_kv_transfer_fence(slot.d2h_done));
     DeviceBackend *backend = &backend_;
     void *data = slot.host->data;
     const uint64_t buffer_bytes = slot.used_bytes;
@@ -3415,13 +4343,12 @@ void QwenExecutor::kvmem_submit_raw_k_writeback_slot(
     std::unique_ptr<DeviceTransferFence> d2h_done =
         std::move(slot.d2h_done);
     slot.submit_ns = kvmem_steady_ns();
-    slot.in_flight = true;
     if (kvmem_gc_) slot.gc_view = block_store_->gc_view();
     slot.future = std::async(
         std::launch::async,
-        [tier, backend, data, buffer_bytes, spans,
+        [tier, backend, data, buffer_bytes, spans, cpu_capture,
          d2h_done = std::move(d2h_done)]() mutable {
-            const DeviceStatus transfer_status =
+            const DeviceStatus transfer_status = cpu_capture ? DeviceStatus{} :
                 backend->wait_kv_transfer_fence(d2h_done);
             if (!transfer_status.ok) {
                 throw std::runtime_error(
@@ -3437,11 +4364,12 @@ void QwenExecutor::kvmem_submit_raw_k_writeback_slot(
                 kvmem_steady_ns() - start_ns;
             return stats;
         });
+    slot.in_flight = true; // async launch failure leaves the staged record retryable
 }
 
 bool QwenExecutor::kvmem_reserve_raw_k_writeback_record(
         uint32_t chunk, uint32_t &slot_index,
-        uint64_t &record_offset) {
+        uint64_t &record_offset, uint64_t bytes) {
     if (!kvmem_raw_k_nvme_enabled_ ||
         kvmem_raw_writeback_record_bytes_ == 0 ||
         chunk >= kvmem_raw_writeback_chunk_slot_.size()) {
@@ -3455,19 +4383,22 @@ bool QwenExecutor::kvmem_reserve_raw_k_writeback_record(
             kvmem_raw_writeback_chunk_offset_[chunk];
         return true;
     }
+    const uint64_t required = bytes ? bytes : kvmem_raw_writeback_record_bytes_;
+    if (std::none_of(kvmem_raw_writeback_slots_.begin(), kvmem_raw_writeback_slots_.end(),
+                    [&](const auto &s) { return s.host && s.capacity_bytes >= required; }))
+        throw std::runtime_error("KVMem raw writeback group exceeds its staging capacity");
     for (;;) {
         kvmem_reap_raw_k_writes(/*wait_all=*/false);
         RawWritebackSlot &slot =
             kvmem_raw_writeback_slots_[
                 kvmem_raw_writeback_fill_slot_];
         if (!slot.in_flight && slot.host &&
-            slot.used_bytes + kvmem_raw_writeback_record_bytes_ <=
+            slot.used_bytes + required <=
                 slot.capacity_bytes) {
             slot_index = kvmem_raw_writeback_fill_slot_;
             record_offset = slot.used_bytes;
-            slot.used_bytes +=
-                kvmem_raw_writeback_record_bytes_;
             slot.chunks.push_back(chunk);
+            slot.used_bytes += required;
             kvmem_raw_writeback_chunk_slot_[chunk] =
                 static_cast<int8_t>(slot_index);
             kvmem_raw_writeback_chunk_offset_[chunk] =
@@ -3492,12 +4423,121 @@ bool QwenExecutor::kvmem_reserve_raw_k_writeback_record(
     }
 }
 
+void QwenExecutor::kvmem_update_repository_raw_chunk_backed(uint32_t chunk) {
+    auto view = kvmem_repository_raw_chunk_read(chunk);
+    bool main = true, mtp = true;
+    for (const auto &span : view.spans) {
+        main = main && kvmem_raw_k_nvme_block_backed_.at(span.handle.slot);
+        if (kvmem_raw_k_nvme_mtp_block_bytes_)
+            mtp = mtp && kvmem_raw_mtp_k_nvme_block_backed_.at(span.handle.slot);
+    }
+    kvmem_raw_k_nvme_backed_.at(chunk) = main;
+    kvmem_raw_k_dirty_.at(chunk) = !main;
+    if (kvmem_raw_k_nvme_mtp_block_bytes_) {
+        kvmem_raw_mtp_k_nvme_backed_.at(chunk) = mtp;
+        kvmem_raw_mtp_k_dirty_.at(chunk) = !mtp;
+    }
+}
+
+bool QwenExecutor::kvmem_copy_repository_raw_chunk_to_writeback(uint32_t chunk) {
+    if (kvmem_raw_k_write_pending_.at(chunk)) return true;
+    auto view = kvmem_repository_raw_chunk_read(chunk);
+    KvMemStorageRead capture;
+    bool unready = false;
+    auto complete = [&](const KvMemStorageSpan &span, const std::vector<uint8_t> &valid) {
+        const uint64_t end = uint64_t(span.storage_begin) + span.token_count;
+        return end <= valid.size() && std::all_of(valid.begin() + span.storage_begin,
+            valid.begin() + end, [](uint8_t v) { return v != 0; });
+    };
+    for (size_t i = 0; i < view.spans.size(); ++i) {
+        const auto &span = view.spans[i];
+        const bool main_clean = kvmem_raw_k_nvme_block_backed_.at(span.handle.slot);
+        const bool mtp_clean = !kvmem_raw_k_nvme_mtp_block_bytes_ ||
+            kvmem_raw_mtp_k_nvme_block_backed_.at(span.handle.slot);
+        if (main_clean && mtp_clean) continue;
+        if (!complete(span, kvmem_raw_k_valid_tokens_) ||
+            (kvmem_raw_k_nvme_mtp_block_bytes_ && !complete(span, kvmem_raw_mtp_k_valid_tokens_))) {
+            unready = true; continue;
+        }
+        capture.spans.push_back(span);
+        capture.leases.push_back(std::move(view.leases[i]));
+    }
+    if (capture.spans.empty()) return !unready;
+    uint32_t slot_index = 0;
+    uint64_t record_offset = 0;
+    const uint64_t bytes = capture.spans.size() * kvmem_raw_k_nvme_slot_bytes_;
+    if (!kvmem_reserve_raw_k_writeback_record(chunk, slot_index, record_offset, bytes)) return false;
+    auto &slot = kvmem_raw_writeback_slots_[slot_index];
+    const uint32_t B = block_store_->config().block_tokens;
+    const auto old_spans = slot.spans.size(), old_captured = slot.repository_capture.spans.size();
+    const auto old_leases = slot.repository_capture.leases.size();
+    try {
+        slot.spans.reserve(old_spans + capture.spans.size());
+        slot.repository_capture.spans.reserve(old_captured + capture.spans.size());
+        slot.repository_capture.leases.reserve(old_leases + capture.leases.size());
+        for (size_t i = 0; i < capture.spans.size(); ++i) {
+            const auto &span = capture.spans[i];
+            const auto id = span.handle.slot;
+            const uint32_t within = span.storage_begin % kvmem_raw_k_chunk_tokens_ / B;
+            if ((kvmem_raw_k_nvme_block_backed_.at(id) ||
+                 (kvmem_raw_k_nvme_mtp_block_bytes_ && kvmem_raw_mtp_k_nvme_block_backed_.at(id))) &&
+                kvmem_raw_k_nvme_tier_->block_slot(id) < 0)
+                throw std::logic_error("KVMem backed raw block lost its NVMe allocation");
+            const auto allocation = kvmem_raw_k_nvme_tier_->place_block(id);
+            if (allocation.slot < 0) throw std::runtime_error("KVMem raw repository NVMe arena is full");
+            const uint64_t offset = record_offset + i * kvmem_raw_k_nvme_slot_bytes_;
+            auto *dst = static_cast<uint8_t *>(slot.host->data) + offset;
+            auto copy_segment = [&](bool mtp) {
+                const auto &chunks = mtp ? kvmem_raw_mtp_k_chunks_ : kvmem_raw_k_chunks_;
+                const auto &backed = mtp ? kvmem_raw_mtp_k_nvme_block_backed_ : kvmem_raw_k_nvme_block_backed_;
+                const uint64_t n = mtp ? kvmem_raw_k_nvme_mtp_block_bytes_ : kvmem_raw_k_nvme_main_block_bytes_;
+                const uint64_t segment = mtp ? kvmem_raw_k_nvme_main_block_bytes_ : 0;
+                if (!n) return;
+                if (chunk < chunks.size() && chunks[chunk])
+                    std::memcpy(dst + segment, chunks[chunk].get() + uint64_t(within) * n, n);
+                else if (backed.at(id)) {
+                    kvmem_raw_k_nvme_tier_->read_slot_range(allocation.slot, segment, dst + segment, n);
+                    kvmem_raw_k_nvme_read_bytes_ += n;
+                } else throw std::logic_error("KVMem dirty raw repository segment has no authority");
+            };
+            copy_segment(false); copy_segment(true);
+            slot.spans.push_back({allocation.slot, offset, kvmem_raw_k_nvme_slot_bytes_});
+        }
+        for (const auto &span : capture.spans) slot.repository_capture.spans.push_back(span);
+        for (auto &lease : capture.leases) slot.repository_capture.leases.push_back(std::move(lease));
+    } catch (...) {
+        // No GPU copy or NVMe task was submitted for this CPU-packed record.
+        // Leave earlier records intact; never flush a half-packed group whose
+        // local capture leases would otherwise disappear during unwinding.
+        slot.spans.resize(old_spans);
+        slot.repository_capture.spans.resize(old_captured);
+        slot.repository_capture.leases.resize(old_leases);
+        slot.used_bytes = record_offset;
+        slot.chunks.pop_back();
+        kvmem_raw_writeback_chunk_slot_[chunk] = -1;
+        kvmem_raw_writeback_chunk_offset_[chunk] = 0;
+        throw;
+    }
+    std::sort(slot.repository_capture.spans.begin(), slot.repository_capture.spans.end(),
+        [](const auto &a, const auto &b) { return a.handle.slot < b.handle.slot; });
+    kvmem_raw_k_write_pending_[chunk] = 1;
+    kvmem_raw_writeback_main_ready_[chunk] = kvmem_raw_writeback_mtp_ready_[chunk] = 1;
+    kvmem_gc_raw_chunk_state(chunk, false);
+    if (slot.used_bytes == slot.capacity_bytes) {
+        kvmem_submit_raw_k_writeback_slot(slot_index);
+        kvmem_raw_writeback_fill_slot_ = (slot_index + 1u) % kvmem_raw_writeback_slots_.size();
+    }
+    return true;
+}
+
 bool QwenExecutor::kvmem_copy_raw_k_chunk_to_writeback(
         uint32_t chunk) {
     if (!kvmem_raw_k_nvme_enabled_ ||
         chunk >= kvmem_raw_k_chunks_.size()) {
         return false;
     }
+    if (block_store_ && block_store_->has_repository())
+        return kvmem_copy_repository_raw_chunk_to_writeback(chunk);
     const bool main_complete =
         kvmem_raw_k_chunk_complete(chunk, /*mtp=*/false);
     const bool mtp_complete =
@@ -3761,7 +4801,7 @@ void QwenExecutor::kvmem_archive_capture_ladder(uint64_t position) {
     KvMemArchiveState state;
     state.position = position;
     state.kvmem_registered_pos = kvmem_registered_pos_;
-    state.mtp_prefix_len = mtp_prefix_len_;
+    state.mtp_prefix_len = checked_local_position(mtp_prefix_len_);
 
     // DeltaNet state is strictly sequential, so it is the one thing a
     // truncation or a resumed build cannot recompute cheaply. Everything else
@@ -3785,6 +4825,7 @@ void QwenExecutor::kvmem_archive_capture_ladder(uint64_t position) {
         add(KvMemArchiveStateEntry::Conv, static_cast<uint32_t>(i),
             conv_states_[i].get());
     }
+    if (dflash_executor_) dflash_executor_->capture_archive_state(state);
     kvmem_archive_->write_state(state);
 }
 
@@ -3804,12 +4845,15 @@ void QwenExecutor::kvmem_archive_restore_ladder(uint64_t position) {
     ensure_mtp_scratch();
     const KvMemArchiveState state = kvmem_archive_->read_state(position);
     uint64_t offset = 0;
+    std::vector<std::pair<DeviceTensor *, uint64_t>> copies;
     for (const KvMemArchiveStateEntry &e : state.entries) {
         DeviceTensor *dst = nullptr;
         switch (e.kind) {
-            case KvMemArchiveStateEntry::Hidden: dst = h_.get(); break;
+            case KvMemArchiveStateEntry::Hidden:
+                if (e.index == 0) dst = h_.get();
+                break;
             case KvMemArchiveStateEntry::MtpPrefixHidden:
-                dst = mtp_prefix_h_.get();
+                if (e.index == 0) dst = mtp_prefix_h_.get();
                 break;
             case KvMemArchiveStateEntry::Recurrent:
                 if (e.index < recurrent_states_.size()) {
@@ -3821,6 +4865,13 @@ void QwenExecutor::kvmem_archive_restore_ladder(uint64_t position) {
                     dst = conv_states_[e.index].get();
                 }
                 break;
+            case KvMemArchiveStateEntry::DFlashMetadata:
+            case KvMemArchiveStateEntry::DFlashRawK:
+            case KvMemArchiveStateEntry::DFlashV:
+                // read_state validates the complete optional payload even
+                // when this engine runs without a draft.
+                offset += e.bytes;
+                continue;
             default: break;
         }
         if (dst == nullptr) {
@@ -3834,10 +4885,23 @@ void QwenExecutor::kvmem_archive_restore_ladder(uint64_t position) {
                 "KVMem archive ladder state has an unexpected tensor size; "
                 "the archive layout does not match this engine");
         }
-        require_status(backend_.copy_bytes_from_host(
-            *dst, /*byte_offset=*/0, state.payload.data() + offset,
-            e.bytes));
+        copies.emplace_back(dst, offset);
         offset += e.bytes;
+    }
+    auto require_entry = [&](const DeviceTensor *tensor) {
+        if (!tensor || tensor->count == 0) return;
+        if (std::none_of(copies.begin(), copies.end(), [&](const auto &copy) { return copy.first == tensor; }))
+            throw std::runtime_error("KVMem archive ladder is missing required target state");
+    };
+    require_entry(h_.get());
+    for (const auto &tensor : recurrent_states_) require_entry(tensor.get());
+    for (const auto &tensor : conv_states_) require_entry(tensor.get());
+    if (state.mtp_prefix_len) require_entry(mtp_prefix_h_.get());
+    // Validate all entries before replacing any live target tensors.
+    if (dflash_executor_) dflash_executor_->restore_archive_state(state);
+    for (const auto &[dst, begin] : copies) {
+        require_status(backend_.copy_bytes_from_host(
+            *dst, 0, state.payload.data() + begin, dst->count * dst->elem_size));
     }
     mtp_prefix_len_ = state.mtp_prefix_len;
 }
@@ -3880,6 +4944,8 @@ bool QwenExecutor::kvmem_evict_one_raw_k_chunk(
         for (uint32_t pass = 0; pass < 3 && victim == UINT32_MAX; ++pass) {
             for (uint32_t chunk = 0; chunk < chunks.size(); ++chunk) {
                 if (!chunks[chunk]) continue;
+                const auto &capture = kvmem_repository_raw_capture_chunks_[mtp ? 1 : 0];
+                if (std::binary_search(capture.begin(), capture.end(), chunk)) continue;
                 // One host capture can straddle two 2048-token cache chunks
                 // when its logical base is not chunk aligned. All chunks in
                 // that capture must stay resident until every layer has been
@@ -4057,9 +5123,13 @@ void QwenExecutor::kvmem_ensure_raw_k_chunks(
                 const auto &block_backed = mtp
                     ? kvmem_raw_mtp_k_nvme_block_backed_
                     : kvmem_raw_k_nvme_block_backed_;
+                const bool bounded = block_store_->has_repository();
+                KvMemStorageRead repository_read;
+                if (bounded) repository_read = kvmem_repository_raw_chunk_read(chunk);
                 for (uint32_t b = 0; b < blocks; ++b) {
                     const uint32_t block_id =
                         static_cast<uint32_t>(first_block + b);
+                    if (bounded && !repository_raw_span(repository_read, block_id)) continue;
                     if (kvmem_gc_ && block_id < block_store_->block_count() && !block_store_->is_live(block_id)) continue;
                     if (block_id >= block_backed.size() ||
                         !block_backed[block_id]) {
@@ -4158,13 +5228,22 @@ void QwenExecutor::kvmem_write_raw_k(
         }
         uint8_t *dst = chunks[chunk].get() +
             row_offset * kvmem_raw_k_row_bytes_;
+        const bool bounded = block_store_ && block_store_->has_repository();
+        if (bounded) {
+            const uint32_t id = pos / bt;
+            auto &backed = mtp ? kvmem_raw_mtp_k_nvme_block_backed_ : kvmem_raw_k_nvme_block_backed_;
+            if (id < backed.size()) backed[id] = 0;
+            const auto h = block_store_->repository_handle(id);
+            if (h.generation && h.generation == kvmem_repository_storage_generation_.at(id))
+                block_store_->set_repository_gc_flags(h, KvMemGc::RawBacked, 0);
+        }
         const uint64_t bytes =
             static_cast<uint64_t>(take) * kvmem_raw_k_row_bytes_;
         std::memcpy(dst, src, static_cast<size_t>(bytes));
         if (chunk < dirty.size()) {
             const bool was_dirty = dirty[chunk] != 0;
             dirty[chunk] = 1;
-            if (!mtp && !was_dirty) kvmem_gc_raw_chunk_state(chunk, false);
+            if (!bounded && !mtp && !was_dirty) kvmem_gc_raw_chunk_state(chunk, false);
         }
         src += bytes;
         pos += take;
@@ -4176,6 +5255,7 @@ void QwenExecutor::kvmem_read_raw_k(
         uint32_t layer_slot, uint32_t base, uint8_t *dst,
         uint32_t rows, bool mtp) {
     if (rows == 0) return;
+    const auto repository_read = kvmem_repository_raw_range(base, rows, mtp);
     const auto &chunks =
         mtp ? kvmem_raw_mtp_k_chunks_ : kvmem_raw_k_chunks_;
     const uint32_t bt = block_store_
@@ -4267,6 +5347,7 @@ void QwenExecutor::kvmem_read_raw_k(
 void QwenExecutor::kvmem_read_raw_k_block(
         uint32_t base, uint32_t rows, uint8_t *dst, bool mtp) {
     if (rows == 0 || !dst || !block_store_) return;
+    const auto repository_read = kvmem_repository_raw_range(base, rows, mtp);
     const uint32_t bt = std::max<uint32_t>(
         1, block_store_->config().block_tokens);
     if (rows > bt || base % bt != 0) {
@@ -4609,7 +5690,7 @@ void QwenExecutor::kvmem_capture_raw_k_decode(
 }
 
 bool QwenExecutor::kvmem_try_direct_raw_k_d2h(
-        uint32_t true_base, uint32_t first_row,
+        uint64_t true_base, uint32_t first_row,
         uint32_t rows) {
     if (!kvmem_raw_k_nvme_enabled_ ||
         !kvmem_raw_k_block_major_ ||
@@ -4700,19 +5781,23 @@ bool QwenExecutor::kvmem_try_direct_raw_k_d2h(
 }
 
 void QwenExecutor::kvmem_flush_raw_k_capture(
-        uint32_t true_base, uint32_t first_row, uint32_t rows) {
+        uint64_t true_base, uint32_t first_row, uint32_t rows) {
     if (!kvmem_immutable_source_k_ || rows == 0) return;
+    const bool bounded = block_store_ && block_store_->has_repository();
     if (!kvmem_raw_capture_host_ ||
-        true_base + rows > kv_ctx_size_ ||
-        first_row + rows > kvmem_raw_capture_rows_) {
+        (!bounded && uint64_t(true_base) + rows > kv_ctx_size_) ||
+        uint64_t(first_row) + rows > kvmem_raw_capture_rows_) {
         throw std::runtime_error("immutable raw-K capture range is invalid");
     }
-    if (kvmem_try_direct_raw_k_d2h(
+    if (!bounded && kvmem_try_direct_raw_k_d2h(
             true_base, first_row, rows)) {
         return;
     }
     const uint64_t row_bytes = kvmem_raw_k_row_bytes_;
     const uint64_t layer_bytes = static_cast<uint64_t>(rows) * row_bytes;
+    KvMemStorageRead view;
+    if (bounded) view = kvmem_repository_storage(true_base, rows);
+    RawCaptureChunkGuard protect(kvmem_repository_raw_capture_chunks_[0], view.spans, kvmem_raw_k_chunk_tokens_);
     require_status(backend_.begin_kv_transfer_from_device());
     for (uint32_t slot = 0; slot < kvmem_raw_layers_.size(); ++slot) {
         require_status(backend_.copy_bytes_to_host_async(
@@ -4727,7 +5812,21 @@ void QwenExecutor::kvmem_flush_raw_k_capture(
         const uint8_t *src =
             static_cast<const uint8_t *>(kvmem_raw_capture_host_->data) +
             static_cast<uint64_t>(slot) * layer_bytes;
-        kvmem_write_raw_k(slot, true_base, src, rows, /*mtp=*/false);
+        if (bounded) {
+            for (const auto &span : view.spans)
+                kvmem_write_raw_k(slot, span.storage_begin,
+                    src + (span.history_begin - true_base) * row_bytes, span.token_count, /*mtp=*/false);
+        } else kvmem_write_raw_k(slot, true_base, src, rows, /*mtp=*/false);
+    }
+    if (bounded) {
+        for (const auto &span : view.spans) {
+            std::fill(kvmem_raw_k_valid_tokens_.begin() + span.storage_begin,
+                      kvmem_raw_k_valid_tokens_.begin() + span.storage_begin + span.token_count, uint8_t{1});
+            kvmem_persist_completed_raw_k_chunks(span.storage_begin, span.token_count, /*mtp=*/false);
+            kvmem_sync_repository_backing_flags(span.handle);
+        }
+        kvmem_maybe_dump_raw_k_window();
+        return;
     }
     std::fill(kvmem_raw_k_valid_tokens_.begin() + true_base,
               kvmem_raw_k_valid_tokens_.begin() + true_base + rows,
@@ -4739,16 +5838,16 @@ void QwenExecutor::kvmem_flush_raw_k_capture(
 
 void QwenExecutor::kvmem_flush_raw_k_decode() {
     if (!kvmem_immutable_source_k_ ||
-        kvmem_raw_decode_block_start_ < 0 ||
+        kvmem_raw_decode_block_start_ == UINT64_MAX ||
         kvmem_raw_decode_rows_ == 0) {
         return;
     }
-    const uint32_t true_base =
-        static_cast<uint32_t>(kvmem_raw_decode_block_start_) +
+    const uint64_t true_base =
+        kvmem_raw_decode_block_start_ +
         kvmem_raw_decode_first_row_;
     kvmem_flush_raw_k_capture(true_base, kvmem_raw_decode_first_row_,
                               kvmem_raw_decode_rows_);
-    kvmem_raw_decode_block_start_ = -1;
+    kvmem_raw_decode_block_start_ = UINT64_MAX;
     kvmem_raw_decode_first_row_ = 0;
     kvmem_raw_decode_rows_ = 0;
 }
@@ -5326,7 +6425,7 @@ void QwenExecutor::kvmem_ensure_raw_mtp_capture_capacity(uint32_t rows) {
 
 bool QwenExecutor::kvmem_try_direct_raw_mtp_k_d2h(
         const DeviceTensor &raw_k,
-        uint32_t logical_base, uint32_t rows) {
+        uint64_t logical_base, uint32_t rows) {
     if (!kvmem_raw_k_nvme_enabled_ ||
         rows != kvmem_raw_k_chunk_tokens_ ||
         logical_base % kvmem_raw_k_chunk_tokens_ != 0 ||
@@ -5391,7 +6490,7 @@ bool QwenExecutor::kvmem_try_direct_raw_mtp_k_d2h(
 
 void QwenExecutor::kvmem_capture_raw_mtp_k(
         const DeviceTensor &raw_k,
-        uint32_t logical_base,
+        uint64_t logical_base,
         uint32_t rows,
         uint32_t src_row) {
     if (kvmem_provisional_prefill_ || kvmem_query_probe_guard_active()) return;
@@ -5400,10 +6499,14 @@ void QwenExecutor::kvmem_capture_raw_mtp_k(
         throw std::runtime_error(
             "immutable MTP raw-K capture requires a zero-based source batch");
     }
-    if (logical_base + rows > kv_ctx_size_) {
+    const bool bounded = block_store_ && block_store_->has_repository();
+    if (!bounded && uint64_t(logical_base) + rows > kv_ctx_size_) {
         throw std::runtime_error(
             "immutable MTP raw-K capture range is invalid");
     }
+    KvMemStorageRead view;
+    if (bounded) view = kvmem_repository_storage(logical_base, rows);
+    RawCaptureChunkGuard protect(kvmem_repository_raw_capture_chunks_[1], view.spans, kvmem_raw_k_chunk_tokens_);
     kvmem_ensure_raw_mtp_capture_capacity(rows);
     auto &capture_fence =
         kvmem_raw_mtp_capture_d2h_done_[
@@ -5421,7 +6524,7 @@ void QwenExecutor::kvmem_capture_raw_mtp_k(
             kvmem_raw_mtp_capture_active_slot_],
         raw_k,
         /*base_pos=*/0, per_pos, rows));
-    if (kvmem_try_direct_raw_mtp_k_d2h(
+    if (!bounded && kvmem_try_direct_raw_mtp_k_d2h(
             *kvmem_raw_mtp_capture_dev_[
                 kvmem_raw_mtp_capture_active_slot_],
             logical_base, rows)) {
@@ -5435,16 +6538,25 @@ void QwenExecutor::kvmem_capture_raw_mtp_k(
             kvmem_raw_mtp_capture_active_slot_],
         kvmem_raw_mtp_capture_host_->data, 0, bytes));
     require_status(backend_.wait_kv_transfer());
-    kvmem_write_raw_k(
-        /*layer_slot=*/0, logical_base,
-        static_cast<const uint8_t *>(kvmem_raw_mtp_capture_host_->data),
-        rows, /*mtp=*/true);
-    std::fill(
-        kvmem_raw_mtp_k_valid_tokens_.begin() + logical_base,
-        kvmem_raw_mtp_k_valid_tokens_.begin() + logical_base + rows,
-        static_cast<uint8_t>(1));
-    kvmem_persist_completed_raw_k_chunks(
-        logical_base, rows, /*mtp=*/true);
+    auto write_span = [&](const KvMemStorageSpan &span) {
+        kvmem_write_raw_k(
+            /*layer_slot=*/0, span.storage_begin,
+            static_cast<const uint8_t *>(kvmem_raw_mtp_capture_host_->data) +
+                (span.history_begin - logical_base) * kvmem_raw_k_row_bytes_,
+            span.token_count, /*mtp=*/true);
+        std::fill(
+            kvmem_raw_mtp_k_valid_tokens_.begin() + span.storage_begin,
+            kvmem_raw_mtp_k_valid_tokens_.begin() + span.storage_begin + span.token_count,
+            static_cast<uint8_t>(1));
+        kvmem_persist_completed_raw_k_chunks(
+            span.storage_begin, span.token_count, /*mtp=*/true);
+    };
+    if (bounded) {
+        for (const auto &span : view.spans) {
+            write_span(span);
+            kvmem_sync_repository_backing_flags(span.handle);
+        }
+    } else write_span({logical_base, checked_local_position(logical_base), rows, {}});
 }
 
 void QwenExecutor::kvmem_materialize_raw_mtp_k(
@@ -5821,7 +6933,14 @@ void QwenExecutor::ensure_logits_batch_scratch(uint32_t batch) {
 
 void QwenExecutor::ensure_batch_scratch(uint32_t batch) {
     if (batch == 0) return;
-    if (batch <= batch_capacity_) return;
+    const bool trim = batch <= 8 && batch_capacity_ > 128 &&
+        !dflash_layers_.empty() &&
+        env_flag_enabled("QW3_EXPERIMENTAL_DFLASH_TRIM_TRANSIENTS", false);
+    if (batch <= batch_capacity_ && !trim) return;
+    if (trim) {
+        std::fprintf(stderr, "[dflash-transient-trim] kind=batch from_rows=%u to_rows=8\n", batch_capacity_);
+        batch = 8;  // Reuse one decode-size allocation across widths 1 through 8.
+    }
     const QwenConfig &cfg = model_.config();
 
     // Determine worst-case per-layer dims (mirrors ensure_scratch).
@@ -6241,6 +7360,10 @@ NativeExecutorReport QwenExecutor::dry_run_token(uint32_t token_id, bool execute
 
 NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
                                                      bool compute_logits) {
+    if (kvmem_blend_pending_) kvmem_blend_selected();
+    kvmem_blend_capture_tokens(position_, &token_id, 1);
+    dflash_feature_view_ = {};
+    if (position_ == UINT64_MAX) throw std::overflow_error("historical token position overflow");
     NativeExecutorReport report;
     const NativePlanInfo &plan = model_.plan();
     if (!plan.supported) {
@@ -6261,6 +7384,11 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
     const bool use_paged_decode =
         kvmem_enabled_ || has_external_kv_cache() ||
         paged_kv_prefill_for_local_cache_enabled();
+    if (!use_paged_decode && !scores_) {
+        // Materialize before backend.begin() and CUDA graph capture.
+        scores_ = backend_.tensor_f32(static_cast<uint64_t>(cfg.n_heads) * std::max<uint32_t>(kv_ctx_size_, 1), "attn_scores");
+        std::fprintf(stderr, "[attention-scores] allocation=materialized path=main\n");
+    }
     const bool kvmem_trace_this_token =
         compute_logits && kvmem_attn_trace_sample_now();
     const bool global_trace_this_token =
@@ -6277,13 +7405,12 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
         !kvmem_query_probe_guard_active()) {
         const uint32_t bt = std::max<uint32_t>(
             1, block_store_->config().block_tokens);
-        const int64_t block_start =
-            static_cast<int64_t>((position_ / bt) * bt);
-        if (kvmem_raw_decode_block_start_ >= 0 &&
+        const uint64_t block_start = (position_ / bt) * bt;
+        if (kvmem_raw_decode_block_start_ != UINT64_MAX &&
             kvmem_raw_decode_block_start_ != block_start) {
             kvmem_flush_raw_k_decode();
         }
-        if (kvmem_raw_decode_block_start_ < 0) {
+        if (kvmem_raw_decode_block_start_ == UINT64_MAX) {
             kvmem_raw_decode_block_start_ = block_start;
             kvmem_raw_decode_first_row_ = position_ % bt;
             kvmem_raw_decode_rows_ = 0;
@@ -6294,6 +7421,11 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
     // tokens are captured with their current token/position arguments and
     // update the existing executable graph before replay. Paged KV and timed
     // executor traces are not capture-safe yet.
+    prepare_dflash_features(1);
+    const uint32_t dflash_rope_base = dflash_layers_.empty() ? 0 :
+        kvmem_active_ && !kvmem_no_rerope_ && !input_mrope_positions_.empty()
+            ? window_mrope_next_
+            : adjusted_multimodal_rope_position(continuous_decode_rope_position());
     const bool try_capture =
         env_flag_enabled("QW3_GRAPH") &&
         !decode_graph_warmup_pending_ &&
@@ -6362,7 +7494,7 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
             // branches are byte-identical to the plain path below.
             const bool bs = kvmem_active_;
             if (bs) kvmem_extend_window_for_decode();
-            const uint32_t attn_pos = bs ? window_query_pos_ : position_;
+            const uint32_t attn_pos = bs ? window_query_pos_ : checked_local_position(position_);
             // RoPE position: under the no-re-RoPE experiment the window keeps true
             // positions, so the new token's Q/K rotate at the TRUE position_ while
             // the append-slot and (length-based) attention mask stay on attn_pos.
@@ -6370,7 +7502,7 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
                 bs && !kvmem_no_rerope_ && !input_mrope_positions_.empty()
                     ? window_mrope_next_
                     : adjusted_multimodal_rope_position(
-                          (bs && kvmem_no_rerope_) ? position_ : attn_pos);
+                          (bs && kvmem_no_rerope_) ? checked_local_position(position_) : attn_pos);
             if (kvmem_mtp_local_positions_ && cfg.n_ctx_train > 0 &&
                 rope_pos >= cfg.n_ctx_train) {
                 throw std::runtime_error(
@@ -6551,7 +7683,11 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
             require_status(backend_.add(*h_, *h_, *ffn_out_));
         }
         record(report, "layer." + std::to_string(il) + ".ffn");
+        capture_dflash_layer(il, *h_, 1, cfg.n_embd);
     }
+
+    if (!dflash_layers_.empty())
+        dflash_feature_view_ = {dflash_features_.get(), position_, dflash_rope_base, 1};
 
     if (kvmem_immutable_source_k_ &&
         !kvmem_query_probe_guard_active()) {
@@ -6779,7 +7915,8 @@ uint32_t QwenExecutor::effective_prefill_chunk_size(uint32_t total) const {
         const uint32_t psz = std::max<uint32_t>(1, kv_pages_.page_size);
         const uint32_t pages_per_block =
             std::max<uint32_t>(1, block_tokens / psz);
-        const uint32_t pool_pages = kvmem_gpu_page_pool_->total_pages();
+        const uint32_t pool_pages = kvmem_gpu_page_pool_->used_pages() +
+                                    kvmem_gpu_page_pool_->free_pages();
         const uint32_t budget_blocks =
             std::max<uint32_t>(1, block_store_->prefill_budget_blocks());
         const uint32_t cushion_blocks =
@@ -6819,8 +7956,12 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                                     uint32_t state_checkpoint_count,
                                                     bool copy_last_logits,
                                                     std::vector<std::vector<float>> *row_logits_host) {
+    dflash_feature_view_ = {};
     NativeExecutorReport report;
     if (tokens.empty()) { report.ok = true; return report; }
+    if (tokens.size() > UINT32_MAX || position_ > UINT64_MAX - tokens.size())
+        throw std::overflow_error("token batch or historical position overflow");
+    if (kvmem_blend_pending_) kvmem_blend_selected();
     const NativePlanInfo &plan = model_.plan();
     if (!plan.supported) {
         report.missing_kernels.push_back("native model plan is incomplete");
@@ -6847,7 +7988,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     // rows may escape.  Batched private-prompt prefill therefore must not append
     // raw K, mutate the persistent content index, register blocks, or trigger
     // pressure offload.  The ordinary batch path keeps all of those behaviors.
-    const bool ephemeral_query_probe = kvmem_query_probe_guard_active();
+    const bool ephemeral_query_probe = kvmem_query_probe_guard_active() || kvmem_blend_active_;
 
     // MTP verify/replay requires the whole batch to live in h_batch_ at the
     // tail (per-row argmax) and consistent checkpoint base positions, so it
@@ -6909,7 +8050,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     const uint32_t beta_stride = beta_batch_ ? row_stride(beta_batch_.get()) : 0;
     const uint32_t core_stride = core_batch_ ? row_stride(core_batch_.get()) : 0;
     const bool use_paged_prefill =
-        has_external_kv_cache() || paged_kv_prefill_for_local_cache_enabled();
+        kvmem_blend_active_ || has_external_kv_cache() || paged_kv_prefill_for_local_cache_enabled();
 
     require_status(backend_.begin());
     begin_record_timing(full_executor_trace_enabled());
@@ -6923,6 +8064,17 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         state_checkpoints ? std::min<uint32_t>(state_checkpoint_count, total) : 0;
     if (state_checkpoints) {
         state_checkpoints->ready = false;
+        state_checkpoints->repository_owner.reset();
+        // A CB request may have just used shared ragged checkpoints. This
+        // invocation writes private recurrent/conv slots and uses h_batch_;
+        // restore must not prefer stale shared tensors or their old row index.
+        state_checkpoints->h.reset();
+        state_checkpoints->h_shared.reset();
+        state_checkpoints->h_checkpoint_row = 0;
+        state_checkpoints->recurrent_states_shared.clear();
+        state_checkpoints->conv_states_shared.clear();
+        state_checkpoints->checkpoint_row = 0;
+        state_checkpoints->checkpoint_stride = 0;
         state_checkpoints->base_position = position_;
         state_checkpoints->count = save_state_checkpoints;
         state_checkpoints->h_stride = h_stride;
@@ -6958,7 +8110,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     for (uint32_t chunk_off = 0; chunk_off < total; chunk_off += chunk_size) {
         const uint32_t batch = std::min(chunk_size, total - chunk_off);
         last_chunk_batch = batch;
-        const uint32_t base_pos = position_ + chunk_off;
+        const uint64_t base_pos = position_ + chunk_off;
         const bool record_ops = (chunk_off == 0);
         const bool full_chunk = (batch == chunk_size);
 
@@ -6972,7 +8124,10 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
             !mtp_single_chunk && !kvmem_provisional_prefill_) {
             kvmem_maybe_prefill_offload(batch);
         }
-        ensure_kv_pages(base_pos, batch);
+        if (!kvmem_blend_active_) ensure_kv_pages(base_pos, batch);
+        // Admission can prune the old repository. Record this chunk only
+        // afterwards, so its not-yet-registered source tokens survive pruning.
+        kvmem_blend_capture_tokens(base_pos, tokens.data() + chunk_off, batch);
 
         // Block-sparse: extend the assembled window so the batch's `batch`
         // tokens can be appended at window slots [window_query_pos_,
@@ -6985,17 +8140,23 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         // is byte-identical to the plain paged path. Non-bs: attn_base_pos ==
         // base_pos and the plain page table is used.
         const bool chunk_bs = kvmem_active_;
-        if (chunk_bs) kvmem_extend_window_for_decode_n(batch, base_pos);
-        const uint32_t attn_base_pos = chunk_bs ? window_query_pos_ : base_pos;
+        if (chunk_bs && !kvmem_blend_active_) kvmem_extend_window_for_decode_n(batch, base_pos);
+        const uint32_t attn_base_pos = chunk_bs ? window_query_pos_ : checked_local_position(base_pos);
         // RoPE position for this chunk's Q/K (and the matching capture de-RoPE):
         // under the no-re-RoPE experiment use the TRUE base_pos so the window keeps
         // true positions; append-slot + (length-based) attention mask stay on
         // attn_base_pos. Default OFF -> rope_base_pos == attn_base_pos (unchanged).
         const uint32_t rope_base_pos =
-            (chunk_bs && kvmem_no_rerope_) ? base_pos : attn_base_pos;
+            adjusted_multimodal_rope_position(
+                (chunk_bs && kvmem_no_rerope_) ? checked_local_position(base_pos) : attn_base_pos);
+        // As in forward_one_token, a dense private text continuation after
+        // images starts at the next M-RoPE coordinate, not the KV token count.
+        // These differ before the first selection; using the KV count also
+        // falsely trips the position guard near a full resident cache.
         last_forward_logical_base_ = base_pos;
         last_forward_rope_base_ = rope_base_pos;
         last_forward_rows_ = batch;
+        prepare_dflash_features(batch);
         const DeviceTensor &attn_pages_dev =
             chunk_bs ? *window_pages_device_ : kv_page_indices_device();
         const uint32_t attn_pages_count =
@@ -7017,10 +8178,18 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
             // actual target position for private MTP prefix priming.
             last_forward_rope_base_ = input_mrope_positions_host_.front();
         }
+        if (kvmem_mtp_local_positions_ && !detail::kvmem_rope_batch_within_limit(
+                rope_base_pos, batch, cfg.n_ctx_train,
+                use_input_mrope ? &input_mrope_positions_host_ : nullptr)) {
+            throw std::runtime_error(
+                "KVMem target prefill/verify RoPE range exceeds the model "
+                "context limit in local-position MTP mode");
+        }
         if (record_ops) record(report, "token_embedding_lookup_batch");
 
         uint32_t layer_begin = 0;
         const bool reuse_provisional_prefix =
+            dflash_layers_.empty() &&
             kvmem_query_replay_active_ &&
             g_provisional_prefix_replay_ready_ &&
             env_flag_enabled(
@@ -7040,7 +8209,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
             std::fprintf(
                 stderr,
                 "[kvmem-provisional] replay-prefix skip chunk_off=%u "
-                "total=%u batch=%u saved_batch=%u base=%u saved_base=%u "
+                "total=%u batch=%u saved_batch=%u base=%" PRIu64 " saved_base=%" PRIu64 " "
                 "layer=%u layers=%u elems=%llu expected_elems=%llu "
                 "storage_bytes=%llu required_bytes=%llu\n",
                 chunk_off, total, batch,
@@ -7078,7 +8247,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                 std::fprintf(
                     stderr,
                     "[kvmem-provisional] replay-prefix reused_layers=%u "
-                    "batch=%u base=%u bytes=%llu\n",
+                    "batch=%u base=%" PRIu64 " bytes=%llu\n",
                     layer_begin, batch, base_pos,
                     static_cast<unsigned long long>(
                         g_provisional_prefix_replay_elems_ *
@@ -7088,6 +8257,27 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
 
         const bool try_capture = prefill_graph_enabled
             && full_chunk && !capture_warmup_pending && backend_.begin_capture();
+
+        // Q8 decode already stores the main residual in BF16 and rounds once
+        // after adding the FP32 projection. Tiny verifier batches must use the
+        // same writeback; materializing a BF16 projection first rounds twice.
+        // Leave ordinary prompt prefill and its established numerics unchanged.
+        const bool q8_verify_residual =
+            mtp_single_chunk && bf16_main_ && weights_.uses_q8() && batch <= 8;
+        auto project_residual = [&](DeviceTensor &scratch,
+                                    const DeviceWeight &weight,
+                                    const DeviceTensor &input, uint32_t input_stride) {
+            if (q8_verify_residual && input_stride == weight.cols) {
+                require_status(backend_.q8_0_matmul_add(
+                    *h_batch_, *h_batch_, scratch, weight, input,
+                    batch, input_stride, h_stride));
+            } else {
+                require_status(backend_.q8_0_matmul(
+                    scratch, weight, input, batch, input_stride, h_stride));
+                require_status(backend_.add_n(*h_batch_, *h_batch_, scratch,
+                    static_cast<uint64_t>(batch) * h_stride));
+            }
+        };
 
         for (uint32_t il = layer_begin; il < weights_.n_layers(); ++il) {
         if (kvmem_provisional_prefill_ &&
@@ -7116,7 +8306,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                         std::fprintf(
                             stderr,
                             "[kvmem-provisional] replay-prefix captured_layers=%u "
-                            "batch=%u base=%u bytes=%llu\n",
+                            "batch=%u base=%" PRIu64 " bytes=%llu\n",
                             il, batch, base_pos,
                             static_cast<unsigned long long>(
                                 elems * h_batch_->elem_size));
@@ -7250,7 +8440,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                                      dn_snap_off,
                                                      dn_decay_off,
                                                      dn_bt,
-                                                     base_pos,
+                                                     dn_snap ? checked_local_position(base_pos) : 0,
                                                      dn_nblocks));
             if (record_ops) record(report, "layer." + std::to_string(il) + ".deltanet_batch");
             // After recurrent_batch, conv_out_batch_ holds this layer's L2-normed
@@ -7262,17 +8452,9 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                              chunk_off, batch, base_pos,
                                              *conv_out_batch_, proj_stride);
             }
-            require_status(backend_.q8_0_matmul(*attn_out_batch_, *layer.ssm_out, *core_batch_,
-                                                 batch, core_stride, h_stride));
+            project_residual(*attn_out_batch_, *layer.ssm_out, *core_batch_, core_stride);
             if (record_ops) record(report, "layer." + std::to_string(il) + ".recurrent_output_batch");
         } else {
-            if (kvmem_mtp_local_positions_ && cfg.n_ctx_train > 0 &&
-                static_cast<uint64_t>(rope_base_pos) + batch >
-                    cfg.n_ctx_train) {
-                throw std::runtime_error(
-                    "KVMem target prefill/verify RoPE range exceeds the model "
-                    "context limit in local-position MTP mode");
-            }
             trace_rope_position_if_out_of_range(
                 "forward_n_tokens.qk", rope_base_pos, batch,
                 cfg.n_ctx_train, static_cast<int32_t>(il),
@@ -7448,9 +8630,9 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                 if (record_ops) record(report, "layer." + std::to_string(il) + ".kv_append_batch_paged");
             } else {
                 require_status(backend_.kv_append_batch(
-                    k_cache(il), *k_batch_, base_pos, per_pos, batch));
+                    k_cache(il), *k_batch_, checked_local_position(base_pos), per_pos, batch));
                 require_status(backend_.kv_append_batch(
-                    v_cache(il), *v_batch_, base_pos, per_pos, batch));
+                    v_cache(il), *v_batch_, checked_local_position(base_pos), per_pos, batch));
                 if (record_ops) record(report, "layer." + std::to_string(il) + ".kv_append_batch");
             }
 
@@ -7509,17 +8691,14 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                     *mid_batch_, *q_batch_, 2 * standard_head_dim,
                     attention_k_cache(il), v_cache(il),
                     standard_n_heads, standard_n_kv_heads,
-                    standard_head_dim, base_pos, batch,
+                    standard_head_dim, checked_local_position(base_pos), batch,
                     q_stride_buf, mid_stride, scale));
                 if (record_ops) record(report, "layer." + std::to_string(il) + ".attention_sdpa_batch");
             }
 
-            require_status(backend_.q8_0_matmul(*attn_out_batch_, *layer.attn_output, *mid_batch_,
-                                                 batch, mid_stride, h_stride));
+            project_residual(*attn_out_batch_, *layer.attn_output, *mid_batch_, mid_stride);
         }
 
-        require_status(backend_.add_n(*h_batch_, *h_batch_, *attn_out_batch_,
-                                      static_cast<uint64_t>(batch) * h_stride));
         if (record_ops) record(report, "layer." + std::to_string(il) + ".attn_residual_batch");
 
         DeviceStatus fused_ffn = backend_.nvfp4_ffn_prefill(
@@ -7562,17 +8741,19 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                     *ffn_mid_batch_, *ffn_gate_batch_, *ffn_up_batch_,
                     static_cast<uint64_t>(batch) * ffn_stride));
             }
-            require_status(backend_.q8_0_matmul(
-                *ffn_out_batch_, *layer.ffn_down, *ffn_mid_batch_,
-                batch, ffn_stride, h_stride));
-        } else if (record_ops) {
-            record(report, "layer." + std::to_string(il) +
-                               ".nvfp4_fused_ffn_batch");
+            project_residual(*ffn_out_batch_, *layer.ffn_down, *ffn_mid_batch_, ffn_stride);
+        } else {
+            if (record_ops) record(report, "layer." + std::to_string(il) +
+                                          ".nvfp4_fused_ffn_batch");
+            require_status(backend_.add_n(*h_batch_, *h_batch_, *ffn_out_batch_,
+                                          static_cast<uint64_t>(batch) * h_stride));
         }
-        require_status(backend_.add_n(*h_batch_, *h_batch_, *ffn_out_batch_,
-                                      static_cast<uint64_t>(batch) * h_stride));
         if (record_ops) record(report, "layer." + std::to_string(il) + ".ffn_batch");
+        capture_dflash_layer(il, *h_batch_, batch, h_stride);
         }
+
+        if (!dflash_layers_.empty())
+            dflash_feature_view_ = {dflash_features_.get(), base_pos, last_forward_rope_base_, batch};
 
         if (!ephemeral_query_probe && kvmem_immutable_source_k_ &&
             !kvmem_provisional_prefill_) {
@@ -7589,7 +8770,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
             // de-rotate (set_selection -> assemble, canonicalize-for-tier) —
             // cancels the real rotation. delta == 0 when not window-active or
             // under NO_REROPE, so this is a no-op below budget and byte-identical.
-            if (chunk_bs &&
+            if (chunk_bs && !block_store_->has_repository() &&
                 (kvmem_fix_bakedpos_ || kvmem_immutable_source_k_) &&
                 block_store_) {
                 const int64_t delta = static_cast<int64_t>(rope_base_pos) -
@@ -7608,7 +8789,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                         const int64_t desired_bake =
                             static_cast<int64_t>(b.orig_pos_start) + delta;
                         block_store_->set_block_baked_pos(
-                            bi, desired_bake);
+                            bi, desired_bake, block_store_->repository_handle(bi).generation);
                     }
                 }
             }
@@ -7635,7 +8816,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     // last chunk leaves its rows in h_batch_ rows [0, last_chunk_batch).
     require_status(backend_.copy_d2d(*h_, *h_batch_, (last_chunk_batch - 1) * h_stride, h_stride));
     if (state_checkpoints && save_state_checkpoints > 0) {
-        state_checkpoints->ready = true;
+        seal_state_checkpoints(*state_checkpoints);
     }
 
     // MTP verify/replay: caller only wants KV + recurrent state advanced (and
@@ -7656,9 +8837,19 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         require_status(backend_.rms_norm_batch(*norm_batch_, *h_batch_, weights_.output_norm(),
                                                 total, h_stride, eps));
         record(report, "output_norm_batch");
-        require_status(backend_.q8_0_matmul(*logits_batch_, weights_.output(),
-                                             *norm_batch_, total, h_stride,
-                                             static_cast<uint32_t>(vocab)));
+        if (weights_.uses_q8() && total <= 8) {
+            // Keep verifier logits on the same Q8_1 quantization/reduction as
+            // decode. General GEMM switches activation scale format at batch 8.
+            DeviceTensor *outs[] = {logits_batch_.get()};
+            const DeviceWeight *ws[] = {&weights_.output()};
+            const uint32_t strides[] = {static_cast<uint32_t>(vocab)};
+            require_status(backend_.q8_0_matmul_fanout(
+                outs, ws, strides, 1, *norm_batch_, total, h_stride));
+        } else {
+            require_status(backend_.q8_0_matmul(*logits_batch_, weights_.output(),
+                                                 *norm_batch_, total, h_stride,
+                                                 static_cast<uint32_t>(vocab)));
+        }
         record(report, "lm_head_batch");
 
         require_status(backend_.argmax_batch(*logits_batch_, total,
@@ -7740,7 +8931,7 @@ void QwenExecutor::restore_last_logits(const DeviceTensor &snapshot) {
 
 NativeExecutorReport QwenExecutor::forward_mtp_draft(uint32_t token_id) {
     ensure_mtp_scratch();
-    return forward_mtp_draft_from(token_id, *h_, position_, 0, 1);
+    return forward_mtp_draft_from(token_id, *h_, checked_local_position(position_), 0, 1);
 }
 
 std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain(uint32_t token_id,
@@ -7753,7 +8944,7 @@ std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain(uint32_t
         if (i >= kv_ctx_size_) break;
         const DeviceTensor &h_input = (i == 0) ? *h_ : *mtp_h_;
         NativeExecutorReport report = forward_mtp_draft_from(current, h_input,
-                                                             position_ + i, i, i + 1);
+                                                             checked_local_position(position_ + i), i, i + 1);
         const int next = report.argmax_token;
         reports.push_back(std::move(report));
         if (next < 0) break;
@@ -7795,12 +8986,12 @@ std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain_with_pre
     const uint32_t pre_window_pages = mtp_window_page_count_;
     uint32_t current = token_id;
     for (uint32_t i = 0; i < max_tokens; ++i) {
-        const uint32_t cache_pos = position_ + i;
-        if (cache_pos >= kv_ctx_size_) break;
+        const uint64_t cache_pos = position_ + i;
+        if ((!block_store_ || !block_store_->has_repository()) && cache_pos >= kv_ctx_size_) break;
         const DeviceTensor &h_input = (i == 0) ? *h_ : *mtp_h_;
         NativeExecutorReport report;
         if (window_mode) {
-            mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, cache_pos, 1);
+            ensure_mtp_kv_pages(cache_pos, 1);
             kvmem_extend_mtp_window_for_decode_n(i + 1, position_);
             const uint32_t win_pos = window_query_pos_ + i;
             const uint32_t rope_pos = input_mrope_positions_.empty()
@@ -7814,15 +9005,15 @@ std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain_with_pre
                                             /*window_frame=*/true);
         } else {
             report = forward_mtp_draft_from(current, h_input,
-                                            cache_pos, cache_pos,
-                                            cache_pos + 1);
+                                            checked_local_position(cache_pos), cache_pos,
+                                            checked_local_position(cache_pos + 1));
         }
         const bool ok = report.ok;
         const int next = report.argmax_token;
         reports.push_back(std::move(report));
         if (!ok || next < 0) break;
         if (!window_mode && i == 0) {
-            mtp_prefix_len_ = std::max<uint32_t>(mtp_prefix_len_, position_ + 1);
+            mtp_prefix_len_ = std::max<uint64_t>(mtp_prefix_len_, position_ + 1);
         }
         current = static_cast<uint32_t>(next);
     }
@@ -7866,15 +9057,15 @@ std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain_with_pre
     std::vector<NativeExecutorReport> reports;
     reports.reserve(max_tokens);
     for (uint32_t i = 0; i < max_tokens; ++i) {
-        const uint32_t cache_pos = position_ + i;
-        if (cache_pos >= kv_ctx_size_) break;
+        const uint64_t cache_pos = position_ + i;
+        if ((!block_store_ || !block_store_->has_repository()) && cache_pos >= kv_ctx_size_) break;
         const DeviceTensor &h_input = (i == 0) ? *h_ : *mtp_h_;
         const DeviceArgmaxBuffer *token_source = i == 0 ? nullptr : mtp_draft_argmaxes_.get();
-        uint32_t draft_rope_pos = cache_pos;
-        uint32_t draft_cache_pos = cache_pos;
+        uint32_t draft_rope_pos = window_mode ? 0 : checked_local_position(cache_pos);
+        uint32_t draft_cache_pos = window_mode ? 0 : checked_local_position(cache_pos);
         bool window_frame = false;
         if (window_mode) {
-            mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, cache_pos, 1);
+            ensure_mtp_kv_pages(cache_pos, 1);
             kvmem_extend_mtp_window_for_decode_n(i + 1, position_);
             draft_cache_pos = window_query_pos_ + i;
             draft_rope_pos = input_mrope_positions_.empty()
@@ -7896,7 +9087,7 @@ std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain_with_pre
         reports.push_back(std::move(report));
         if (!ok) break;
         if (!window_mode && i == 0) {
-            mtp_prefix_len_ = std::max<uint32_t>(mtp_prefix_len_, position_ + 1);
+            mtp_prefix_len_ = std::max<uint64_t>(mtp_prefix_len_, position_ + 1);
         }
     }
     if (window_mode && mtp_window_page_count_ != pre_window_pages) {
@@ -7924,7 +9115,7 @@ std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain_with_pre
 NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
                                                           const DeviceTensor &h_input,
                                                           uint32_t rope_pos,
-                                                          uint32_t cache_pos,
+                                                          uint64_t cache_pos,
                                                           uint32_t seq_len,
                                                           bool compute_logits,
                                                           DeviceArgmaxBuffer *argmax_out,
@@ -7950,7 +9141,10 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
         return report;
     }
     ensure_mtp_scratch();
-    if (seq_len == 0 || cache_pos >= kv_ctx_size_ || seq_len > kv_ctx_size_) {
+    const bool bounded_prefix = block_store_ && block_store_->has_repository() &&
+        !window_frame && kv_only;
+    if (seq_len == 0 || (!bounded_prefix &&
+        (cache_pos >= kv_ctx_size_ || seq_len > kv_ctx_size_))) {
         report.missing_kernels.push_back("native MTP KV cache is too small for requested draft chain");
         return report;
     }
@@ -7971,9 +9165,12 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
 
     require_status(backend_.begin());
     begin_record_timing(executor_trace_timing_enabled());
-    // Private MTP callers supply the target's scalar text position. Re-reading
-    // input positions here would advance the private tail during draft/prime.
-    const bool use_input_mrope = !kvmem_query_probe_guard_active() && !token_source &&
+    // Windowed drafts address local cache slots, not historical source rows.
+    // They and generated-text priming already receive the target's scalar RoPE
+    // position. Re-reading input metadata could match an unrelated old token,
+    // address deleted history, or advance the multimodal tail a second time.
+    const bool use_input_mrope = !window_frame && !kvmem_query_probe_guard_active() &&
+        !token_source && cache_pos < input_multimodal_prompt_tokens_.size() &&
         prepare_input_mrope_batch(&token_id, 1, cache_pos);
 
     if (token_source) {
@@ -8048,7 +9245,7 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
     // already-primed physical MTP pages, so no ensure_pages/validate is needed;
     // the page table is the lockstep MTP window built in kvmem_assemble.
     if (!window_frame) {
-        mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, cache_pos, 1);
+        ensure_mtp_kv_pages(cache_pos, 1);
         if (external_mtp_kv_cache_) {
             mtp_kv_pages_.validate_physical_capacity(
                 external_mtp_kv_cache_->physical_slots, "external MTP");
@@ -8058,27 +9255,34 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
     // slots), NOT a dense full-context buffer: a dense append by absolute
     // position would land out of the pool's range. Force the paged append so
     // prime writes (window_frame=false) route through mtp_kv_pages_ too.
-    const bool use_paged_prefix =
-        mtp_paged_prefix_enabled() || window_frame || kvmem_mtp_tiered_;
+    // An external cache is shared by concurrent requests. Logical positions
+    // must always resolve through this request's page table, even when the
+    // optional paged-prefix switch is off; dense writes would alias request 0.
+    const bool use_paged_prefix = external_mtp_kv_cache_ ||
+        mtp_paged_prefix_enabled() || window_frame || kvmem_mtp_tiered_ || bounded_prefix;
+    const uint32_t write_pos = bounded_prefix ?
+        kvmem_prepare_mtp_repository_write(cache_pos, 1) : checked_local_position(cache_pos);
     const DeviceTensor &mtp_pages_dev =
-        window_frame ? *mtp_window_pages_device_ : mtp_kv_pages_.device_indices();
+        bounded_prefix ? *mtp_repository_write_pages_device_ :
+        (window_frame ? *mtp_window_pages_device_ : mtp_kv_pages_.device_indices());
     const uint32_t mtp_pages_count =
-        window_frame ? mtp_window_page_count_ : mtp_kv_pages_.count();
+        bounded_prefix ? static_cast<uint32_t>(mtp_repository_write_pages_host_.size()) :
+        (window_frame ? mtp_window_page_count_ : mtp_kv_pages_.count());
     const uint32_t mtp_page_size = mtp_kv_pages_.page_size;
     DeviceTensor &mtp_k = mtp_k_cache();
     DeviceTensor &mtp_v = mtp_v_cache();
     if (use_paged_prefix) {
         require_status(backend_.kv_append_batch_paged_device(
-            mtp_k, *k_, cache_pos, per_pos,
+            mtp_k, *k_, write_pos, per_pos,
             1, mtp_pages_dev,
             mtp_pages_count, mtp_page_size));
         require_status(backend_.kv_append_batch_paged_device(
-            mtp_v, *v_, cache_pos, per_pos,
+            mtp_v, *v_, write_pos, per_pos,
             1, mtp_pages_dev,
             mtp_pages_count, mtp_page_size));
     } else {
-        require_status(backend_.kv_append(mtp_k, *k_, cache_pos, per_pos));
-        require_status(backend_.kv_append(mtp_v, *v_, cache_pos, per_pos));
+        require_status(backend_.kv_append(mtp_k, *k_, write_pos, per_pos));
+        require_status(backend_.kv_append(mtp_v, *v_, write_pos, per_pos));
     }
     record(report, "mtp.kv_append");
 
@@ -8107,6 +9311,10 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
             seq_len - 1, 1, 2 * standard_head_dim,
             standard_n_heads * standard_head_dim, scale));
     } else {
+        if (!scores_) {
+            scores_ = backend_.tensor_f32(static_cast<uint64_t>(cfg.n_heads) * std::max<uint32_t>(kv_ctx_size_, 1), "attn_scores");
+            std::fprintf(stderr, "[attention-scores] allocation=materialized path=mtp\n");
+        }
         require_status(backend_.attention_decode(*mid_, *scores_, *q_,
                                                  2 * standard_head_dim,
                                                  mtp_k, mtp_v,
@@ -8172,12 +9380,13 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
     return report;
 }
 
-void QwenExecutor::commit_mtp_prefix(uint32_t prefix_len) {
-    mtp_prefix_len_ = std::max<uint32_t>(mtp_prefix_len_,
-                                         std::min<uint32_t>(prefix_len, kv_ctx_size_));
+void QwenExecutor::commit_mtp_prefix(uint64_t prefix_len) {
+    const uint64_t committed = block_store_ && block_store_->has_repository()
+        ? prefix_len : std::min<uint64_t>(prefix_len, kv_ctx_size_);
+    mtp_prefix_len_ = std::max(mtp_prefix_len_, committed);
 }
 
-void QwenExecutor::commit_mtp_prefix_from_current_hidden(uint32_t prefix_len) {
+void QwenExecutor::commit_mtp_prefix_from_current_hidden(uint64_t prefix_len) {
     ensure_mtp_scratch();
     if (h_ && mtp_prefix_h_) {
         require_status(backend_.copy_d2d(*mtp_prefix_h_, *h_, 0, h_->count));
@@ -8192,6 +9401,8 @@ QwenExecutor::StateSnapshot QwenExecutor::snapshot_state() {
 }
 
 void QwenExecutor::capture_state(StateSnapshot &snapshot) {
+    // This copies compute state, not historical K/V. In particular an MTP
+    // checkpoint must keep the current query-local blend window installed.
     // A replay/prefix checkpoint may outlive persistence writes already
     // published by the decode path. Wait for those writes before recording the
     // checkpoint boundary. Partial decode tails are flushed explicitly by the
@@ -8200,9 +9411,31 @@ void QwenExecutor::capture_state(StateSnapshot &snapshot) {
     kvmem_sync_raw_k_persistence();
     capture_transient_state(snapshot);
     if (kvmem_gc_ && block_store_) snapshot.gc_lease = block_store_->gc_checkpoint_lease();
+    protect_state_checkpoint(snapshot);
+}
+
+void QwenExecutor::protect_state_checkpoint(StateSnapshot &snapshot) {
+    if (!snapshot.ready) throw std::invalid_argument("cannot protect an unready checkpoint");
+    if (block_store_ && block_store_->has_repository()) {
+        if (snapshot.kvmem_selection_generation != kvmem_selection_generation_ ||
+            !block_store_->repository_checkpoint_valid(snapshot.repository_checkpoint))
+            throw std::invalid_argument("cannot protect a stale or foreign checkpoint");
+        snapshot.ready = false;
+        block_store_->protect_repository_checkpoint(snapshot.repository_checkpoint);
+        snapshot.ready = true;
+    }
 }
 
 void QwenExecutor::capture_transient_state(StateSnapshot &snapshot) {
+    snapshot.ready = false;
+    snapshot.dflash.reset();
+    snapshot.repository_checkpoint.reset();
+    if (block_store_ && block_store_->has_repository())
+        // Transient MTP snapshots cannot cross a working-set transition.
+        // Existing GPU leases protect their pages; copying every block lease
+        // here would add a repository scan to each speculative decode cycle.
+        snapshot.repository_checkpoint = block_store_->repository_checkpoint(
+            std::min<uint64_t>(position_, block_store_->history_end()), false);
     ensure_scratch();
     snapshot.position = position_;
     snapshot.kv_logical_pages = kv_pages_.count();
@@ -8269,12 +9502,75 @@ void QwenExecutor::capture_transient_state(StateSnapshot &snapshot) {
                                              0, conv_states_[i]->count));
         }
     }
+    if (dflash_executor_ && dflash_executor_->next_position() == position_)
+        snapshot.dflash = std::make_shared<DFlashExecutor::StateSnapshot>(dflash_executor_->snapshot());
     snapshot.ready = true;
 }
 
+void QwenExecutor::restore_state_preserving_query(
+        const StateSnapshot &snapshot, uint64_t query_source_end) {
+    if (!snapshot.ready || !block_store_ || !block_store_->has_repository() ||
+        kvmem_query_probe_guard_active() ||
+        query_source_end > snapshot.position ||
+        query_source_end > snapshot.kvmem_registered_pos ||
+        kvmem_query_end_ > query_source_end) {
+        throw std::runtime_error("cannot preserve a query derived from discarded history");
+    }
+    kvmem_drain_query_capture();
+    const uint64_t query_begin = kvmem_query_begin_;
+    const uint64_t query_end = kvmem_query_end_;
+    const uint32_t query_count = g_query_multi_count_;
+    const bool query_ready = g_query_multi_ready_;
+    const bool selection_ready = kvmem_query_selection_ready();
+    // General truncation drains capture, but does not overwrite Q storage or
+    // its row layout. Preserve those bytes in place, including guided Q whose
+    // row count can differ from the public task span. Do not overwrite the
+    // separate clean-query stash used by warm continuation/query replay.
+    restore_state(snapshot);
+    kvmem_query_begin_ = query_begin;
+    kvmem_query_end_ = query_end;
+    g_query_multi_count_ = query_count;
+    g_query_multi_ready_ = query_ready;
+    // The content index does cover discarded reasoning and must be rebuilt
+    // against retained repository handles, including an unaligned tail block.
+    // Never resurrect its pre-truncation ready bits or a pending selection.
+    if (selection_ready &&
+        !kvmem_finalize_content_index_from_raw_k(snapshot.kvmem_registered_pos)) {
+        throw std::runtime_error("cannot rebuild retained index after thinking rollback");
+    }
+}
+
 void QwenExecutor::restore_state(const StateSnapshot &snapshot) {
+    dflash_feature_view_ = {};
     if (!snapshot.ready) {
         throw std::runtime_error("cannot restore an empty QwenExecutor snapshot");
+    }
+    if (block_store_ && block_store_->has_repository()) {
+        if (!block_store_->repository_checkpoint_valid(snapshot.repository_checkpoint) ||
+            snapshot.kvmem_selection_generation != kvmem_selection_generation_)
+            throw std::runtime_error("KVMem checkpoint belongs to a discarded history or working set");
+        if (block_store_->history_end() > snapshot.kvmem_registered_pos)
+            kvmem_truncate_to(snapshot.kvmem_registered_pos);
+        else if (kvmem_repository_append_ && !kvmem_query_probe_guard_active()) {
+            // A guided query / speculative verify has not changed committed
+            // history. Cancel its private tail without clearing the query Q
+            // that the caller just published or the retained content index.
+            kvmem_drain_mean_index_capture();
+            kvmem_finish_proactive_d2h(true);
+            kvmem_reap_pending_writes(true);
+            kvmem_flush_raw_k_writes(true);
+            kvmem_truncate_repository(snapshot.kvmem_registered_pos);
+        }
+        // Nested speculative rejection inside a private generation restores
+        // only the recurrent state and visible tail. Its reservation also owns
+        // earlier, accepted private tokens, so keep those pages and overwrite
+        // the rejected suffix on replay. The outer owner cancels the probe
+        // before restoring its boundary, which releases the entire append.
+        else if (kvmem_repository_append_ &&
+                 (snapshot.position < block_store_->history_end() ||
+                  snapshot.position > kvmem_repository_append_->end())) {
+            throw std::runtime_error("private checkpoint is outside its append");
+        }
     }
     ensure_scratch();
     if (kvmem_gc_ && block_store_) block_store_->gc_restore_lease(snapshot.gc_lease);
@@ -8307,13 +9603,16 @@ void QwenExecutor::restore_state(const StateSnapshot &snapshot) {
         }
     }
     position_ = snapshot.position;
+    restore_dflash_state(snapshot);
     kvmem_registered_pos_ = snapshot.kvmem_registered_pos;
     kvmem_selection_generation_ = snapshot.kvmem_selection_generation;
-    kv_pages_.truncate_to_logical_pages(snapshot.kv_logical_pages);
-    mtp_kv_pages_.truncate_to_logical_pages(snapshot.mtp_kv_logical_pages);
-    mtp_prefix_len_ = std::min<uint32_t>(mtp_prefix_len_,
+    if (!block_store_ || !block_store_->has_repository()) {
+        kv_pages_.truncate_to_logical_pages(snapshot.kv_logical_pages);
+        mtp_kv_pages_.truncate_to_logical_pages(snapshot.mtp_kv_logical_pages);
+    }
+    mtp_prefix_len_ = std::min<uint64_t>(mtp_prefix_len_,
                                          snapshot.mtp_prefix_len);
-    kvmem_mtp_payload_valid_through_ = std::min<uint32_t>(
+    kvmem_mtp_payload_valid_through_ = std::min<uint64_t>(
         kvmem_mtp_payload_valid_through_,
         snapshot.mtp_payload_valid_through);
     // Roll the kvmem window back to where it was at capture. Verify/decode only
@@ -8372,6 +9671,9 @@ void QwenExecutor::restore_recurrent_state(const StateSnapshot &snapshot) {
         throw std::runtime_error(
             "cannot restore recurrent state from an empty snapshot");
     }
+    if (block_store_ && block_store_->has_repository() &&
+        !block_store_->repository_checkpoint_valid(snapshot.repository_checkpoint))
+        throw std::runtime_error("KVMem recurrent checkpoint belongs to discarded history");
     ensure_scratch();
     if (snapshot.recurrent_states.size() != recurrent_states_.size() ||
         snapshot.conv_states.size() != conv_states_.size()) {
@@ -8405,6 +9707,49 @@ void QwenExecutor::restore_recurrent_state(const StateSnapshot &snapshot) {
     }
 }
 
+bool QwenExecutor::kvmem_rebase_identity_checkpoint(StateSnapshot &snapshot) {
+    // During dense preparation a pressure assembly may only extend the MTP
+    // mirror past P, but it still advances the selection epoch. In this narrow
+    // case P's recurrent/hidden state and the entire causal prefix are intact.
+    // Prove identity on both sides before projecting P onto the new page view;
+    // this must never turn a sparse/partially deleted prefix into a dense one.
+    if (!block_store_ || !block_store_->has_repository() || !snapshot.ready ||
+        !input_mrope_positions_.empty() ||
+        !snapshot.kvmem_active || snapshot.window_query_pos != snapshot.position ||
+        !kvmem_active_ || kvmem_pending_reselect_ || window_query_pos_ != position_ ||
+        position_ > block_store_->select_budget_tokens() ||
+        snapshot.position == 0 || snapshot.position > position_ ||
+        snapshot.position % block_store_->config().block_tokens != 0 ||
+        !block_store_->repository_checkpoint_valid(snapshot.repository_checkpoint)) return false;
+    if (snapshot.kvmem_selection_generation == kvmem_selection_generation_) return true;
+    const auto prefix = block_store_->history_span_blocks(0, snapshot.position, false);
+    uint64_t next = 0;
+    uint32_t page = 0;
+    for (auto id : prefix) {
+        const auto &b = block_store_->blocks()[id];
+        if (b.history_pos_start != next || !b.in_working_set ||
+            b.baked_pos != static_cast<int64_t>(next) ||
+            b.n_tokens > snapshot.position - next) return false;
+        const uint32_t first = b.orig_pos_start / kv_pages_.page_size;
+        const uint32_t last = (b.orig_pos_start + b.n_tokens - 1) / kv_pages_.page_size;
+        for (uint32_t p = first; p <= last; ++p, ++page) {
+            if (page >= snapshot.window_page_count || page >= window_pages_host_.size() ||
+                p >= kv_pages_.pages.size() || kv_pages_.pages[p] < 0 ||
+                window_pages_host_[page] != kv_pages_.pages[p]) return false;
+            if (snapshot.mtp_prefix_len >= snapshot.position &&
+                (page >= mtp_window_pages_host_.size() || p >= mtp_kv_pages_.pages.size() ||
+                 mtp_kv_pages_.pages[p] < 0 ||
+                 mtp_window_pages_host_[page] != mtp_kv_pages_.pages[p])) return false;
+        }
+        next += b.n_tokens;
+    }
+    if (next != snapshot.position || page != snapshot.window_page_count) return false;
+    // No state, coordinate, page or lease changes. The unselected decode tail
+    // beyond P is irrelevant: restore will truncate it with its own MTP state.
+    snapshot.kvmem_selection_generation = kvmem_selection_generation_;
+    return true;
+}
+
 void QwenExecutor::kvmem_rebase_checkpoint_to_selected_prefix(
         StateSnapshot &snapshot) {
     const uint32_t bt = block_store_
@@ -8413,6 +9758,8 @@ void QwenExecutor::kvmem_rebase_checkpoint_to_selected_prefix(
     if (!snapshot.ready || !kvmem_enabled_ || !block_store_ ||
         !kvmem_active_ || kvmem_pending_reselect_ ||
         snapshot.position == 0 || snapshot.position > position_ ||
+        (block_store_->has_repository() &&
+         !block_store_->repository_checkpoint_valid(snapshot.repository_checkpoint)) ||
         snapshot.position % bt != 0 || snapshot.position % page_size != 0 ||
         (mtp_kv_pages_.page_size &&
          snapshot.position % mtp_kv_pages_.page_size != 0)) {
@@ -8425,8 +9772,14 @@ void QwenExecutor::kvmem_rebase_checkpoint_to_selected_prefix(
     // Selection retains source order and repacks K/RoPE. Only its metadata is
     // projected here; model tensors still describe the original first pass at
     // snapshot.position. This is the same pre-query state used by full replay.
-    for (const KvMemBlock &block : block_store_->blocks()) {
-        if (block.orig_pos_start >= snapshot.position) {
+    const bool bounded = block_store_->has_repository();
+    std::vector<uint32_t> ordered;
+    if (bounded) ordered = block_store_->history_span_blocks(0, block_store_->history_end(), false);
+    else for (const auto &b : block_store_->blocks()) ordered.push_back(b.block_id);
+    for (const auto id : ordered) {
+        const auto &block = block_store_->blocks()[id];
+        const uint64_t begin = bounded ? block.history_pos_start : block.orig_pos_start;
+        if (begin >= snapshot.position) {
             if (!block.in_working_set) {
                 throw std::runtime_error("no-replay query suffix is not fully selected");
             }
@@ -8434,7 +9787,7 @@ void QwenExecutor::kvmem_rebase_checkpoint_to_selected_prefix(
         }
         if (!block.in_working_set) continue;
         if (block.baked_pos != static_cast<int64_t>(tokens) ||
-            block.orig_pos_start + block.n_tokens > snapshot.position ||
+            begin + block.n_tokens > snapshot.position ||
             prefix_blocks >= bs_window_block_ids_.size() ||
             bs_window_block_ids_[prefix_blocks] != block.block_id) {
             throw std::runtime_error("no-replay checkpoint prefix is not packed");
@@ -8466,9 +9819,9 @@ void QwenExecutor::kvmem_rebase_checkpoint_to_selected_prefix(
     snapshot.kvmem_selection_generation = kvmem_selection_generation_;
     snapshot.kvmem_active = true;
     snapshot.kvmem_registered_pos = snapshot.position;
-    snapshot.kv_logical_pages = snapshot.position / page_size;
+    snapshot.kv_logical_pages = bounded ? kv_pages_.count() : checked_local_position(snapshot.position / page_size);
     if (mtp_kv_pages_.page_size) {
-        snapshot.mtp_kv_logical_pages = snapshot.position / mtp_kv_pages_.page_size;
+        snapshot.mtp_kv_logical_pages = bounded ? mtp_kv_pages_.count() : checked_local_position(snapshot.position / mtp_kv_pages_.page_size);
     }
     snapshot.window_query_pos = tokens;
     snapshot.window_page_count = pages;
@@ -8476,6 +9829,10 @@ void QwenExecutor::kvmem_rebase_checkpoint_to_selected_prefix(
     snapshot.window_mrope_append_active = false;
     snapshot.window_mrope_append_source_next = 0;
     snapshot.window_mrope_append_delta = {0, 0, 0};
+    if (bounded) {
+        snapshot.repository_checkpoint.reset();
+        snapshot.repository_checkpoint = block_store_->repository_checkpoint(snapshot.position);
+    }
 }
 
 void QwenExecutor::kvmem_begin_query_replay(
@@ -8484,6 +9841,7 @@ void QwenExecutor::kvmem_begin_query_replay(
         bool reset_recurrent_state,
         bool preserve_selected_context,
         bool preserve_query_capture) {
+    kvmem_blend_restore();
     const bool trace =
         kvmem_perf_trace_flag() || std::getenv("QW3_KVMEM_TRACE");
     const uint64_t replay_prepare_start =
@@ -8496,6 +9854,13 @@ void QwenExecutor::kvmem_begin_query_replay(
         throw std::runtime_error(
             "KVMem query replay requires an enabled block store");
     }
+    const bool bounded = block_store_->has_repository();
+    if (bounded && !block_store_->repository_checkpoint_valid(boundary.repository_checkpoint))
+        throw std::runtime_error("KVMem query replay checkpoint belongs to discarded history");
+    const auto history_begin = [&](uint32_t id) -> uint64_t {
+        const auto &b = block_store_->blocks().at(id);
+        return bounded ? b.history_pos_start : b.orig_pos_start;
+    };
     if (kvmem_pending_reselect_) {
         throw std::runtime_error(
             "KVMem query replay cannot start during a pending reselect");
@@ -8512,7 +9877,7 @@ void QwenExecutor::kvmem_begin_query_replay(
     const bool has_persistent_suffix = position_ > boundary.position;
     for (uint32_t id : context_block_ids) {
         if (id >= block_store_->block_count() ||
-            block_store_->blocks()[id].orig_pos_start >= boundary.position) {
+            history_begin(id) >= boundary.position) {
             throw std::runtime_error(
                 "KVMem query replay context selection crosses replay boundary");
         }
@@ -8527,7 +9892,9 @@ void QwenExecutor::kvmem_begin_query_replay(
                 "KVMem query replay cannot preserve an inactive window");
         }
         std::vector<uint32_t> requested = context_block_ids;
-        std::sort(requested.begin(), requested.end());
+        std::sort(requested.begin(), requested.end(), [&](uint32_t a, uint32_t b) {
+            return history_begin(a) < history_begin(b);
+        });
         if (std::adjacent_find(requested.begin(), requested.end()) !=
             requested.end()) {
             throw std::runtime_error(
@@ -8537,9 +9904,13 @@ void QwenExecutor::kvmem_begin_query_replay(
         const uint32_t page_size = std::max<uint32_t>(
             1, kv_pages_.page_size);
         uint32_t expected_baked_pos = 0;
-        for (const KvMemBlock &block : block_store_->blocks()) {
+        std::vector<uint32_t> ordered;
+        if (bounded) ordered = block_store_->history_span_blocks(0, block_store_->history_end(), false);
+        else for (const auto &b : block_store_->blocks()) ordered.push_back(b.block_id);
+        for (const auto id : ordered) {
+            const auto &block = block_store_->blocks()[id];
             if (!block.in_working_set) continue;
-            if (block.orig_pos_start >= boundary.position) {
+            if (history_begin(block.block_id) >= boundary.position) {
                 ++dropped_suffix_blocks;
                 continue;
             }
@@ -8576,8 +9947,7 @@ void QwenExecutor::kvmem_begin_query_replay(
              i < bs_window_block_ids_.size(); ++i) {
             const uint32_t id = bs_window_block_ids_[i];
             if (id >= block_store_->block_count() ||
-                block_store_->blocks()[id].orig_pos_start <
-                    boundary.position) {
+                history_begin(id) < boundary.position) {
                 throw std::runtime_error(
                     "KVMem query replay suffix is not a window tail");
             }
@@ -8608,6 +9978,7 @@ void QwenExecutor::kvmem_begin_query_replay(
         trace ? kvmem_steady_ns() : 0;
 
     if (preserve_selected_context) {
+        if (bounded) kvmem_drain_scores();
         // Semantic assembly orders selected blocks chronologically, hence every
         // replay-suffix page is a window tail. Shortening the valid host/count
         // prefix is sufficient; the device page table already contains the
@@ -8685,17 +10056,17 @@ void QwenExecutor::kvmem_begin_query_replay(
         }
     }
     position_ = boundary.position;
+    restore_dflash_state(boundary);
     kvmem_registered_pos_ = boundary.position;
-    mtp_prefix_len_ = std::min<uint32_t>(mtp_prefix_len_,
+    mtp_prefix_len_ = std::min<uint64_t>(mtp_prefix_len_,
                                          boundary.mtp_prefix_len);
 
     // The replay boundary is block/page aligned, so the complete suffix can be
     // discarded without sharing a physical page with preserved context.
-    const uint32_t logical_pages = boundary.position / page_size;
-    kv_pages_.truncate_to_logical_pages(logical_pages);
-    if (mtp_kv_pages_.page_size > 0) {
+    if (!bounded) kv_pages_.truncate_to_logical_pages(checked_local_position(boundary.position / page_size));
+    if (!bounded && mtp_kv_pages_.page_size > 0) {
         const uint32_t mtp_pages =
-            boundary.position / mtp_kv_pages_.page_size;
+            checked_local_position(boundary.position / mtp_kv_pages_.page_size);
         mtp_kv_pages_.truncate_to_logical_pages(mtp_pages);
     }
 
@@ -8703,9 +10074,12 @@ void QwenExecutor::kvmem_begin_query_replay(
     // removed suffix. Prefix mean-K slices remain position-invariant and valid;
     // the replayed suffix is invalidated logically and overwritten as its final
     // K rows are produced below.
-    if (has_persistent_suffix) {
+    if (bounded && (has_persistent_suffix || kvmem_repository_append_)) {
+        kvmem_drain_mean_index_capture();
+        kvmem_truncate_repository(boundary.position);
+    } else if (has_persistent_suffix) {
         std::vector<KvMemDroppedBlock> dropped =
-            block_store_->truncate_to(boundary.position);
+            block_store_->truncate_to(checked_local_position(boundary.position));
         kvmem_writeback_next_block_ = std::min<uint32_t>(
             kvmem_writeback_next_block_, block_store_->block_count());
         for (const KvMemDroppedBlock &d : dropped) {
@@ -8727,7 +10101,7 @@ void QwenExecutor::kvmem_begin_query_replay(
                 kvmem_raw_mtp_k_valid_tokens_.begin() + boundary.position,
                 kvmem_raw_mtp_k_valid_tokens_.end(), static_cast<uint8_t>(0));
         }
-        kvmem_truncate_raw_k(boundary.position);
+        kvmem_truncate_raw_k(checked_local_position(boundary.position));
         if (mtp_baked_pos_.size() > block_store_->block_count()) {
             mtp_baked_pos_.resize(block_store_->block_count());
         }
@@ -8743,9 +10117,10 @@ void QwenExecutor::kvmem_begin_query_replay(
     // Fixed4 try to append the mid-block query segment to their block-atomic
     // packed index and fail whenever query_begin is not block aligned.
     kvmem_qc_prompt_tokens_ = boundary.position;
-    kvmem_qc_total_blocks_ = boundary.position / bt;
+    kvmem_qc_total_blocks_ = bounded ? block_store_->block_count() : checked_local_position(boundary.position / bt);
     kvmem_qc_captured_tokens_ = boundary.position;
-    kvmem_qc_captured_blocks_ = boundary.position / bt;
+    kvmem_qc_captured_blocks_ = kvmem_qc_total_blocks_;
+    if (bounded) kvmem_repository_score_history_end_ = boundary.position;
 
     // Ordinarily replay captures a fresh representation of the original query.
     // Guided retrieval already published its generated compact-query Q before
@@ -8759,12 +10134,18 @@ void QwenExecutor::kvmem_begin_query_replay(
     g_query_ready_ = false;
     kvmem_dn_qcount_ = 0;
     kvmem_dn_ready_ = false;
+    // The window prefix has fewer blocks than the selection scored above.
+    // Both the representative-K tensor's head stride and the generation list
+    // must describe this new prefix; resizing only the block IDs lets the next
+    // decode/drain use scores with the old shape (or an already-retired suffix).
+    if (bounded && preserve_selected_context) kvmem_recompute_kbar();
     kvmem_query_replay_active_ = true;
+    kvmem_blend_pending_ = kvmem_blend_ratio_ > 0;
 
     if (trace) {
         const uint64_t replay_prepare_end = kvmem_steady_ns();
         std::fprintf(stderr,
-                     "[bs-query-replay] begin boundary=%u context_blocks=%zu "
+                     "[bs-query-replay] begin boundary=%" PRIu64 " context_blocks=%zu "
                      "window_tokens=%u reset_recurrent=%d mode=%s "
                      "dropped_suffix_blocks=%u drain_ms=%.3f "
                      "rollback_ms=%.3f total_ms=%.3f\n",
@@ -8782,6 +10163,7 @@ void QwenExecutor::kvmem_begin_query_replay(
 }
 
 void QwenExecutor::kvmem_end_query_replay() {
+    kvmem_blend_pending_ = false;
     if (!kvmem_query_replay_active_) return;
     kvmem_register_until(position_);
     // Final-query replay deliberately indexes only the sealed history before
@@ -8797,7 +10179,7 @@ void QwenExecutor::kvmem_end_query_replay() {
     kvmem_query_replay_active_ = false;
     if (std::getenv("QW3_KVMEM_TRACE")) {
         std::fprintf(stderr,
-                     "[bs-query-replay] end position=%u window_tokens=%u "
+                     "[bs-query-replay] end position=%" PRIu64 " window_tokens=%u "
                      "query_rows=%u ready=%d\n",
                      position_, window_query_pos_, g_query_multi_count_,
                      g_query_multi_ready_ ? 1 : 0);
@@ -8855,14 +10237,23 @@ void QwenExecutor::kvmem_start_query_prefetch(
 
     std::vector<uint32_t> guaranteed;
     const auto &blocks = block_store_->blocks();
-    const uint32_t block_count = static_cast<uint32_t>(blocks.size());
+    // Slot numbers no longer identify the oldest/newest history. Retain the
+    // chronological live cohort until start_prefetch takes its own IO leases;
+    // otherwise a GC retirement between enumeration and transfer can hand us
+    // a deleted generation (or a reused slot with unrelated content).
+    const auto cohort = block_store_->repository_read_leases();
+    const uint32_t block_count = block_store_->has_repository()
+        ? static_cast<uint32_t>(cohort.size()) : static_cast<uint32_t>(blocks.size());
+    const auto slot_at = [&](uint32_t ordinal) {
+        return block_store_->has_repository() ? cohort[ordinal].handle().slot : ordinal;
+    };
     const uint32_t sink = std::min(cfg.sink_blocks, block_count);
     const uint32_t recent = std::min(cfg.recent_blocks, block_count);
     guaranteed.reserve(static_cast<size_t>(sink) + recent);
-    for (uint32_t id = 0; id < sink; ++id) guaranteed.push_back(id);
+    for (uint32_t id = 0; id < sink; ++id) guaranteed.push_back(slot_at(id));
     const uint32_t recent_begin = block_count - recent;
     for (uint32_t id = recent_begin; id < block_count; ++id) {
-        if (id >= sink) guaranteed.push_back(id);
+        if (id >= sink) guaranteed.push_back(slot_at(id));
     }
 
     KvMemPlan advisory;
@@ -9175,7 +10566,7 @@ void QwenExecutor::kvmem_reset_recurrent_state() {
     if (std::getenv("QW3_KVMEM_TRACE")) {
         std::fprintf(stderr,
                      "[bs-query-replay] reset recurrent/conv state at "
-                     "position=%u\n",
+                     "position=%" PRIu64 "\n",
                      position_);
     }
 }
@@ -9288,7 +10679,59 @@ uint32_t QwenExecutor::kvmem_set_runtime_select_budget(uint32_t tokens) {
 }
 
 void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
-    if (cfg.gc.max_live_blocks &&
+    kvmem_blend_restore();
+    if (const char *ratio = std::getenv("QW3_KVMEM_BLEND_RATIO")) {
+        char *end = nullptr;
+        kvmem_blend_ratio_ = std::strtod(ratio, &end);
+        if (end == ratio || *end || !std::isfinite(kvmem_blend_ratio_) ||
+            kvmem_blend_ratio_ < 0 || kvmem_blend_ratio_ > 1)
+            throw std::invalid_argument("QW3_KVMEM_BLEND_RATIO must be in [0,1]");
+    } else kvmem_blend_ratio_ = 0;
+    kvmem_blend_max_tokens_ = UINT32_MAX;
+    if (const char *limit = std::getenv("QW3_KVMEM_BLEND_MAX_TOKENS")) {
+        char *end = nullptr;
+        const unsigned long value = std::strtoul(limit, &end, 10);
+        if (end == limit || *end || *limit == '-' || value == 0 || value > UINT32_MAX)
+            throw std::invalid_argument("QW3_KVMEM_BLEND_MAX_TOKENS must be a positive uint32");
+        kvmem_blend_max_tokens_ = static_cast<uint32_t>(value);
+    }
+    if (cfg.repository_blocks) {
+        // The repository directory is private; physical page IDs may address
+        // a larger shared arena. SharedKvPagePool reserves this executor's
+        // working-set quota, while physical_page_capacity validates arena IDs.
+        // Frontend admission is still gated separately until its lifecycle and
+        // host/NVMe quotas are integrated.
+        if (external_kv_cache_ && external_kv_cache_ != &kvmem_kv_cache_view_) {
+            if (!env_flag_enabled("QW3_EXPERIMENTAL_BOUNDED_CONTINUOUS", false) ||
+                !external_kv_page_allocator_ || !kv_pages_.page_size ||
+                uint64_t(external_kv_page_allocator_->physical_page_capacity()) * kv_pages_.page_size >
+                    external_kv_cache_->physical_slots)
+                throw std::invalid_argument("bounded KVMem shared arena requires an enabled, capacity-matched page allocator");
+            if (cfg.mtp_enabled && (!external_mtp_kv_cache_ || !external_mtp_page_allocator_ ||
+                uint64_t(external_mtp_page_allocator_->physical_page_capacity()) * mtp_kv_pages_.page_size >
+                    external_mtp_kv_cache_->physical_slots))
+                throw std::invalid_argument("bounded KVMem shared MTP arena requires its capacity-matched page allocator");
+        }
+        if (!cfg.block_tokens || uint64_t(cfg.repository_blocks) * cfg.block_tokens != kv_ctx_size_ ||
+            !cfg.immutable_source_k || kvmem_archive_ ||
+            cfg.index_placement != KvMemIndexPlacement::CPU ||
+            (cfg.retrieval_method != KvMemRetrievalMethod::MeanK &&
+             cfg.retrieval_method != KvMemRetrievalMethod::SubBlockMeanK) ||
+            !cfg.n_subblocks ||
+            (cfg.prototype_mode == KvMemPrototypeMode::Contiguous
+                ? cfg.block_tokens % cfg.n_subblocks != 0
+                : (cfg.block_tokens % 32 != 0 || cfg.n_subblocks != (cfg.block_tokens / 32) * 4)) ||
+            (cfg.n_subblocks > 1 && cfg.subblock_reduce != KvMemSubblockReduce::Max) ||
+            uint64_t(cfg.repository_blocks) * cfg.n_subblocks > INT32_MAX ||
+            (cfg.adaptive_score_mode != KvMemAdaptiveScoreMode::Auto &&
+             cfg.adaptive_score_mode != KvMemAdaptiveScoreMode::TiledOnePass) ||
+            env_flag_enabled("QW3_KVMEM_MEAN_LEGACY_OUTER", false) ||
+            cfg.semantic_expansion != KvMemSemanticExpansion::None || !cfg.optimize_stage_out)
+            throw std::invalid_argument(
+                "KVMem bounded integration requires physical ctx=repository_blocks*block_tokens, "
+                "online immutable KV, CPU Mean-K prototypes with max reduction and inclusive stage-out");
+    }
+    if (!cfg.repository_blocks && cfg.gc.max_live_blocks &&
         (!cfg.raw_k_nvme || !cfg.immutable_source_k || cfg.mtp_enabled ||
          cfg.index_placement != KvMemIndexPlacement::CPU ||
          cfg.retrieval_method != KvMemRetrievalMethod::MeanK || cfg.n_subblocks != 1 ||
@@ -9304,11 +10747,23 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             "KVMem GC v1 requires online immutable raw-K NVMe, CPU index placement, "
             "plain Mean-K/top-k, inclusive stage-out, and MTP/group/archive disabled");
     }
+    if (kvmem_repository_gc_) kvmem_repository_gc_->stop();
+    kvmem_repository_gc_.reset();
+    kvmem_discard_repository_prefetch();
     if (kvmem_gc_) kvmem_gc_->stop();
     kvmem_gc_.reset();
     kvmem_gc_mandatory_lease_.reset();
+    kvmem_repository_mandatory_leases_.clear();
     kvmem_gc_score_event_.reset(); kvmem_gc_score_sequence_ = 0;
     kvmem_drain_mean_index_capture();
+    kvmem_repository_score_frame_ = {};
+    kvmem_repository_index_.clear();
+    kvmem_repository_storage_generation_.clear();
+    kvmem_repository_score_history_end_ = 0;
+    kvmem_repository_append_.reset();
+    mtp_repository_write_pages_host_.clear();
+    mtp_repository_write_pages_device_.reset();
+    mtp_repository_write_pages_capacity_ = 0;
     kvmem_finish_proactive_d2h(/*wait_all=*/true);
     kvmem_reap_pending_writes(/*wait_all=*/true);
     kvmem_flush_raw_k_writes(/*wait_all=*/true);
@@ -9325,6 +10780,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     kvmem_inclusive_cpu_backing_ = false;
     kvmem_mtp_incremental_assembly_ = false;
     kvmem_writeback_slab_count_ = 0;
+    kvmem_writeback_slabs_allocated_ = 0;
     kvmem_read_slab_count_ = 0;
     kvmem_writeback_next_block_ = 0;
     kvmem_writeback_d2h_bytes_ = 0;
@@ -9484,11 +10940,14 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         count_standard_attention_layers(model_cfg, weights_.n_layers());
     if (kvmem_immutable_source_k_) {
         effective.immutable_max_baked_position = model_cfg.n_ctx_train;
-        // The end-to-end accuracy control found a deterministic FP16 answer
-        // regression at 32 resident moves. Use the conservative limit of 8 for
-        // both FP16 and FP8. Cold blocks still rebuild unconditionally, and an
-        // environment override remains available for controlled experiments.
+        // FP16 retains its bounded in-place remap policy. FP8 must rebuild at
+        // every changed position: even fewer than eight quantized delta-RoPE
+        // writes changed fixed-seed answers across identical warm requests.
+        // Stable resident positions still skip work; cold blocks always rebuild.
+        // Explicit environment overrides remain available for experiments.
         effective.immutable_refresh_remaps = 8u;
+        if (kvmem_kv_dtype && std::strcmp(kvmem_kv_dtype, "fp8") == 0)
+            effective.immutable_refresh_abs_delta_tokens = 1;
         if (const char *env =
                 std::getenv("QW3_KVMEM_IMMUTABLE_REFRESH_REMAPS")) {
             const long long v = std::atoll(env);
@@ -9536,7 +10995,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     // (src_bytes < expected) trips.
     const bool mtp_will_tier =
         effective.mtp_enabled && weights_.mtp() != nullptr &&
-        external_mtp_kv_cache_ == nullptr &&
+        (!external_mtp_kv_cache_ || external_mtp_page_allocator_) &&
         kvmem_mtp_tier_enabled();
     kvmem_mtp_local_positions_ =
         kvmem_immutable_source_k_ && mtp_will_tier &&
@@ -9583,6 +11042,13 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     const uint64_t gpu_resident_block_bytes =
         standard_kv_block_bytes + mtp_kv_block_bytes;
     effective.gpu_resident_block_bytes = gpu_resident_block_bytes;
+    const uint64_t probe_reserve_tokens = env_uint64_or(
+        "QW3_KVMEM_PROBE_RESERVE_TOKENS", 8192);
+    if (probe_reserve_tokens > UINT32_MAX)
+        throw std::invalid_argument("KVMem private-query reserve exceeds uint32 token capacity");
+    const uint64_t probe_reserve_bytes =
+        ((probe_reserve_tokens + effective.block_tokens - 1) / effective.block_tokens) *
+        gpu_resident_block_bytes;
 
     uint64_t raw_k_mirror_max_bytes = 0;
     uint64_t raw_k_row_bytes = 0;
@@ -9700,7 +11166,19 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         }
     }
     const uint64_t total_device_bytes = backend_.total_device_bytes();
-    if (effective.gpu_memory_ratio > 0.0 &&
+    const bool bounded_shared_arena = effective.repository_blocks && external_kv_page_allocator_;
+    if (bounded_shared_arena) {
+        // The serving arena is already allocated. Charging its pages against
+        // cudaMemGetInfo again at each admission can reject later slots even
+        // though their guaranteed working-set pages are free in that arena.
+        const uint64_t blocks =
+            (uint64_t(std::max(effective.select_budget, effective.prefill_budget)) + effective.block_tokens - 1) / effective.block_tokens +
+            (uint64_t(effective.gen_budget) + effective.block_tokens - 1) / effective.block_tokens;
+        if (blocks > UINT32_MAX)
+            throw std::invalid_argument("bounded shared working set exceeds block capacity");
+        effective.estimated_gpu_block_capacity = static_cast<uint32_t>(blocks);
+    }
+    if (!bounded_shared_arena && effective.gpu_memory_ratio > 0.0 &&
         total_device_bytes > 0 &&
         gpu_resident_block_bytes > 0) {
         // The ratio bounds TOTAL process GPU usage (model weights + GPU-resident
@@ -9742,7 +11220,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             const long long v = std::atoll(env);
             if (v >= 0) scratch_reserve = static_cast<uint64_t>(v) << 20;
         }
-        const uint64_t reserved = used_now + scratch_reserve;
+        const uint64_t reserved = used_now + scratch_reserve + probe_reserve_bytes;
         const uint64_t cap_bytes =
             (ceiling > reserved + gpu_resident_block_bytes)
                 ? (ceiling - reserved)
@@ -9843,7 +11321,13 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         }
     }
 
-    block_store_ = std::make_unique<KvMemStore>(effective);
+    if (effective.repository_blocks) {
+        block_store_ = std::make_unique<KvMemStore>(effective,
+            std::make_shared<KvMemRepository>(KvMemRepository::Config{
+                effective.repository_blocks, effective.block_tokens}));
+    } else {
+        block_store_ = std::make_unique<KvMemStore>(effective);
+    }
     // Index placement is part of the allocation topology. Reconfiguration may
     // switch between a resident full-device index and a pageable CPU authority
     // with two bounded pinned/device staging slots, so discard the old topology
@@ -9913,7 +11397,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     g_kbar_stream_distribution_capacity_ = 0;
     g_kbar_stream_group_dist_.reset();
     g_kbar_stream_group_dist_capacity_ = 0;
-    kvmem_active_ = false;
+    kvmem_active_ = cfg.repository_blocks != 0;
     window_pages_host_.clear();
     window_page_count_ = 0;
     window_mrope_positions_host_.clear();
@@ -9943,6 +11427,11 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         external_kv_cache_ = nullptr;
         kv_pages_.set_allocator(nullptr);
     }
+    if (external_kv_page_allocator_) {
+        kv_pages_.reset();
+        kv_pages_.set_allocator(external_kv_page_allocator_);
+    }
+    if (kv_pages_.bounded_slots) kv_pages_.configure(kv_ctx_size_, nullptr);
     kvmem_gpu_page_pool_.reset();
     kvmem_k_cache_storage_.clear();
     kvmem_v_cache_storage_.clear();
@@ -9994,7 +11483,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     kvmem_raw_transfer_dev_.reset();
     kvmem_raw_transfer_host_.reset();
     kvmem_raw_transfer_blocks_ = 0;
-    kvmem_raw_decode_block_start_ = -1;
+    kvmem_raw_decode_block_start_ = UINT64_MAX;
     kvmem_raw_decode_first_row_ = 0;
     kvmem_raw_decode_rows_ = 0;
     kvmem_raw_mtp_k_chunks_.clear();
@@ -10026,7 +11515,8 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     // are reset so ensure_mtp_scratch reallocates fresh (dense or bounded) on the
     // next forward; configure_kvmem always precedes any forward.
     mtp_kv_pages_.reset();
-    mtp_kv_pages_.set_allocator(nullptr);
+    mtp_kv_pages_.set_allocator(external_mtp_page_allocator_);
+    if (mtp_kv_pages_.bounded_slots) mtp_kv_pages_.configure(kv_ctx_size_, nullptr);
     kvmem_mtp_gpu_page_pool_.reset();
     kvmem_mtp_tiered_ = false;
     mtp_scratch_ready_ = false;
@@ -10036,7 +11526,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     const bool can_spill =
         effective.estimated_block_bytes > 0 &&
         (effective.cpu_tier_bytes > 0 || effective.nvme_tier_bytes > 0);
-    if (!external_kv_cache_ && can_spill &&
+    if ((!external_kv_cache_ || external_kv_page_allocator_) && can_spill &&
         effective.estimated_gpu_block_capacity > 0) {
         const uint64_t ctx_blocks =
             (static_cast<uint64_t>(kv_ctx_size_) + effective.block_tokens - 1) /
@@ -10049,22 +11539,44 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
                 1, effective.block_tokens / std::max<uint32_t>(1, page_size));
             const uint32_t pool_pages = std::max<uint32_t>(
                 1, gpu_blocks * pages_per_block);
-            kvmem_gpu_page_pool_ = std::make_unique<LocalKvPagePool>(
-                pool_pages, page_size, "main");
+            // Private query prompt/reasoning/MTP KV is rolled back before
+            // semantic selection. Keep its scratch separate from the unchanged
+            // resident budget; pressure eviction during a probe would invalidate
+            // its snapshot and change the evidence used to generate the query.
+            const uint32_t reserve_pages = static_cast<uint32_t>(
+                (probe_reserve_tokens + page_size - 1) / page_size);
+            if (external_kv_page_allocator_)
+                kvmem_gpu_page_pool_ = std::make_unique<SharedKvPagePool>(
+                    *external_kv_page_allocator_, pool_pages, reserve_pages, "main");
+            else
+                kvmem_gpu_page_pool_ = std::make_unique<LocalKvPagePool>(
+                    pool_pages, page_size, "main", reserve_pages);
             kv_pages_.set_allocator(kvmem_gpu_page_pool_.get());
-            allocate_kvmem_gpu_cache(
-                static_cast<uint64_t>(pool_pages) * page_size);
+            if (!external_kv_cache_)
+                allocate_kvmem_gpu_cache(
+                    static_cast<uint64_t>(kvmem_gpu_page_pool_->total_pages()) * page_size);
             // Give the MTP layer its own bounded sibling pool so its KV rides
             // the same GPU->CPU->NVMe tiering as the 16 std layers instead of a
             // dense full-context cache. Single-request internal-MTP path only.
             if (mtp_will_tier) {
-                kvmem_mtp_gpu_page_pool_ = std::make_unique<LocalKvPagePool>(
-                    pool_pages, page_size, "mtp");
+                if (external_mtp_page_allocator_)
+                    kvmem_mtp_gpu_page_pool_ = std::make_unique<SharedKvPagePool>(
+                        *external_mtp_page_allocator_, pool_pages, reserve_pages, "mtp");
+                else
+                    kvmem_mtp_gpu_page_pool_ = std::make_unique<LocalKvPagePool>(
+                        pool_pages, page_size, "mtp", reserve_pages);
                 mtp_kv_pages_.set_allocator(kvmem_mtp_gpu_page_pool_.get());
                 kvmem_mtp_tiered_ = true;
-                allocate_kvmem_mtp_gpu_cache(
-                    static_cast<uint64_t>(pool_pages) * page_size);
+                if (!external_mtp_kv_cache_)
+                    allocate_kvmem_mtp_gpu_cache(
+                        static_cast<uint64_t>(kvmem_mtp_gpu_page_pool_->total_pages()) * page_size);
             }
+            std::fprintf(stderr,
+                "[kvmem-probe-reserve] resident_tokens=%llu reserve_tokens=%llu "
+                "private_only=1 mtp_tiered=%d\n",
+                static_cast<unsigned long long>(uint64_t(pool_pages) * page_size),
+                static_cast<unsigned long long>(uint64_t(reserve_pages) * page_size),
+                kvmem_mtp_tiered_ ? 1 : 0);
             if (kvmem_tier_trace_enabled()) {
                 std::fprintf(stderr,
                              "[kvmem-tier] bounded_gpu_pool blocks=%u pages=%u page_size=%u slots=%llu mtp_tiered=%d\n",
@@ -10617,44 +12129,45 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         kvmem_writeback_slab_count_ =
             kvmem_writeback_slab_count();
         for (size_t i = 0;
-             i < kvmem_writeback_slab_count_; ++i) {
+             !host_io_pool_ && i < kvmem_writeback_slab_count_; ++i) {
             std::unique_ptr<HostBuffer> slab =
-                backend_.host_buffer(
+                allocate_kvmem_io_buffer(
                     slab_bytes, "kvmem_prefill_writeback_slab");
             kvmem_free_writeback_slabs_.push_back(
                 std::shared_ptr<HostBuffer>(std::move(slab)));
+            ++kvmem_writeback_slabs_allocated_;
         }
         std::fprintf(
             stderr,
             "[kvmem-io] prefill_writeback_slab_pool slabs=%zu "
-            "slab_mib=%zu pinned_mib=%zu warmup_ms=%.3f\n",
+            "slab_mib=%zu pinned_mib=%zu warmup_ms=%.3f lazy=%d\n",
             kvmem_writeback_slab_count_,
             static_cast<size_t>(
                 slab_bytes / (1024ull * 1024ull)),
             static_cast<size_t>(
-                kvmem_writeback_slab_count_ * slab_bytes /
+                kvmem_writeback_slabs_allocated_ * slab_bytes /
                 (1024ull * 1024ull)),
-            (kvmem_steady_ns() - warm0) / 1.0e6);
+            (kvmem_steady_ns() - warm0) / 1.0e6, host_io_pool_ != nullptr);
     }
     if (packed_d2h) {
         const uint64_t warm0 = kvmem_steady_ns();
         const size_t slab_bytes = kvmem_io_slab_bytes();
         constexpr size_t kStageOutSlabs = 2;
-        for (size_t i = 0; i < kStageOutSlabs; ++i) {
+        for (size_t i = 0; !host_io_pool_ && i < kStageOutSlabs; ++i) {
             kvmem_free_stageout_slabs_.push_back(
-                backend_.host_buffer(
+                allocate_kvmem_io_buffer(
                     slab_bytes, "kvmem_stageout_packed_slab"));
         }
         std::fprintf(
             stderr,
             "[kvmem-io] packed_stageout_slab_pool slabs=%zu slab_mib=%zu "
-            "pinned_mib=%zu warmup_ms=%.3f\n",
+            "pinned_mib=%zu warmup_ms=%.3f lazy=%d\n",
             kStageOutSlabs,
             static_cast<size_t>(slab_bytes / (1024ull * 1024ull)),
             static_cast<size_t>(
-                kStageOutSlabs * slab_bytes /
+                kvmem_free_stageout_slabs_.size() * slab_bytes /
                 (1024ull * 1024ull)),
-            (kvmem_steady_ns() - warm0) / 1.0e6);
+            (kvmem_steady_ns() - warm0) / 1.0e6, host_io_pool_ != nullptr);
     }
     if (pipelined_h2d) {
         const uint64_t warm0 = kvmem_steady_ns();
@@ -10664,22 +12177,22 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         // pinned memory after the other has consumed the common pool.
         kvmem_read_slab_count_ =
             has_ssd && kvmem_cpu_tier_ ? 4 : 2;
-        for (size_t i = 0; i < kvmem_read_slab_count_; ++i) {
+        for (size_t i = 0; !host_io_pool_ && i < kvmem_read_slab_count_; ++i) {
             kvmem_free_read_slabs_.push_back(
-                backend_.host_buffer(
+                allocate_kvmem_io_buffer(
                     slab_bytes, "kvmem_stagein_read_slab"));
         }
         std::fprintf(
             stderr,
             "[kvmem-io] read_slab_pool slabs=%zu slab_mib=%zu "
-            "pinned_mib=%zu warmup_ms=%.3f\n",
+            "pinned_mib=%zu warmup_ms=%.3f lazy=%d\n",
             kvmem_read_slab_count_,
             static_cast<size_t>(
                 slab_bytes / (1024ull * 1024ull)),
             static_cast<size_t>(
-                kvmem_read_slab_count_ * slab_bytes /
+                kvmem_free_read_slabs_.size() * slab_bytes /
                 (1024ull * 1024ull)),
-            (kvmem_steady_ns() - warm0) / 1.0e6);
+            (kvmem_steady_ns() - warm0) / 1.0e6, host_io_pool_ != nullptr);
     }
     // Capacity guarantee for the bounded GPU pool. When the pool engaged
     // (gpu_blocks < ctx_blocks, so a >budget prompt must spill), every history
@@ -10767,7 +12280,15 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     g_indexed_blocks_ = 0;
     g_orig_base_host_.clear();
     g_blk_tokens_host_.clear();
-    if (effective.gc.max_live_blocks) {
+    if (effective.repository_blocks) {
+        kv_pages_.configure_bounded(kv_ctx_size_, kvmem_gpu_page_pool_.get());
+        if (effective.mtp_enabled) {
+            if (!kvmem_mtp_gpu_page_pool_)
+                throw std::invalid_argument("KVMem bounded MTP requires its tiered page pool");
+            mtp_kv_pages_.configure_bounded(kv_ctx_size_, kvmem_mtp_gpu_page_pool_.get());
+        }
+        kvmem_start_repository_gc();
+    } else if (effective.gc.max_live_blocks) {
         const uint32_t capacity = static_cast<uint32_t>(
             (static_cast<uint64_t>(kv_ctx_size_) + effective.block_tokens - 1) / effective.block_tokens);
         const uint64_t protected_budget =
@@ -10799,13 +12320,44 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     }
 }
 
-void QwenExecutor::kvmem_register_append(uint32_t n_new_tokens) {
+void QwenExecutor::kvmem_start_repository_gc() {
+    if (!block_store_ || !block_store_->has_repository()) return;
+    const auto &cfg = block_store_->config();
+    const auto &repo = block_store_->repository();
+    const uint32_t capacity = repo->capacity();
+    KvMemRepositoryGc::Config gc;
+    gc.policy = cfg.gc;
+    gc.mode = cfg.repository_gc_mode;
+    const uint32_t append_blocks = static_cast<uint32_t>(
+        (uint64_t(effective_prefill_chunk_size(kv_ctx_size_)) + cfg.block_tokens - 1) /
+        cfg.block_tokens + 1); // a chunk may begin inside a partial block
+    const uint64_t default_low = std::max<uint64_t>(capacity / 20, uint64_t(append_blocks) * 2);
+    const uint64_t default_high = std::max<uint64_t>(capacity / 10, default_low + append_blocks);
+    if (default_high > UINT32_MAX) throw std::invalid_argument("KVMem ready reserve overflows block capacity");
+    gc.ready_low = cfg.repository_ready_low ? cfg.repository_ready_low : static_cast<uint32_t>(default_low);
+    gc.ready_high = cfg.repository_ready_high ? cfg.repository_ready_high :
+        std::max(gc.ready_low, static_cast<uint32_t>(default_high));
+    gc.recent_tokens = uint64_t(cfg.recent_blocks) * cfg.block_tokens;
+    gc.candidate_ingest_tokens = uint64_t(gc.ready_high) * cfg.block_tokens;
+    const uint64_t protected_blocks =
+        (uint64_t(std::max(cfg.select_budget, cfg.prefill_budget)) + cfg.gen_budget +
+         cfg.block_tokens - 1) / cfg.block_tokens;
+    if (protected_blocks + gc.ready_high >= capacity)
+        throw std::invalid_argument("KVMem repository must exceed working+generation budgets and ready reserve");
+    kvmem_repository_storage_generation_.assign(capacity, 0);
+    kvmem_repository_index_.assign(capacity, {});
+    kvmem_repository_gc_ = std::make_shared<KvMemRepositoryGc>(gc, repo,
+        kvmem_repository_storage_release(capacity, kvmem_raw_k_nvme_tier_.get(), kvmem_nvme_tier_.get()));
+    block_store_->attach_repository_gc(kvmem_repository_gc_);
+}
+
+void QwenExecutor::kvmem_register_append(uint64_t n_new_tokens) {
     if (!kvmem_enabled_ || !block_store_) return;
     if (n_new_tokens == 0) return;
     if (position_ <= kvmem_registered_pos_) return;
-    const uint32_t append_begin = kvmem_registered_pos_;
-    const uint32_t target = std::min<uint32_t>(
-        position_, kvmem_registered_pos_ + n_new_tokens);
+    const uint64_t append_begin = kvmem_registered_pos_;
+    const uint64_t target = kvmem_registered_pos_ + std::min<uint64_t>(
+        position_ - kvmem_registered_pos_, n_new_tokens);
     kvmem_register_until(target);
 
     // Decode/MTP callers register only after the accepted model rows have
@@ -10813,7 +12365,8 @@ void QwenExecutor::kvmem_register_append(uint32_t n_new_tokens) {
     // therefore need their actual window construction frame recorded here;
     // register_append's default orig_pos_start is only correct in the dense
     // identity frame.
-    if (kvmem_active_ && (kvmem_fix_bakedpos_ || kvmem_immutable_source_k_)) {
+    if (kvmem_active_ && !block_store_->has_repository() &&
+        (kvmem_fix_bakedpos_ || kvmem_immutable_source_k_)) {
         const int64_t delta = static_cast<int64_t>(window_query_pos_) -
                               static_cast<int64_t>(position_);
         if (delta != 0) {
@@ -10823,17 +12376,43 @@ void QwenExecutor::kvmem_register_append(uint32_t n_new_tokens) {
                 const KvMemBlock &b = blocks[bi];
                 if (b.orig_pos_start < append_begin) break;
                 block_store_->set_block_baked_pos(
-                    bi, static_cast<int64_t>(b.orig_pos_start) + delta);
+                    bi, static_cast<int64_t>(b.orig_pos_start) + delta, block_store_->repository_handle(bi).generation);
             }
         }
     }
 }
 
-void QwenExecutor::kvmem_register_until(uint32_t target_pos) {
+void QwenExecutor::kvmem_register_until(uint64_t target_pos) {
     if (!kvmem_enabled_ || !block_store_) return;
     if (target_pos <= kvmem_registered_pos_) return;
-    const uint32_t first = kvmem_registered_pos_;
-    block_store_->register_append(target_pos - kvmem_registered_pos_);
+    if (block_store_->has_repository()) {
+        if (!kvmem_repository_append_ || target_pos < block_store_->history_end() ||
+            target_pos > kvmem_repository_append_->end())
+            throw std::logic_error("KVMem commit exceeds prepared forward history");
+        const uint32_t accepted = static_cast<uint32_t>(target_pos - block_store_->history_end());
+        // This ordinary foreground stage-out must precede cancellation of the
+        // rejected reservations. The CPU worker must never free GPU pages or
+        // return a slot whose old page aliases are still installed.
+        if (target_pos < kvmem_repository_append_->end()) {
+            const auto main_discarded = kvmem_repository_append_->discarded_page_ranges(
+                accepted, kv_pages_.page_size);
+            const auto mtp_discarded = kvmem_repository_append_->discarded_page_ranges(
+                accepted, mtp_kv_pages_.page_size);
+            kv_pages_.release_logical_page_ranges(backend_, main_discarded);
+            mtp_kv_pages_.release_logical_page_ranges(backend_, mtp_discarded);
+        }
+        kvmem_repository_append_->commit(accepted);
+        for (const auto &span : kvmem_repository_append_->spans()) {
+            if (span.history_begin >= target_pos) continue;
+            kvmem_sync_repository_index_flag(span.handle);
+            kvmem_sync_repository_backing_flags(span.handle);
+        }
+        kvmem_repository_append_.reset();
+        kvmem_registered_pos_ = target_pos;
+        return;
+    }
+    const uint32_t first = checked_local_position(kvmem_registered_pos_);
+    block_store_->register_append(checked_local_position(target_pos - kvmem_registered_pos_));
     kvmem_registered_pos_ = target_pos;
     if (kvmem_gc_ && kvmem_raw_k_chunk_tokens_) {
         const uint32_t bt = block_store_->config().block_tokens;
@@ -10981,12 +12560,12 @@ void QwenExecutor::kvmem_build_index_from_raw_k(uint32_t blocks) {
 }
 
 bool QwenExecutor::kvmem_finalize_content_index_from_raw_k(
-        uint32_t tokens) {
+        uint64_t tokens) {
     const auto unavailable = [&](const char *reason) {
         if (std::getenv("QW3_KVMEM_TRACE")) {
             std::fprintf(stderr,
-                "[bs-tail-index] unavailable reason=%s target=%u "
-                "captured=%u active=%d mean=%d pertok=%d deltanet=%d "
+                "[bs-tail-index] unavailable reason=%s target=%" PRIu64 " "
+                "captured=%" PRIu64 " active=%d mean=%d pertok=%d deltanet=%d "
                 "subblocks=%u adaptive=%d stride=%u raw_valid=%zu "
                 "layers=%zu expected_layers=%u\n",
                 reason, tokens, kvmem_qc_captured_tokens_,
@@ -11012,23 +12591,28 @@ bool QwenExecutor::kvmem_finalize_content_index_from_raw_k(
     // This runs once at the agent-step boundary, not for speculative snapshots.
     kvmem_flush_raw_k_decode();
     kvmem_sync_raw_k_persistence();
+    if (block_store_ && block_store_->has_repository())
+        return kvmem_finalize_repository_index(tokens);
     if (tokens <= kvmem_qc_captured_tokens_) {
         return kvmem_content_index_covers(tokens);
     }
     if (!kvmem_enabled_ || !block_store_ || !kvmem_qc_capture_active_ ||
         !kvmem_mean_index_available() || kvmem_qc_pertoken_ ||
-        kvmem_qc_deltanet_ || kvmem_qc_n_subblocks_ != 1 ||
-        kvmem_adaptive_prototypes() ||
+        kvmem_qc_deltanet_ || kvmem_qc_n_subblocks_ == 0 ||
+        block_store_->config().prototype_mode != KvMemPrototypeMode::Contiguous ||
         kvmem_qc_layer_stride_blocks_ == 0) {
         return unavailable("unsupported-state");
     }
     const uint32_t bt = std::max<uint32_t>(
         1, block_store_->config().block_tokens);
-    const uint32_t target_blocks = (tokens + bt - 1) / bt;
+    const uint32_t target_blocks = checked_local_position(tokens / bt + (tokens % bt != 0));
     if (target_blocks > kvmem_qc_layer_stride_blocks_) {
         return unavailable("stride-capacity");
     }
 
+    // Contiguous sub-block means use the same exact partial-mean merge as
+    // prefill. Direction-based prototypes have different merge semantics and
+    // remain excluded above. Keep raw-row coverage and layer checks intact.
     // Accepted MTP rows reach the same immutable raw-K authority as ordinary
     // decode, but not the per-token plain-decode index hook.  Publish pending
     // D2H before reading that authority, then merge only the uncaptured suffix.
@@ -11037,7 +12621,7 @@ bool QwenExecutor::kvmem_finalize_content_index_from_raw_k(
     // raw K that a guided reselection is allowed to have evicted.  The ordinary
     // incremental capture path has exact partial-mean merge semantics, so start
     // at the exact captured-token cursor instead.
-    const uint32_t start = kvmem_qc_captured_tokens_;
+    const uint32_t start = checked_local_position(kvmem_qc_captured_tokens_);
     if (start >= tokens || tokens > kvmem_raw_k_valid_tokens_.size()) {
         return unavailable("raw-range");
     }
@@ -11046,7 +12630,7 @@ bool QwenExecutor::kvmem_finalize_content_index_from_raw_k(
             if (std::getenv("QW3_KVMEM_TRACE")) {
                 std::fprintf(stderr,
                     "[bs-tail-index] first_missing_raw_token=%u "
-                    "range=[%u,%u)\n",
+                    "range=[%u,%" PRIu64 ")\n",
                     pos, start, tokens);
             }
             return unavailable("raw-token-missing");
@@ -11060,7 +12644,7 @@ bool QwenExecutor::kvmem_finalize_content_index_from_raw_k(
     }
     const uint64_t row_elems =
         static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
-    const uint32_t rows = tokens - start;
+    const uint32_t rows = checked_local_position(tokens - start);
     const uint64_t raw_elems = static_cast<uint64_t>(rows) * row_elems;
     const uint64_t raw_bytes = static_cast<uint64_t>(rows) *
                                kvmem_raw_k_row_bytes_;
@@ -11079,8 +12663,8 @@ bool QwenExecutor::kvmem_finalize_content_index_from_raw_k(
     }
 
     const uint32_t saved_total_blocks = kvmem_qc_total_blocks_;
-    const uint32_t saved_prompt_tokens = kvmem_qc_prompt_tokens_;
-    const uint32_t saved_captured_tokens = kvmem_qc_captured_tokens_;
+    const uint64_t saved_prompt_tokens = kvmem_qc_prompt_tokens_;
+    const uint64_t saved_captured_tokens = kvmem_qc_captured_tokens_;
     const uint32_t saved_captured_blocks = kvmem_qc_captured_blocks_;
     const bool saved_multi_ready = g_kbar_multi_ready_;
     const bool saved_content_ready = g_content_ready_;
@@ -11129,7 +12713,7 @@ bool QwenExecutor::kvmem_finalize_content_index_from_raw_k(
         }
         if (std::getenv("QW3_KVMEM_TRACE")) {
             std::fprintf(stderr,
-                "[bs-tail-index] raw-k finalize range=[%u,%u) "
+                "[bs-tail-index] raw-k finalize range=[%u,%" PRIu64 ") "
                 "blocks=%u generation=%llu\n",
                 start, tokens, target_blocks,
                 static_cast<unsigned long long>(
@@ -11205,9 +12789,9 @@ uint64_t QwenExecutor::kvmem_attach_archive(uint64_t tokens) {
     if (kvmem_nvme_tier_) kvmem_nvme_tier_->mark_present_range(0, blocks);
     for (uint32_t b = 0; b < blocks; ++b) {
         block_store_->set_block_tier(b, KvTier::SSD, -1,
-                                     static_cast<int32_t>(b));
+                                     static_cast<int32_t>(b), block_store_->repository_handle(b).generation);
         block_store_->set_block_ssd_backing(b, static_cast<int32_t>(b),
-                                            /*clean=*/true);
+                                            /*clean=*/true, block_store_->repository_handle(b).generation);
     }
 
     // Raw K is the authority for K, and it stays on SSD until a block is
@@ -11279,7 +12863,9 @@ uint64_t QwenExecutor::kvmem_attach_archive(uint64_t tokens) {
     }
 
     if (restore_pos > 0) kvmem_archive_restore_ladder(restore_pos);
-    position_ = static_cast<uint32_t>(restore_pos);
+    position_ = restore_pos;
+    dflash_feature_view_ = {};
+    if (dflash_executor_ && restore_pos == 0) dflash_executor_->reset(position_);
     kvmem_archive_attached_tokens_ = restore_pos;
     std::fprintf(stderr,
                  "[kvmem-archive] attach dir=%s requested_tokens=%llu "
@@ -11293,7 +12879,91 @@ uint64_t QwenExecutor::kvmem_attach_archive(uint64_t tokens) {
     return restore_pos;
 }
 
-void QwenExecutor::kvmem_truncate_to(uint32_t token_pos) {
+void QwenExecutor::kvmem_truncate_repository(uint64_t token_pos) {
+    if (token_pos > block_store_->history_end())
+        throw std::invalid_argument("KVMem rewind exceeds committed repository history");
+    kvmem_repository_score_frame_ = {};
+    auto clear_discarded = [&](const std::vector<KvMemStorageSpan> &spans) {
+        for (const auto &span : spans) {
+            const uint64_t end = uint64_t(span.storage_begin) + span.token_count;
+            for (auto *valid : {&kvmem_raw_k_valid_tokens_, &kvmem_raw_mtp_k_valid_tokens_}) {
+                if (valid->empty()) continue;
+                if (end > valid->size()) throw std::logic_error("KVMem rewind validity range exceeds arena");
+                std::fill(valid->begin() + span.storage_begin, valid->begin() + end, uint8_t{0});
+            }
+            if (!input_compact_mrope_valid_.empty()) {
+                if (end > input_compact_mrope_valid_.size())
+                    throw std::logic_error("multimodal rewind exceeds coordinate arena");
+                std::fill(input_compact_mrope_valid_.begin() + span.storage_begin,
+                          input_compact_mrope_valid_.begin() + end, uint8_t{0});
+            }
+            auto &stamp = kvmem_repository_index_.at(span.handle.slot);
+            const uint64_t block_begin = uint64_t(span.handle.slot) * block_store_->config().block_tokens;
+            // Cancelling a speculative suffix does not alter the certified
+            // partial prefix. A real rewind into that prefix does invalidate it.
+            if (stamp.handle != span.handle || block_begin + stamp.tokens > span.storage_begin) {
+                stamp = {};
+                if (block_store_->repository_handle(span.handle.slot) == span.handle &&
+                    block_store_->is_live(span.handle.slot))
+                    block_store_->set_repository_gc_flags(span.handle, KvMemRepositoryGc::Indexed, 0);
+            }
+            if (span.handle.slot < kvmem_raw_k_gpu_block_to_slot_.size()) {
+                const auto cached = kvmem_raw_k_gpu_block_to_slot_[span.handle.slot];
+                if (cached >= 0) kvmem_raw_k_gpu_slot_to_block_.at(cached) = -1;
+                kvmem_raw_k_gpu_block_to_slot_[span.handle.slot] = -1;
+            }
+        }
+    };
+    auto release_pages = [&](const std::vector<KvMemStorageSpan> &spans) {
+        for (auto *table : {&kv_pages_, &mtp_kv_pages_}) {
+            std::vector<std::pair<uint32_t, uint32_t>> ranges;
+            const auto P = table->page_size;
+            for (const auto &span : spans) {
+                const uint32_t first = (uint64_t(span.storage_begin) + P - 1) / P;
+                const uint32_t last = (uint64_t(span.storage_begin) + span.token_count + P - 1) / P;
+                if (last > first) ranges.emplace_back(first, last - first);
+            }
+            table->release_logical_page_ranges(backend_, ranges);
+        }
+    };
+    // All asynchronous capture/transfers were drained by the caller. Cancel
+    // unpublished speculation before changing the committed directory, keeping
+    // the page containing the still-valid partial prefix.
+    if (kvmem_repository_append_) {
+        const auto &spans = kvmem_repository_append_->spans();
+        release_pages(spans);
+        clear_discarded(spans);
+        kvmem_repository_append_.reset();
+    }
+    kvmem_raw_decode_block_start_ = UINT64_MAX;
+    kvmem_raw_decode_first_row_ = kvmem_raw_decode_rows_ = 0;
+    auto rewind = block_store_->prepare_repository_rewind(token_pos);
+    release_pages(rewind->discarded_spans());
+    clear_discarded(rewind->discarded_spans());
+    rewind->commit();
+    for (const auto &span : rewind->discarded_spans()) {
+        if (span.history_begin % block_store_->config().block_tokens == 0 && kvmem_cpu_tier_) {
+            const auto slot = kvmem_cpu_tier_->block_slot(span.handle.slot);
+            kvmem_cpu_tier_->forget_block(span.handle.slot);
+            kvmem_release_cpu_slot(slot);
+        }
+    }
+    // Rewind owns no NVMe release: retired bundles remain pinned through this
+    // function and are returned only by the CPU worker's generation check.
+}
+
+void QwenExecutor::kvmem_truncate_to(uint64_t token_pos) {
+    kvmem_blend_restore();
+    if (block_store_ && kvmem_blend_ratio_ > 0) {
+        for (auto it = kvmem_blend_tokens_.begin(); it != kvmem_blend_tokens_.end();) {
+            if (it->first >= token_pos) it = kvmem_blend_tokens_.erase(it);
+            else {
+                if (token_pos - it->first < it->second.size())
+                    it->second.resize(static_cast<size_t>(token_pos - it->first));
+                ++it;
+            }
+        }
+    }
     if (!kvmem_enabled_ || !block_store_) return;
     kvmem_drain_mean_index_capture();
     kvmem_finish_proactive_d2h(/*wait_all=*/true);
@@ -11302,27 +12972,32 @@ void QwenExecutor::kvmem_truncate_to(uint32_t token_pos) {
     // Rewind the block table to `token_pos` tokens. restore_state() has already
     // rewound position/KV-pages/recurrent/window; this reconciles the block
     // store + tier slots + selection indices, which restore_state does not touch.
-    std::vector<KvMemDroppedBlock> dropped = block_store_->truncate_to(token_pos);
-    kvmem_writeback_next_block_ = std::min<uint32_t>(
-        kvmem_writeback_next_block_, block_store_->block_count());
-    if (token_pos < kvmem_raw_k_valid_tokens_.size()) {
-        std::fill(kvmem_raw_k_valid_tokens_.begin() + token_pos,
-                  kvmem_raw_k_valid_tokens_.end(),
-                  static_cast<uint8_t>(0));
+    std::vector<KvMemDroppedBlock> dropped;
+    if (block_store_->has_repository()) {
+        kvmem_truncate_repository(token_pos);
+    } else {
+        dropped = block_store_->truncate_to(checked_local_position(token_pos));
+        kvmem_writeback_next_block_ = std::min<uint32_t>(
+            kvmem_writeback_next_block_, block_store_->block_count());
+        if (token_pos < kvmem_raw_k_valid_tokens_.size()) {
+            std::fill(kvmem_raw_k_valid_tokens_.begin() + token_pos,
+                      kvmem_raw_k_valid_tokens_.end(),
+                      static_cast<uint8_t>(0));
+        }
+        if (token_pos < kvmem_raw_mtp_k_valid_tokens_.size()) {
+            std::fill(kvmem_raw_mtp_k_valid_tokens_.begin() + token_pos,
+                      kvmem_raw_mtp_k_valid_tokens_.end(),
+                      static_cast<uint8_t>(0));
+        }
+        kvmem_truncate_raw_k(checked_local_position(token_pos));
     }
-    if (token_pos < kvmem_raw_mtp_k_valid_tokens_.size()) {
-        std::fill(kvmem_raw_mtp_k_valid_tokens_.begin() + token_pos,
-                  kvmem_raw_mtp_k_valid_tokens_.end(),
-                  static_cast<uint8_t>(0));
-    }
-    kvmem_truncate_raw_k(token_pos);
     // A truncated block id may later be reused for different token content.
     // Keep the allocation reusable but invalidate every logical cache entry.
     std::fill(kvmem_raw_k_gpu_block_to_slot_.begin(),
               kvmem_raw_k_gpu_block_to_slot_.end(), -1);
     std::fill(kvmem_raw_k_gpu_slot_to_block_.begin(),
               kvmem_raw_k_gpu_slot_to_block_.end(), -1);
-    kvmem_raw_decode_block_start_ = -1;
+    kvmem_raw_decode_block_start_ = UINT64_MAX;
     kvmem_raw_decode_first_row_ = 0;
     kvmem_raw_decode_rows_ = 0;
     // Release CPU/NVMe tier slots for dropped blocks. GPU pages are NOT released
@@ -11427,7 +13102,7 @@ void QwenExecutor::kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens,
         std::fprintf(
             stderr,
             "[kvmem-%s-capacity-recovery] mode=keep-selected-to-pressure "
-            "position=%u free_pages=%u required_pages=%u chunk_tokens=%u\n",
+            "position=%" PRIu64 " free_pages=%u required_pages=%u chunk_tokens=%u\n",
             decode ? "decode" : "prefill",
             position_, free_pages, next_chunk_pages, next_chunk_tokens);
         kvmem_keep_selected_prefill_ = false;
@@ -11524,12 +13199,12 @@ bool QwenExecutor::kvmem_block_mtp_pages_resident(const KvMemBlock &block) const
 
 void QwenExecutor::kvmem_mark_mtp_payload_incomplete(
         const KvMemBlock &block, const char *source) {
-    kvmem_mtp_payload_valid_through_ = std::min<uint32_t>(
-        kvmem_mtp_payload_valid_through_, block.orig_pos_start);
+    kvmem_mtp_payload_valid_through_ = std::min<uint64_t>(
+        kvmem_mtp_payload_valid_through_, block_store_->has_repository() ? block.history_pos_start : block.orig_pos_start);
     std::fprintf(
         stderr,
         "[kvmem-mtp] event=incomplete_spill block=%u begin=%u end=%u "
-        "source=%s action=main_only checkpoint_valid_through=%u\n",
+        "source=%s action=main_only checkpoint_valid_through=%" PRIu64 "\n",
         block.block_id, block.orig_pos_start, block.orig_pos_end(),
         source ? source : "unknown", kvmem_mtp_payload_valid_through_);
 }
@@ -11542,7 +13217,7 @@ bool QwenExecutor::kvmem_mtp_prefix_covers_registered() const {
 
 QwenExecutor::MtpCheckpointStatus
 QwenExecutor::kvmem_mtp_checkpoint_status(
-        uint32_t checkpoint_pos) const {
+        uint64_t checkpoint_pos) const {
     MtpCheckpointStatus out;
     out.prefix_len = mtp_prefix_len_;
     out.payload_valid_through = kvmem_mtp_payload_valid_through_;
@@ -11571,10 +13246,20 @@ QwenExecutor::kvmem_mtp_checkpoint_status(
         out.reason = "mtp_page_table_uninitialized";
         return out;
     }
-    for (const KvMemBlock &block : block_store_->blocks()) {
-        if (block.orig_pos_start >= checkpoint_pos) break;
-        const uint32_t required_end =
-            std::min<uint32_t>(block.orig_pos_end(), checkpoint_pos);
+    auto pins = block_store_->has_repository() ? block_store_->repository_read_leases() :
+        std::vector<KvMemRepository::Lease>{};
+    std::vector<const KvMemBlock *> candidates;
+    if (block_store_->has_repository()) {
+        for (const auto &pin : pins) candidates.push_back(&block_store_->blocks()[pin.handle().slot]);
+    } else {
+        for (const auto &block : block_store_->blocks()) candidates.push_back(&block);
+    }
+    for (const KvMemBlock *candidate : candidates) {
+        const KvMemBlock &block = *candidate;
+        const uint64_t begin = block_store_->has_repository() ? block.history_pos_start : block.orig_pos_start;
+        if (!block.n_tokens || begin >= checkpoint_pos) continue;
+        const uint32_t required_end = block.orig_pos_start +
+            static_cast<uint32_t>(std::min<uint64_t>(block.n_tokens, checkpoint_pos - begin));
         bool resident = true;
         const uint32_t page_size = mtp_kv_pages_.page_size;
         const uint32_t first_page = block.orig_pos_start / page_size;
@@ -11688,7 +13373,7 @@ void QwenExecutor::kvmem_canonicalize_block_for_tier(uint32_t block_id) {
                 /*to_base=*/static_cast<int32_t>(block.orig_pos_start),
                 kv_page_indices_device(), kv_pages_.page_size, cfg.rope_theta));
         }
-        block_store_->record_block_rerope(block_id, canonical);
+        block_store_->record_block_rerope(block_id, canonical, block_store_->repository_handle(block_id).generation);
         if (kvmem_tier_trace_enabled()) {
             std::fprintf(stderr,
                          "[kvmem-tier] canonicalize block=%u from=%lld to=%u\n",
@@ -12060,7 +13745,7 @@ void QwenExecutor::kvmem_submit_prefetch_cpu_batches() {
             }
         }
         if (!batch.buffer) {
-            batch.buffer = backend_.host_buffer(
+            batch.buffer = allocate_kvmem_io_buffer(
                 std::max<uint64_t>(batch_bytes, slab_target_bytes),
                 "kvmem_stagein_cpu_slab");
         }
@@ -12196,7 +13881,7 @@ void QwenExecutor::kvmem_submit_prefetch_nvme_batches() {
             }
         }
         if (!batch.buffer) {
-            batch.buffer = backend_.host_buffer(
+            batch.buffer = allocate_kvmem_io_buffer(
                 batch_bytes, "kvmem_stagein_read_slab");
         }
         batch.spans.reserve(end - begin);
@@ -12224,6 +13909,19 @@ void QwenExecutor::kvmem_submit_prefetch_nvme_batches() {
     }
 }
 
+void QwenExecutor::kvmem_discard_repository_prefetch() {
+    if (!block_store_ || !block_store_->has_repository() || !kvmem_prefetch_.active) return;
+    // Error/reset path only. Never drop leases or host read buffers before
+    // both CPU producers and their already-enqueued GPU consumers finish.
+    // A failed device drain leaves the member state intact for teardown.
+    if (kvmem_repository_gc_) kvmem_repository_gc_->stop();
+    if (kvmem_prefetch_.nvme_future.valid()) kvmem_prefetch_.nvme_future.wait();
+    for (auto &batch : kvmem_prefetch_.nvme_batches)
+        if (batch.future.valid()) batch.future.wait();
+    require_status(backend_.wait_kv_transfer());
+    kvmem_prefetch_ = KvMemPrefetchState{};
+}
+
 void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
     if (!block_store_) return;
     if (kvmem_prefetch_.active) {
@@ -12234,6 +13932,12 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
     const uint64_t t_in0 = tm ? kvmem_steady_ns() : 0;
     kvmem_prefetch_ = KvMemPrefetchState{};
     kvmem_prefetch_.active = true;
+    if (block_store_->has_repository()) {
+        std::vector<uint32_t> ids;
+        ids.reserve(plan.remaps.size());
+        for (const auto &rm : plan.remaps) ids.push_back(rm.block_id);
+        kvmem_prefetch_.repository_leases = kvmem_repository_pin_blocks(ids);
+    }
     if (kvmem_gc_) kvmem_prefetch_.gc_view = block_store_->gc_view();
     if (perf_trace) {
         kvmem_prefetch_.perf.start_enter_ns = t_in0;
@@ -12284,7 +13988,7 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
         for (const KvMemRemap &rm : plan.remaps) {
             const KvMemBlock &block = blocks[rm.block_id];
             if (kvmem_block_pages_resident(block)) {
-                block_store_->set_block_tier(rm.block_id, KvTier::GPU);
+                block_store_->set_block_tier(rm.block_id, KvTier::GPU, -1, -1, kvmem_repository_io_generation(kvmem_prefetch_.repository_leases, rm.block_id));
                 continue;
             }
             const uint64_t bytes = kvmem_block_spill_bytes(block);
@@ -12449,6 +14153,7 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
             }
         }
     } catch (...) {
+        kvmem_discard_repository_prefetch();
         kvmem_prefetch_ = KvMemPrefetchState{};
         throw;
     }
@@ -12547,27 +14252,31 @@ void QwenExecutor::kvmem_finish_prefetch() {
             if (placement.evicted_block >= 0) {
                 const uint32_t victim = static_cast<uint32_t>(
                     placement.evicted_block);
-                if (victim >= blocks.size()) {
-                    throw std::runtime_error(
-                        "KVMem SSD stage-in CPU admission evicted an "
-                        "unknown block");
-                }
-                const KvMemBlock &victim_block = blocks[victim];
-                const bool victim_backed =
-                    victim_block.ssd_clean &&
-                    victim_block.nvme_slot >= 0 &&
-                    kvmem_nvme_tier_->block_slot(victim) ==
-                        victim_block.nvme_slot;
-                if (!victim_backed) {
-                    throw std::runtime_error(
-                        "KVMem SSD stage-in CPU admission would evict "
-                        "the last durable copy of a block");
-                }
-                block_store_->set_block_cpu_copy(victim, -1);
-                if (!kvmem_block_pages_resident(victim_block)) {
-                    block_store_->set_block_tier(
-                        victim, KvTier::SSD, -1,
-                        victim_block.nvme_slot);
+                const auto victim_lease = kvmem_repository_pin_current(victim);
+                if (!block_store_->has_repository() || victim_lease) {
+                    if (victim >= blocks.size()) {
+                        throw std::runtime_error(
+                            "KVMem SSD stage-in CPU admission evicted an "
+                            "unknown block");
+                    }
+                    const KvMemBlock &victim_block = blocks[victim];
+                    const bool victim_backed =
+                        victim_block.ssd_clean &&
+                        victim_block.nvme_slot >= 0 &&
+                        kvmem_nvme_tier_->block_slot(victim) ==
+                            victim_block.nvme_slot;
+                    if (!victim_backed) {
+                        throw std::runtime_error(
+                            "KVMem SSD stage-in CPU admission would evict "
+                            "the last durable copy of a block");
+                    }
+                    block_store_->set_block_cpu_copy(victim, -1, block_store_->repository_handle(victim).generation);
+                    if (!kvmem_block_pages_resident(victim_block)) {
+                        block_store_->set_block_tier(
+                            victim, KvTier::SSD, -1,
+                            victim_block.nvme_slot, block_store_->repository_handle(victim).generation);
+                    }
+
                 }
             }
 
@@ -12577,7 +14286,7 @@ void QwenExecutor::kvmem_finish_prefetch() {
                     "KVMem SSD stage-in CPU admission lost its slot");
             }
             block_store_->set_block_cpu_copy(
-                source.block_id, placement.slot);
+                source.block_id, placement.slot, kvmem_repository_io_generation(kvmem_prefetch_.repository_leases, source.block_id));
             CopyTarget target{source.block_id, placement.slot, dst,
                               source.src, source.bytes};
             const auto existing = slot_target.find(placement.slot);
@@ -12834,16 +14543,17 @@ void QwenExecutor::kvmem_finish_prefetch() {
                     kvmem_cpu_tier_->release_block(pb.block_id);
                     kvmem_release_cpu_slot(slot);
                     block_store_->set_block_cpu_copy(
-                        pb.block_id, -1);
+                        pb.block_id, -1, kvmem_repository_io_generation(kvmem_prefetch_.repository_leases, pb.block_id));
                 }
             } else if (pb.from == KvTier::SSD && kvmem_nvme_tier_) {
                 if (!inclusive) {
                     kvmem_nvme_tier_->release_block(pb.block_id);
                 }
             }
-            block_store_->set_block_tier(pb.block_id, KvTier::GPU);
+            block_store_->set_block_tier(pb.block_id, KvTier::GPU, -1, -1, kvmem_repository_io_generation(kvmem_prefetch_.repository_leases, pb.block_id));
         }
     } catch (...) {
+        kvmem_discard_repository_prefetch();
         kvmem_prefetch_ = KvMemPrefetchState{};
         throw;
     }
@@ -12875,7 +14585,7 @@ void QwenExecutor::kvmem_reap_pending_writes(bool wait_all) {
         } catch (...) {
             if (block_store_) {
                 for (uint32_t id : front.block_ids) {
-                    block_store_->set_block_io_in_flight(id, false);
+                    block_store_->set_block_io_in_flight(id, false, kvmem_repository_io_generation(front.repository_leases, id));
                 }
             }
             if (kvmem_cpu_tier_) {
@@ -12886,7 +14596,7 @@ void QwenExecutor::kvmem_reap_pending_writes(bool wait_all) {
                         kvmem_release_cpu_slot(copy.slot);
                         if (block_store_) {
                             block_store_->set_block_cpu_copy(
-                                copy.block_id, -1);
+                                copy.block_id, -1, kvmem_repository_io_generation(front.repository_leases, copy.block_id));
                         }
                     }
                 }
@@ -12903,9 +14613,9 @@ void QwenExecutor::kvmem_reap_pending_writes(bool wait_all) {
                 }
                 const int32_t slot = front.spans[i].slot;
                 if (kvmem_nvme_tier_->block_slot(id) == slot) {
-                    block_store_->set_block_ssd_backing(id, slot, true);
+                    block_store_->set_block_ssd_backing(id, slot, true, kvmem_repository_io_generation(front.repository_leases, id));
                 }
-                block_store_->set_block_io_in_flight(id, false);
+                block_store_->set_block_io_in_flight(id, false, kvmem_repository_io_generation(front.repository_leases, id));
             }
         }
         if (block_store_ && kvmem_cpu_tier_) {
@@ -12917,13 +14627,15 @@ void QwenExecutor::kvmem_reap_pending_writes(bool wait_all) {
                     copy.slot) {
                     const KvMemBlock &block =
                         block_store_->blocks()[copy.block_id];
-                    if (kvmem_block_pages_resident(block)) {
+                    const bool resident = kvmem_block_pages_resident(block);
+                    if (resident || block_store_->has_repository()) {
                         block_store_->set_block_cpu_copy(
-                            copy.block_id, copy.slot);
-                    } else {
+                            copy.block_id, copy.slot, kvmem_repository_io_generation(front.repository_leases, copy.block_id));
+                    }
+                    if (!resident) {
                         block_store_->set_block_tier(
                             copy.block_id, KvTier::CPU,
-                            copy.slot, block.nvme_slot);
+                            copy.slot, block.nvme_slot, kvmem_repository_io_generation(front.repository_leases, copy.block_id));
                     }
                 }
                 // SSD write-back clears this above when its durable write
@@ -12931,10 +14643,12 @@ void QwenExecutor::kvmem_reap_pending_writes(bool wait_all) {
                 // publish the clean CPU authority here.
                 if (!kvmem_nvme_tier_) {
                     block_store_->set_block_io_in_flight(
-                        copy.block_id, false);
+                        copy.block_id, false, kvmem_repository_io_generation(front.repository_leases, copy.block_id));
                 }
             }
         }
+        for (const auto &lease : front.repository_leases)
+            kvmem_sync_repository_backing_flags(lease.handle());
         kvmem_async_write_completed_bytes_ += stats.bytes;
         kvmem_async_write_completed_syscalls_ += stats.syscalls;
         kvmem_async_write_completed_ns_ += stats.duration_ns;
@@ -13009,6 +14723,7 @@ void QwenExecutor::kvmem_submit_write_batch(
     pending.buffer_bytes = pending.buffer->size();
     pending.spans = std::move(spans);
     pending.block_ids = std::move(block_ids);
+    pending.repository_leases = kvmem_repository_pin_blocks(pending.block_ids);
     pending.submit_ns = kvmem_steady_ns();
     auto worker_buffer = pending.buffer;
     auto worker_spans = pending.spans;
@@ -13061,6 +14776,7 @@ void QwenExecutor::kvmem_submit_pinned_write_batch(
     pending.proactive = true;
     pending.spans = std::move(spans);
     pending.block_ids = std::move(block_ids);
+    pending.repository_leases = kvmem_repository_pin_blocks(pending.block_ids);
     pending.cpu_copies = std::move(cpu_copies);
     pending.submit_ns = kvmem_steady_ns();
     auto worker_buffer = pending.pinned_buffer;
@@ -13140,6 +14856,7 @@ void QwenExecutor::kvmem_submit_pinned_cpu_copy_batch(
     pending.buffer_bytes = bytes;
     pending.proactive = true;
     pending.block_ids = std::move(block_ids);
+    pending.repository_leases = kvmem_repository_pin_blocks(pending.block_ids);
     pending.cpu_copies = std::move(cpu_copies);
     pending.submit_ns = kvmem_steady_ns();
     auto worker_buffer = pending.pinned_buffer;
@@ -13205,7 +14922,7 @@ void QwenExecutor::kvmem_finish_proactive_d2h(bool wait_all) {
             const uint32_t block_count =
                 static_cast<uint32_t>(batch.block_ids.size());
             const uint64_t bytes = batch.bytes;
-            const uint32_t completed_pos = batch.completed_pos;
+            const uint64_t completed_pos = batch.completed_pos;
             kvmem_submit_pinned_cpu_copy_batch(
                 std::move(batch.buffer), bytes,
                 std::move(batch.block_ids),
@@ -13214,7 +14931,7 @@ void QwenExecutor::kvmem_finish_proactive_d2h(bool wait_all) {
                 std::fprintf(
                     stderr,
                     "[kvmem-writeback] event=cpu_submit "
-                    "completed_pos=%u blocks=%u bytes=%llu "
+                    "completed_pos=%" PRIu64 " blocks=%u bytes=%llu "
                     "d2h_wait_ms=%.3f overlap_window_ms=%.3f "
                     "pending_cpu=%zu\n",
                     completed_pos, block_count,
@@ -13240,8 +14957,8 @@ void QwenExecutor::kvmem_finish_proactive_d2h(bool wait_all) {
             }
             // Only now is it safe for pressure selection to release the GPU
             // page: the pinned slab owns a complete immutable copy.
-            block_store_->set_block_ssd_backing(id, slot, false);
-            block_store_->set_block_io_in_flight(id, true);
+            block_store_->set_block_ssd_backing(id, slot, false, kvmem_repository_io_generation(batch.repository_leases, id));
+            block_store_->set_block_io_in_flight(id, true, kvmem_repository_io_generation(batch.repository_leases, id));
 
             // Preserve the existing inclusive CPU-cache behavior. Without
             // this admission, proactive persistence would make every later
@@ -13287,29 +15004,33 @@ void QwenExecutor::kvmem_finish_proactive_d2h(bool wait_all) {
                 const uint32_t victim =
                     static_cast<uint32_t>(
                         placement.evicted_block);
-                if (victim >= block_store_->block_count()) {
-                    throw std::runtime_error(
-                        "KVMem proactive CPU admission evicted an "
-                        "unknown block");
-                }
-                const KvMemBlock &victim_block =
-                    block_store_->blocks()[victim];
-                const bool victim_backed =
-                    (victim_block.ssd_clean ||
-                     victim_block.in_flight) &&
-                    victim_block.nvme_slot >= 0 &&
-                    kvmem_nvme_tier_->block_slot(victim) ==
-                        victim_block.nvme_slot;
-                if (!victim_backed) {
-                    throw std::runtime_error(
-                        "KVMem proactive CPU admission would evict "
-                        "the last durable copy of a block");
-                }
-                block_store_->set_block_cpu_copy(victim, -1);
-                if (!kvmem_block_pages_resident(victim_block)) {
-                    block_store_->set_block_tier(
-                        victim, KvTier::SSD, -1,
-                        victim_block.nvme_slot);
+                const auto victim_lease = kvmem_repository_pin_current(victim);
+                if (!block_store_->has_repository() || victim_lease) {
+                    if (victim >= block_store_->block_count()) {
+                        throw std::runtime_error(
+                            "KVMem proactive CPU admission evicted an "
+                            "unknown block");
+                    }
+                    const KvMemBlock &victim_block =
+                        block_store_->blocks()[victim];
+                    const bool victim_backed =
+                        (victim_block.ssd_clean ||
+                         victim_block.in_flight) &&
+                        victim_block.nvme_slot >= 0 &&
+                        kvmem_nvme_tier_->block_slot(victim) ==
+                            victim_block.nvme_slot;
+                    if (!victim_backed) {
+                        throw std::runtime_error(
+                            "KVMem proactive CPU admission would evict "
+                            "the last durable copy of a block");
+                    }
+                    block_store_->set_block_cpu_copy(victim, -1, block_store_->repository_handle(victim).generation);
+                    if (!kvmem_block_pages_resident(victim_block)) {
+                        block_store_->set_block_tier(
+                            victim, KvTier::SSD, -1,
+                            victim_block.nvme_slot, block_store_->repository_handle(victim).generation);
+                    }
+
                 }
             }
             uint8_t *dst =
@@ -13327,7 +15048,7 @@ void QwenExecutor::kvmem_finish_proactive_d2h(bool wait_all) {
         const uint32_t block_count =
             static_cast<uint32_t>(batch.block_ids.size());
         const uint64_t bytes = batch.bytes;
-        const uint32_t completed_pos = batch.completed_pos;
+        const uint64_t completed_pos = batch.completed_pos;
         const size_t cpu_copy_blocks = cpu_copies.size();
         kvmem_submit_pinned_write_batch(
             std::move(batch.buffer), bytes,
@@ -13337,7 +15058,7 @@ void QwenExecutor::kvmem_finish_proactive_d2h(bool wait_all) {
         if (kvmem_perf_trace_flag()) {
             std::fprintf(
                 stderr,
-                "[kvmem-writeback] event=ssd_submit completed_pos=%u "
+                "[kvmem-writeback] event=ssd_submit completed_pos=%" PRIu64 " "
                 "blocks=%u bytes=%llu d2h_wait_ms=%.3f "
                 "overlap_window_ms=%.3f cpu_admit_blocks=%zu "
                 "cpu_admit_mib=%.3f "
@@ -13353,7 +15074,7 @@ void QwenExecutor::kvmem_finish_proactive_d2h(bool wait_all) {
     }
 }
 
-void QwenExecutor::kvmem_prefill_writeback(uint32_t completed_pos) {
+void QwenExecutor::kvmem_prefill_writeback(uint64_t completed_pos) {
     if (!kvmem_prefill_writeback_enabled_ || !block_store_ ||
         (!kvmem_nvme_tier_ && !kvmem_cpu_tier_) ||
         kvmem_query_replay_active_) {
@@ -13405,6 +15126,24 @@ void QwenExecutor::kvmem_prefill_writeback(uint32_t completed_pos) {
     }
     if (candidates.empty()) return;
 
+    // Old selected rows may still await their first proactive write-through.
+    // Persist only canonical source KV, never a query-local blend overlay.
+    if (!kvmem_blend_backup_.empty()) {
+        bool overlaps = false;
+        const uint64_t per_pos = model_.config().n_kv_heads * model_.config().head_dim;
+        for (uint32_t id : candidates) {
+            const auto &block = blocks[id];
+            const uint32_t first = block.orig_pos_start / kv_pages_.page_size;
+            const uint32_t count = (block.n_tokens + kv_pages_.page_size - 1) / kv_pages_.page_size;
+            for (uint32_t i = 0; i < count && !overlaps; ++i) {
+                const auto page = kv_pages_.pages.at(first + i);
+                for (const auto &piece : kvmem_blend_backup_.front().pieces)
+                    overlaps |= piece.offset / (per_pos * kv_pages_.page_size) == static_cast<uint64_t>(page);
+            }
+        }
+        if (overlaps) kvmem_blend_restore();
+    }
+
     struct PackedTarget {
         DeviceTensor *tensor = nullptr;
         bool mtp = false;
@@ -13435,6 +15174,12 @@ void QwenExecutor::kvmem_prefill_writeback(uint32_t completed_pos) {
     while (candidate < candidates.size()) {
         kvmem_reap_pending_writes(/*wait_all=*/false);
         while (kvmem_free_writeback_slabs_.empty()) {
+            if (host_io_pool_ && kvmem_writeback_slabs_allocated_ < kvmem_writeback_slab_count_) {
+                auto slab = allocate_kvmem_io_buffer(slab_target_bytes, "kvmem_prefill_writeback_slab");
+                kvmem_free_writeback_slabs_.push_back(std::shared_ptr<HostBuffer>(std::move(slab)));
+                ++kvmem_writeback_slabs_allocated_;
+                break;
+            }
             if (!kvmem_proactive_d2h_batches_.empty()) {
                 kvmem_finish_proactive_d2h(/*wait_all=*/true);
                 kvmem_reap_pending_writes(/*wait_all=*/false);
@@ -13500,7 +15245,7 @@ void QwenExecutor::kvmem_prefill_writeback(uint32_t completed_pos) {
                 batch.cpu_copies.push_back(
                     KvMemPendingWriteBatch::CpuCopy{
                         id, placement.slot, dst, batch.bytes, bytes});
-                block_store_->set_block_io_in_flight(id, true);
+                block_store_->set_block_io_in_flight(id, true, block_store_->repository_handle(id).generation);
             }
             block_offsets.push_back(batch.bytes);
             batch.block_ids.push_back(id);
@@ -13508,6 +15253,7 @@ void QwenExecutor::kvmem_prefill_writeback(uint32_t completed_pos) {
             ++candidate;
         }
 
+        batch.repository_leases = kvmem_repository_pin_blocks(batch.block_ids);
         uint32_t pages_per_target = 0;
         for (uint32_t id : batch.block_ids) {
             const KvMemBlock &block = blocks[id];
@@ -13573,13 +15319,13 @@ void QwenExecutor::kvmem_prefill_writeback(uint32_t completed_pos) {
             if (!kvmem_nvme_tier_) {
                 for (const auto &copy : batch.cpu_copies) {
                     block_store_->set_block_io_in_flight(
-                        copy.block_id, false);
+                        copy.block_id, false, block_store_->repository_handle(copy.block_id).generation);
                     if (kvmem_cpu_tier_->block_slot(copy.block_id) ==
                         copy.slot) {
                         kvmem_cpu_tier_->release_block(copy.block_id);
                         kvmem_release_cpu_slot(copy.slot);
                         block_store_->set_block_cpu_copy(
-                            copy.block_id, -1);
+                            copy.block_id, -1, block_store_->repository_handle(copy.block_id).generation);
                     }
                 }
             }
@@ -13599,7 +15345,7 @@ void QwenExecutor::kvmem_prefill_writeback(uint32_t completed_pos) {
         if (kvmem_perf_trace_flag()) {
             std::fprintf(
                 stderr,
-                "[kvmem-writeback] event=d2h_submit completed_pos=%u "
+                "[kvmem-writeback] event=d2h_submit completed_pos=%" PRIu64 " "
                 "blocks=%zu bytes=%llu target=%s pending_d2h=%zu\n",
                 completed_pos, batch.block_ids.size(),
                 static_cast<unsigned long long>(batch.bytes),
@@ -13614,6 +15360,7 @@ void QwenExecutor::kvmem_prefill_writeback(uint32_t completed_pos) {
 void QwenExecutor::kvmem_stage_out_packed(
         const std::vector<uint32_t> &block_ids) {
     if (!block_store_ || block_ids.empty()) return;
+    const auto repository_leases = kvmem_repository_pin_blocks(block_ids);
     if (!kvmem_cpu_tier_ && !kvmem_nvme_tier_) {
         throw std::runtime_error(
             "KVMem packed stage-out requires a lower spill tier");
@@ -13655,7 +15402,7 @@ void QwenExecutor::kvmem_stage_out_packed(
                 return slab;
             }
         }
-        return backend_.host_buffer(
+        return allocate_kvmem_io_buffer(
             std::max<uint64_t>(required, slab_target_bytes),
             "kvmem_stageout_packed_slab");
     };
@@ -13810,13 +15557,13 @@ void QwenExecutor::kvmem_stage_out_packed(
             if (to_cpu) {
                 block_store_->set_block_tier(
                     task.block_id, KvTier::CPU,
-                    task.cpu_slot, -1);
+                    task.cpu_slot, -1, block_store_->repository_handle(task.block_id).generation);
             } else {
                 block_store_->set_block_ssd_backing(
-                    task.block_id, task.nvme_slot, true);
+                    task.block_id, task.nvme_slot, true, block_store_->repository_handle(task.block_id).generation);
                 block_store_->set_block_tier(
                     task.block_id, KvTier::SSD,
-                    -1, task.nvme_slot);
+                    -1, task.nvme_slot, block_store_->repository_handle(task.block_id).generation);
             }
             ++staged_out;
             if (perf_trace) {
@@ -14001,40 +15748,44 @@ void QwenExecutor::kvmem_stage_out_packed(
             }
             const uint32_t victim =
                 static_cast<uint32_t>(placement.evicted_block);
-            if (victim >= blocks.size()) {
-                throw std::runtime_error(
-                    "KVMem packed CPU eviction selected an unknown block");
-            }
-            const uint8_t *victim_src =
-                kvmem_cpu_slot_data(placement.slot);
-            if (!victim_src) {
-                throw std::runtime_error(
-                    "KVMem packed CPU eviction lost its slot data");
-            }
-            const KvMemBlock &victim_block = blocks[victim];
-            const uint64_t victim_bytes =
-                kvmem_block_spill_bytes(victim_block);
-            const bool victim_backed =
-                block_store_->config().optimize_stage_out &&
-                (victim_block.ssd_clean || victim_block.in_flight) &&
-                victim_block.nvme_slot >= 0 &&
-                kvmem_nvme_tier_->block_slot(victim) ==
-                    victim_block.nvme_slot;
-            if (!victim_backed) {
-                kvmem_nvme_tier_->write_block(
-                    victim, victim_src, victim_bytes);
-                block_store_->set_block_ssd_backing(
-                    victim,
-                    kvmem_nvme_tier_->block_slot(victim), true);
-            }
-            block_store_->set_block_cpu_copy(victim, -1);
-            if (kvmem_block_pages_resident(victim_block)) {
-                block_store_->set_block_tier(
-                    victim, KvTier::GPU);
-            } else {
-                block_store_->set_block_tier(
-                    victim, KvTier::SSD, -1,
-                    kvmem_nvme_tier_->block_slot(victim));
+            const auto victim_lease = kvmem_repository_pin_current(victim);
+            if (!block_store_->has_repository() || victim_lease) {
+                if (victim >= blocks.size()) {
+                    throw std::runtime_error(
+                        "KVMem packed CPU eviction selected an unknown block");
+                }
+                const uint8_t *victim_src =
+                    kvmem_cpu_slot_data(placement.slot);
+                if (!victim_src) {
+                    throw std::runtime_error(
+                        "KVMem packed CPU eviction lost its slot data");
+                }
+                const KvMemBlock &victim_block = blocks[victim];
+                const uint64_t victim_bytes =
+                    kvmem_block_spill_bytes(victim_block);
+                const bool victim_backed =
+                    block_store_->config().optimize_stage_out &&
+                    (victim_block.ssd_clean || victim_block.in_flight) &&
+                    victim_block.nvme_slot >= 0 &&
+                    kvmem_nvme_tier_->block_slot(victim) ==
+                        victim_block.nvme_slot;
+                if (!victim_backed) {
+                    kvmem_nvme_tier_->write_block(
+                        victim, victim_src, victim_bytes);
+                    block_store_->set_block_ssd_backing(
+                        victim,
+                        kvmem_nvme_tier_->block_slot(victim), true, block_store_->repository_handle(victim).generation);
+                }
+                block_store_->set_block_cpu_copy(victim, -1, block_store_->repository_handle(victim).generation);
+                if (kvmem_block_pages_resident(victim_block)) {
+                    block_store_->set_block_tier(
+                        victim, KvTier::GPU, -1, -1, block_store_->repository_handle(victim).generation);
+                } else {
+                    block_store_->set_block_tier(
+                        victim, KvTier::SSD, -1,
+                        kvmem_nvme_tier_->block_slot(victim), block_store_->repository_handle(victim).generation);
+                }
+
             }
         }
         return placement.slot;
@@ -14054,7 +15805,7 @@ void QwenExecutor::kvmem_stage_out_packed(
                 const uint32_t released_pages =
                     release_gpu_pages(block);
                 block_store_->set_block_tier(
-                    block_id, KvTier::CPU, cached, -1);
+                    block_id, KvTier::CPU, cached, -1, block_store_->repository_handle(block_id).generation);
                 ++staged_out;
                 if (perf_trace) {
                     ++kvmem_last_stage_out_perf_.blocks;
@@ -14084,7 +15835,7 @@ void QwenExecutor::kvmem_stage_out_packed(
                     release_gpu_pages(block);
                 block_store_->set_block_tier(
                     block_id, KvTier::SSD, -1,
-                    block.nvme_slot);
+                    block.nvme_slot, block_store_->repository_handle(block_id).generation);
                 ++staged_out;
                 if (perf_trace) {
                     ++kvmem_last_stage_out_perf_.blocks;
@@ -14167,8 +15918,10 @@ void QwenExecutor::kvmem_stage_out_packed(
 void QwenExecutor::kvmem_stage_out(
         const std::vector<uint32_t> &block_ids,
         bool force_unpacked) {
+    kvmem_blend_restore();
     kvmem_last_stage_out_perf_ = KvMemStageOutPerf{};
     if (!block_store_ || block_ids.empty()) return;
+    const auto repository_leases = kvmem_repository_pin_blocks(block_ids);
     if (!kvmem_cpu_tier_ && !kvmem_nvme_tier_) return;
     if (block_store_->config().optimize_pack && !force_unpacked) {
         if (kvmem_prefill_writeback_enabled_) {
@@ -14294,8 +16047,8 @@ void QwenExecutor::kvmem_stage_out(
         }
         write_spans.push_back(NvmeIoSpan{p.slot, offset, bytes});
         write_blocks.push_back(block_id);
-        block_store_->set_block_ssd_backing(block_id, p.slot, false);
-        block_store_->set_block_io_in_flight(block_id, true);
+        block_store_->set_block_ssd_backing(block_id, p.slot, false, block_store_->repository_handle(block_id).generation);
+        block_store_->set_block_io_in_flight(block_id, true, block_store_->repository_handle(block_id).generation);
         return p.slot;
     };
     auto release_gpu_pages = [&](const KvMemBlock &block) {
@@ -14335,7 +16088,7 @@ void QwenExecutor::kvmem_stage_out(
             const uint32_t released_pages = release_gpu_pages(block);
             block_store_->set_block_tier(
                 block_id, cpu_slot >= 0 ? KvTier::CPU : KvTier::SSD,
-                cpu_slot, block.nvme_slot);
+                cpu_slot, block.nvme_slot, block_store_->repository_handle(block_id).generation);
             ++staged_out;
             if (perf_trace) {
                 ++kvmem_last_stage_out_perf_.blocks;
@@ -14416,59 +16169,63 @@ void QwenExecutor::kvmem_stage_out(
                 if (placement.evicted_block >= 0) {
                     const uint32_t victim =
                         static_cast<uint32_t>(placement.evicted_block);
-                    const uint64_t victim_bytes =
-                        kvmem_block_spill_bytes(blocks[victim]);
-                    const uint8_t *victim_src =
-                        kvmem_cpu_slot_data(placement.slot);
-                    if (!victim_src) {
-                        throw std::runtime_error(
-                            "KVMem CPU eviction lost its slot backing");
-                    }
-                    const KvMemBlock &victim_block = blocks[victim];
-                    const bool victim_backed =
-                        inclusive &&
-                        (victim_block.ssd_clean ||
-                         victim_block.in_flight) &&
-                        victim_block.nvme_slot >= 0 &&
-                        kvmem_nvme_tier_->block_slot(victim) ==
-                            victim_block.nvme_slot;
-                    if (!victim_backed) {
-                        const uint64_t t_nvme0 =
-                            perf_trace ? kvmem_steady_ns() : 0;
-                        kvmem_nvme_tier_->write_block(
-                            victim, victim_src, victim_bytes);
-                        if (perf_trace) {
-                            kvmem_last_stage_out_perf_.nvme_write_ns +=
-                                kvmem_steady_ns() - t_nvme0;
+                    const auto victim_lease = kvmem_repository_pin_current(victim);
+                    if (!block_store_->has_repository() || victim_lease) {
+                        const uint64_t victim_bytes =
+                            kvmem_block_spill_bytes(blocks[victim]);
+                        const uint8_t *victim_src =
+                            kvmem_cpu_slot_data(placement.slot);
+                        if (!victim_src) {
+                            throw std::runtime_error(
+                                "KVMem CPU eviction lost its slot backing");
+                        }
+                        const KvMemBlock &victim_block = blocks[victim];
+                        const bool victim_backed =
+                            inclusive &&
+                            (victim_block.ssd_clean ||
+                             victim_block.in_flight) &&
+                            victim_block.nvme_slot >= 0 &&
+                            kvmem_nvme_tier_->block_slot(victim) ==
+                                victim_block.nvme_slot;
+                        if (!victim_backed) {
+                            const uint64_t t_nvme0 =
+                                perf_trace ? kvmem_steady_ns() : 0;
+                            kvmem_nvme_tier_->write_block(
+                                victim, victim_src, victim_bytes);
+                            if (perf_trace) {
+                                kvmem_last_stage_out_perf_.nvme_write_ns +=
+                                    kvmem_steady_ns() - t_nvme0;
+                            }
+                            if (inclusive) {
+                                block_store_->set_block_ssd_backing(
+                                    victim,
+                                    kvmem_nvme_tier_->block_slot(victim), true, block_store_->repository_handle(victim).generation);
+                            }
+                        }
+                        if (kvmem_tier_trace_enabled()) {
+                            std::fprintf(stderr,
+                                         "[kvmem-tier] cpu_evict block=%u to=nvme "
+                                         "slot=%d bytes=%llu ssd_write=%d\n",
+                                         victim, kvmem_nvme_tier_->block_slot(victim),
+                                         static_cast<unsigned long long>(victim_bytes),
+                                         victim_backed ? 0 : 1);
                         }
                         if (inclusive) {
-                            block_store_->set_block_ssd_backing(
-                                victim,
-                                kvmem_nvme_tier_->block_slot(victim), true);
-                        }
-                    }
-                    if (kvmem_tier_trace_enabled()) {
-                        std::fprintf(stderr,
-                                     "[kvmem-tier] cpu_evict block=%u to=nvme "
-                                     "slot=%d bytes=%llu ssd_write=%d\n",
-                                     victim, kvmem_nvme_tier_->block_slot(victim),
-                                     static_cast<unsigned long long>(victim_bytes),
-                                     victim_backed ? 0 : 1);
-                    }
-                    if (inclusive) {
-                        block_store_->set_block_cpu_copy(victim, -1);
-                        if (kvmem_block_pages_resident(victim_block)) {
-                            block_store_->set_block_tier(
-                                victim, KvTier::GPU);
+                            block_store_->set_block_cpu_copy(victim, -1, block_store_->repository_handle(victim).generation);
+                            if (kvmem_block_pages_resident(victim_block)) {
+                                block_store_->set_block_tier(
+                                    victim, KvTier::GPU, -1, -1, block_store_->repository_handle(victim).generation);
+                            } else {
+                                block_store_->set_block_tier(
+                                    victim, KvTier::SSD, -1,
+                                    kvmem_nvme_tier_->block_slot(victim), block_store_->repository_handle(victim).generation);
+                            }
                         } else {
                             block_store_->set_block_tier(
                                 victim, KvTier::SSD, -1,
-                                kvmem_nvme_tier_->block_slot(victim));
+                                kvmem_nvme_tier_->block_slot(victim), block_store_->repository_handle(victim).generation);
                         }
-                    } else {
-                        block_store_->set_block_tier(
-                            victim, KvTier::SSD, -1,
-                            kvmem_nvme_tier_->block_slot(victim));
+
                     }
                 }
                 uint8_t *dst = kvmem_cpu_slot_data(placement.slot);
@@ -14532,7 +16289,7 @@ void QwenExecutor::kvmem_stage_out(
         const uint32_t released_pages = release_gpu_pages(block);
         block_store_->set_block_tier(
             block_id, cpu_slot >= 0 ? KvTier::CPU : KvTier::SSD,
-            cpu_slot, nvme_slot);
+            cpu_slot, nvme_slot, block_store_->repository_handle(block_id).generation);
         if (kvmem_tier_trace_enabled()) {
             std::fprintf(stderr,
                          "[kvmem-tier] stage_out block=%u to=%s slot=%d bytes=%llu pages=%u\n",
@@ -14572,12 +16329,16 @@ void QwenExecutor::build_kvmem_window_mrope_positions(
     std::fill(input_compact_mrope_valid_.begin(),
               input_compact_mrope_valid_.end(), 0);
     const auto &blocks = block_store_->blocks();
+    const bool bounded = block_store_->has_repository();
+    const auto history_begin = [bounded](const KvMemBlock &block) -> uint64_t {
+        return bounded ? block.history_pos_start : block.orig_pos_start;
+    };
     uint32_t cursor = 0;
     size_t begin = 0;
     while (begin < plan.remaps.size()) {
         size_t end = begin + 1;
-        uint32_t source_end =
-            blocks[plan.remaps[begin].block_id].orig_pos_start +
+        uint64_t source_end =
+            history_begin(blocks[plan.remaps[begin].block_id]) +
             plan.remaps[begin].n_tokens;
         uint32_t destination_end =
             static_cast<uint32_t>(plan.remaps[begin].to_base) +
@@ -14585,7 +16346,7 @@ void QwenExecutor::build_kvmem_window_mrope_positions(
         while (end < plan.remaps.size()) {
             const KvMemRemap &next = plan.remaps[end];
             const KvMemBlock &next_block = blocks[next.block_id];
-            if (next_block.orig_pos_start != source_end ||
+            if (history_begin(next_block) != source_end ||
                 static_cast<uint32_t>(next.to_base) != destination_end) {
                 break;
             }
@@ -14597,7 +16358,7 @@ void QwenExecutor::build_kvmem_window_mrope_positions(
         const KvMemBlock &first_block =
             blocks[plan.remaps[begin].block_id];
         const auto first_source = source_multimodal_rope_position(
-            first_block.orig_pos_start);
+            history_begin(first_block));
         std::array<int64_t, 3> delta{};
         for (uint32_t axis = 0; axis < 3; ++axis) {
             delta[axis] = static_cast<int64_t>(cursor) -
@@ -14613,7 +16374,8 @@ void QwenExecutor::build_kvmem_window_mrope_positions(
                     "multimodal KVMem remap exceeds compact window");
             }
             for (uint32_t tok = 0; tok < rm.n_tokens; ++tok) {
-                const uint32_t source_pos = block.orig_pos_start + tok;
+                const uint64_t source_pos = history_begin(block) + tok;
+                const uint64_t compact_row = bounded ? uint64_t(block.orig_pos_start) + tok : source_pos;
                 const uint32_t destination_pos =
                     static_cast<uint32_t>(rm.to_base) + tok;
                 const auto source =
@@ -14633,9 +16395,9 @@ void QwenExecutor::build_kvmem_window_mrope_positions(
                         static_cast<int32_t>(value);
                     group_next = std::max(group_next, compact[axis] + 1u);
                 }
-                if (source_pos < input_compact_mrope_positions_.size()) {
-                    input_compact_mrope_positions_[source_pos] = compact;
-                    input_compact_mrope_valid_[source_pos] = 1;
+                if (compact_row < input_compact_mrope_positions_.size()) {
+                    input_compact_mrope_positions_[compact_row] = compact;
+                    input_compact_mrope_valid_[compact_row] = 1;
                 }
             }
         }
@@ -14657,6 +16419,7 @@ void QwenExecutor::build_kvmem_window_mrope_positions(
 }
 
 void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
+    kvmem_blend_restore();
     const bool tm = kvmem_measure_timing_flag();
     const uint64_t t_asm0 = tm ? kvmem_steady_ns() : 0;
     kvmem_assembly_raw_gather_ns_ = 0;
@@ -15119,6 +16882,7 @@ void QwenExecutor::kvmem_prepare_content_index_before_first_selection() {
 }
 
 uint32_t QwenExecutor::kvmem_reselect_prefill_pressure() {
+    kvmem_blend_capture_tokens(0, nullptr, 0);
     if (!kvmem_enabled_ || !block_store_) return 0;
     if (block_store_->block_count() == 0) return 0;
     if (kvmem_pending_reselect_) {
@@ -15132,8 +16896,12 @@ uint32_t QwenExecutor::kvmem_reselect_prefill_pressure() {
     kvmem_prepare_content_index_before_first_selection();
     const std::vector<uint32_t> mandatory =
         kvmem_materialize_mandatory_blocks();
+    auto pressure = block_store_->has_repository()
+        ? block_store_->pin_repository_pressure_selection(mandatory)
+        : KvMemStore::RepositoryPressureSelection{};
     const std::vector<uint32_t> selected =
-        block_store_->pick_prefill_pressure_blocks(mandatory);
+        block_store_->has_repository() ? pressure.blocks
+                                     : block_store_->pick_prefill_pressure_blocks(mandatory);
     if (std::getenv("QW3_KVMEM_TRACE")) {
         const uint32_t n = block_store_->block_count();
         const uint32_t sink = std::min<uint32_t>(
@@ -15168,12 +16936,16 @@ void QwenExecutor::kvmem_prepare_prefill_window(uint32_t upcoming_tokens) {
 }
 
 uint32_t QwenExecutor::kvmem_prepare_reselect() {
+    kvmem_blend_restore();
+    kvmem_blend_capture_tokens(0, nullptr, 0);
     if (!kvmem_enabled_ || !block_store_) return 0;
     if (block_store_->block_count() == 0) return 0;
     if (kvmem_pending_reselect_) {
         throw std::runtime_error("KVMem reselect already prepared");
     }
     kvmem_gc_score_event_.reset();
+    if (block_store_->has_repository())
+        kvmem_repository_score_frame_.leases = block_store_->repository_read_leases();
     const bool had_query_prefetch = kvmem_query_prefetch_active_;
     const uint64_t query_prefetch_start_ns =
         kvmem_query_prefetch_start_ns_;
@@ -15314,7 +17086,13 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
                     scorer_used = scorer_requested;
                 } else {
                     add_scorer_failure(scorer_requested, reason);
-                    if (kvmem_gc_) {
+                    if (kvmem_gc_ || block_store_->has_repository()) {
+                        if (g_query_multi_ready_ && g_query_multi_count_ > 0) {
+                            throw std::runtime_error(
+                                "KVMem bounded retrieval scorer failed; refusing "
+                                "window-profile fallback for a captured query: " +
+                                scorer_fallback_reason);
+                        }
                         // Keep the existing window profile if the normal scorer
                         // is unavailable. Never run an unmasked fallback over holes.
                         scorer_used = "window-profile";
@@ -15341,7 +17119,7 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
             break;
     }
     kvmem_pending_plan_ =
-        block_store_->set_selection(kvmem_selection_with_pin());
+        kvmem_store_select(kvmem_selection_with_pin());
     if (kvmem_gc_score_event_) {
         auto &event = *kvmem_gc_score_event_;
         event.selected.assign(event.scores.size(), 0);
@@ -15407,7 +17185,8 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
         // QW3_KVMEM_TRACE.  The latter also prints every raw-K refresh batch;
         // enabling it during a pack ablation makes logging volume depend on
         // the arm and therefore perturbs the timing being measured.
-        if (fallback || perf_trace || std::getenv("QW3_KVMEM_TRACE")) {
+        if (fallback || block_store_->has_repository() || perf_trace ||
+            std::getenv("QW3_KVMEM_TRACE")) {
             static std::atomic<uint64_t> scorer_event_sequence{0};
             const uint64_t seq =
                 scorer_event_sequence.fetch_add(1, std::memory_order_relaxed);
@@ -15415,10 +17194,7 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
             for (const KvMemBlock &block : block_store_->blocks()) {
                 selected_blocks += block.in_working_set ? 1u : 0u;
             }
-            const uint32_t query_expected =
-                kvmem_query_end_ > kvmem_query_begin_
-                    ? kvmem_query_end_ - kvmem_query_begin_
-                    : 0;
+            const uint32_t query_expected = kvmem_query_expected_tokens();
             uint32_t indexed_blocks = 0;
             if (std::strcmp(scorer_used, "per-token") == 0 ||
                 std::strcmp(scorer_used, "deltanet") == 0) {
@@ -15446,7 +17222,7 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
             }
             std::fprintf(
                 stderr,
-                "[kvmem-scorer] seq=%llu tag=%s position=%u "
+                "[kvmem-scorer] seq=%llu tag=%s position=%" PRIu64 " "
                 "requested=%s used=%s fallback=%d reason=%s "
                 "query_expected=%u query_captured=%u query_ready=%d "
                 "indexed_blocks=%u source_blocks=%u selected_blocks=%u\n",
@@ -15468,8 +17244,8 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
         // Dump once per distinct question span (the post-prefill retrieval), so a
         // single server launch handling several requests emits one snapshot each.
         static int kvmem_dump_seq = 0;
-        static uint32_t kvmem_dump_last_qb = 0xffffffffu;
-        static uint32_t kvmem_dump_last_qe = 0xffffffffu;
+        static uint64_t kvmem_dump_last_qb = 0xffffffffu;
+        static uint64_t kvmem_dump_last_qe = 0xffffffffu;
         static std::string kvmem_dump_last_tag;
         // Only dump once the content index the scorer actually uses is LIVE. The
         // warm-checkpoint boundary split calls reselect mid-prefill (with the same
@@ -15508,8 +17284,8 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
                         "{\"type\":\"meta\",\"schema_version\":"
                         "\"qw3_kvmem_retrieval_dump.v2\",\"seq\":%d,"
                         "\"trace_tag\":\"%s\",\"block_count\":%zu,"
-                        "\"selected\":%u,\"query_begin\":%u,\"query_end\":%u,"
-                        "\"context_begin\":%u,\"context_end\":%u,"
+                        "\"selected\":%u,\"query_begin\":%" PRIu64 ",\"query_end\":%" PRIu64 ","
+                        "\"context_begin\":%" PRIu64 ",\"context_end\":%" PRIu64 ","
                         "\"prompt_tokens\":%zu,"
                         "\"budget_blocks\":%u,"
                         "\"prefill_budget_blocks\":%u,"
@@ -15518,7 +17294,7 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
                         "\"scorer_requested\":\"%s\","
                         "\"scorer_used\":\"%s\","
                         "\"scorer_fallback_reason\":\"%s\","
-                        "\"query_expected\":%u,\"query_captured\":%u,"
+                        "\"query_expected\":%" PRIu64 ",\"query_captured\":%u,"
                         "\"qc_total_blocks\":%u,\"qc_captured_blocks\":%u,"
                         "\"trace_event\":%u,\"trace_events\":%u,"
                         "\"index_ready\":%d,\"query_ready\":%d,"
@@ -15599,18 +17375,18 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
             if (can_sweep) {
                 if (kvmem_retrieval_score_mean_softmax(0)) {
                     kvmem_pending_plan_ =
-                        block_store_->set_selection(kvmem_selection_with_pin());
+                        kvmem_store_select(kvmem_selection_with_pin());
                     dump_snapshot(0);
                 }
                 if (kvmem_retrieval_score_mean_softmax(1)) {
                     kvmem_pending_plan_ =
-                        block_store_->set_selection(kvmem_selection_with_pin());
+                        kvmem_store_select(kvmem_selection_with_pin());
                     dump_snapshot(1);
                 }
                 // Restore production-consistent scoring/selection.
                 (void)kvmem_retrieval_score_mean_softmax(-1);
                 kvmem_pending_plan_ =
-                    block_store_->set_selection(kvmem_selection_with_pin());
+                    kvmem_store_select(kvmem_selection_with_pin());
             } else {
                 dump_snapshot(-1);
             }
@@ -15629,8 +17405,8 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     if (const char *layer_dump_path =
             std::getenv("QW3_KVMEM_DUMP_LAYER_SCORES")) {
         static uint32_t kvmem_layer_dump_seq = 0;
-        static uint32_t kvmem_layer_dump_last_qb = 0xffffffffu;
-        static uint32_t kvmem_layer_dump_last_qe = 0xffffffffu;
+        static uint64_t kvmem_layer_dump_last_qb = 0xffffffffu;
+        static uint64_t kvmem_layer_dump_last_qe = 0xffffffffu;
         static std::string kvmem_layer_dump_last_tag;
         const bool request_is_new = !kvmem_trace_tag_.empty()
             ? kvmem_trace_tag_ != kvmem_layer_dump_last_tag
@@ -15749,10 +17525,10 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
                     "{\"type\":\"sample\",\"schema_version\":"
                     "\"qw3_kvmem_layer_score_dump.v1\",\"seq\":%u,"
                     "\"trace_tag\":\"%s\",\"block_count\":%u,"
-                    "\"layer_count\":%u,\"query_begin\":%u,"
-                    "\"query_end\":%u,\"prompt_tokens\":%zu,"
+                    "\"layer_count\":%u,\"query_begin\":%" PRIu64 ","
+                    "\"query_end\":%" PRIu64 ",\"prompt_tokens\":%zu,"
                     "\"budget_blocks\":%u,\"selected\":%u,"
-                    "\"sink\":%u,\"recent\":%u,\"pin_from_block\":%u,"
+                    "\"sink\":%u,\"recent\":%u,\"pin_from_block\":%" PRIu64 ","
                     "\"block_tokens\":%u,\"subblocks\":%u,"
                     "\"subblock_reduce\":\"%s\","
                     "\"mask_excl_lo_end\":%u,"
@@ -15968,7 +17744,7 @@ uint32_t QwenExecutor::kvmem_finish_reselect() {
             kvmem_selection_hash(kvmem_pending_plan_);
         std::fprintf(
             stderr,
-            "[kvmem-reselect-perf] kind=semantic seq=%llu tag=%s position=%u "
+            "[kvmem-reselect-perf] kind=semantic seq=%llu tag=%s position=%" PRIu64 " "
             "source_blocks=%u selected_blocks=%zu selected_hash=%016llx "
             "remaps=%zu stage_out=%zu "
             "selection_ms=%.3f pre_score_ms=%.3f "
@@ -16090,6 +17866,37 @@ uint32_t QwenExecutor::kvmem_finish_reselect() {
     return window_query_pos_;
 }
 
+void QwenExecutor::kvmem_store_scores(const std::vector<double> &scores) {
+    if (!block_store_->has_repository()) {
+        block_store_->set_retrieval_scores(scores);
+        return;
+    }
+    const auto &frame = kvmem_repository_score_frame_;
+    if (frame.enabled.size() != scores.size())
+        throw std::logic_error("KVMem scores have no matching repository frame");
+    std::vector<KvMemBlockHandle> handles;
+    std::vector<double> values;
+    handles.reserve(frame.leases.size()); values.reserve(frame.leases.size());
+    for (const auto &lease : frame.leases) {
+        const auto h = lease.handle();
+        if (frame.enabled[h.slot]) { handles.push_back(h); values.push_back(scores[h.slot]); }
+    }
+    block_store_->set_repository_retrieval_scores(handles, values);
+}
+
+KvMemPlan QwenExecutor::kvmem_store_select(const std::vector<uint32_t> &ids,
+                                          bool force_raw_refresh) {
+    if (!block_store_->has_repository())
+        return block_store_->set_selection(ids, force_raw_refresh);
+    std::vector<KvMemBlockHandle> handles;
+    handles.reserve(ids.size());
+    for (auto id : ids) handles.push_back(block_store_->repository_handle(id));
+    auto plan = block_store_->set_repository_selection(handles, force_raw_refresh);
+    kvmem_repository_score_frame_ = {}; // installed window/transfer plans now own their leases
+    if (kvmem_repository_gc_) kvmem_repository_gc_->notify_progress();
+    return plan;
+}
+
 uint32_t QwenExecutor::kvmem_set_selection(
         const std::vector<uint32_t> &block_ids,
         bool force_raw_refresh) {
@@ -16104,7 +17911,7 @@ uint32_t QwenExecutor::kvmem_set_selection(
     if (kvmem_immutable_source_k_) kvmem_flush_raw_k_decode();
     const uint64_t t_select0 =
         perf_trace ? kvmem_steady_ns() : 0;
-    KvMemPlan plan = block_store_->set_selection(
+    KvMemPlan plan = kvmem_store_select(
         block_ids, force_raw_refresh);
     const uint64_t selection_ns =
         perf_trace ? kvmem_steady_ns() - t_select0 : 0;
@@ -16216,7 +18023,7 @@ uint32_t QwenExecutor::kvmem_set_selection(
         std::fprintf(
             stderr,
             "[kvmem-reselect-perf] kind=explicit seq=%llu tag=%s "
-            "position=%u source_blocks=%u selected_blocks=%zu remaps=%zu "
+            "position=%" PRIu64 " source_blocks=%u selected_blocks=%zu remaps=%zu "
             "stage_out=%zu selection_ms=%.3f stage_out_ms=%.3f "
             "stage_out_d2h_ms=%.3f stage_out_cpu_copy_ms=%.3f "
             "stage_out_disk_write_ms=%.3f "
@@ -16296,11 +18103,17 @@ uint32_t QwenExecutor::kvmem_set_selection(
 // appends the exact page kv_pages_ just grew — keeping the two tables in
 // lockstep and the decode path byte-identical to plain.
 void QwenExecutor::kvmem_extend_window_for_decode() {
+    if (block_store_ && block_store_->has_repository()) {
+        kvmem_append_repository_window(kv_pages_, window_pages_host_, position_, 1, window_query_pos_);
+        window_page_count_ = static_cast<uint32_t>(window_pages_host_.size());
+        sync_window_pages_device(window_page_count_);
+        return;
+    }
     const uint32_t page_size = kv_pages_.page_size;
     const uint32_t need_pages = (window_query_pos_ + page_size) / page_size;
     if (need_pages <= window_page_count_) return;  // current page has room
     // The true tail page kv_pages_ just allocated for `position_`.
-    const uint32_t true_page = position_ / page_size;
+    const uint32_t true_page = checked_local_position(position_ / page_size);
     if (true_page >= kv_pages_.pages.size()) {
         throw std::runtime_error(
             "block-sparse decode: true KV page not allocated before window extend");
@@ -16321,8 +18134,14 @@ void QwenExecutor::kvmem_extend_window_for_decode() {
 // position_ and window_query_pos_ together, so window page `pg` aliases true
 // page `pg + (position_ - window_query_pos_)/page_size`). Syncs once at the end.
 void QwenExecutor::kvmem_extend_window_for_decode_n(uint32_t n,
-                                                    uint32_t true_base_pos) {
+                                                    uint64_t true_base_pos) {
     if (n == 0) return;
+    if (block_store_ && block_store_->has_repository()) {
+        kvmem_append_repository_window(kv_pages_, window_pages_host_, true_base_pos, n, window_query_pos_);
+        window_page_count_ = static_cast<uint32_t>(window_pages_host_.size());
+        sync_window_pages_device(window_page_count_);
+        return;
+    }
     const uint32_t page_size = kv_pages_.page_size;
     const uint32_t need_pages =
         (window_query_pos_ + n + page_size - 1) / page_size;
@@ -16333,7 +18152,7 @@ void QwenExecutor::kvmem_extend_window_for_decode_n(uint32_t n,
         throw std::runtime_error(
             "block-sparse batched decode: true base precedes window tail");
     }
-    const uint32_t delta = (true_base_pos - window_query_pos_) / page_size;
+    const uint32_t delta = checked_local_position((true_base_pos - window_query_pos_) / page_size);
     for (uint32_t pg = window_page_count_; pg < need_pages; ++pg) {
         const uint32_t true_page = pg + delta;
         if (true_page >= kv_pages_.pages.size()) {
@@ -16348,8 +18167,23 @@ void QwenExecutor::kvmem_extend_window_for_decode_n(uint32_t n,
 }
 
 void QwenExecutor::kvmem_extend_mtp_window_for_decode_n(uint32_t n,
-                                                        uint32_t true_base_pos) {
+                                                        uint64_t true_base_pos) {
     if (n == 0) return;
+    if (block_store_ && block_store_->has_repository()) {
+        // Prefix priming writes MTP KV after the main forward but does not
+        // advance this attention window. Fill its already-primed recent tail
+        // before appending draft pages, using historical -> physical spans;
+        // main and MTP page allocators need not have the same physical IDs.
+        const uint64_t covered = uint64_t(mtp_window_pages_host_.size()) * mtp_kv_pages_.page_size;
+        const uint32_t missing = covered < window_query_pos_ ? window_query_pos_ - covered : 0;
+        if (missing > true_base_pos || uint64_t(missing) + n > UINT32_MAX)
+            throw std::logic_error("KVMem MTP window tail exceeds its history interval");
+        kvmem_append_repository_window(mtp_kv_pages_, mtp_window_pages_host_,
+            uint64_t(true_base_pos) - missing, missing + n, window_query_pos_ - missing);
+        mtp_window_page_count_ = static_cast<uint32_t>(mtp_window_pages_host_.size());
+        sync_mtp_window_pages_device(mtp_window_page_count_);
+        return;
+    }
     const uint32_t page_size = mtp_kv_pages_.page_size;
     const uint32_t need_pages =
         (window_query_pos_ + n + page_size - 1) / page_size;
@@ -16367,7 +18201,7 @@ void QwenExecutor::kvmem_extend_mtp_window_for_decode_n(uint32_t n,
         throw std::runtime_error(
             "block-sparse MTP draft: true base precedes window tail");
     }
-    const uint32_t delta = (true_base_pos - window_query_pos_) / page_size;
+    const uint32_t delta = checked_local_position((true_base_pos - window_query_pos_) / page_size);
     while (mtp_window_pages_host_.size() < need_pages) {
         const uint32_t pg = static_cast<uint32_t>(mtp_window_pages_host_.size());
         const uint32_t true_page = pg + delta;
@@ -16390,8 +18224,16 @@ void QwenExecutor::kvmem_extend_mtp_window_for_decode_n(uint32_t n,
 // per-step kernel will score against.
 void QwenExecutor::kvmem_recompute_kbar() {
     bs_score_ready_ = false;
+    bs_window_repository_handles_.clear();
     bs_window_blocks_ = static_cast<uint32_t>(bs_window_block_ids_.size());
     if (bs_window_blocks_ == 0) return;
+    if (block_store_->has_repository()) {
+        for (auto id : bs_window_block_ids_) {
+            const auto h = block_store_->repository_handle(id);
+            if (!h.generation) throw std::logic_error("KVMem attention window lost its block generation");
+            bs_window_repository_handles_.push_back(h);
+        }
+    }
 
     const QwenConfig &cfg = model_.config();
     // Pick the first standard attention layer as the global representative.
@@ -16467,7 +18309,12 @@ void QwenExecutor::kvmem_drain_scores() {
         const uint32_t id = bs_window_block_ids_[w];
         if (id < scores.size()) scores[id] += static_cast<double>(accum[w]);
     }
-    block_store_->accumulate_attn(scores);
+    if (block_store_->has_repository()) {
+        if (bs_window_repository_handles_.size() != bs_window_blocks_)
+            throw std::logic_error("KVMem attention accumulator lost its window identities");
+        std::vector<double> window_scores(accum.begin(), accum.end());
+        block_store_->accumulate_repository_attn(bs_window_repository_handles_, window_scores);
+    } else block_store_->accumulate_attn(scores);
     if (std::getenv("QW3_KVMEM_TRACE")) {
         // Surface the top attention-heat blocks of the interval so the
         // selection signal is observable (internal diagnostic, default off).
@@ -16515,8 +18362,7 @@ void QwenExecutor::kvmem_set_query_score_token_indices(
     kvmem_query_score_token_indices_ = indices;
 }
 
-bool QwenExecutor::kvmem_begin_query_attention_probe(uint32_t begin,
-                                                     uint32_t end) {
+bool QwenExecutor::kvmem_begin_query_attention_probe(uint64_t begin, uint64_t end) {
     kvmem_cancel_query_attention_probe();
     if (!kvmem_active_ || !block_store_ || end <= begin || end > position_ ||
         !window_pages_device_ || window_page_count_ == 0 ||
@@ -16534,12 +18380,30 @@ bool QwenExecutor::kvmem_begin_query_attention_probe(uint32_t begin,
         window_page_by_physical.emplace(window_pages_host_[i], i);
     }
 
-    const uint32_t count = end - begin;
+    if (end - begin > INT32_MAX) return false;
+    const uint32_t count = static_cast<uint32_t>(end - begin);
+    KvMemStorageRead repository_view;
+    if (block_store_->has_repository()) {
+        try { repository_view = block_store_->repository_storage_read(begin, count); }
+        catch (const std::runtime_error &) { return false; }
+    }
+    size_t span_index = 0;
     kvmem_query_attention_probe_base_host_.reserve(count);
     kvmem_query_attention_probe_tokens_host_.assign(count, 1);
     int64_t previous_compact = -1;
-    for (uint32_t pos = begin; pos < end; ++pos) {
-        const uint32_t logical_page = pos / page_size;
+    for (uint64_t pos = begin; pos < end; ++pos) {
+        uint32_t storage = 0;
+        if (block_store_->has_repository()) {
+            while (span_index < repository_view.spans.size() &&
+                   pos >= repository_view.spans[span_index].history_begin + repository_view.spans[span_index].token_count)
+                ++span_index;
+            if (span_index == repository_view.spans.size()) {
+                kvmem_cancel_query_attention_probe(); return false;
+            }
+            const auto &span = repository_view.spans[span_index];
+            storage = span.storage_begin + static_cast<uint32_t>(pos - span.history_begin);
+        } else storage = checked_local_position(pos);
+        const uint32_t logical_page = storage / page_size;
         if (logical_page >= kv_pages_.pages.size()) {
             kvmem_cancel_query_attention_probe();
             return false;
@@ -16552,7 +18416,7 @@ bool QwenExecutor::kvmem_begin_query_attention_probe(uint32_t begin,
         }
         const uint64_t compact64 =
             static_cast<uint64_t>(found->second) * page_size +
-            (pos % page_size);
+            (storage % page_size);
         if (compact64 >= window_query_pos_ || compact64 > INT32_MAX ||
             static_cast<int64_t>(compact64) <= previous_compact) {
             kvmem_cancel_query_attention_probe();
@@ -16649,6 +18513,77 @@ void QwenExecutor::kvmem_cancel_query_attention_probe() {
     kvmem_query_attention_probe_tokens_host_.clear();
 }
 
+std::unique_ptr<QwenExecutor> QwenExecutor::make_isolated_generation(
+        uint32_t minimum_capacity, uint32_t desired_capacity) {
+    if (!minimum_capacity || minimum_capacity > desired_capacity)
+        throw std::invalid_argument("invalid isolated generation capacity");
+    if (!kvmem_gpu_page_pool_ || !external_kv_cache_ ||
+        !block_store_ || !block_store_->has_repository() || kvmem_query_probe_guard_active())
+        return nullptr;
+    auto &pool = *kvmem_gpu_page_pool_;
+    pool.set_transient_allocation(true);
+    struct ResetTransient {
+        KvPhysicalPageAllocator &pool;
+        ~ResetTransient() { pool.set_transient_allocation(false); }
+    } reset{pool};
+    const uint32_t page_size = kv_pages_.page_size;
+    const uint32_t free_pages = pool.free_pages();
+    // Keep one parent tail page free. The child releases its entire lease
+    // before the parent's replacement replay starts.
+    const uint64_t available = free_pages > 1 ? uint64_t(free_pages - 1) * page_size : 0;
+    uint64_t capacity = std::min<uint64_t>(desired_capacity, available);
+    if (model_.config().n_ctx_train) capacity = std::min<uint64_t>(capacity, model_.config().n_ctx_train);
+    if (capacity < minimum_capacity) return nullptr;
+    const uint32_t pages = uint32_t((capacity + page_size - 1) / page_size);
+    auto lease = std::make_unique<SharedKvPagePool>(pool, pages, 0, "isolated-summary");
+    auto child = std::make_unique<QwenExecutor>(model_, weights_, backend_, uint32_t(capacity),
+                                               lease.get(), external_kv_cache_);
+    child->isolated_kv_page_pool_ = std::move(lease);
+    child->set_prefill_chunk_override(256);
+    child->ensure_scratch();
+    child->reset_state(); // Explicitly zero recurrent/conv state before prefill.
+    return child;
+}
+
+bool QwenExecutor::kvmem_begin_private_generation_probe(uint32_t append_capacity) {
+    const uint32_t capacity = kvmem_begin_bounded_private_generation_probe(append_capacity);
+    if (capacity == append_capacity && capacity != 0) return true;
+    if (capacity) kvmem_cancel_guided_query_probe();
+    return false;
+}
+
+uint32_t QwenExecutor::kvmem_begin_bounded_private_generation_probe(uint32_t desired_capacity) {
+    if (!kvmem_enabled_ || !block_store_ || !desired_capacity ||
+        kvmem_query_probe_guard_active()) return 0;
+    kvmem_cancel_guided_query_probe();
+    if (kvmem_gpu_page_pool_) kvmem_gpu_page_pool_->set_transient_allocation(true);
+    if (kvmem_mtp_gpu_page_pool_) kvmem_mtp_gpu_page_pool_->set_transient_allocation(true);
+    uint64_t capacity = desired_capacity;
+    const auto page_capacity = [&](const auto &pool) -> uint64_t {
+        const uint64_t free = pool->free_pages();
+        return free > 1 ? (free - 1) * std::max<uint32_t>(1, kv_pages_.page_size) : 0;
+    };
+    if (kvmem_gpu_page_pool_)
+        capacity = std::min(capacity, page_capacity(kvmem_gpu_page_pool_));
+    else {
+        const uint64_t used = kvmem_active_ ? window_query_pos_ : position_;
+        capacity = std::min(capacity, used < kv_ctx_size_ ? kv_ctx_size_ - used : uint64_t{0});
+    }
+    if (kvmem_mtp_gpu_page_pool_)
+        capacity = std::min(capacity, page_capacity(kvmem_mtp_gpu_page_pool_));
+    if (block_store_->has_repository()) {
+        const uint32_t bt = block_store_->config().block_tokens;
+        // Cancelled reservations become ready asynchronously. Leave another
+        // full tail for replacement so
+        // replay never depends on the CPU reclaimer winning a scheduling race.
+        const uint64_t blocks = block_store_->repository()->ready_slots() / 2;
+        capacity = std::min(capacity, blocks > 1 ? (blocks - 1) * bt : uint64_t{0});
+    }
+    if (!capacity) { kvmem_cancel_guided_query_probe(); return 0; }
+    kvmem_guided_query_probe_active_ = true;
+    return static_cast<uint32_t>(capacity);
+}
+
 bool QwenExecutor::kvmem_begin_guided_query_probe(
         uint32_t query_capacity) {
     kvmem_cancel_guided_query_probe();
@@ -16685,6 +18620,8 @@ bool QwenExecutor::kvmem_begin_guided_query_probe(
     kvmem_guided_query_capture_failed_ = false;
     kvmem_guided_query_capture_this_token_ = false;
     kvmem_guided_query_probe_active_ = true;
+    if (kvmem_gpu_page_pool_) kvmem_gpu_page_pool_->set_transient_allocation(true);
+    if (kvmem_mtp_gpu_page_pool_) kvmem_mtp_gpu_page_pool_->set_transient_allocation(true);
     return true;
 }
 
@@ -16737,10 +18674,11 @@ NativeExecutorReport QwenExecutor::forward_guided_query_mtp(
         mtp_prefix_len_ < position_) {
         throw std::runtime_error("guided MTP requires a contiguous private prefix");
     }
-    const uint32_t base = position_, query_base = kvmem_guided_query_count_;
+    const uint64_t base = position_;
+    const uint32_t query_base = kvmem_guided_query_count_;
     const uint32_t rope_base = kvmem_active_
         ? (input_mrope_positions_.empty() ? window_query_pos_ : window_mrope_next_)
-        : position_;
+        : checked_local_position(position_);
     tokens.assign(1, current);
     const auto drafts = forward_mtp_draft_chain_with_prefix_device(
         current, std::min(chain, remaining - 1));
@@ -16789,8 +18727,87 @@ NativeExecutorReport QwenExecutor::forward_guided_query_mtp(
     return report;
 }
 
+NativeExecutorReport QwenExecutor::forward_guided_query_dflash(
+        uint32_t current, uint32_t chain, uint32_t remaining,
+        const std::array<int32_t, 3> &stops, StateCheckpointSet &checkpoints,
+        DeviceTensor &noise, std::vector<uint32_t> &tokens) {
+    if (!kvmem_guided_query_probe_active_ || remaining == 0 ||
+        !dflash_executor_ || dflash_executor_->next_position() != position_) {
+        throw std::runtime_error("guided DFlash requires a contiguous private prefix");
+    }
+    auto &draft = *dflash_executor_;
+    const uint64_t base = position_;
+    const uint32_t query_base = kvmem_guided_query_count_;
+    const bool capture = kvmem_guided_query_capture_this_token_;
+    // Scope is only the private greedy query. Main-request width is unchanged.
+    static const bool five_drafts = [] {
+        const char *v = std::getenv("QW3_EXPERIMENTAL_GUIDED_DFLASH_FIVE");
+        return v && std::strcmp(v, "1") == 0;
+    }();
+    if (five_drafts) chain = std::min(chain, 5u);
+    const uint32_t limit = capture
+        ? std::min({chain, remaining - 1, draft.config().block_size - 1}) : 0;
+    tokens.assign(1, current);
+    if (limit) {
+        std::vector<uint64_t> ids(limit + 1, draft.config().mask_token_id);
+        ids.front() = current;
+        auto status = backend_.begin();
+        if (status.ok) status = backend_.q8_0_get_rows_batch(
+            noise, weights_.token_embd(), ids.data(), ids.size());
+        if (!status.ok) throw std::runtime_error(status.message);
+        draft.forward(noise, ids.size(), base);
+        // Greedy private queries must never consume the main request's RNG.
+        std::mt19937_64 private_rng(0);
+        const auto proposal = draft.propose(weights_.output(), current, 0.0f, private_rng);
+        if (proposal.tokens.size() != limit)
+            throw std::runtime_error("guided DFlash proposal size mismatch");
+        for (int32_t token : proposal.tokens) {
+            if (token < 0 || std::find(stops.begin(), stops.end(), token) != stops.end()) break;
+            tokens.push_back(static_cast<uint32_t>(token));
+        }
+    }
+    const uint32_t drafted = static_cast<uint32_t>(tokens.size() - 1);
+    NativeExecutorReport report;
+    if (!drafted) {
+        report = forward_one_token(current);
+        if (report.ok && (kvmem_guided_query_capture_failed_ ||
+                kvmem_guided_query_count_ != query_base + (capture ? 1 : 0)))
+            throw std::runtime_error("guided DFlash serial query Q count mismatch");
+    } else {
+        std::vector<DeviceArgmax> next;
+        report = forward_n_tokens(tokens, true, &next, &checkpoints, drafted,
+                                  /*copy_last_logits=*/false);
+        if (!report.ok || next.size() != tokens.size())
+            throw std::runtime_error("guided DFlash target verification failed");
+        if (kvmem_guided_query_capture_failed_ ||
+            kvmem_guided_query_count_ != query_base + tokens.size())
+            throw std::runtime_error("guided DFlash lost provisional query Q rows");
+        uint32_t accepted = 1; // current is already target-confirmed.
+        while (accepted < tokens.size() &&
+               next[accepted - 1].token == static_cast<int32_t>(tokens[accepted])) ++accepted;
+        if (accepted < tokens.size()) restore_state_checkpoint(checkpoints, accepted - 1);
+        kvmem_guided_query_count_ = query_base + accepted;
+        report.argmax_token = next[accepted - 1].token;
+        tokens.resize(accepted);
+    }
+    if (!report.ok) return report;
+    const auto features = dflash_features();
+    if (!features.data || features.logical_base != base || features.rows != tokens.size() ||
+        position_ != base + tokens.size())
+        throw std::runtime_error("guided DFlash accepted feature/state mismatch");
+    // Never append rejected target features. The enclosing private-branch
+    // snapshot owns both target and DFlash restoration, including exceptions.
+    draft.append_context(*features.data, tokens.size(), base);
+    std::fprintf(stderr,
+        "[kvmem-guided-dflash] drafted=%u accepted=%zu capture=%u query_before=%u query_after=%u\n",
+        drafted, tokens.size() - 1, unsigned(capture), query_base, kvmem_guided_query_count_);
+    return report;
+}
+
 uint32_t QwenExecutor::kvmem_end_guided_query_probe() {
     const uint32_t count = kvmem_guided_query_count_;
+    if (kvmem_gpu_page_pool_) kvmem_gpu_page_pool_->set_transient_allocation(false);
+    if (kvmem_mtp_gpu_page_pool_) kvmem_mtp_gpu_page_pool_->set_transient_allocation(false);
     kvmem_guided_query_probe_active_ = false;
     kvmem_guided_query_capture_this_token_ = false;
     if (kvmem_guided_query_capture_failed_ || count == 0 ||
@@ -16821,6 +18838,16 @@ uint32_t QwenExecutor::kvmem_end_guided_query_probe() {
             *g_query_multi_, dst, *kvmem_guided_query_dev_, src,
             static_cast<uint64_t>(count) * row_elems));
     }
+    if (env_flag_enabled("QW3_EXPERIMENTAL_DFLASH_TRIM_TRANSIENTS", false)) {
+        // The score tensor owns the compact accepted Q rows. Complete its D2D
+        // copies before retiring the larger private-query capture allocation.
+        require_status(backend_.synchronize());
+        std::fprintf(stderr, "[dflash-transient-trim] kind=query_end from_bytes=%llu\n",
+            static_cast<unsigned long long>(kvmem_guided_query_dev_->count * kvmem_guided_query_dev_->elem_size));
+        kvmem_guided_query_dev_.reset();
+        kvmem_guided_query_tensor_capacity_ = 0;
+        kvmem_guided_query_capacity_ = 0;
+    }
     g_query_multi_capacity_ = rows;
     kvmem_query_span_ = count;
     g_query_multi_count_ = count;
@@ -16836,6 +18863,18 @@ uint32_t QwenExecutor::kvmem_end_guided_query_probe() {
 }
 
 void QwenExecutor::kvmem_cancel_guided_query_probe() {
+    if (kvmem_guided_query_dev_ &&
+        env_flag_enabled("QW3_EXPERIMENTAL_DFLASH_TRIM_TRANSIENTS", false)) {
+        // Capture is CUDA-only. Its owned CudaTensor retires with cudaFree,
+        // as in existing buffer replacement; do not add a throwing sync to
+        // cancellation, which also runs during exception unwinding.
+        std::fprintf(stderr, "[dflash-transient-trim] kind=query_cancel from_bytes=%llu\n",
+            static_cast<unsigned long long>(kvmem_guided_query_dev_->count * kvmem_guided_query_dev_->elem_size));
+        kvmem_guided_query_dev_.reset();
+        kvmem_guided_query_tensor_capacity_ = 0;
+    }
+    if (kvmem_gpu_page_pool_) kvmem_gpu_page_pool_->set_transient_allocation(false);
+    if (kvmem_mtp_gpu_page_pool_) kvmem_mtp_gpu_page_pool_->set_transient_allocation(false);
     kvmem_guided_query_probe_active_ = false;
     kvmem_guided_query_capture_this_token_ = false;
     kvmem_guided_query_capture_failed_ = false;
@@ -16904,7 +18943,7 @@ void QwenExecutor::kvmem_trace_attention_layer(uint32_t layer_index,
     std::FILE *f = kvmem_attn_trace_file_;
     std::fprintf(f,
                  "{\"kind\":\"kvmem_attention_mass\","
-                 "\"sample\":%llu,\"position\":%u,\"window_query_pos\":%u,"
+                 "\"sample\":%llu,\"position\":%" PRIu64 ",\"window_query_pos\":%u,"
                  "\"seq_len\":%u,\"layer\":%u,\"n_heads\":%u,"
                  "\"n_kv_heads\":%u,\"head_dim\":%u,\"sum\":%.9g,"
                  "\"block_ids\":[",
@@ -17012,7 +19051,7 @@ void QwenExecutor::global_trace_attention_layer(uint32_t layer_index,
     std::FILE *f = global_attn_trace_file_;
     std::fprintf(f,
                  "{\"kind\":\"attention_mass\",\"mode\":\"global\","
-                 "\"sample\":%llu,\"position\":%u,\"seq_len\":%u,"
+                 "\"sample\":%llu,\"position\":%" PRIu64 ",\"seq_len\":%u,"
                  "\"layer\":%u,\"n_heads\":%u,\"n_kv_heads\":%u,"
                  "\"head_dim\":%u,\"block_tokens\":%u,\"sum\":%.9g,"
                  "\"block_ids\":[",
@@ -17099,7 +19138,11 @@ void QwenExecutor::kvmem_build_content_index() {
             blocks[i].n_tokens, cfg.n_ctx_train, bs_score_layer_);
     }
 
-    if (n_blocks > g_kbar_global_capacity_) {
+    // CPU query-conditioned indexing can release the legacy GPU output while
+    // retaining its metadata capacity. A later, smaller cold request still
+    // needs an output tensor; capacity alone does not prove it exists.
+    if (n_blocks > g_kbar_global_capacity_ || !g_kbar_ || !g_score_dev_ ||
+        !g_orig_base_dev_ || !g_blk_tokens_dev_) {
         g_kbar_global_capacity_ = n_blocks;
         g_kbar_ = kvmem_alloc_mean_index_tensor(
             static_cast<uint64_t>(g_kbar_global_capacity_) * n_kv_heads * head_dim,
@@ -17238,7 +19281,7 @@ bool QwenExecutor::kvmem_retrieval_score(std::string *failure_reason) {
     for (uint32_t id = 0; id < g_indexed_blocks_ && id < scores.size(); ++id) {
         scores[id] = static_cast<double>(score[id]);
     }
-    block_store_->set_retrieval_scores(scores);
+    kvmem_store_scores(scores);
     if (std::getenv("QW3_KVMEM_TRACE")) {
         std::vector<std::pair<float, uint32_t>> ranked;
         ranked.reserve(g_indexed_blocks_);
@@ -17283,12 +19326,14 @@ void QwenExecutor::kvmem_set_trace_metadata(
 // content-frame buffer are ready so kvmem_capture_query_multi can de-RoPE the
 // in-span Q rows during prefill. begin==end (default) leaves everything inert
 // -> the single-token retrieval / recency path runs unchanged.
-void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
-                                        uint32_t prompt_tokens,
-                                        uint32_t index_tokens,
+void QwenExecutor::kvmem_set_query_span(uint64_t begin, uint64_t end,
+                                        uint64_t prompt_tokens,
+                                        uint64_t index_tokens,
                                         bool preserve_content_index,
                                         bool capture_content_without_query,
                                         uint32_t min_query_storage_rows) {
+    if (end < begin || end > prompt_tokens || end - begin > INT32_MAX)
+        throw std::invalid_argument("KVMem query span is outside the prompt or local capture range");
     // A previous request may have left the final asynchronous capture copy in
     // flight. Drain it before changing the span or reusing either bounce slot.
     kvmem_drain_mean_index_capture();
@@ -17301,10 +19346,10 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     // kvmem_truncate_to on a session-continuation turn). It is only USED when a
     // span is active below (above-budget QC); on a cold/below-budget call it is
     // still cleared here so it can never leak into a later turn.
-    const uint32_t resume_base = kvmem_qc_resume_base_tokens_;
+    const uint64_t resume_base = kvmem_qc_resume_base_tokens_;
     kvmem_qc_resume_base_tokens_ = 0;
     const uint32_t preserved_captured_blocks = kvmem_qc_captured_blocks_;
-    const uint32_t preserved_captured_tokens = kvmem_qc_captured_tokens_;
+    const uint64_t preserved_captured_tokens = kvmem_qc_captured_tokens_;
     const uint32_t preserved_stride_blocks = kvmem_qc_layer_stride_blocks_;
     const uint32_t preserved_subblocks = kvmem_qc_n_subblocks_;
     kvmem_query_begin_ = begin;
@@ -17337,8 +19382,7 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     // g_query_multi_ holds the per-layer de-RoPE'd question rows, laid out
     // [L, S, n_heads, head_dim] (S = span length, per-layer row stride). Allocate
     // by the exact L*S so a tiny question only costs tens of MB.
-    const uint32_t public_query_rows =
-        kvmem_query_end_ - kvmem_query_begin_;
+    const uint32_t public_query_rows = kvmem_query_expected_tokens();
     const uint32_t S = detail::kvmem_query_storage_rows(
         public_query_rows, min_query_storage_rows);
     kvmem_query_span_ = S;
@@ -17488,7 +19532,7 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     // Query replay ranks historical blocks only. Its query span remains in the
     // full prompt coordinate frame, while the content index deliberately ends
     // at the query boundary so it is complete before the final replay begins.
-    uint32_t indexed_tokens = index_tokens > 0 ? index_tokens : prompt_tokens;
+    uint64_t indexed_tokens = index_tokens > 0 ? index_tokens : prompt_tokens;
     if (indexed_tokens == 0) return;
     const uint32_t bt = std::max<uint32_t>(block_store_->config().block_tokens, 1u);
     // An explicit index boundary separates sealed historical content from a
@@ -17506,10 +19550,12 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
         indexed_tokens = (indexed_tokens / bt) * bt;
         if (indexed_tokens == 0) return;
     }
-    const uint32_t total_blocks = (indexed_tokens + bt - 1) / bt;
+    const uint32_t total_blocks = block_store_->has_repository() ? block_store_->block_count() :
+        checked_local_position(indexed_tokens / bt + (indexed_tokens % bt != 0));
     if (total_blocks == 0) return;
     kvmem_qc_total_blocks_ = total_blocks;
     kvmem_qc_prompt_tokens_ = indexed_tokens;
+    if (block_store_->has_repository()) kvmem_repository_score_history_end_ = indexed_tokens;
     // Sub-block mean-k (SubBlockMeanK): capture this many equal, non-overlapping
     // sub-block means per block so the scorer can run softmax at sub-block
     // granularity. 1 for plain mean-k / per-token -> byte-identical layout.
@@ -17567,7 +19613,8 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     // reallocates as the session grows. Clamp up so a prompt longer than the
     // configured ctx can't under-size the stride.
     const uint32_t ctx_blocks = (kv_ctx_size_ + bt - 1) / bt;
-    const uint32_t stride_blocks = std::max(ctx_blocks, total_blocks);
+    const uint32_t stride_blocks = block_store_->has_repository() ? total_blocks :
+        std::max(ctx_blocks, total_blocks);
     if (preserve_content_index &&
         (kvmem_qc_pertoken_ || kvmem_qc_deltanet_ ||
          !kvmem_mean_index_available() ||
@@ -17682,7 +19729,8 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
             kvmem_qc_captured_tokens_ =
                 std::min(resume_base, indexed_tokens);
             kvmem_qc_captured_blocks_ =
-                (kvmem_qc_captured_tokens_ + bt - 1) / bt;
+                block_store_->has_repository() ? block_store_->block_count() :
+                checked_local_position(kvmem_qc_captured_tokens_ / bt + (kvmem_qc_captured_tokens_ % bt != 0));
         } else {
             kvmem_qc_captured_blocks_ = 0;
             kvmem_qc_captured_tokens_ = 0;
@@ -17690,7 +19738,8 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     } else if (resume_index_available && !freshly_allocated) {
         kvmem_qc_captured_tokens_ = std::min(resume_base, indexed_tokens);
         kvmem_qc_captured_blocks_ =
-            (kvmem_qc_captured_tokens_ + bt - 1) / bt;
+            block_store_->has_repository() ? block_store_->block_count() :
+                checked_local_position(kvmem_qc_captured_tokens_ / bt + (kvmem_qc_captured_tokens_ % bt != 0));
     } else {
         kvmem_qc_captured_tokens_ = 0;
         if (g_kbar_multi_) {
@@ -17703,7 +19752,7 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     // layers) this is ~7.4 GB, so it is allocated ONLY under --kvmem-retrieval-method
     // per-token (the default mean-k path pays zero).
     if (kvmem_qc_pertoken_) {
-        kvmem_qc_total_tokens_ = indexed_tokens;
+        kvmem_qc_total_tokens_ = checked_local_position(indexed_tokens);
         const uint64_t kraw_per_layer =
             static_cast<uint64_t>(indexed_tokens) * n_kv_heads * head_dim;
         const uint64_t kraw_total = kraw_per_layer * L;
@@ -17712,7 +19761,7 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
         }
         if (std::getenv("QW3_KVMEM_TRACE")) {
             std::fprintf(stderr,
-                "[bs-exactmass] alloc g_kraw_multi: L=%u total_tokens=%u -> %.2f GiB\n",
+                "[bs-exactmass] alloc g_kraw_multi: L=%u total_tokens=%" PRIu64 " -> %.2f GiB\n",
                          L, indexed_tokens,
                 static_cast<double>(kraw_total) * sizeof(float) / (1024.0*1024.0*1024.0));
         }
@@ -17791,7 +19840,9 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     // context block. No suffix capture will run before selection, so publish the
     // preserved index now instead of waiting for kvmem_capture_kbar_multi().
     if (!freshly_allocated &&
-        kvmem_qc_captured_blocks_ >= kvmem_qc_total_blocks_) {
+        (block_store_->has_repository() ?
+         kvmem_qc_captured_tokens_ >= indexed_tokens && kvmem_repository_index_covers(indexed_tokens) :
+         kvmem_qc_captured_blocks_ >= kvmem_qc_total_blocks_)) {
         g_content_ready_ = true;
         g_indexed_blocks_ = kvmem_qc_total_blocks_;
         g_kbar_multi_ready_ = true;
@@ -17802,7 +19853,7 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     }
 }
 
-bool QwenExecutor::kvmem_publish_captured_prefix(uint32_t scoreable_tokens) {
+bool QwenExecutor::kvmem_publish_captured_prefix(uint64_t scoreable_tokens) {
     if (!kvmem_enabled_ || !block_store_ ||
         !kvmem_mean_index_available()) {
         return false;
@@ -17813,11 +19864,19 @@ bool QwenExecutor::kvmem_publish_captured_prefix(uint32_t scoreable_tokens) {
     // Score only sealed context blocks before the replay boundary. The live
     // first-pass query suffix is pinned by kvmem_set_pin_from_block() and must
     // not dilute the softmax or publish temporary K means.
-    const uint32_t n_blocks = std::min<uint32_t>(
+    const bool bounded = block_store_->has_repository();
+    const uint32_t n_blocks = bounded ? block_store_->block_count() : std::min<uint32_t>(
         block_store_->block_count(), scoreable_tokens / bt);
-    if (n_blocks == 0 || scoreable_tokens > kvmem_qc_captured_tokens_ ||
-        n_blocks > kvmem_qc_captured_blocks_ ||
+    if (n_blocks == 0 || scoreable_tokens == 0 || scoreable_tokens > kvmem_qc_captured_tokens_ ||
+        (!bounded && n_blocks > kvmem_qc_captured_blocks_) ||
         n_blocks > kvmem_qc_total_blocks_) {
+        std::fprintf(stderr,
+                     "[kvmem-publish-incomplete] scoreable_tokens=%" PRIu64 " "
+                     "captured_tokens=%" PRIu64 " blocks=%u captured_blocks=%u "
+                     "total_blocks=%u query_ready=%d\n",
+                     scoreable_tokens, kvmem_qc_captured_tokens_, n_blocks,
+                     kvmem_qc_captured_blocks_, kvmem_qc_total_blocks_,
+                     g_query_multi_ready_ ? 1 : 0);
         return false;
     }
     const QwenConfig &cfg = model_.config();
@@ -17827,6 +19886,7 @@ bool QwenExecutor::kvmem_publish_captured_prefix(uint32_t scoreable_tokens) {
     if (kvmem_mean_index_cpu() && !kvmem_adaptive_prototypes()) {
         kvmem_drain_mean_index_capture();
     }
+    if (bounded && !kvmem_repository_index_covers(scoreable_tokens)) return false;
     if (kvmem_adaptive_prototypes()) {
         // Unlike fixed-stride Mean-K, Adaptive has only its appendable host
         // authority during prefill. Materialize the exact packed GPU image at
@@ -17840,6 +19900,7 @@ bool QwenExecutor::kvmem_publish_captured_prefix(uint32_t scoreable_tokens) {
         require_status(backend_.copy_d2d(*g_kbar_, *g_kbar_multi_, 0,
                                          slot0_elems));
     }
+    if (bounded) kvmem_repository_score_history_end_ = scoreable_tokens;
     g_content_ready_ = true;
     g_indexed_blocks_ = n_blocks;
     g_kbar_multi_ready_ = true;
@@ -17847,7 +19908,7 @@ bool QwenExecutor::kvmem_publish_captured_prefix(uint32_t scoreable_tokens) {
     if (std::getenv("QW3_KVMEM_TRACE")) {
         std::fprintf(stderr,
                      "[bs-kbar-build] publish transcript prefix: blocks=%u "
-                     "captured=%u captured_tokens=%u scoreable_tokens=%u "
+                     "captured=%u captured_tokens=%" PRIu64 " scoreable_tokens=%" PRIu64 " "
                      "total=%u query_ready=%d\n",
                      n_blocks, kvmem_qc_captured_blocks_,
                      kvmem_qc_captured_tokens_, scoreable_tokens,
@@ -18005,7 +20066,7 @@ void QwenExecutor::kvmem_resolve_deltanet_layers() {
 void QwenExecutor::kvmem_capture_deltanet_query(uint32_t dn_slot,
                                                 uint32_t chunk_off,
                                                 uint32_t batch,
-                                                uint32_t base_pos,
+                                                uint64_t base_pos,
                                                 const DeviceTensor &conv_out,
                                                 uint32_t conv_stride) {
     if (kvmem_query_end_ <= kvmem_query_begin_) return;
@@ -18198,7 +20259,7 @@ bool QwenExecutor::kvmem_retrieval_score_deltanet(
         }
         best[j] = s;
     }
-    block_store_->set_retrieval_scores(best);
+    kvmem_store_scores(best);
     if (std::getenv("QW3_KVMEM_TRACE") || std::getenv("QW3_KVMEM_DELTANET_TRACE")) {
         std::fprintf(stderr,
             "[bs-deltanet] scored %u blocks over L_dn=%u layers, M=%u query "
@@ -18259,7 +20320,7 @@ void QwenExecutor::kvmem_drain_query_capture() {
 // contiguous run, so one batched launch covers it; counts accumulate across
 // chunks until the whole span is captured. Inert unless a span is active.
 void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
-                                             uint32_t batch, uint32_t base_pos,
+                                             uint32_t batch, uint64_t base_pos,
                                              uint32_t rope_base_pos,
                                              uint32_t q_token_stride,
                                              const DeviceTensor *mrope_positions,
@@ -18696,7 +20757,7 @@ bool QwenExecutor::kvmem_query_selection_ready() const {
 // With no pin (the default cleared by reset_state), preserve the ordinary
 // selector byte-for-byte.
 void QwenExecutor::kvmem_set_oracle_token_spans(
-        const std::vector<std::pair<uint32_t, uint32_t>> &spans,
+        const std::vector<std::pair<uint64_t, uint64_t>> &spans,
         bool oracle_only) {
     kvmem_oracle_token_spans_.clear();
     kvmem_oracle_only_ = oracle_only && !spans.empty();
@@ -18716,25 +20777,46 @@ void QwenExecutor::kvmem_set_oracle_token_spans(
 }
 
 void QwenExecutor::kvmem_set_mandatory_token_spans(
-        const std::vector<std::pair<uint32_t, uint32_t>> &spans) {
-    kvmem_mandatory_token_spans_.clear();
-    kvmem_mandatory_token_spans_.reserve(spans.size());
-    uint32_t previous_begin = 0;
+        const std::vector<std::pair<uint64_t, uint64_t>> &spans) {
+    std::vector<std::pair<uint64_t, uint64_t>> validated;
+    validated.reserve(spans.size());
+    uint64_t previous_begin = 0;
     for (size_t i = 0; i < spans.size(); ++i) {
         const auto &[begin, end] = spans[i];
         if (end <= begin || (i > 0 && begin < previous_begin)) {
             throw std::runtime_error(
                 "KVMem mandatory token spans must be sorted and non-empty");
         }
-        kvmem_mandatory_token_spans_.emplace_back(begin, end);
+        validated.emplace_back(begin, end);
         previous_begin = begin;
     }
+    if (block_store_ && block_store_->has_repository()) {
+        std::vector<uint32_t> ids;
+        for (const auto &[begin, end] : validated) {
+            const auto part = block_store_->history_span_blocks(
+                begin, std::min<uint64_t>(end, block_store_->history_end()), true);
+            ids.insert(ids.end(), part.begin(), part.end());
+        }
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        std::vector<KvMemRepository::Lease> pins;
+        for (auto id : ids) {
+            auto pin = kvmem_repository_pin_current(id);
+            if (!pin) throw std::runtime_error("KVMem mandatory history was deleted before pinning");
+            pins.push_back(std::move(pin));
+        }
+        // Retain the old pins until the complete replacement is protected.
+        // Future tokens are initially protected by their GPU residence and
+        // are included by mandatory materialization before each selection.
+        kvmem_repository_mandatory_leases_ = std::move(pins);
+    }
+    kvmem_mandatory_token_spans_ = std::move(validated);
     if (kvmem_gc_ && block_store_) {
         std::vector<uint32_t> ids;
         const uint32_t bt = block_store_->config().block_tokens;
         for (const auto &[begin, end] : spans) {
-            const uint32_t last = std::min(block_store_->block_count(), (end - 1) / bt + 1);
-            for (uint32_t id = begin / bt; id < last; ++id) {
+            const uint32_t last = static_cast<uint32_t>(std::min<uint64_t>(block_store_->block_count(), (end - 1) / bt + 1));
+            for (uint64_t id = begin / bt; id < last; ++id) {
                 if (!block_store_->is_live(id)) throw std::runtime_error("GC mandatory history requires cold prefill");
                 ids.push_back(id);
             }
@@ -18750,7 +20832,7 @@ void QwenExecutor::kvmem_set_mandatory_token_spans(
 }
 
 void QwenExecutor::kvmem_set_retrieval_group_spans(
-        const std::vector<std::pair<uint32_t, uint32_t>> &spans) {
+        const std::vector<std::pair<uint64_t, uint64_t>> &spans) {
     kvmem_retrieval_group_spans_.clear();
     kvmem_round_group_scores_.clear();
     kvmem_round_group_begin_host_.clear();
@@ -18764,8 +20846,8 @@ void QwenExecutor::kvmem_set_retrieval_group_spans(
         }
         return;
     }
-    uint32_t previous_begin = 0;
-    uint32_t previous_end = 0;
+    uint64_t previous_begin = 0;
+    uint64_t previous_end = 0;
     kvmem_retrieval_group_spans_.reserve(spans.size());
     for (size_t i = 0; i < spans.size(); ++i) {
         const auto &[begin, end] = spans[i];
@@ -18782,7 +20864,7 @@ void QwenExecutor::kvmem_set_retrieval_group_spans(
     if (!spans.empty() && std::getenv("QW3_KVMEM_TRACE")) {
         std::fprintf(stderr,
                      "[bs-semantic-groups] configured groups=%zu "
-                     "token_span=[%u,%u)\n",
+                     "token_span=[%" PRIu64 ",%" PRIu64 ")\n",
                      spans.size(), spans.front().first, spans.back().second);
     }
 }
@@ -18853,9 +20935,28 @@ bool QwenExecutor::kvmem_prepare_round_score_groups(uint32_t n_blocks) {
 std::vector<uint32_t> QwenExecutor::kvmem_materialize_mandatory_blocks() const {
     const uint32_t nb = block_store_->block_count();
     std::vector<uint32_t> mandatory;
+    if (block_store_->has_repository()) {
+        // Pins are expressed in historical block/token coordinates. A reused
+        // physical slot can hold any age of history; its index is not a range.
+        const auto append_span = [&](uint64_t begin, uint64_t end, bool complete) {
+            auto ids = block_store_->history_span_blocks(
+                begin, std::min(end, block_store_->history_end()), complete);
+            mandatory.insert(mandatory.end(), ids.begin(), ids.end());
+        };
+        if (kvmem_qc_pin_from_block_ != UINT64_MAX)
+            append_span(uint64_t(kvmem_qc_pin_from_block_) * block_store_->config().block_tokens,
+                        block_store_->history_end(), true);
+        for (const auto &[begin, end] : kvmem_oracle_token_spans_)
+            append_span(begin, end, false);
+        for (const auto &[begin, end] : kvmem_mandatory_token_spans_)
+            append_span(begin, end, true);
+        std::sort(mandatory.begin(), mandatory.end());
+        mandatory.erase(std::unique(mandatory.begin(), mandatory.end()), mandatory.end());
+        return mandatory;
+    }
     if (kvmem_qc_pin_from_block_ < nb) {
         mandatory.reserve(nb - kvmem_qc_pin_from_block_);
-        for (uint32_t id = kvmem_qc_pin_from_block_; id < nb; ++id) {
+        for (uint32_t id = static_cast<uint32_t>(kvmem_qc_pin_from_block_); id < nb; ++id) {
             mandatory.push_back(id);
         }
     }
@@ -18863,11 +20964,11 @@ std::vector<uint32_t> QwenExecutor::kvmem_materialize_mandatory_blocks() const {
         const uint32_t bt =
             std::max<uint32_t>(1, block_store_->config().block_tokens);
         for (const auto &[begin, end] : kvmem_oracle_token_spans_) {
-            const uint32_t first = begin / bt;
-            const uint32_t last = (end - 1) / bt;
+            const uint64_t first = begin / bt;
+            const uint64_t last = (end - 1) / bt;
             if (first >= nb) continue;
-            const uint32_t capped_last = std::min(last, nb - 1);
-            for (uint32_t id = first; id <= capped_last; ++id) {
+            const uint32_t capped_last = static_cast<uint32_t>(std::min<uint64_t>(last, nb - 1));
+            for (uint32_t id = static_cast<uint32_t>(first); id <= capped_last; ++id) {
                 mandatory.push_back(id);
             }
         }
@@ -18884,11 +20985,11 @@ std::vector<uint32_t> QwenExecutor::kvmem_materialize_mandatory_blocks() const {
         const uint32_t bt =
             std::max<uint32_t>(1, block_store_->config().block_tokens);
         for (const auto &[begin, end] : kvmem_mandatory_token_spans_) {
-            const uint32_t first = begin / bt;
-            const uint32_t last = (end - 1) / bt;
+            const uint64_t first = begin / bt;
+            const uint64_t last = (end - 1) / bt;
             if (first >= nb) continue;
-            const uint32_t capped_last = std::min(last, nb - 1);
-            for (uint32_t id = first; id <= capped_last; ++id) {
+            const uint32_t capped_last = static_cast<uint32_t>(std::min<uint64_t>(last, nb - 1));
+            for (uint32_t id = static_cast<uint32_t>(first); id <= capped_last; ++id) {
                 mandatory.push_back(id);
             }
         }
@@ -18910,13 +21011,36 @@ std::vector<uint32_t> QwenExecutor::kvmem_materialize_mandatory_blocks() const {
 uint32_t QwenExecutor::kvmem_set_bounded_recent_pin(
         uint32_t desired_tokens) {
     if (!block_store_ || block_store_->block_count() == 0) {
-        kvmem_qc_pin_from_block_ = 0xffffffffu;
+        kvmem_qc_pin_from_block_ = UINT64_MAX;
         return 0;
     }
     // Materialize only the durable request pins. The previous live-suffix pin
     // is deliberately replaced rather than accumulated forever.
-    kvmem_qc_pin_from_block_ = 0xffffffffu;
+    kvmem_qc_pin_from_block_ = UINT64_MAX;
     std::vector<uint32_t> base = kvmem_materialize_mandatory_blocks();
+    if (block_store_->has_repository()) {
+        const auto &cfg = block_store_->config();
+        const auto ids = block_store_->history_span_blocks(0, block_store_->history_end(), false);
+        // The budget helper operates on contiguous chronological ordinals,
+        // never physical slots. Translate both its input pins and its result.
+        std::vector<uint32_t> ordinals;
+        for (uint32_t i = 0; i < ids.size(); ++i) {
+            const auto &b = block_store_->blocks()[ids[i]];
+            if (b.history_pos_start < uint64_t(cfg.sink_blocks) * cfg.block_tokens ||
+                std::binary_search(base.begin(), base.end(), ids[i]))
+                ordinals.push_back(i);
+        }
+        const uint32_t pin = detail::kvmem_bounded_tail_pin_from_block(
+            ids.size(), block_store_->budget_blocks(),
+            (uint64_t(desired_tokens) + cfg.block_tokens - 1) / cfg.block_tokens, ordinals);
+        if (pin == 0xffffffffu) return 0;
+        const uint64_t history_begin = block_store_->blocks()[ids[pin]].history_pos_start;
+        // A missing tail cannot be silently replaced by older, noncontiguous
+        // evidence. Fail before publishing a pin that replay cannot satisfy.
+        block_store_->history_span_blocks(history_begin, block_store_->history_end(), true);
+        kvmem_qc_pin_from_block_ = history_begin / cfg.block_tokens;
+        return (ids.size() - pin) * cfg.block_tokens;
+    }
     const uint32_t nb = block_store_->block_count();
     const uint32_t sink = std::min<uint32_t>(
         block_store_->config().sink_blocks, nb);
@@ -18927,7 +21051,7 @@ uint32_t QwenExecutor::kvmem_set_bounded_recent_pin(
         (desired_tokens + bt - 1) / bt;
     const uint32_t pin = detail::kvmem_bounded_tail_pin_from_block(
         nb, block_store_->budget_blocks(), desired_blocks, base);
-    kvmem_qc_pin_from_block_ = pin;
+    kvmem_qc_pin_from_block_ = pin == UINT32_MAX ? UINT64_MAX : pin;
     return pin == 0xffffffffu ? 0 : (nb - pin) * bt;
 }
 
@@ -18939,7 +21063,7 @@ std::vector<uint32_t> QwenExecutor::kvmem_selection_with_pin() {
         kvmem_round_group_scores_.size() ==
             kvmem_retrieval_group_spans_.size();
     if (!round_ready &&
-        kvmem_qc_pin_from_block_ == 0xffffffffu &&
+        kvmem_qc_pin_from_block_ == UINT64_MAX &&
         kvmem_oracle_token_spans_.empty() &&
         kvmem_mandatory_token_spans_.empty()) {
         return block_store_->pick_topk_blocks();
@@ -18968,9 +21092,13 @@ std::vector<uint32_t> QwenExecutor::kvmem_selection_with_pin() {
         return mandatory;
     }
     if (round_ready) {
-        return block_store_->pick_semantic_groups(
-            kvmem_retrieval_group_spans_,
-            kvmem_round_group_scores_, mandatory);
+        if (block_store_->has_repository())
+            return block_store_->pick_repository_semantic_groups(
+                kvmem_retrieval_group_spans_, kvmem_round_group_scores_, mandatory);
+        std::vector<std::pair<uint32_t, uint32_t>> dense_groups;
+        for (const auto &[begin, end] : kvmem_retrieval_group_spans_)
+            dense_groups.emplace_back(checked_local_position(begin), checked_local_position(end));
+        return block_store_->pick_semantic_groups(dense_groups, kvmem_round_group_scores_, mandatory);
     }
     return block_store_->pick_topk_blocks(mandatory);
 }
@@ -18989,7 +21117,7 @@ std::vector<uint32_t> QwenExecutor::kvmem_selection_with_pin() {
 // when the whole history is covered the index is published (g_kbar_/g_kbar_multi_
 // ready, g_content_ready_), which also keeps the one-shot paged builder gated off.
 void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
-                                            uint32_t base_pos,
+                                            uint64_t base_pos,
                                             uint32_t rope_base_pos,
                                             uint32_t k_token_stride) {
     if (!kvmem_qc_capture_active_) return;
@@ -19018,8 +21146,8 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     // index. This is especially easy to hit when multimodal query tokens make
     // the suffix span more than one prefill micro-batch.
     if (base_pos >= kvmem_qc_prompt_tokens_) return;
-    const uint32_t capture_batch = std::min<uint32_t>(
-        batch, kvmem_qc_prompt_tokens_ - base_pos);
+    const uint32_t capture_batch = static_cast<uint32_t>(std::min<uint64_t>(
+        batch, kvmem_qc_prompt_tokens_ - base_pos));
     if (capture_batch == 0) return;
     // Per-layer slice base uses the FIXED session stride (ctx_blocks) when set, so
     // preserved [0,D) slices stay put as the block count grows across resumed turns
@@ -19041,11 +21169,19 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
             std::to_string(kvmem_query_replay_active_ ? 1 : 0));
     }
     const uint32_t off = base_pos % bt;
-    const uint32_t first_block = base_pos / bt;
-    if (first_block >= kvmem_qc_total_blocks_) return;
-    const uint32_t n_blocks_chunk = std::min(
-        (off + capture_batch + bt - 1) / bt,
-        kvmem_qc_total_blocks_ - first_block);
+    const uint64_t first_block = base_pos / bt;
+    const bool bounded = block_store_->has_repository();
+    if (bounded && off && block_store_->config().prototype_mode != KvMemPrototypeMode::Contiguous) {
+        // Direction prototypes cannot merge independent partial clusters.
+        // Leave their generation stamp invalid and rebuild the affected block
+        // from its complete raw-K prefix at the ordinary index publication.
+        if (slot + 1 == kvmem_qc_num_layers_) kvmem_qc_captured_tokens_ = base_pos + capture_batch;
+        return;
+    }
+    if (!bounded && first_block >= kvmem_qc_total_blocks_) return;
+    const uint32_t chunk_blocks = (off + capture_batch + bt - 1) / bt;
+    const uint32_t n_blocks_chunk = bounded ? chunk_blocks : std::min(
+        chunk_blocks, checked_local_position(kvmem_qc_total_blocks_ - first_block));
     if (n_blocks_chunk == 0) return;
     const uint64_t per_pos = static_cast<uint64_t>(n_kv_heads) * head_dim;
     DeviceTensor *capture_index = g_kbar_multi_.get();
@@ -19055,7 +21191,7 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     if (kvmem_mean_index_cpu() && !kvmem_adaptive_prototypes()) {
         if (slot == 0) {
             cpu_stage_slot = kvmem_begin_mean_index_capture(
-                first_block, n_blocks_chunk, off != 0);
+                first_block, n_blocks_chunk, off != 0, uint64_t(base_pos) + capture_batch);
         } else if (g_kbar_capture_active_slot_ < 0) {
             throw std::runtime_error(
                 "KVMem CPU mean-index capture has no active staging slot");
@@ -19140,7 +21276,7 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     if (kvmem_qc_pertoken_ && g_kraw_multi_ &&
         kvmem_qc_total_tokens_ > 0 && base_pos < kvmem_qc_total_tokens_) {
         const uint32_t store_rows =
-            std::min(capture_batch, kvmem_qc_total_tokens_ - base_pos);
+            std::min<uint64_t>(capture_batch, kvmem_qc_total_tokens_ - base_pos);
         const uint64_t out_base_elem =
             (static_cast<uint64_t>(slot) * kvmem_qc_total_tokens_ + base_pos) *
             n_kv_heads * head_dim;
@@ -19162,7 +21298,8 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     }
     kvmem_qc_captured_tokens_ = base_pos + capture_batch;
     kvmem_qc_captured_blocks_ =
-        (kvmem_qc_captured_tokens_ + bt - 1) / bt;
+        block_store_->has_repository() ? block_store_->block_count() :
+                checked_local_position(kvmem_qc_captured_tokens_ / bt + (kvmem_qc_captured_tokens_ % bt != 0));
     if (kvmem_qc_captured_tokens_ < kvmem_qc_prompt_tokens_) return;
     // Whole history covered: publish the index. Copy the slot-0 slice into g_kbar_
     // so the single last-token fallback scorer ranks against the same full-coverage
@@ -19249,9 +21386,9 @@ void QwenExecutor::kvmem_decode_capture_stage(uint32_t layer_index,
     const uint32_t per_pos = n_kv_heads * head_dim;
     const uint32_t bt = std::max<uint32_t>(block_store_->config().block_tokens, 1u);
     const uint32_t L = std::max<uint32_t>(kvmem_qc_num_layers_, 1u);
-    const uint32_t p = position_;                 // true position of this token
+    const uint64_t p = position_;                 // true position of this token
     const uint32_t i = p % bt;                     // row within its block
-    const uint32_t block = p / bt;
+    const uint64_t block = p / bt;
     // Decide block membership once per token (on the first std layer). A block is
     // eligible only if we captured its offset-0 token: on i==0 start a fresh block;
     // otherwise continue only if we are already mid-staging THIS block.
@@ -19264,7 +21401,7 @@ void QwenExecutor::kvmem_decode_capture_stage(uint32_t layer_index,
         }
     }
     if (!decode_stage_active_ || decode_stage_block_ != block) return;
-    if (block >= kvmem_qc_layer_stride_blocks_) {         // beyond the fixed index
+    if (!block_store_->has_repository() && block >= kvmem_qc_layer_stride_blocks_) {
         decode_stage_active_ = false;
         return;
     }
@@ -19306,13 +21443,13 @@ void QwenExecutor::kvmem_decode_capture_stage(uint32_t layer_index,
 // scorer are left untouched (a reselect mid-decode must keep scoring the prompt's
 // blocks); the NEXT turn re-establishes coverage via kvmem_set_query_span's resume
 // seeding, which trusts these preserved slices.
-void QwenExecutor::kvmem_capture_decode_block(uint32_t true_block_index,
+void QwenExecutor::kvmem_capture_decode_block(uint64_t true_block_index,
                                               uint32_t rows) {
     if (!g_kbar_decode_stage_ ||
         !kvmem_mean_index_available() || rows == 0) {
         return;
     }
-    if (true_block_index >= kvmem_qc_layer_stride_blocks_) return;
+    if (!block_store_->has_repository() && true_block_index >= kvmem_qc_layer_stride_blocks_) return;
     const QwenConfig &cfg = model_.config();
     const uint32_t n_kv_heads = cfg.n_kv_heads;
     const uint32_t head_dim = cfg.head_dim;
@@ -19325,7 +21462,7 @@ void QwenExecutor::kvmem_capture_decode_block(uint32_t true_block_index,
     if (kvmem_mean_index_cpu() && !kvmem_adaptive_prototypes()) {
         cpu_stage_slot = kvmem_begin_mean_index_capture(
             true_block_index, /*n_blocks=*/1,
-            /*seed_partial=*/false);
+            /*seed_partial=*/false, uint64_t(true_block_index) * bt + rows);
         capture_index =
             g_kbar_stream_slots_[cpu_stage_slot].device.get();
     }
@@ -19349,7 +21486,7 @@ void QwenExecutor::kvmem_capture_decode_block(uint32_t true_block_index,
     }
     if (std::getenv("QW3_KVMEM_TRACE")) {
         std::fprintf(stderr,
-            "[bs-decode-cap] block=%u rows=%u -> g_kbar_multi_ (L=%u stride=%u)\n",
+            "[bs-decode-cap] block=%" PRIu64 " rows=%u -> g_kbar_multi_ (L=%u stride=%u)\n",
             true_block_index, rows, L, stride);
     }
 }
@@ -19804,7 +21941,7 @@ void QwenExecutor::kvmem_migrate_adaptive_index_to_pinned() {
     g_adaptive_layer_values_pinned_.resize(layers);
     g_adaptive_layer_values_pinned_size_.resize(layers, 0);
     g_adaptive_layer_values_pinned_capacity_.resize(layers, 0);
-    const uint64_t reserve_bytes =
+    const uint64_t reserve_bytes = block_store_->has_repository() ? 0 :
         static_cast<uint64_t>(std::clamp<uint32_t>(
             env_uint32_or("QW3_KVMEM_ADAPTIVE_PINNED_RESERVE_MIB", 8),
             1u, 64u)) * 1024ull * 1024ull;
@@ -19884,6 +22021,30 @@ void QwenExecutor::kvmem_reset_adaptive_index(
             static_cast<uint64_t>(layers) * stride_blocks, 0);
         g_adaptive_block_counts_host_.assign(
             static_cast<uint64_t>(layers) * stride_blocks, 0);
+        if (block_store_->has_repository()) {
+            // Each physical block owns a fixed maximum-width slice. Chosen
+            // counts remain variable; recycling a block overwrites only that
+            // slice, never truncates its neighbours or grows a packed suffix.
+            const uint32_t width = block_store_->config().n_subblocks;
+            const uint64_t rows = uint64_t(stride_blocks) * width;
+            const uint64_t bytes = rows * model_.config().n_kv_heads * model_.config().head_dim * elem_size;
+            if (!width || rows > INT32_MAX || bytes > SIZE_MAX)
+                throw std::invalid_argument("bounded Adaptive prototype arena overflow");
+            for (uint32_t layer = 0; layer < layers; ++layer) {
+                g_adaptive_layer_values_host_[layer].resize(bytes);
+                auto &parents = g_adaptive_layer_parent_host_[layer];
+                parents.resize(rows);
+                for (uint32_t b = 0; b < stride_blocks; ++b) {
+                    g_adaptive_block_offsets_host_[uint64_t(layer) * stride_blocks + b] = b * width;
+                    std::fill_n(parents.begin() + uint64_t(b) * width, width, static_cast<int32_t>(b));
+                }
+            }
+            kvmem_repository_index_.assign(stride_blocks, {});
+            for (const auto &lease : block_store_->repository_read_leases())
+                kvmem_sync_repository_index_flag(lease.handle());
+            g_kbar_stream_tile_blocks_ = std::min<uint32_t>(stride_blocks,
+                std::max<uint32_t>(1, 8192 / block_store_->config().block_tokens));
+        }
         g_adaptive_p1_slices_ = 0;
         g_adaptive_p2_slices_ = 0;
         g_adaptive_p4_slices_ = 0;
@@ -20068,9 +22229,9 @@ void QwenExecutor::kvmem_upload_adaptive_gpu_layer(
 }
 
 void QwenExecutor::kvmem_capture_adaptive_layer(
-        uint32_t slot, uint32_t first_block, uint32_t n_blocks_chunk,
+        uint32_t slot, uint64_t first_block, uint32_t n_blocks_chunk,
         uint32_t batch, uint32_t k_token_stride,
-        uint32_t rope_base_pos) {
+        uint32_t rope_base_pos, const KvMemStorageRead *repository_capture) {
     if (!kvmem_adaptive_prototypes() || !block_store_) return;
     const DeviceTensor *k_src = kvmem_index_rebuild_source_ != nullptr
                                     ? kvmem_index_rebuild_source_
@@ -20085,8 +22246,15 @@ void QwenExecutor::kvmem_capture_adaptive_layer(
     const uint32_t bt =
         std::max<uint32_t>(1, block_store_->config().block_tokens);
     const uint32_t n_slices = bt / 32u;
+    const bool bounded = block_store_->has_repository();
+    KvMemStorageRead captured;
+    if (bounded && !repository_capture) {
+        captured = kvmem_repository_storage(first_block * bt, batch);
+        repository_capture = &captured;
+    }
     if (slot >= layers || n_slices == 0 ||
-        first_block + n_blocks_chunk > g_adaptive_index_stride_blocks_) {
+        (bounded ? (!repository_capture || repository_capture->spans.size() != n_blocks_chunk)
+                 : first_block + n_blocks_chunk > g_adaptive_index_stride_blocks_)) {
         throw std::runtime_error(
             "KVMem adaptive capture metadata is out of range");
     }
@@ -20154,7 +22322,7 @@ void QwenExecutor::kvmem_capture_adaptive_layer(
 
     // Aligned overwrite/replay: discard this layer's stale packed suffix.
     const uint32_t truncate_proto =
-        first_block == 0
+        bounded ? 0u : first_block == 0
             ? 0u
             : static_cast<uint32_t>(
                   std::max(
@@ -20165,7 +22333,7 @@ void QwenExecutor::kvmem_capture_adaptive_layer(
                       g_adaptive_block_counts_host_[
                           meta_base + first_block - 1],
                       0));
-    if (truncate_proto < parents.size()) {
+    if (!bounded && truncate_proto < parents.size()) {
         parents.resize(truncate_proto);
         const uint64_t truncated_bytes =
             static_cast<uint64_t>(truncate_proto) * proto_row_bytes;
@@ -20183,7 +22351,7 @@ void QwenExecutor::kvmem_capture_adaptive_layer(
                 static_cast<int32_t>(truncate_proto);
             g_adaptive_block_counts_host_[meta] = 0;
         }
-    } else if (truncate_proto > parents.size()) {
+    } else if (!bounded && truncate_proto > parents.size()) {
         throw std::runtime_error(
             "KVMem adaptive packed offset exceeds layer storage");
     }
@@ -20193,10 +22361,12 @@ void QwenExecutor::kvmem_capture_adaptive_layer(
     const double gain_2to4 =
         block_store_->config().adaptive_gain_2to4;
     for (uint32_t b = 0; b < n_blocks_chunk; ++b) {
-        const uint32_t global_block = first_block + b;
+        const uint32_t global_block = bounded ? repository_capture->spans[b].handle.slot
+                                             : checked_local_position(first_block + b);
         const uint64_t meta = meta_base + global_block;
         const uint32_t block_begin =
-            static_cast<uint32_t>(parents.size());
+            bounded ? global_block * block_store_->config().n_subblocks : static_cast<uint32_t>(parents.size());
+        uint32_t written = 0;
         g_adaptive_block_offsets_host_[meta] =
             static_cast<int32_t>(block_begin);
         for (uint32_t slice = 0; slice < n_slices; ++slice) {
@@ -20236,10 +22406,16 @@ void QwenExecutor::kvmem_capture_adaptive_layer(
                     candidate_slot + p;
                 const uint64_t src_byte =
                     dense_row * proto_row_bytes;
-                const uint64_t old_size =
-                    kvmem_adaptive_layer_value_bytes(slot);
+                const uint64_t old_size = bounded ? uint64_t(block_begin + written) * proto_row_bytes
+                                                 : kvmem_adaptive_layer_value_bytes(slot);
                 const uint64_t new_size = old_size + proto_row_bytes;
-                if (pinned_values) {
+                if (bounded) {
+                    if (written >= block_store_->config().n_subblocks ||
+                        new_size > kvmem_adaptive_layer_value_bytes(slot))
+                        throw std::logic_error("bounded Adaptive capture exceeds block slice");
+                    std::memcpy(kvmem_adaptive_layer_value_data(slot) + old_size,
+                        dense.data() + src_byte, static_cast<size_t>(proto_row_bytes));
+                } else if (pinned_values) {
                     if (new_size >
                         g_adaptive_layer_values_pinned_capacity_[slot]) {
                         throw std::runtime_error(
@@ -20259,15 +22435,25 @@ void QwenExecutor::kvmem_capture_adaptive_layer(
                         dense.data() + src_byte,
                         static_cast<size_t>(proto_row_bytes));
                 }
-                parents.push_back(static_cast<int32_t>(global_block));
+                if (!bounded) parents.push_back(static_cast<int32_t>(global_block));
+                ++written;
             }
         }
         const uint32_t count =
-            static_cast<uint32_t>(parents.size()) - block_begin;
+            bounded ? written : static_cast<uint32_t>(parents.size()) - block_begin;
         g_adaptive_block_counts_host_[meta] =
             static_cast<int32_t>(count);
     }
     g_adaptive_index_dirty_ = true;
+    if (bounded) {
+        if (slot + 1 == layers) {
+            for (const auto &span : repository_capture->spans) {
+                kvmem_repository_index_[span.handle.slot] = {span.handle, span.token_count};
+                kvmem_sync_repository_index_flag(span.handle);
+            }
+        }
+        return;
+    }
     kvmem_upload_adaptive_gpu_layer(slot, truncate_proto);
 }
 
@@ -21138,7 +23324,7 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
             : KvMemAdaptiveScoreMode::Auto;
     // The legacy layer-one-pass kernel is Adaptive-specific and scalar. Plain
     // Mean-K enters the shared layer-major tiled Tensor-GEMM scheduler below.
-    if (!plain_one_prototype &&
+    if (!plain_one_prototype && !block_store_->has_repository() &&
         (score_mode == KvMemAdaptiveScoreMode::Auto ||
          score_mode == KvMemAdaptiveScoreMode::LayerOnePass)) {
         std::string layer_failure;
@@ -21192,7 +23378,8 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
         std::min(excl_hi_begin, n_blocks);
     const bool plain_shape_ok =
         !plain_one_prototype ||
-        (kvmem_qc_n_subblocks_ == 1 &&
+        (kvmem_qc_n_subblocks_ >= 1 &&
+         (kvmem_qc_n_subblocks_ == 1 || kvmem_qc_subblock_max_) &&
          kvmem_mean_index_available() &&
          index_elem_size != 0 &&
          index_stride_blocks >= n_blocks);
@@ -21213,19 +23400,27 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
     }
     auto prototype_offset = [&](uint32_t layer, uint32_t block) -> int32_t {
         if (plain_one_prototype) {
-            return static_cast<int32_t>(block);
+            return static_cast<int32_t>(uint64_t(block) * kvmem_qc_n_subblocks_);
         }
         return g_adaptive_block_offsets_host_[
             static_cast<uint64_t>(layer) * index_stride_blocks + block];
     };
     auto prototype_count = [&](uint32_t layer, uint32_t block) -> int32_t {
-        if (plain_one_prototype) return 1;
+        if (plain_one_prototype) {
+            if (block_store_->has_repository() && block_store_->config().prototype_mode == KvMemPrototypeMode::Contiguous) {
+                const uint32_t sub_tokens = (block_store_->config().block_tokens + kvmem_qc_n_subblocks_ - 1) /
+                                             kvmem_qc_n_subblocks_;
+                const uint32_t rows = kvmem_repository_index_.at(block).tokens;
+                return static_cast<int32_t>(std::min(kvmem_qc_n_subblocks_, (rows + sub_tokens - 1) / sub_tokens));
+            }
+            return static_cast<int32_t>(kvmem_qc_n_subblocks_);
+        }
         return g_adaptive_block_counts_host_[
             static_cast<uint64_t>(layer) * index_stride_blocks + block];
     };
     auto layer_prototype_count = [&](uint32_t layer) -> uint64_t {
         return plain_one_prototype
-            ? static_cast<uint64_t>(n_blocks)
+            ? static_cast<uint64_t>(n_blocks) * kvmem_qc_n_subblocks_
             : g_adaptive_layer_parent_host_[layer].size();
     };
     auto layer_value_data = [&](uint32_t layer) -> const uint8_t * {
@@ -21277,7 +23472,8 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
         return scorer_unavailable(
             failure_reason, "cpu_adaptive_stream_row_size_zero");
     }
-    uint64_t max_block_prototypes = 1;
+    uint64_t max_block_prototypes = (plain_one_prototype || block_store_->has_repository())
+        ? kvmem_qc_n_subblocks_ : 1;
     if (!plain_one_prototype) {
         for (uint32_t l = 0; l < layers; ++l) {
             for (uint32_t b = included_begin; b < included_end; ++b) {
@@ -21349,7 +23545,8 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
                 const uint64_t proposed_end =
                     static_cast<uint64_t>(
                         static_cast<uint32_t>(offset_i32)) +
-                    static_cast<uint32_t>(count_i32);
+                    (block_store_->has_repository()
+                        ? kvmem_qc_n_subblocks_ : static_cast<uint32_t>(count_i32));
                 if (proposed_end < prototype_begin ||
                     proposed_end > layer_prototypes) {
                     return scorer_unavailable(
@@ -21459,6 +23656,7 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
          gqa_group == 6u);
     uint64_t block_stats_entries = 0;
     uint64_t block_stats_bytes = 0;
+    uint32_t query_tile_tokens = n_tokens;
     std::string tiled_one_pass_fallback;
     if (use_tiled_one_pass) {
         const uint64_t local_distributions =
@@ -21484,14 +23682,28 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
                         "QW3_KVMEM_ADAPTIVE_BLOCK_STATS_MIB", 512)) *
                     1024ull * 1024ull;
                 if (block_stats_bytes > workspace_cap) {
-                    use_tiled_one_pass = false;
-                    tiled_one_pass_fallback =
-                        "block_stats_workspace_cap";
+                    // Each Q row has its own complete softmax over blocks.
+                    // Tile Q, never the softmax domain: final scores add across
+                    // rows, so no query truncation or approximate scorer is
+                    // needed when the statistics workspace reaches its cap.
+                    const uint64_t bytes_per_query =
+                        uint64_t(cfg.n_heads) * included_blocks *
+                        2ull * sizeof(float);
+                    query_tile_tokens = static_cast<uint32_t>(
+                        workspace_cap / bytes_per_query);
+                    if (query_tile_tokens == 0) {
+                        use_tiled_one_pass = false;
+                        tiled_one_pass_fallback = "block_stats_workspace_cap";
+                    } else {
+                        block_stats_entries = uint64_t(query_tile_tokens) *
+                            cfg.n_heads * included_blocks;
+                        block_stats_bytes = block_stats_entries * 2ull * sizeof(float);
+                    }
                 }
             }
         }
     }
-    if (kvmem_gc_ && !use_tiled_one_pass) {
+    if ((kvmem_gc_ || block_store_->has_repository()) && !use_tiled_one_pass) {
         // The older two-pass denominator ignores block_counts. Do not let
         // deleted prototypes contribute mass through that fallback.
         return scorer_unavailable(failure_reason, "gc_requires_tiled_one_pass_workspace");
@@ -21548,7 +23760,7 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
             use_gemm_two_pass = false;
         } else {
             gemm_logits_entries =
-                static_cast<uint64_t>(n_tokens) * capacity_rows_u64 *
+                static_cast<uint64_t>(use_tiled_one_pass ? query_tile_tokens : n_tokens) * capacity_rows_u64 *
                 gqa_group;
         }
     }
@@ -21628,8 +23840,24 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
     uint64_t h2d_wait_ns = 0;
     const uint64_t begin_ns = kvmem_steady_ns();
 
-    auto run_pass = [&](uint32_t pass) -> bool {
-        const uint32_t partial_layers = pass == 0
+    auto run_pass = [&](uint32_t pass, uint32_t query_begin,
+                        uint32_t query_count) -> bool {
+        const bool complete_query = query_tile_tokens == n_tokens;
+        const uint32_t n_tokens = query_count;
+        const uint64_t query_row_elems = uint64_t(cfg.n_heads) * cfg.head_dim;
+        std::unique_ptr<DeviceTensor> query_view;
+        if (query_begin > 0) {
+            const uint64_t offset = uint64_t(query_begin) * query_row_elems;
+            query_view = backend_.tensor_view(*g_query_multi_,
+                offset * g_query_multi_->elem_size, g_query_multi_->count - offset,
+                g_query_multi_->elem_size, g_query_multi_->dtype,
+                "g_adaptive_stream_query_tile");
+            if (!query_view) return scorer_unavailable(failure_reason, "query_tile_view_failed");
+        }
+        const DeviceTensor &query = query_view ? *query_view : *g_query_multi_;
+        // A partial-layer hint is only valid after that layer prefix has seen
+        // every Q row. Skip this optional hint when Q spans multiple tiles.
+        const uint32_t partial_layers = pass == 0 && complete_query
             ? std::min<uint32_t>(
                   env_uint32_or("QW3_KVMEM_ADAPTIVE_PARTIAL_LAYERS", 0),
                   layers)
@@ -21710,9 +23938,12 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
                             tile.layer, tile.first_block + b) -
                         static_cast<int32_t>(
                             tile.prototype_begin);
-                    counts[b] =
-                        kvmem_gc_ && !block_store_->is_live(tile.first_block + b)
-                            ? 0 : prototype_count(tile.layer, tile.first_block + b);
+                    const uint32_t id = tile.first_block + b;
+                    const bool deleted = kvmem_gc_ && !block_store_->is_live(id);
+                    const bool masked = block_store_->has_repository() &&
+                        (id >= kvmem_repository_score_frame_.enabled.size() ||
+                         !kvmem_repository_score_frame_.enabled[id]);
+                    counts[b] = deleted || masked ? 0 : prototype_count(tile.layer, id);
                 }
             }
             pack_ns += kvmem_steady_ns() - pack_begin;
@@ -21770,7 +24001,7 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
                             *g_adaptive_stream_block_max_,
                             *g_adaptive_stream_block_sum_,
                             *g_adaptive_stream_logits_,
-                            *g_query_multi_, *slot.values,
+                            query, *slot.values,
                             *slot.block_offsets, *slot.block_counts,
                             tile.layer, layers, n_tokens,
                             q_layer_stride, tile.prototype_count,
@@ -21796,7 +24027,7 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
                         block_attn_stream_adaptive_block_stats_device(
                             *g_adaptive_stream_block_max_,
                             *g_adaptive_stream_block_sum_,
-                            *g_query_multi_, *slot.values,
+                            query, *slot.values,
                             *slot.block_offsets, *slot.block_counts,
                             tile.layer, layers, n_tokens,
                             q_layer_stride, tile.prototype_count,
@@ -21916,7 +24147,7 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
                         partial_best[id] =
                             static_cast<double>(partial[id]);
                     }
-                    block_store_->set_retrieval_scores(partial_best);
+                    kvmem_store_scores(partial_best);
                     g_adaptive_partial_selection_ =
                         kvmem_selection_with_pin();
                 }
@@ -21928,20 +24159,22 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
     };
 
     if (use_tiled_one_pass) {
-        if (!run_pass(0)) return false;
+        for (uint32_t qb = 0; qb < n_tokens; qb += query_tile_tokens) {
+            if (!run_pass(0, qb, std::min(query_tile_tokens, n_tokens - qb))) return false;
+        }
         if (std::getenv("QW3_KVMEM_TRACE") ||
             kvmem_perf_trace_flag()) {
             std::fprintf(
                 stderr,
                 "[bs-adaptive-stream] placement=cpu index=%s exact=1 "
                 "mode=tiled-one-pass passes=1 layers=%u blocks=%u "
-                "query_tokens=%u tiles=%zu staging_mib=%.2f "
+                "query_tokens=%u query_tile_tokens=%u tiles=%zu staging_mib=%.2f "
                 "block_stats_mib=%.2f gather_workers=%zu "
                 "gqa_group=%u tile_scorer=%s logits_mib=%.2f "
                 "transferred_gib=%.3f "
                 "pack_ms=%.3f h2d_wait_ms=%.3f total_ms=%.3f\n",
                 plain_one_prototype ? "plain-count1" : "adaptive",
-                layers, n_blocks, n_tokens, tiles.size(),
+                layers, n_blocks, n_tokens, query_tile_tokens, tiles.size(),
                 static_cast<double>(value_bytes) /
                     (1024.0 * 1024.0),
                 static_cast<double>(block_stats_bytes) /
@@ -21959,7 +24192,7 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
         return true;
     }
 
-    if (!run_pass(1) || !run_pass(2)) return false;
+    if (!run_pass(1, 0, n_tokens) || !run_pass(2, 0, n_tokens)) return false;
     if (std::getenv("QW3_KVMEM_TRACE") ||
         kvmem_perf_trace_flag()) {
         std::fprintf(
@@ -23794,6 +26027,24 @@ bool QwenExecutor::kvmem_retrieval_score_mean_softmax(
     // kbar_layer_stride is the fixed session stride when resumable indexing is live
     // (g_kbar_multi_ over-allocated at ctx_blocks so preserved [0,D) slices survive
     // a growing block count); otherwise it equals nb (byte-identical legacy layout).
+    if (block_store_->has_repository()) {
+        // All score tiles and the following selection refer to one leased
+        // generation set. The slot mask is uploaded as counts=0 before dot /
+        // softmax reduction; masking only the returned scores is not correct.
+        if (!kvmem_mean_index_cpu() ||
+            (kvmem_qc_n_subblocks_ > 1 && !kvmem_qc_subblock_max_) ||
+            block_store_->config().semantic_expansion != KvMemSemanticExpansion::None ||
+            env_flag_enabled("QW3_KVMEM_MEAN_LEGACY_OUTER", false))
+            return scorer_unavailable(failure_reason, "bounded_index_layout_not_integrated");
+        kvmem_drain_mean_index_capture();
+        const char *mask_env = std::getenv("QW3_KVMEM_MASK_KEPT");
+        const bool mask_kept = mask_mode == 1 ||
+            (mask_mode != 0 && !(mask_env && std::strcmp(mask_env, "0") == 0));
+        kvmem_repository_score_frame_ = block_store_->repository_score_frame(
+            kvmem_repository_index_, kvmem_repository_score_history_end_, mask_kept);
+        excl_lo_end = 0;
+        excl_hi_begin = nb;
+    }
     const uint32_t kbar_stride =
         kvmem_qc_layer_stride_blocks_ != 0 ? kvmem_qc_layer_stride_blocks_ : nb;
     const bool round_mode =
@@ -23947,8 +26198,8 @@ bool QwenExecutor::kvmem_retrieval_score_mean_softmax(
             const auto &[begin, end] =
                 kvmem_retrieval_group_spans_[g];
             if (end <= begin) continue;
-            const uint32_t first = begin / bt;
-            const uint32_t last = (end - 1) / bt;
+            const uint64_t first = begin / bt;
+            const uint64_t last = (end - 1) / bt;
             for (uint32_t id = first;
                  id <= last && id < best.size(); ++id) {
                 best[id] = std::max(best[id],
@@ -23961,7 +26212,7 @@ bool QwenExecutor::kvmem_retrieval_score_mean_softmax(
             best[id] = static_cast<double>(score[id]);
         }
     }
-    block_store_->set_retrieval_scores(best);
+    kvmem_store_scores(best);
     if (!g_adaptive_partial_selection_.empty()) {
         const std::vector<uint32_t> final_selection =
             kvmem_selection_with_pin();
@@ -24137,7 +26388,7 @@ bool QwenExecutor::kvmem_retrieval_score_exactmass(
     for (uint32_t id = 0; id < nb && id < best.size(); ++id) {
         best[id] = static_cast<double>(score[id]);
     }
-    block_store_->set_retrieval_scores(best);
+    kvmem_store_scores(best);
     if (std::getenv("QW3_KVMEM_TRACE")) {
         std::fprintf(stderr,
                      "[bs-exactmass] query-conditioned raw-key ExactMass (per-head): "
@@ -24147,11 +26398,27 @@ bool QwenExecutor::kvmem_retrieval_score_exactmass(
     return true;
 }
 
+void QwenExecutor::seal_state_checkpoints(StateCheckpointSet &checkpoints) const {
+    checkpoints.repository_owner = block_store_ ? block_store_->repository() : nullptr;
+    checkpoints.repository_append_serial = kvmem_repository_append_ ? kvmem_repository_append_serial_ : 0;
+    checkpoints.kvmem_selection_generation = kvmem_selection_generation_;
+    checkpoints.ready = true;
+}
+
 void QwenExecutor::restore_state_checkpoint(const StateCheckpointSet &checkpoints,
                                             uint32_t index) {
     if (!checkpoints.ready || index >= checkpoints.count) {
         throw std::runtime_error("cannot restore an empty QwenExecutor checkpoint");
     }
+    const bool bounded = block_store_ && block_store_->has_repository();
+    if (bounded && (!kvmem_repository_append_ ||
+        checkpoints.repository_owner != block_store_->repository() ||
+        checkpoints.repository_append_serial != kvmem_repository_append_serial_ ||
+        checkpoints.kvmem_selection_generation != kvmem_selection_generation_ ||
+        checkpoints.base_position < block_store_->history_end() ||
+        uint64_t(checkpoints.base_position) + index + 1 > position_ ||
+        uint64_t(checkpoints.base_position) + index + 1 > kvmem_repository_append_->end()))
+        throw std::runtime_error("KVMem MTP checkpoint does not belong to the current append");
     ensure_scratch();
     if (h_ && checkpoints.h_stride > 0) {
         const DeviceTensor *hidden_source = checkpoints.h_shared
@@ -24226,6 +26493,9 @@ void QwenExecutor::restore_state_checkpoint(const StateCheckpointSet &checkpoint
         }
     }
     position_ = checkpoints.base_position + index + 1;
+    if (dflash_feature_view_.data && dflash_feature_view_.logical_base == checkpoints.base_position)
+        dflash_feature_view_.rows = std::min(dflash_feature_view_.rows, index + 1);
+    else dflash_feature_view_ = {};
     // kvmem block-store registration tracks how many committed tokens have been
     // folded into the block store, which only ever grows via register_append.
     // The MTP verify batch is mtp_single_chunk, so it registered NOTHING; the
@@ -24239,10 +26509,13 @@ void QwenExecutor::restore_state_checkpoint(const StateCheckpointSet &checkpoint
     // behind position_ (RoPE-frame desync, growing each reject). Restore to the
     // store's true registered length so advance_to registers the gap. Mirrors
     // restore_state, which restores the pre-verify kvmem_registered_pos.
-    if (kvmem_enabled_) kvmem_registered_pos_ = checkpoints.base_position;
-    const uint32_t logical_pages =
-        (position_ + kv_pages_.page_size - 1) / kv_pages_.page_size;
-    kv_pages_.truncate_to_logical_pages(logical_pages);
+    if (kvmem_enabled_) kvmem_registered_pos_ = bounded
+        ? block_store_->history_end() : checkpoints.base_position;
+    const uint32_t logical_pages = bounded ? 0 : checked_local_position(
+        position_ / kv_pages_.page_size + (position_ % kv_pages_.page_size != 0));
+    // Bounded reservations still own all provisional physical pages here.
+    // kvmem_register_until releases only the rejected suffix on acceptance.
+    if (!bounded) kv_pages_.truncate_to_logical_pages(logical_pages);
     // Roll the kvmem window tail back to the accepted row, mirroring the
     // position_/kv_pages_ rollback above. The verify batch only GREW the window
     // at the tail (kvmem_extend_window_for_decode_n, no mid-batch re-RoPE), so
@@ -24271,22 +26544,22 @@ void QwenExecutor::restore_state_checkpoint(const StateCheckpointSet &checkpoint
             mtp_window_pages_host_.resize(mtp_window_page_count_);
         }
     }
-    mtp_prefix_len_ = std::min<uint32_t>(mtp_prefix_len_, position_);
+    mtp_prefix_len_ = std::min<uint64_t>(mtp_prefix_len_, position_);
 }
 
 NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_current(uint32_t token,
-                                                                 uint32_t base_position) {
+                                                                 uint64_t base_position) {
     return prime_mtp_prefix_from_current_at(
-        token, base_position, base_position);
+        token, base_position, checked_local_position(base_position));
 }
 
 NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_current_at(
         uint32_t token,
-        uint32_t logical_position,
+        uint64_t logical_position,
         uint32_t rope_position) {
     NativeExecutorReport report;
     ensure_mtp_scratch();
-    if (logical_position >= kv_ctx_size_) {
+    if ((!block_store_ || !block_store_->has_repository()) && logical_position >= kv_ctx_size_) {
         report.missing_kernels.push_back("native MTP prefix KV cache is too small");
         return report;
     }
@@ -24321,14 +26594,14 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_current_at(
     }
     require_status(backend_.copy_d2d(*mtp_prefix_h_, *h_, 0, h_->count));
     mtp_prefix_len_ =
-        std::max<uint32_t>(mtp_prefix_len_, logical_position + 1);
+        std::max<uint64_t>(mtp_prefix_len_, logical_position + 1);
     report.ok = true;
     return report;
 }
 
 NativeExecutorReport QwenExecutor::replay_tokens_with_mtp_prefix(
         const std::vector<uint32_t> &tokens,
-        uint32_t base_position,
+        uint64_t base_position,
         bool rebuild_prefix,
         double *prefix_seconds,
         uint64_t *prefix_ops) {
@@ -24354,7 +26627,7 @@ NativeExecutorReport QwenExecutor::replay_tokens_with_mtp_prefix(
 
             if (rebuild_prefix) {
                 const double t0 = steady_seconds();
-                const uint32_t logical_pos = base_position + i;
+                const uint64_t logical_pos = base_position + i;
                 NativeExecutorReport prefix = kvmem_mtp_local_positions_
                     ? prime_mtp_prefix_from_current_at(
                           tokens[i], logical_pos,
@@ -24381,15 +26654,15 @@ NativeExecutorReport QwenExecutor::replay_tokens_with_mtp_prefix(
 }
 
 NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::vector<uint32_t> &tokens,
-                                                                    uint32_t base_position,
+                                                                    uint64_t base_position,
                                                                     uint32_t batch_min_override) {
     return prime_mtp_prefix_from_last_batch_at(
-        tokens, base_position, base_position, batch_min_override);
+        tokens, base_position, checked_local_position(base_position), batch_min_override);
 }
 
 NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
         const std::vector<uint32_t> &tokens,
-        uint32_t logical_base_position,
+        uint64_t logical_base_position,
         uint32_t rope_base_position,
         uint32_t batch_min_override) {
     NativeExecutorReport report;
@@ -24402,8 +26675,8 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
         report.missing_kernels.push_back("native MTP prefix requires the last target batch hidden states");
         return report;
     }
-    if (static_cast<uint64_t>(logical_base_position) + tokens.size() >
-        kv_ctx_size_) {
+    if ((!block_store_ || !block_store_->has_repository()) &&
+        static_cast<uint64_t>(logical_base_position) + tokens.size() > kv_ctx_size_) {
         report.missing_kernels.push_back("native MTP prefix KV cache is too small");
         return report;
     }
@@ -24426,7 +26699,7 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
     auto prime_sequential = [&]() -> NativeExecutorReport {
         NativeExecutorReport seq_report;
         for (uint32_t i = 0; i < batch; ++i) {
-            const uint32_t logical_pos = logical_base_position + i;
+            const uint64_t logical_pos = logical_base_position + i;
             const uint32_t rope_pos = rope_base_position + i;
             const DeviceTensor *h_input = mtp_zero_h_.get();
             if (logical_pos > 0) {
@@ -24460,7 +26733,7 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
         require_status(backend_.copy_d2d(*mtp_prefix_h_, *h_batch_,
                                          static_cast<uint64_t>(batch - 1) * h_stride,
                                          h_stride));
-        mtp_prefix_len_ = std::max<uint32_t>(
+        mtp_prefix_len_ = std::max<uint64_t>(
             mtp_prefix_len_, logical_base_position + batch);
         seq_report.ok = true;
         return seq_report;
@@ -24533,11 +26806,12 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
 
     require_status(backend_.begin());
     begin_record_timing(full_executor_trace_enabled());
-    // The target private batch already advanced the multimodal tail. Reuse its
-    // scalar text positions; preparing them again would advance that tail twice.
-    const bool private_text = kvmem_query_probe_guard_active() &&
-        logical_base_position >= input_multimodal_prompt_tokens_.size();
-    const bool use_input_mrope = !private_text && prepare_input_mrope_batch(
+    // All generated-text batches, including private guided queries, already
+    // advanced the target's multimodal tail. Prime with the supplied scalar
+    // coordinates; only actual prompt rows need source M-RoPE metadata.
+    const bool prompt_rows = logical_base_position < input_multimodal_prompt_tokens_.size() &&
+        batch <= input_multimodal_prompt_tokens_.size() - logical_base_position;
+    const bool use_input_mrope = prompt_rows && prepare_input_mrope_batch(
         tokens.data(), batch, logical_base_position);
 
     const DeviceTensor &first_h =
@@ -24628,33 +26902,37 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
             cfg.rope_theta));
     }
     const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
-    mtp_kv_pages_.ensure_pages(
-        backend_, kv_ctx_size_, logical_base_position, batch);
+    ensure_mtp_kv_pages(logical_base_position, batch);
     if (external_mtp_kv_cache_) {
         mtp_kv_pages_.validate_physical_capacity(
             external_mtp_kv_cache_->physical_slots, "external MTP");
     }
     // Tiered MTP uses a bounded paged pool; a dense append by absolute position
     // would overrun it. Force paged append (see the single-token path).
-    const bool use_paged_prefix =
-        mtp_paged_prefix_enabled() || kvmem_mtp_tiered_;
+    const bool bounded_prefix = block_store_ && block_store_->has_repository();
+    const bool use_paged_prefix = external_mtp_kv_cache_ ||
+        mtp_paged_prefix_enabled() || kvmem_mtp_tiered_ || bounded_prefix;
+    const uint32_t write_pos = bounded_prefix ?
+        kvmem_prepare_mtp_repository_write(logical_base_position, batch) : checked_local_position(logical_base_position);
     DeviceTensor &mtp_k = mtp_k_cache();
     DeviceTensor &mtp_v = mtp_v_cache();
     if (use_paged_prefix) {
+        const DeviceTensor &pages = bounded_prefix ?
+            *mtp_repository_write_pages_device_ : mtp_kv_pages_.device_indices();
+        const uint32_t page_count = bounded_prefix ?
+            static_cast<uint32_t>(mtp_repository_write_pages_host_.size()) : mtp_kv_pages_.count();
         require_status(backend_.kv_append_batch_paged_device(
-            mtp_k, mtp_k_batch, logical_base_position, per_pos, batch,
-            mtp_kv_pages_.device_indices(), mtp_kv_pages_.count(),
-            mtp_kv_pages_.page_size));
+            mtp_k, mtp_k_batch, write_pos, per_pos, batch,
+            pages, page_count, mtp_kv_pages_.page_size));
         require_status(backend_.kv_append_batch_paged_device(
-            mtp_v, mtp_v_batch, logical_base_position, per_pos, batch,
-            mtp_kv_pages_.device_indices(), mtp_kv_pages_.count(),
-            mtp_kv_pages_.page_size));
+            mtp_v, mtp_v_batch, write_pos, per_pos, batch,
+            pages, page_count, mtp_kv_pages_.page_size));
     } else {
         require_status(backend_.kv_append_batch(mtp_k, mtp_k_batch,
-                                                logical_base_position,
+                                                write_pos,
                                                 per_pos, batch));
         require_status(backend_.kv_append_batch(mtp_v, mtp_v_batch,
-                                                logical_base_position,
+                                                write_pos,
                                                 per_pos, batch));
     }
     record(report, "mtp.kv_append_batch");
@@ -24672,7 +26950,7 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
     require_status(backend_.copy_d2d(*mtp_prefix_h_, *h_batch_,
                                      static_cast<uint64_t>(batch - 1) * h_stride,
                                      h_stride));
-    mtp_prefix_len_ = std::max<uint32_t>(
+    mtp_prefix_len_ = std::max<uint64_t>(
         mtp_prefix_len_, logical_base_position + batch);
     report.ok = true;
     return report;

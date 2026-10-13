@@ -152,8 +152,8 @@ struct KvMemRequestPlan {
     // selection instead of attempting an unsafe keep-selected append.
     bool pressure_ingest = false;
     bool checkpoint_available = false;
-    uint32_t resume_position = 0;
-    uint32_t common_prefix = 0;
+    uint64_t resume_position = 0;
+    uint64_t common_prefix = 0;
     uint64_t incremental_suffix_tokens = 0;
 };
 
@@ -233,6 +233,11 @@ struct EngineOptions {
     bool native_mtp_chain_set = false;
     bool native_mtp_prefix = false; // populate diagnostic MTP prefix KV cache
     bool native_mtp_speculate = false; // run experimental MTP speculative decode
+    // Explicit draft selection: none, mtp, dflash2. Auto preserves legacy
+    // native_mtp_* / dflash_model_path flags and environment configuration.
+    // Explicit mtp defaults to four draft tokens when no chain was specified.
+    std::string speculative_method = "auto";
+    std::string dflash_model_path; // independent DFlash 2 draft; shares target embedding/head
     std::string mtp_policy = "fixed"; // fixed or adaptive
     int mtp_adaptive_min_chain = 0; // 0 = backend default
     int mtp_adaptive_max_chain = 0; // 0 = backend default / mtp_chain
@@ -346,8 +351,11 @@ struct EngineOptions {
     // default for compatibility; enable for contexts whose raw-K authority
     // exceeds the CPU tier budget.
     bool kvmem_raw_k_nvme = false;
-    // Opt-in CPU background retirement; logical live-block target. The first
-    // implementation keeps the existing --ctx admission/storage reservation.
+    // Experimental bounded repository integration. ctx_size is the physical
+    // block capacity; cumulative history is independent. Zero is legacy mode.
+    uint32_t kvmem_repository_blocks = 0;
+    std::string kvmem_repository_gc_mode = "delete"; // off|shadow|delete
+    // Legacy CPU background retirement; keeps ctx admission and storage reservation.
     uint32_t kvmem_gc_max_blocks = 0;
     bool kvmem_gc_shadow = false;
     int kvmem_gc_cpu = -1;
@@ -369,6 +377,13 @@ struct EngineOptions {
     uint64_t kvmem_archive_ladder_tokens = 0;
 };
 
+// Joint applies top-p to full-vocabulary probabilities before intersecting
+// top-k/min-p. TopKFirst renormalizes top-k before the top-p cutoff, matching
+// SGLang's DFlash verifier. The policy applies to plain and speculative decode.
+enum class SamplingFilterOrder { Joint, TopKFirst };
+SamplingFilterOrder parse_sampling_filter_order(const std::string &name);
+const char *sampling_filter_order_name(SamplingFilterOrder order);
+
 struct GenerationOptions {
     // Thread-safe transport/request cancellation, checked between GPU chunks.
     std::function<bool()> should_cancel;
@@ -377,6 +392,7 @@ struct GenerationOptions {
     float top_p = 0.95f;
     int top_k = 20; // Qwen3 recommended default; <=0 disables top-k filtering
     float min_p = 0.0f;
+    SamplingFilterOrder sampling_filter_order = SamplingFilterOrder::Joint;
     float presence_penalty = 0.0f;
     float repetition_penalty = 1.0f;
     uint64_t seed = 0;
@@ -437,6 +453,26 @@ struct GenerationOptions {
     // Whether the prompt already opened a <think> block (enable_thinking). The
     // budget counter only runs while a think block is open.
     bool thinking_open = false;
+    // Experimental transactional thinking compaction. The
+    // isolated current-thinking summary replaces completed reasoning before answer
+    // decoding; only the replacement is returned to the caller and cached.
+    // Natural summary termination is bounded by original length and available
+    // private capacity. A nonzero legacy token cap also enables the feature.
+    bool thinking_summary = false;
+    uint32_t thinking_summary_tokens = 0;
+    uint32_t thinking_summary_min_tokens = 1024;
+    bool thinking_compaction_enabled() const {
+        return thinking_summary || thinking_summary_tokens != 0;
+    }
+    struct ThinkingSummaryStats {
+        uint32_t original_tokens = 0, retained_tokens = 0, summary_decode_tokens = 0;
+        uint32_t summary_input_tokens = 0, summary_yields = 0;
+        uint32_t discarded_tokens = 0;
+        bool compacted = false;
+    };
+    // Optional request-owned telemetry, written by its generation controller.
+    // Discarded tokens still consume the original generation allowance.
+    std::shared_ptr<ThinkingSummaryStats> thinking_summary_stats;
     // Unified serving/prefix/executor admission decision. Ordinary library
     // callers leave this disabled and preserve the legacy behavior.
     KvMemRequestPlan kvmem_request_plan;
@@ -475,16 +511,16 @@ struct GenerationOptions {
     // that is the user's question. The executor captures these query rows during
     // prefill and uses them for multi-token block selection. begin==end (default)
     // means no span -> the recency/single-token path runs unchanged.
-    uint32_t kvmem_query_begin = 0;
-    uint32_t kvmem_query_end = 0;
+    uint64_t kvmem_query_begin = 0;
+    uint64_t kvmem_query_end = 0;
     // Optional half-open token span [begin,end) that must be checkpointed,
     // pinned, and replayed after semantic selection.  This is deliberately
     // independent of kvmem_query_*: benchmark task instructions and output
     // framing may need to be replayed for answer fidelity while only the raw
     // question contributes Q rows to retrieval scoring.  begin==end preserves
     // the legacy behavior by using kvmem_query_* as the replay span.
-    uint32_t kvmem_replay_begin = 0;
-    uint32_t kvmem_replay_end = 0;
+    uint64_t kvmem_replay_begin = 0;
+    uint64_t kvmem_replay_end = 0;
     // Experimental query-token pruning. When both values are non-zero, the
     // backend greedily decodes `probe_tokens` from the provisional prompt,
     // measures their attention mass over the original query span, rolls the
@@ -540,8 +576,8 @@ struct GenerationOptions {
     // semantic-expansion mode. The model/KV storage remains fixed-block; these
     // spans affect semantic score reduction and selection only.
     struct KvMemRetrievalGroupSpan {
-        uint32_t begin = 0;
-        uint32_t end = 0;
+        uint64_t begin = 0;
+        uint64_t end = 0;
     };
     std::vector<KvMemRetrievalGroupSpan> kvmem_retrieval_group_spans;
     // Production semantic pins derived by protocol adapters. Unlike the
@@ -558,8 +594,8 @@ struct GenerationOptions {
         RootTask = 5,
     };
     struct KvMemPinnedTokenSpan {
-        uint32_t begin = 0;
-        uint32_t end = 0;
+        uint64_t begin = 0;
+        uint64_t end = 0;
         KvMemPinnedReason reason = KvMemPinnedReason::CurrentQuery;
     };
     std::vector<KvMemPinnedTokenSpan> kvmem_pinned_token_spans;
@@ -572,8 +608,8 @@ struct GenerationOptions {
     // flattened benchmark history inside the rendered prompt, while trace_tag
     // provides a stable request/sample key for offline retrieval analysis.
     // These fields never participate in scoring or block selection.
-    uint32_t kvmem_context_begin = 0;
-    uint32_t kvmem_context_end = 0;
+    uint64_t kvmem_context_begin = 0;
+    uint64_t kvmem_context_end = 0;
     std::string kvmem_trace_tag;
     // Diagnostics-only oracle control. Each half-open span is expressed in
     // already-rendered prompt-token coordinates and forces every overlapping
@@ -581,8 +617,8 @@ struct GenerationOptions {
     // The server accepts this field only when QW3_KVMEM_ENABLE_ORACLE=1.
     // Empty is the production/default path and leaves selection byte-identical.
     struct KvMemOracleTokenSpan {
-        uint32_t begin = 0;
-        uint32_t end = 0;
+        uint64_t begin = 0;
+        uint64_t end = 0;
     };
     std::vector<KvMemOracleTokenSpan> kvmem_oracle_token_spans;
     // When true, the final-query diagnostic selection contains only sink,
@@ -604,6 +640,11 @@ struct GenerationOptions {
     std::string kvmem_rebuilt_state_capture_key;
     std::string kvmem_rebuilt_state_seed_key;
 #endif
+    // Optional process-local cache hint for complete-history KVMem requests
+    // on the continuous controller. Distinct from the fragment-based session
+    // API above. The server may evict an idle lineage; a miss is a cold request.
+    // A key permits one outstanding request at a time.
+    std::string kvmem_prefix_cache_key;
 };
 
 struct ModelInfo {

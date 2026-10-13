@@ -1,10 +1,12 @@
 #include "qw3/device_backend.hpp"
+#include "flashinfer_decode_adapter.hpp"
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
@@ -15,7 +17,7 @@ void check(qw3::DeviceStatus status) {
 template<class KV>
 void compare(qw3::DeviceBackend &backend, unsigned heads, unsigned kv_heads, bool fp8,
              bool prefill = false, unsigned dim = 256, unsigned batch = 4,
-             unsigned base = 1001) {
+             unsigned base = 1001, bool cpu_oracle = true, bool prefill_serial = false) {
     constexpr unsigned page = 32;
     const unsigned pages = (base + batch + page - 1) / page;
     const unsigned stride = kv_heads * dim, q_stride = heads * 2 * dim;
@@ -43,7 +45,7 @@ void compare(qw3::DeviceBackend &backend, unsigned heads, unsigned kv_heads, boo
     check(backend.copy_bytes_from_host(*qd, 0, query.data(), query.size() * sizeof(float)));
     check(backend.copy_i32_from_host(*pd, 0, mapping.data(), pages));
     std::vector<float> expected(result.size(), sentinel);
-    for (unsigned b = 0; b < batch; ++b) {
+    for (unsigned b = 0; cpu_oracle && b < batch; ++b) {
         const unsigned length = base + b + 1;
         for (unsigned h = 0; h < heads; ++h) {
             const unsigned kh = h / (heads / kv_heads);
@@ -69,6 +71,30 @@ void compare(qw3::DeviceBackend &backend, unsigned heads, unsigned kv_heads, boo
             }
         }
     }
+    // A speculative verifier must preserve the single-token decoder's
+    // numerics, including when batch width exceeds the number of KV tiles.
+    std::vector<float> serial(result.size(), sentinel);
+    if (!prefill || prefill_serial) {
+        auto single_q = backend.tensor_f32(q_stride, "serial Q");
+        auto single_out = backend.tensor_f32(out_stride, "serial O");
+        for (unsigned b = 0; b < batch; ++b) {
+            check(backend.copy_bytes_from_host(*single_q, 0, query.data() + b * q_stride,
+                                               q_stride * sizeof(float)));
+            check(backend.copy_bytes_from_host(*single_out, 0, serial.data() + b * out_stride,
+                                               out_stride * sizeof(float)));
+            const auto status = prefill_serial
+                ? backend.attention_prefill_batch_paged_gated_device(
+                    *single_out, *single_q, 2 * dim, *kd, *vd, *pd, pages, page,
+                    heads, kv_heads, dim, base + b, 1, q_stride, out_stride,
+                    1.0f / std::sqrt(float(dim)))
+                : backend.attention_decode_batch_paged_gated_device(
+                    *single_out, *single_q, 2 * dim, *kd, *vd, *pd, pages, page,
+                    heads, kv_heads, dim, base + b, 1, q_stride, out_stride,
+                    1.0f / std::sqrt(float(dim)));
+            check(status);
+            check(backend.copy_to_host(*single_out, serial.data() + b * out_stride, 0, out_stride));
+        }
+    }
     float max_error = 0;
     for (unsigned repeat = 0; repeat < 3; ++repeat) {
         std::fill(result.begin(), result.end(), sentinel);
@@ -86,12 +112,18 @@ void compare(qw3::DeviceBackend &backend, unsigned heads, unsigned kv_heads, boo
             if (!std::isfinite(result[i])) throw std::runtime_error("non-finite attention output");
             if (i % out_stride >= heads * dim && result[i] != sentinel)
                 throw std::runtime_error("attention overwrote output row guard");
-            max_error = std::max(max_error, std::abs(result[i] - expected[i]));
+            if (cpu_oracle) max_error = std::max(max_error, std::abs(result[i] - expected[i]));
+            if ((!prefill || prefill_serial) && result[i] != serial[i])
+                throw std::runtime_error(std::string(prefill_serial ? "paged prefill" : "paged decode") +
+                    " differs between batched and single-token calls: base=" +
+                    std::to_string(base) + " batch=" + std::to_string(batch) + " index=" + std::to_string(i));
         }
     }
-    std::printf("mode=%s dim=%u batch=%u base=%u GQA=%u heads=%u kv=%u dtype=%s repeats=3 max_abs_error=%g\n",
+    std::printf("mode=%s dim=%u batch=%u base=%u GQA=%u heads=%u kv=%u dtype=%s repeats=3 oracle=%s max_abs_error=%g\n",
                 prefill ? "prefill" : "decode", dim, batch, base,
-                heads / kv_heads, heads, kv_heads, fp8 ? "FP8" : "FP16", max_error);
+                heads / kv_heads, heads, kv_heads, fp8 ? "FP8" : "FP16",
+                cpu_oracle ? "cpu" : "serial", max_error);
+    std::fflush(stdout);
     if (max_error > 0.001f) throw std::runtime_error("paged causal attention differs from CPU oracle");
 }
 
@@ -156,12 +188,83 @@ void queued_prefill(qw3::DeviceBackend &backend, bool fp8,
 
 int main(int argc, char **argv) try {
     const bool prefill = argc == 2 && std::strcmp(argv[1], "--prefill") == 0;
+    const bool serial_parity = argc == 2 && std::strcmp(argv[1], "--serial-parity") == 0;
+    const bool serial_small = argc == 2 && std::strcmp(argv[1], "--serial-parity-small") == 0;
+    const bool serial_long = argc == 2 && std::strcmp(argv[1], "--serial-parity-long") == 0;
+    const bool prefill_serial = argc == 2 && std::strcmp(argv[1], "--prefill-serial-parity") == 0;
     const bool queued = argc == 2 && std::strcmp(argv[1], "--queued") == 0;
     const bool queued_small = argc == 2 && std::strcmp(argv[1], "--queued-small") == 0;
-    if (argc != 1 && !prefill && !queued && !queued_small)
-        throw std::runtime_error("usage: flashinfer_decode_gqa [--prefill|--queued|--queued-small]");
+    if (argc != 1 && !prefill && !queued && !queued_small && !serial_parity && !serial_small && !serial_long && !prefill_serial)
+        throw std::runtime_error("usage: flashinfer_decode_gqa [--prefill|--queued|--queued-small|--serial-parity|--serial-parity-small|--serial-parity-long]");
     auto backend = qw3::make_cuda_device_backend(qw3::LinearBackend::Cublas);
     check(backend->begin());
+    if (prefill_serial) {
+        // Feasibility gate for using the existing tensor-core prefill kernel
+        // for BOTH one-token target execution and speculative verification.
+        // Never switch production dispatch based solely on a fast batch path.
+        unsigned failures = 0, cases = 0;
+        for (unsigned batch : {2u, 4u, 8u}) {
+            for (unsigned base : {1024u, 65597u, 65609u, 131209u, 131221u}) {
+                ++cases;
+                std::printf("prefill_serial_case base=%u batch=%u\n", base, batch);
+                std::fflush(stdout);
+                try {
+                    compare<__nv_fp8_e4m3>(*backend, 24, 4, true, true, 256, batch, base, false, true);
+                } catch (const std::exception &error) {
+                    ++failures;
+                    std::printf("prefill_serial_failure %s\n", error.what());
+                    std::fflush(stdout);
+                }
+            }
+        }
+        std::printf("prefill_serial_cases=%u failures=%u performance_claim=false\n", cases, failures);
+        return failures ? 1 : 0;
+    }
+    if (serial_long) {
+        unsigned failures = 0;
+        // Freeze the search ranges around the actual long KVMem/full-KV
+        // lengths. Locate a partition change with the production planner,
+        // then compare a nearby control and an eight-row crossing batch.
+        for (unsigned cache : {0u, 1u}) {
+            setenv("QW3_FLASHINFER_VERIFY_PLAN_CACHE", cache ? "1" : "0", 1);
+            auto chunk = [](unsigned length) {
+                return qw3::flashinfer_adapter::batch_decode_f32q_fp8kv_chunk_size(24, 4, 256, 1, length);
+            };
+            for (unsigned start : {65536u, 131072u}) {
+                unsigned edge = start + 16;
+                while (edge < start + 4096 && chunk(edge) == chunk(edge - 1)) ++edge;
+                if (edge == start + 4096 || !chunk(edge))
+                    throw std::runtime_error("long partition boundary not found");
+                for (unsigned base : {edge - 16, edge - 4}) {
+                    std::printf("long_serial_case cache=%u base=%u first_chunk=%u last_chunk=%u\n",
+                        cache, base, chunk(base + 1), chunk(base + 8));
+                    std::fflush(stdout);
+                    try {
+                        compare<__nv_fp8_e4m3>(*backend, 24, 4, true, false, 256, 8, base, false);
+                    } catch (const std::exception &error) {
+                        ++failures;
+                        std::printf("long_serial_failure %s\n", error.what());
+                        std::fflush(stdout);
+                    }
+                }
+            }
+        }
+        std::printf("long_serial_failures=%u\n", failures);
+        return failures ? 1 : 0;
+    }
+    if (serial_parity || serial_small) {
+        // Race instrumentation is expensive. Its bounded variant retains both
+        // KV dtypes and the problematic rows > tile-count merge regime.
+        const std::vector<unsigned> dims = serial_small ? std::vector<unsigned>{256} : std::vector<unsigned>{128, 256};
+        const std::vector<unsigned> widths = serial_small ? std::vector<unsigned>{8} : std::vector<unsigned>{2, 4, 5, 6, 7, 8};
+        const std::vector<unsigned> bases = serial_small ? std::vector<unsigned>{256, 1024} : std::vector<unsigned>{255, 256, 511, 1021, 1024, 1277, 2047};
+        for (unsigned dim : dims) for (unsigned batch : widths)
+            for (unsigned base : bases) {
+                compare<__nv_fp8_e4m3>(*backend, 24, 4, true, false, dim, batch, base, false);
+                compare<half>(*backend, 24, 4, false, false, dim, batch, base, false);
+            }
+        return 0;
+    }
     if (queued || queued_small) {
         // Race instrumentation retains extensive shared-memory access history.
         // Keep its bounded variant above two complete pinned-ring wraps; the

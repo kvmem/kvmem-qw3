@@ -202,6 +202,14 @@ public:
         erase_lru(block_id);
     }
 
+    // A repository slot is about to represent a different historical block.
+    // Normal tier eviction retains heat; identity reuse must forget it.
+    // Foreground only, just like place_block/release_block.
+    void forget_block(uint32_t block_id) {
+        release_block(block_id);
+        heat_.erase(block_id);
+    }
+
     // Mark a block most-recently-used (called on stage-in / access) so the LRU
     // victim picked by evict_lru_victim() is the coldest resident block.
     void touch(uint32_t block_id) {

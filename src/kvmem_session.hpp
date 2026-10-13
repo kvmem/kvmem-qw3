@@ -48,6 +48,7 @@ struct KvMemSessionConfig {
     float temperature = 0.0f;
     float top_p = 1.0f;
     int top_k = 0;
+    SamplingFilterOrder sampling_filter_order = SamplingFilterOrder::Joint;
 };
 
 // Loads the model once (kvmem on, update-mode step, MTP on) and runs the growth

@@ -1,9 +1,27 @@
 #include "kvmem_prefix_reuse_policy.hpp"
+
+// Native Anthropic tool traffic replays from 2432 while its scoring query is
+// [2415,2439). Keeping that replay origin as P caused a next-turn cold prefill.
+static_assert(!qw3::detail::kvmem_checkpoint_outside_query(2432, 2415, 2439, 32));
+static_assert(qw3::detail::kvmem_checkpoint_outside_query(2400, 2415, 2439, 32));
+static_assert(qw3::detail::kvmem_checkpoint_outside_query(2464, 2415, 2439, 32));
 #include "multimodal_prefix_cache.hpp"
 
 #include <cstdlib>
 #include <iostream>
 #include <string>
+
+// Cumulative history positions are independent of bounded physical slots.
+static_assert(qw3::detail::kvmem_branch_safe_prompt_checkpoint_split(
+    (1ull << 40) + 253053, (1ull << 40) + 253005, 32) == (1ull << 40) + 253024);
+static_assert(qw3::detail::kvmem_query_safe_prompt_checkpoint_split(
+    (1ull << 40) + 6792, 0, 32, (1ull << 40) + 6550, (1ull << 40) + 6783)
+        == (1ull << 40) + 6528);
+static_assert(qw3::detail::kvmem_branch_safe_prompt_checkpoint_split(
+    UINT64_MAX, UINT64_MAX - 1, 32) == 0);
+static_assert(qw3::detail::kvmem_warm_query_snapshot_reusable(
+    true, (1ull << 40) + 1, (1ull << 40) + 3, (1ull << 40) + 5,
+    (1ull << 40) + 1, (1ull << 40) + 3, (1ull << 40) + 8));
 
 namespace {
 
@@ -309,7 +327,66 @@ void test_multimodal_prefix_identity() {
 
 }  // namespace
 
+void test_warm_periodic_selection_preserves_replay_origin() {
+    using qw3::detail::kvmem_periodic_reselect_boundary_due;
+    using qw3::detail::kvmem_periodic_reselect_align_drafts;
+    // Retained live trace: prompt158994, periodic selections159062/159128,
+    // P159104 at generation57 invalidated by generation58, then EOS159158.
+    // The candidate instead selects at159104 and retains that aligned P.
+    require(kvmem_periodic_reselect_boundary_due(159104, 158994, 64, 128),
+            "retained trace did not reach its first due aligned selection");
+    require(!kvmem_periodic_reselect_boundary_due(159128, 159104, 64, 128),
+            "late partial-block selection invalidated the replay origin");
+    require(!kvmem_periodic_reselect_boundary_due(159158, 159104, 64, 128),
+            "EOS triggered an unaligned selection");
+    for (uint32_t bt : {1u, 32u, 128u}) {
+        for (uint32_t interval : {1u, 64u, 255u, 256u}) {
+            for (uint32_t offset = 0; offset < bt; ++offset) {
+                for (uint32_t acceptance = 1; acceptance <= 8; ++acceptance) {
+                    uint64_t pos = (1ull << 40) + offset;
+                    uint64_t last = pos;
+                    const uint64_t end = pos + 1024;
+                    while (pos < end) {
+                        const uint32_t drafts = qw3::detail::kvmem_checkpoint_draft_limit(
+                            pos, bt, 7, kvmem_periodic_reselect_align_drafts(pos, last, interval, bt, 7));
+                        const uint32_t count = acceptance < drafts + 1 ? acceptance : drafts + 1;
+                        pos += count;
+                        if (kvmem_periodic_reselect_boundary_due(pos, last, interval, bt)) {
+                            require(pos % bt == 0, "periodic selection is not aligned");
+                            require(pos - last >= interval, "periodic selection happened early");
+                            require(pos - last < uint64_t(interval) + bt,
+                                    "speculation skipped a due selection boundary");
+                            last = pos;
+                        }
+                    }
+                    require(pos - last < uint64_t(interval) + bt,
+                            "periodic selection was postponed indefinitely");
+                }
+            }
+        }
+    }
+    require(!kvmem_periodic_reselect_align_drafts(10, 11, 64, 128, 7),
+            "invalid reversed progress enabled a boundary clamp");
+}
+
 int main() {
+    test_warm_periodic_selection_preserves_replay_origin();
+    // Every possible MTP acceptance length reaches an aligned state before
+    // crossing it, including the final current-token-only transition.
+    for (uint64_t start = 1071316; start < 1071348; ++start) {
+        uint64_t pos = start;
+        const uint64_t boundary = (start / 32 + 1) * 32;
+        while (pos < boundary) {
+            const auto drafts = qw3::detail::kvmem_checkpoint_draft_limit(pos, 32, 4, true);
+            require(pos + drafts + 1 <= boundary, "MTP skipped the replay checkpoint boundary");
+            pos += drafts + 1;
+        }
+        require(pos == boundary, "post-selection checkpoint boundary was not reached");
+    }
+    require(qw3::detail::kvmem_checkpoint_draft_limit(31, 32, 4, false) == 4,
+            "ordinary MTP decode was changed without a due checkpoint");
+    require(qw3::detail::kvmem_checkpoint_draft_limit((1ull << 40) + 31, 32, 4, true) == 0,
+            "checkpoint scheduling truncated the logical history position");
     test_tool_continuation_falls_back_from_m_to_p();
     test_branch_safe_prompt_checkpoint();
     test_query_safe_prompt_checkpoint();
@@ -321,3 +398,33 @@ int main() {
     std::cout << "kvmem_prefix_reuse_policy_test: PASS\n";
     return 0;
 }
+
+// Native Anthropic text observation: live message header begins at 1022,
+// scoring body at 1025, M=1016. Replay needs 992, not the body's 1024.
+static_assert(qw3::detail::kvmem_replay_capture_begin(1025, 1022, 1125) / 32 * 32 == 992);
+static_assert(qw3::detail::kvmem_replay_capture_begin(1025, 0, 0) == 1025);
+static_assert(qw3::detail::kvmem_replay_capture_begin(1025, 2048, 2100) == 1025);
+
+static_assert(qw3::detail::kvmem_query_safe_prompt_checkpoint_split(582, 0, 32, 31, 573) == 576);
+static_assert(qw3::detail::kvmem_query_safe_prompt_checkpoint_split(582, 0, 32, 31, 580) == 0);
+static_assert(qw3::detail::kvmem_complete_query_replay_boundary(2441, 2415, 2439, 128) == 2304);
+static_assert(qw3::detail::kvmem_complete_query_replay_boundary(2574, 2415, 2439, 128) == 2560);
+static_assert(qw3::detail::kvmem_complete_query_replay_boundary(1019, 1025, 1080, 32) == 992);
+
+// The Windows long-history failure restored P=127744 but the current tool
+// result begins around 253K. Replaying everything after P incorrectly pins
+// about 189K tokens against a 128K window. Advance only the replay checkpoint,
+// without truncating any ingested source or relaxing the complete-Q rule.
+static_assert(qw3::detail::kvmem_cached_query_replay_boundary(
+    253799, 1882, 1972, 128, 127744) == 253696);
+static_assert(316760 - qw3::detail::kvmem_cached_query_replay_boundary(
+    253799, 1882, 1972, 128, 127744) < 65536);
+static_assert(qw3::detail::kvmem_cached_query_replay_boundary(
+    2441, 2415, 2439, 128, 2048) == 2304);
+static_assert(qw3::detail::kvmem_cached_query_replay_boundary(
+    1882, 1882, 1972, 128, 127744) == 127744);
+static_assert(qw3::detail::kvmem_cached_query_replay_boundary(
+    1019, 1025, 1080, 32, 1024) == 1024);
+static_assert(qw3::detail::kvmem_cached_query_replay_boundary(
+    (1ull << 40) + 500, 1882, 1972, 128, (1ull << 40)) ==
+    (1ull << 40) + 384);

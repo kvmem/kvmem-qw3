@@ -7,6 +7,19 @@
 
 namespace qw3::detail {
 
+// Validate the coordinates actually consumed by RoPE, not the number of KV
+// slots. Image patches can share coordinates, so these lengths are distinct.
+inline bool kvmem_rope_batch_within_limit(
+        uint64_t scalar_base, uint32_t tokens, uint32_t limit,
+        const std::vector<int32_t> *mrope = nullptr) {
+    if (limit == 0) return true;
+    if (!mrope) return scalar_base <= limit && tokens <= limit - scalar_base;
+    if (mrope->size() != uint64_t(tokens) * 3) return false;
+    return std::all_of(mrope->begin(), mrope->end(), [limit](int32_t pos) {
+        return pos >= 0 && static_cast<uint32_t>(pos) < limit;
+    });
+}
+
 inline bool kvmem_middecode_refresh_due(
         uint32_t decoded, uint32_t epoch_begin, uint32_t trigger_tokens,
         uint32_t refreshes, uint32_t max_refreshes) {
@@ -26,6 +39,19 @@ inline constexpr uint32_t kvmem_middecode_trigger_for_epoch(
     return completed_refreshes > 0 && steady_trigger_tokens > 0
         ? steady_trigger_tokens
         : first_trigger_tokens;
+}
+
+// A speculative cycle may emit its accepted drafts plus one target token.
+// Stop at the first refresh threshold, then use one-token transitions until
+// the same safe text boundary a serial decoder would observe is reached.
+inline constexpr uint32_t kvmem_middecode_draft_limit(
+        uint32_t requested, uint32_t decoded, uint32_t epoch_begin,
+        uint32_t trigger_tokens, uint32_t refreshes, uint32_t max_refreshes) {
+    if (!trigger_tokens || !max_refreshes || refreshes >= max_refreshes) return requested;
+    if (decoded < epoch_begin) return 0;
+    const uint32_t elapsed = decoded - epoch_begin;
+    if (elapsed >= trigger_tokens) return 0;
+    return std::min(requested, trigger_tokens - elapsed - 1);
 }
 
 // Local-position MTP only needs enough RoPE headroom for one generation

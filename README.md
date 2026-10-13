@@ -517,7 +517,12 @@ The following are intentionally outside the first quick start:
   required by FP8 KV, KVMem/device-paged attention, continuous batching, native
   CUDA vision, and NVFP4. Use the [FlashInfer build](#optional-flashinfer-build).
 - **NVFP4:** 4-bit `compressed-tensors` weights on SM120a, not generic Q4 GGUF.
-- **MTP speculative decode:** enable with `--mtp-chain N`.
+- **Speculative decode:** select `--speculative-method mtp --mtp-chain N` for
+  the target's native MTP head, or `--speculative-method dflash2
+  --dflash-model DIR` for an independent DFlash 2 checkpoint. Use
+  `--speculative-method none` to disable speculation. Legacy `--mtp-chain N`
+  serving and `--dflash-model DIR` remain supported. See
+  [draft selection and KVMem integration](docs/dflash2_integration.md).
 - **Image input:** enable with `--vision-model DIR --vision-device cpu|cuda`;
   image requests currently use serialized serving.
 - **Continuous batching:** use a FlashInfer-enabled binary and enable with

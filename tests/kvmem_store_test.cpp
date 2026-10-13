@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 using namespace qw3;
@@ -178,6 +179,26 @@ static void test_cold_immutable_same_position_rebuilds_k() {
     CHECK(!plan.remaps[1].working_k_resident);
     CHECK(plan.remaps[1].raw_refresh);
     CHECK(!plan.remaps[1].skip);
+}
+
+static void test_fp8_every_move_uses_raw_authority() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 32; cfg.immutable_source_k = true;
+    cfg.immutable_refresh_abs_delta_tokens = 1;
+    KvMemStore store(cfg); store.register_append(32 * 6);
+    // Block 4 repeatedly moves between compact slots 1 and 2. No intermediate
+    // quantized working K may become the next rotation's numerical authority.
+    for (unsigned i = 0; i < 100; ++i) {
+        const auto ids = i % 2 ? std::vector<uint32_t>{0, 2, 4} : std::vector<uint32_t>{0, 4};
+        const auto moved = store.set_selection(ids);
+        const auto &last = moved.remaps.back();
+        CHECK(last.block_id == 4 && last.working_k_resident);
+        CHECK(!last.skip && last.raw_refresh);
+        CHECK(store.blocks()[4].remap_count == 0);
+        CHECK(store.blocks()[4].remap_abs_delta == 0);
+        const auto same = store.set_selection(ids);
+        for (const auto &entry : same.remaps) CHECK(entry.skip && !entry.raw_refresh);
+    }
 }
 
 static void test_default_profile_reuses_moved_resident_k() {
@@ -1087,10 +1108,624 @@ static void test_round_groups_charge_shared_boundary_once() {
     }
 }
 
+static void test_repository_reuse_order_and_generations() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 4; cfg.select_budget = 16; cfg.prefill_budget = 8;
+    cfg.sink_blocks = 1; cfg.recent_blocks = 1; cfg.immutable_source_k = true;
+    auto repo = std::make_shared<KvMemRepository>(KvMemRepository::Config{4, 4});
+    KvMemStore s(cfg, repo);
+    std::vector<KvMemBlockHandle> hs;
+    for (uint32_t i = 0; i < 4; ++i) {
+        auto l = repo->try_reserve(i * 4, 4).commit();
+        hs.push_back(l.handle());
+        s.register_repository_block(std::move(l), i * 4);
+        s.set_block_tier(hs.back().slot, KvTier::CPU, i, -1, hs.back().generation);
+    }
+    const auto old = hs[1];
+    CHECK(repo->retire_if_unpinned(old));
+    CHECK(repo->try_reclaim(old, [](const auto &) { return true; }) == KvMemRepository::ReclaimResult::Reclaimed);
+    auto newest = repo->try_reserve(16, 4).commit();
+    hs[1] = newest.handle();
+    CHECK(hs[1].slot == old.slot);
+    s.register_repository_block(std::move(newest), 12);
+    CHECK(s.block_count() == 4 && s.history_end() == 20);
+    CHECK(s.blocks()[1].orig_pos_start == 4 && s.blocks()[1].history_pos_start == 16);
+    CHECK(s.history_span_blocks(8, 20) == std::vector<uint32_t>({2, 3, 1}));
+    CHECK(s.history_span_blocks(4, 12, false) == std::vector<uint32_t>({2}));
+    bool missing_history = false;
+    try { s.history_span_blocks(4, 12); }
+    catch (const std::runtime_error &) { missing_history = true; }
+    CHECK(missing_history); // slot 1 now stores [16,20), never the missing [4,8)
+    s.set_repository_retrieval_scores(hs, {0, 0, 0, 0});
+    s.set_runtime_select_budget(8);
+    CHECK(s.pick_topk_blocks() == std::vector<uint32_t>({0, 1}));
+    CHECK(s.pick_prefill_pressure_blocks() == std::vector<uint32_t>({0, 1}));
+    s.set_runtime_select_budget(0);
+    CHECK(s.pick_topk_blocks() == std::vector<uint32_t>({0, 2, 3, 1}));
+    s.set_runtime_select_budget(12);
+    CHECK(s.pick_repository_semantic_groups({{4, 12}, {8, 12}}, {100, 1}) ==
+          std::vector<uint32_t>({0, 2, 1})); // skip incomplete high-scoring group
+    s.set_runtime_select_budget(0);
+    auto frame = s.repository_read_leases();
+    CHECK(frame.size() == 4 && frame[3].record().token_begin == 16);
+    CHECK(!repo->retire_if_unpinned(hs[2])); // in-flight scorer owns its frame
+    frame.clear();
+
+    s.set_repository_retrieval_scores(hs, {1, 2, 3, 4});
+    bool stale = false;
+    try { s.set_repository_retrieval_scores({old}, {100}); }
+    catch (const std::runtime_error &) { stale = true; }
+    CHECK(stale && s.blocks()[1].retrieval_score == 2); // no partial score update
+    s.accumulate_repository_attn({hs[0], hs[1]}, {3, 7});
+    s.accumulate_repository_attn({hs[1]}, {2});
+    CHECK(s.blocks()[0].profile_score == 3 && s.blocks()[1].profile_score == 9);
+    stale = false;
+    try { s.accumulate_repository_attn({hs[0], old}, {100, 100}); }
+    catch (const std::runtime_error &) { stale = true; }
+    CHECK(stale && s.blocks()[0].profile_score == 3 && s.blocks()[1].profile_score == 9);
+    bool duplicate = false;
+    try { s.accumulate_repository_attn({hs[0], hs[0]}, {100, 100}); }
+    catch (const std::invalid_argument &) { duplicate = true; }
+    CHECK(duplicate && s.blocks()[0].profile_score == 3);
+    stale = false;
+    try { s.set_block_ssd_backing(old.slot, 42, true, old.generation); }
+    catch (const std::runtime_error &) { stale = true; }
+    CHECK(stale && !s.blocks()[1].ssd_clean);
+    stale = false;
+    try { s.set_repository_selection({old}); }
+    catch (const std::runtime_error &) { stale = true; }
+    CHECK(stale);
+
+    auto plan = s.set_repository_selection({hs[1], hs[3], hs[0]});
+    CHECK(plan.remaps.size() == 3 && plan.total_window_tokens == 12);
+    CHECK(plan.remaps[0].block_id == 0 && plan.remaps[0].to_base == 0);
+    CHECK(plan.remaps[1].block_id == 3 && plan.remaps[1].to_base == 4);
+    CHECK(plan.remaps[2].block_id == 1 && plan.remaps[2].to_base == 8);
+    auto checkpoint = s.repository_checkpoint_leases();
+    CHECK(checkpoint.size() == 3);
+    s.clear_working_set();
+    s.set_block_tier(hs[1].slot, KvTier::CPU, 1, -1, hs[1].generation);
+    CHECK(!repo->retire_if_unpinned(hs[1]));
+    checkpoint.clear();
+    CHECK(!repo->retire_if_unpinned(hs[1])); // pending transition still owns old window
+    plan.repository_previous_window.reset();
+    CHECK(repo->retire_if_unpinned(hs[1]));
+    CHECK(repo->try_reclaim(hs[1], [](const auto &) { return true; }) == KvMemRepository::ReclaimResult::Reclaimed);
+    CHECK(s.pick_topk_blocks() == std::vector<uint32_t>({0, 2, 3}));
+}
+
+static void test_repository_high_positions_and_holes() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 32; cfg.select_budget = 64; cfg.prefill_budget = 64;
+    cfg.sink_blocks = 0; cfg.recent_blocks = 0;
+    auto repo = std::make_shared<KvMemRepository>(KvMemRepository::Config{8, 32});
+    KvMemStore s(cfg, repo);
+    const uint64_t base = uint64_t{1} << 34;
+    std::vector<KvMemBlockHandle> hs;
+    for (uint32_t i = 0; i < 3; ++i) {
+        auto l = repo->try_reserve(base + i * 32, 32).commit();
+        hs.push_back(l.handle());
+        s.register_repository_block(std::move(l), i * 32);
+    }
+    CHECK(s.history_end() == base + 96);
+    CHECK(s.pick_topk_blocks() == std::vector<uint32_t>({1, 2}));
+    CHECK(s.pick_prefill_pressure_blocks() == std::vector<uint32_t>({1, 2}));
+    auto plan = s.set_repository_selection({hs[2], hs[1]});
+    CHECK(plan.stage_out == std::vector<uint32_t>({0})); // never unallocated slots
+    CHECK(plan.remaps.size() == 2 && plan.total_window_tokens == 64);
+    CHECK(plan.remaps[0].to_base == 0 && plan.remaps[1].to_base == 32);
+    CHECK(s.blocks()[1].history_pos_start == base + 32);
+    CHECK(s.history_span_blocks(base + 32, base + 96) == std::vector<uint32_t>({1, 2}));
+    CHECK(s.pick_repository_semantic_groups({{base + 32, base + 96}}, {1}) ==
+          std::vector<uint32_t>({1, 2}));
+}
+
+static void test_repository_store_long_continuation() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 32; cfg.select_budget = 96; cfg.prefill_budget = 96;
+    cfg.sink_blocks = 1; cfg.recent_blocks = 1; cfg.immutable_source_k = true;
+    auto repo = std::make_shared<KvMemRepository>(KvMemRepository::Config{8, 32});
+    KvMemStore s(cfg, repo);
+    const size_t metadata_slots = s.blocks().capacity();
+    for (uint32_t step = 0; step < 2048; ++step) {
+        if (repo->stats().ready == 0) {
+            // The CPU resource owner reclaims a cold non-working block. The
+            // selection below is the production KvMemStore implementation.
+            uint32_t victim = UINT32_MAX;
+            for (const auto &b : s.blocks()) {
+                if (!s.is_live(b.block_id) || b.tier == KvTier::GPU || b.in_working_set ||
+                    b.history_pos_start == 0) continue;
+                if (victim == UINT32_MAX || b.history_pos_start < s.blocks()[victim].history_pos_start)
+                    victim = b.block_id;
+            }
+            CHECK(victim != UINT32_MAX);
+            if (victim == UINT32_MAX) return;
+            const auto h = s.repository_handle(victim);
+            CHECK(repo->retire_if_unpinned(h));
+            CHECK(repo->try_reclaim(h, [](const auto &) { return true; }) == KvMemRepository::ReclaimResult::Reclaimed);
+        }
+        auto fresh = repo->try_reserve(uint64_t(step) * 32, 32).commit();
+        s.register_repository_block(std::move(fresh), 96);
+        auto scoring = s.repository_read_leases();
+        std::vector<KvMemBlockHandle> handles;
+        std::vector<double> scores;
+        for (const auto &l : scoring) {
+            handles.push_back(l.handle());
+            scores.push_back(double((l.record().logical_id * 17 + step) % 23));
+        }
+        s.set_repository_retrieval_scores(handles, scores);
+        handles.clear();
+        for (auto id : s.pick_topk_blocks()) handles.push_back(s.repository_handle(id));
+        auto plan = s.set_repository_selection(handles);
+        CHECK(plan.total_window_tokens <= cfg.select_budget);
+        uint64_t prior = 0;
+        for (size_t i = 0; i < plan.remaps.size(); ++i) {
+            const auto &b = s.blocks()[plan.remaps[i].block_id];
+            CHECK(i == 0 || b.history_pos_start > prior);
+            CHECK(plan.remaps[i].to_base == int32_t(i * 32));
+            prior = b.history_pos_start;
+        }
+        for (auto id : plan.stage_out) {
+            const auto h = s.repository_handle(id);
+            s.set_block_tier(id, KvTier::CPU, int32_t(id), -1, h.generation);
+        }
+        for (auto id : plan.stage_in) {
+            const auto h = s.repository_handle(id);
+            s.set_block_tier(id, KvTier::GPU, -1, -1, h.generation);
+        }
+        CHECK(s.blocks().capacity() == metadata_slots);
+        CHECK(s.history_end() == uint64_t(step + 1) * 32);
+    }
+    CHECK(repo->stats().reclaimed == 2040 && s.block_count() == 8);
+}
+
+static void test_repository_batched_append_and_partial_commit() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 32; cfg.select_budget = 64;
+    auto repo = std::make_shared<KvMemRepository>(KvMemRepository::Config{4, 32});
+    KvMemStore s(cfg, repo);
+    auto a = s.prepare_repository_append(73, 0);
+    CHECK(a && a->spans().size() == 3 && repo->ready_slots() == 1);
+    CHECK(repo->stats().writing == 3 && repo->stats().live == 0);
+    CHECK(s.history_end() == 0 && s.repository_read_leases().empty());
+    bool rejected = false;
+    try { s.repository_storage_read(0, 1); } catch (const std::runtime_error &) { rejected = true; }
+    CHECK(rejected); // no unwritten payload is published by allocation
+    rejected = false;
+    try { s.prepare_repository_append(1, 0); } catch (const std::logic_error &) { rejected = true; }
+    CHECK(rejected);
+    auto dma = a->io_leases();
+    const auto cancelled = a->spans()[2].handle;
+    a->commit(37); // accept a full block and five tokens, reject the third
+    CHECK(s.history_end() == 37 && s.repository_directory_entries() == 2);
+    CHECK(s.blocks()[1].n_tokens == 5 && repo->stats().cancelled == 1);
+    CHECK(repo->try_reclaim(cancelled, [](const auto &) { return true; }) ==
+          KvMemRepository::ReclaimResult::DeferredReaders);
+    dma.clear();
+    CHECK(repo->try_reclaim(cancelled, [](const auto &) { return true; }) ==
+          KvMemRepository::ReclaimResult::Reclaimed);
+    auto read = s.repository_storage_read(30, 7);
+    CHECK(read.spans.size() == 2 && read.spans[0].storage_begin == 30 &&
+          read.spans[0].token_count == 2 && read.spans[1].storage_begin == 32 &&
+          read.spans[1].token_count == 5);
+    rejected = false;
+    try { s.repository_storage_read(37, 1); } catch (const std::runtime_error &) { rejected = true; }
+    CHECK(rejected); // rejected draft bytes do not extend valid KV
+
+    // Crossing a partial tail and two fresh blocks keeps one ordinary batch.
+    a = s.prepare_repository_append(60, 37);
+    CHECK(a && a->spans().size() == 3);
+    CHECK(a->spans()[0].token_count == 27 && a->spans()[0].storage_begin == 37);
+    CHECK(a->spans()[1].history_begin == 64 && a->spans()[1].storage_begin == 96);
+    CHECK(a->spans()[2].history_begin == 96 && a->spans()[2].storage_begin == 64);
+    const auto pages = kvmem_storage_page_spans(a->spans(), 16, 37);
+    CHECK(pages.size() == 3);
+    CHECK(pages[0].storage_page == 2 && pages[0].window_page == 2 && pages[0].page_count == 2);
+    CHECK(pages[1].storage_page == 6 && pages[1].window_page == 4 && pages[1].page_count == 2);
+    CHECK(pages[2].storage_page == 4 && pages[2].window_page == 6 && pages[2].page_count == 1);
+    a->commit(60);
+    CHECK(s.history_end() == 97 && repo->ready_slots() == 0);
+    CHECK(s.history_span_blocks(0, 97) == std::vector<uint32_t>({0, 1, 3, 2}));
+    // Reserving a further whole block fails atomically, leaving the partial
+    // tail available for a smaller append; no foreground GC/reclaim happens.
+    const auto before = repo->stats().reservations;
+    CHECK(!s.prepare_repository_append(32, 97));
+    CHECK(s.history_end() == 97 && repo->stats().reservations == before);
+    a = s.prepare_repository_append(31, 97);
+    CHECK(a && a->spans().size() == 1);
+    a->commit(31);
+    CHECK(s.history_end() == 128 && s.blocks()[2].n_tokens == 32);
+}
+
+static void test_repository_append_extension_and_write_views() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 32;
+    auto repo = std::make_shared<KvMemRepository>(KvMemRepository::Config{3, 32});
+    KvMemStore s(cfg, repo);
+    auto a = s.prepare_repository_append(29, 0);
+    a->commit(29);
+    a = s.prepare_repository_append(1, 29);
+    CHECK(a->extend(3) && a->spans().size() == 1);
+    CHECK(a->extend(7) && a->spans().size() == 2);
+    CHECK(a->begin() == 29 && a->end() == 36 && s.history_end() == 29);
+    CHECK(s.blocks()[0].n_tokens == 29); // speculative extension is not committed
+    auto write = a->storage_write(31, 4);
+    CHECK(write.spans.size() == 2 && write.leases.size() == 2);
+    CHECK(write.spans[0].token_count == 1 && write.spans[0].storage_begin == 31);
+    CHECK(write.spans[1].token_count == 3 && write.spans[1].history_begin == 32);
+    const auto pending = write.spans[1].handle;
+    CHECK(!repo->try_pin(pending)); // Writing is accessible only through its reservation
+    CHECK(a->extend(40) && a->spans().size() == 3 && a->end() == 69);
+    CHECK(a->spans()[1].token_count == 32 && a->spans()[2].token_count == 5);
+    const auto before = repo->stats().reservations;
+    CHECK(!a->extend(68)); // one additional block is unavailable
+    CHECK(a->end() == 69 && a->spans().size() == 3 && repo->stats().reservations == before);
+    CHECK(a->extend(39) && a->end() == 69); // never shrink outstanding writes
+    bool rejected = false;
+    try { a->storage_write(68, 2); } catch (const std::invalid_argument &) { rejected = true; }
+    CHECK(rejected);
+    const auto cancelled = a->spans()[2].handle;
+    auto late_io = a->storage_write(64, 5);
+    CHECK(a->discarded_page_ranges(40, 16).empty());
+    CHECK(a->discarded_page_ranges(4, 16) ==
+          (std::vector<std::pair<uint32_t, uint32_t>>{{3, 2}}));
+    CHECK(a->discarded_page_ranges(3, 16) ==
+          (std::vector<std::pair<uint32_t, uint32_t>>{{2, 3}}));
+    CHECK(a->discarded_page_ranges(0, 16) ==
+          (std::vector<std::pair<uint32_t, uint32_t>>{{2, 3}})); // preserve committed page [16,32)
+    a->commit(4); // accept 3 tail tokens and just 1 new-block token
+    CHECK(s.history_end() == 33 && s.blocks()[pending.slot].n_tokens == 1);
+    CHECK(repo->try_reclaim(cancelled, [](const auto &) { return true; }) ==
+          KvMemRepository::ReclaimResult::DeferredReaders);
+    late_io = {};
+    CHECK(repo->try_reclaim(cancelled, [](const auto &) { return true; }) ==
+          KvMemRepository::ReclaimResult::Reclaimed);
+    write = {};
+    // The following batch must still use the correct partial-tail reservation.
+    a = s.prepare_repository_append(1, 33);
+    CHECK(a->extend(31) && a->spans().size() == 1);
+    CHECK(a->extend(32) && a->spans().size() == 2);
+    auto tail = a->storage_write(63, 2);
+    CHECK(tail.spans.size() == 2 && tail.spans[0].token_count == 1);
+    a->commit(32);
+    CHECK(s.history_end() == 65);
+}
+
+static void test_repository_score_frame_masks_and_versions() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 32; cfg.select_budget = 64;
+    cfg.sink_blocks = 1; cfg.recent_blocks = 1;
+    auto repo = std::make_shared<KvMemRepository>(KvMemRepository::Config{5, 32});
+    KvMemStore s(cfg, repo);
+    std::vector<KvMemIndexStamp> index(5);
+    for (uint32_t i = 0; i < 5; ++i) {
+        auto l = repo->try_reserve(i * 32, 32).commit();
+        const auto h = l.handle();
+        index[h.slot] = {h, 32};
+        s.register_repository_block(std::move(l), 0);
+        s.set_block_tier(h.slot, KvTier::CPU, 0, -1, h.generation);
+    }
+    auto frame = s.repository_score_frame(index, 160, true);
+    CHECK(frame.enabled == std::vector<uint8_t>({0, 1, 1, 1, 0}));
+    const auto old = index[1].handle;
+    CHECK(!repo->retire_if_unpinned(old)); // scoring pins survive through selection
+    frame = {};
+    CHECK(repo->retire_if_unpinned(old));
+    CHECK(repo->try_reclaim(old, [](const auto &) { return true; }) ==
+          KvMemRepository::ReclaimResult::Reclaimed);
+    auto next = repo->try_reserve(160, 32).commit();
+    const auto fresh = next.handle();
+    CHECK(fresh.slot == old.slot && fresh.generation != old.generation);
+    s.register_repository_block(std::move(next), 0);
+    s.set_block_tier(fresh.slot, KvTier::CPU, 0, -1, fresh.generation);
+    bool rejected = false;
+    try { s.repository_score_frame(index, 192, true); }
+    catch (const std::runtime_error &) { rejected = true; }
+    CHECK(rejected); // valid address, stale canonical Mean-K generation
+    index[fresh.slot] = {fresh, 32};
+    frame = s.repository_score_frame(index, 192, true);
+    CHECK(frame.enabled == std::vector<uint8_t>({0, 0, 1, 1, 1}));
+    frame = {};
+    CHECK(repo->retire_if_unpinned(index[3].handle));
+    frame = s.repository_score_frame(index, 192, false);
+    CHECK(frame.enabled == std::vector<uint8_t>({1, 1, 1, 0, 1})); // deleted block excluded before softmax
+    frame = s.repository_score_frame(index, 128, true);
+    CHECK(frame.enabled == std::vector<uint8_t>({1, 0, 1, 0, 0})); // exact query boundary, all-fit
+    frame = {};
+    rejected = false;
+    try { s.repository_score_frame(index, 80, false); }
+    catch (const std::runtime_error &) { rejected = true; }
+    CHECK(rejected); // full-block mean is not a mean of its first 16 tokens
+    index[2].tokens = 16;
+    frame = s.repository_score_frame(index, 80, false);
+    CHECK(frame.enabled == std::vector<uint8_t>({1, 0, 1, 0, 0}));
+}
+
+static void test_repository_append_abort_and_read_lifetime() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 32;
+    auto repo = std::make_shared<KvMemRepository>(KvMemRepository::Config{3, 32});
+    KvMemStore s(cfg, repo);
+    auto a = s.prepare_repository_append(5, 0);
+    a->commit(5);
+    a = s.prepare_repository_append(50, 5);
+    const auto cancelled = a->spans()[1].handle;
+    a.reset();
+    CHECK(s.history_end() == 5 && s.blocks()[0].n_tokens == 5);
+    CHECK(s.repository_read_leases().size() == 1);
+    CHECK(repo->try_reclaim(cancelled, [](const auto &) { return true; }) ==
+          KvMemRepository::ReclaimResult::Reclaimed);
+    a = s.prepare_repository_append(27, 5);
+    a->commit(27);
+    const auto h = s.repository_handle(0);
+    auto read = s.repository_storage_read(4, 6);
+    s.set_block_tier(0, KvTier::CPU, 0, -1, h.generation);
+    CHECK(!repo->retire_if_unpinned(h));
+    read = {};
+    CHECK(repo->retire_if_unpinned(h));
+    CHECK(repo->try_reclaim(h, [](const auto &) { return true; }) ==
+          KvMemRepository::ReclaimResult::Reclaimed);
+    bool rejected = false;
+    try { s.repository_storage_read(0, 1); } catch (const std::runtime_error &) { rejected = true; }
+    CHECK(rejected);
+    // Reusing a slot never causes its old logical interval to reappear.
+    for (unsigned i = 0; i < 3; ++i) {
+        a = s.prepare_repository_append(32, 0);
+        a->commit(32);
+    }
+    CHECK(s.repository_directory_entries() == 3);
+    CHECK(s.blocks()[0].history_pos_start == 96);
+    CHECK(s.repository_storage_read(96, 1).spans[0].storage_begin == 0);
+    rejected = false;
+    try { s.repository_storage_read(0, 1); } catch (const std::runtime_error &) { rejected = true; }
+    CHECK(rejected);
+}
+
+static void test_repository_chunked_payload_continuation() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 32;
+    auto repo = std::make_shared<KvMemRepository>(KvMemRepository::Config{8, 32});
+    KvMemStore s(cfg, repo);
+    std::vector<uint64_t> payload(8 * 32, UINT64_MAX);
+    const uint64_t high = uint64_t{1} << 34;
+    s.register_repository_block(repo->try_reserve(high, 32).commit(), 0);
+    for (uint32_t i = 0; i < 32; ++i) payload[i] = high + i;
+    bool recycled = false;
+    for (uint32_t step = 0; step < 4096; ++step) {
+        const uint32_t count = step % 113 + 1;
+        // Simulate a CPU owner maintaining ready capacity in advance. This
+        // tests addressing, not GC victim policy or GPU performance.
+        for (const auto &b : s.blocks()) {
+            if (!s.is_live(b.block_id) || b.history_pos_start + b.n_tokens >= s.history_end()) continue;
+            const auto h = s.repository_handle(b.block_id);
+            s.set_block_tier(h.slot, KvTier::CPU, h.slot, -1, h.generation);
+            CHECK(repo->retire_if_unpinned(h));
+            CHECK(repo->try_reclaim(h, [](const auto &) { return true; }) ==
+                  KvMemRepository::ReclaimResult::Reclaimed);
+            recycled = true;
+        }
+        const uint64_t begin = s.history_end();
+        const uint32_t tail_offset = static_cast<uint32_t>(begin % 32);
+        uint32_t local = 0;
+        if (tail_offset) {
+            auto read = s.repository_storage_read(begin - 1, 1);
+            const auto &b = s.blocks()[read.spans[0].handle.slot];
+            local = static_cast<uint32_t>(b.baked_pos) + tail_offset;
+        }
+        auto a = s.prepare_repository_append(count, local);
+        CHECK(bool(a));
+        if (!a) return;
+        for (const auto &span : a->spans()) {
+            CHECK(span.storage_begin + span.token_count <= payload.size());
+            for (uint32_t i = 0; i < span.token_count; ++i)
+                payload[span.storage_begin + i] = span.history_begin + i;
+        }
+        const auto page_spans = kvmem_storage_page_spans(a->spans(), 16, local);
+        std::vector<uint32_t> page_map((local + count + 15) / 16, UINT32_MAX);
+        for (const auto &p : page_spans)
+            for (uint32_t i = 0; i < p.page_count; ++i) page_map[p.window_page + i] = p.storage_page + i;
+        // This is the same compact-page-table addressing the attention kernel
+        // uses for both main and MTP KV append: only the page aliases differ.
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t win = local + i;
+            CHECK(payload[page_map[win / 16] * 16 + win % 16] == begin + i);
+        }
+        a->commit(count);
+        const auto read = s.repository_storage_read(begin, count);
+        for (const auto &span : read.spans)
+            for (uint32_t i = 0; i < span.token_count; ++i)
+                CHECK(payload[span.storage_begin + i] == span.history_begin + i);
+        CHECK(s.repository_directory_entries() <= 8 && s.block_count() == 8);
+    }
+    CHECK(recycled && s.history_end() > high + 200000);
+}
+
+static void test_repository_page_map_invalid_inputs() {
+    const std::vector<std::vector<KvMemStorageSpan>> cases{
+        {{0, 0, 0, {}}},                        // empty slice
+        {{0, 1, 32, {}}},                       // different page offset
+        {{0, 0, 31, {}}, {31, 64, 5, {}}},      // split in the middle of a page
+        {{0, 0, 32, {}}, {64, 64, 5, {}}},      // missing history
+        {{UINT64_MAX - 1, 0, 32, {}}},          // history overflow
+        {{0, UINT32_MAX - 15, 32, {}}},         // storage overflow
+    };
+    for (const auto &spans : cases) {
+        bool rejected = false;
+        try { kvmem_storage_page_spans(spans, 16, 0); }
+        catch (const std::invalid_argument &) { rejected = true; }
+        CHECK(rejected);
+    }
+    const auto compact = kvmem_storage_page_spans({{1024, 32, 32, {}}, {1056, 64, 32, {}}}, 16, 0);
+    CHECK(compact.size() == 1 && compact[0].storage_page == 2 &&
+          compact[0].window_page == 0 && compact[0].page_count == 4);
+}
+
+static void test_repository_io_completion_during_append() {
+    auto repo = std::make_shared<KvMemRepository>(KvMemRepository::Config{4, 32});
+    KvMemStoreConfig cfg; cfg.block_tokens = 32; cfg.sink_blocks = 0;
+    KvMemStore store(cfg, repo);
+    auto a = store.prepare_repository_append(32, 0);
+    const auto h = a->spans().front().handle;
+    a->commit(32); a.reset();
+    auto io = store.repository_storage_read(0, 32);
+    store.set_block_io_in_flight(h.slot, true, h.generation);
+    a = store.prepare_repository_append(32, 32);
+    store.set_block_cpu_copy(h.slot, 0, h.generation);
+    store.set_block_ssd_backing(h.slot, 0, true, h.generation);
+    store.set_block_io_in_flight(h.slot, false, h.generation);
+    CHECK(store.blocks()[h.slot].cpu_slot == 0 && store.blocks()[h.slot].ssd_clean);
+    CHECK(store.history_end() == 32); // completion did not publish prepared tokens
+    bool rejected = false;
+    try { store.set_repository_selection({h}); } catch (const std::logic_error &) { rejected = true; }
+    CHECK(rejected); // structural changes remain forbidden
+    a->commit(32); a.reset();
+    store.set_block_tier(h.slot, KvTier::CPU, 0, 0, h.generation);
+    CHECK(!repo->retire_if_unpinned(h)); // actual reader still owns payload
+    io = {};
+    CHECK(repo->retire_if_unpinned(h));
+    CHECK(repo->try_reclaim(h, [](const auto &) { return true; }) == KvMemRepository::ReclaimResult::Reclaimed);
+    rejected = false;
+    try { store.set_block_cpu_copy(h.slot, 0, h.generation); } catch (const std::runtime_error &) { rejected = true; }
+    CHECK(rejected); // a late publication cannot target a retired generation
+}
+
+static void test_repository_physical_snapshot() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 32; cfg.sink_blocks = 0;
+    auto repo = std::make_shared<KvMemRepository>(KvMemRepository::Config{4, 32});
+    KvMemStore store(cfg, repo);
+    auto a = store.prepare_repository_append(37, 0);
+    auto first = a->spans()[0].handle;
+    a->commit(37); a.reset();
+    store.set_block_tier(first.slot, KvTier::CPU, first.slot, -1, first.generation);
+    CHECK(repo->retire_if_unpinned(first));
+    auto holes = store.repository_slot_read(0, 4);
+    CHECK(holes.spans.size() == 1 && holes.spans[0].token_count == 5);
+    a = store.prepare_repository_append(50, 37);
+    auto writing = a->spans().back().handle;
+    auto capture = store.repository_slot_read(0, 4, a.get());
+    CHECK(capture.spans.size() == 2 && capture.spans[0].token_count == 32 && capture.spans[1].token_count == 23);
+    CHECK(store.repository_slot_read(writing.slot, 1).spans.empty());
+    CHECK(!repo->try_pin(writing)); // only the reservation supplied this lease
+    a.reset();
+    CHECK(repo->try_reclaim(writing, [](const auto &) { return true; }) == KvMemRepository::ReclaimResult::DeferredReaders);
+    capture = {};
+    CHECK(repo->try_reclaim(writing, [](const auto &) { return true; }) == KvMemRepository::ReclaimResult::Reclaimed);
+    CHECK(store.repository_slot_read(0, 4).spans.size() == 1);
+    CHECK(repo->try_reclaim(first, [](const auto &) { return true; }) == KvMemRepository::ReclaimResult::Reclaimed);
+}
+
+static void test_repository_checkpoint_rewind() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 32; cfg.sink_blocks = 0;
+    auto repo = std::make_shared<KvMemRepository>(KvMemRepository::Config{8, 32});
+    KvMemStore store(cfg, repo);
+    auto append = store.prepare_repository_append(37, 0);
+    const auto first = append->spans()[0].handle, tail = append->spans()[1].handle;
+    append->commit(37); append.reset();
+    auto before = store.repository_checkpoint(37);
+    append = store.prepare_repository_append(50, 37);
+    const auto last = append->spans().back().handle;
+    append->commit(50); append.reset();
+    auto after = store.repository_checkpoint(87);
+    store.set_block_io_in_flight(last.slot, true, last.generation);
+    bool rejected = false;
+    try { store.prepare_repository_rewind(37); } catch (const std::logic_error &) { rejected = true; }
+    CHECK(rejected && store.history_end() == 87 && after->valid());
+    store.set_block_io_in_flight(last.slot, false, last.generation);
+    auto rewind = store.prepare_repository_rewind(37);
+    CHECK(rewind->discarded_spans().size() == 2);
+    CHECK(rewind->discarded_spans()[0].storage_begin == tail.slot * 32 + 5);
+    CHECK(rewind->discarded_spans()[0].token_count == 27);
+    CHECK(rewind->discarded_spans()[1].handle == last);
+    rewind.reset(); // preflight cancellation leaves the live branch unchanged
+    CHECK(store.history_end() == 87 && after->valid());
+    rewind = store.prepare_repository_rewind(37);
+    rewind->commit();
+    CHECK(store.history_end() == 37 && store.blocks()[tail.slot].n_tokens == 5);
+    CHECK(store.repository_checkpoint_valid(before) && !store.repository_checkpoint_valid(after));
+    CHECK(store.repository_directory_entries() == 2);
+    CHECK(repo->try_reclaim(last, [](const auto &) { return true; }) == KvMemRepository::ReclaimResult::DeferredReaders);
+    rewind.reset();
+    CHECK(repo->try_reclaim(last, [](const auto &) { return true; }) == KvMemRepository::ReclaimResult::Reclaimed);
+    append = store.prepare_repository_append(50, 37);
+    CHECK(append->spans().back().handle != last);
+    append->commit(50); append.reset();
+    CHECK(!after->valid() && store.repository_checkpoint_valid(before)); // same length, new branch
+    auto read = store.repository_storage_read(32, 55);
+    CHECK(read.spans.size() == 2 && read.spans[1].handle != last);
+    read = {}; after.reset();
+    std::vector<std::shared_ptr<KvMemStore::RepositoryCheckpoint>> checkpoints;
+    for (size_t i = 1; i < KvMemStore::repository_checkpoint_capacity; ++i)
+        checkpoints.push_back(store.repository_checkpoint(87));
+    rejected = false;
+    try { store.repository_checkpoint(87); } catch (const std::runtime_error &) { rejected = true; }
+    CHECK(rejected);
+    checkpoints.clear();
+    for (size_t i = 0; i < 1000; ++i) CHECK(store.repository_checkpoint(87)->valid());
+    // A checkpoint pins its selected prefix even after foreground stage-out.
+    store.set_block_tier(first.slot, KvTier::CPU, first.slot, -1, first.generation);
+    CHECK(!repo->retire_if_unpinned(first));
+    before.reset();
+    CHECK(repo->retire_if_unpinned(first));
+    CHECK(repo->try_reclaim(first, [](const auto &) { return true; }) == KvMemRepository::ReclaimResult::Reclaimed);
+    // Rewind may preserve older GC holes, but cannot invent a partial tail in one.
+    rejected = false;
+    try { store.prepare_repository_rewind(17); } catch (const std::runtime_error &) { rejected = true; }
+    CHECK(rejected && store.history_end() == 87);
+    rewind = store.prepare_repository_rewind(32); rewind->commit(); rewind.reset();
+    CHECK(store.history_end() == 32 && store.repository_directory_entries() == 1);
+    for (uint32_t slot = 0; slot < repo->capacity(); ++slot) {
+        const auto h = repo->retired_at(slot);
+        if (h.generation) CHECK(repo->try_reclaim(h, [](const auto &) { return true; }) == KvMemRepository::ReclaimResult::Reclaimed);
+    }
+    CHECK(repo->ready_slots() == 8);
+}
+
+static void test_repository_pressure_selection_lifetime() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 32; cfg.prefill_budget = 96;
+    cfg.sink_blocks = 1;
+    auto repo = std::make_shared<KvMemRepository>(KvMemRepository::Config{4, 32});
+    KvMemStore store(cfg, repo);
+    std::vector<KvMemBlockHandle> handles;
+    for (uint32_t i = 0; i < 4; ++i) {
+        auto lease = repo->try_reserve(i * 32, 32).commit();
+        handles.push_back(lease.handle());
+        store.register_repository_block(std::move(lease), 0);
+        store.set_block_tier(handles.back().slot, KvTier::CPU, 0, -1, handles.back().generation);
+    }
+    auto selection = store.pin_repository_pressure_selection({});
+    CHECK(selection.blocks == std::vector<uint32_t>({0, 2, 3}));
+    // Deterministically put a CPU reclaimer BETWEEN candidate selection and
+    // installation, the gap that previously had no repository lease.
+    std::vector<uint8_t> retired(4);
+    std::thread worker([&] {
+        for (uint32_t i = 0; i < 4; ++i) retired[i] = repo->retire_if_unpinned(handles[i]);
+    });
+    worker.join();
+    CHECK(retired == std::vector<uint8_t>({0, 1, 0, 0}));
+    std::vector<KvMemBlockHandle> chosen;
+    for (const auto &lease : selection.leases) chosen.push_back(lease.handle());
+    auto plan = store.set_repository_selection(chosen);
+    selection.leases.clear();
+    CHECK(plan.total_window_tokens == 96);
+    for (auto id : selection.blocks) CHECK(!repo->retire_if_unpinned(handles[id]));
+    store.clear_working_set();
+    for (auto id : selection.blocks) CHECK(repo->retire_if_unpinned(handles[id]));
+}
+
 int main() {
+    test_repository_pressure_selection_lifetime();
+    test_repository_checkpoint_rewind();
+    test_repository_physical_snapshot();
+    test_repository_batched_append_and_partial_commit();
+    test_repository_io_completion_during_append();
+    test_repository_append_extension_and_write_views();
+    test_repository_score_frame_masks_and_versions();
+    test_repository_append_abort_and_read_lifetime();
+    test_repository_chunked_payload_continuation();
+    test_repository_page_map_invalid_inputs();
+    test_repository_reuse_order_and_generations();
+    test_repository_high_positions_and_holes();
+    test_repository_store_long_continuation();
     test_register_append();
     test_selection_diff_and_remap();
     test_immutable_source_selection_uses_bounded_delta_remaps();
+    test_fp8_every_move_uses_raw_authority();
     test_cold_immutable_same_position_rebuilds_k();
     test_default_profile_reuses_moved_resident_k();
     test_explicit_force_raw_refresh_rebuilds_stable_selection();

@@ -2610,19 +2610,26 @@ static void run_adaptive_benchmark() {
 // exact denominator used by the host-index one-pass scheduler, including an
 // entirely dead tile and a completely masked index. Dead logits are huge so a
 // post-softmax mask cannot accidentally pass this reference comparison.
-static void run_gc_hole_mask_test() {
+static void run_gc_hole_mask_case(uint32_t width) {
     constexpr uint32_t blocks = 8, dim = 32, tile = 2;
-    const std::vector<float> logits{0, 100, 1, 100, 100, 100, 2, 100};
-    std::vector<float> query(dim, 0), keys(blocks * dim, 0);
+    const uint32_t rows = blocks * width;
+    std::vector<float> logits(rows, 100.0f), query(dim, 0), keys(rows * dim, 0);
+    std::vector<int32_t> offsets(blocks), live{1,0,static_cast<int32_t>(width),0,0,0,static_cast<int32_t>(width > 1 ? 2 : 1),0};
     query[0] = 1;
-    for (uint32_t b = 0; b < blocks; ++b) keys[b * dim] = logits[b];
-    const int32_t offsets[blocks]{0,1,0,1,0,1,0,1};
+    for (uint32_t b = 0; b < blocks; ++b) {
+        offsets[b] = (b % tile) * width;
+        for (uint32_t p = 0; p < width; ++p) {
+            const uint32_t row = b * width + p;
+            if (p < static_cast<uint32_t>(live[b])) logits[row] = float(b) / 3 + float(p) / 4;
+            keys[row * dim] = logits[row];
+        }
+    }
     float *q = nullptr, *k = nullptr, *x = nullptr, *score = nullptr;
     float *bmax = nullptr, *bsum = nullptr, *gmax = nullptr, *gsum = nullptr;
     int32_t *off = nullptr, *counts = nullptr;
     CHECK(cudaMalloc(&q, dim * sizeof(float)));
-    CHECK(cudaMalloc(&k, blocks * dim * sizeof(float)));
-    CHECK(cudaMalloc(&x, blocks * sizeof(float)));
+    CHECK(cudaMalloc(&k, rows * dim * sizeof(float)));
+    CHECK(cudaMalloc(&x, rows * sizeof(float)));
     CHECK(cudaMalloc(&score, blocks * sizeof(float)));
     CHECK(cudaMalloc(&bmax, blocks * sizeof(float)));
     CHECK(cudaMalloc(&bsum, blocks * sizeof(float)));
@@ -2632,24 +2639,25 @@ static void run_gc_hole_mask_test() {
     CHECK(cudaMalloc(&counts, blocks * sizeof(int32_t)));
     CHECK(cudaMemcpy(q, query.data(), dim * sizeof(float), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(k, keys.data(), keys.size() * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(x, logits.data(), blocks * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(off, offsets, sizeof(offsets), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(x, logits.data(), rows * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(off, offsets.data(), blocks * sizeof(int32_t), cudaMemcpyHostToDevice));
     for (bool all_dead : {false, true}) {
-        std::vector<int32_t> live{1,0,1,0,0,0,1,0};
-        if (all_dead) std::fill(live.begin(), live.end(), 0);
-        CHECK(cudaMemcpy(counts, live.data(), blocks * sizeof(int32_t), cudaMemcpyHostToDevice));
+        auto enabled = live;
+        if (all_dead) std::fill(enabled.begin(), enabled.end(), 0);
+        CHECK(cudaMemcpy(counts, enabled.data(), blocks * sizeof(int32_t), cudaMemcpyHostToDevice));
         double denom = 0;
-        for (uint32_t b = 0; b < blocks; ++b) if (live[b]) denom += std::exp(double(logits[b]));
+        for (uint32_t b = 0; b < blocks; ++b)
+            for (int32_t p = 0; p < enabled[b]; ++p) denom += std::exp(double(logits[b * width + p]));
         for (bool gemm : {false, true}) {
             CHECK(cudaMemset(score, 0, blocks * sizeof(float)));
             for (uint32_t first = 0; first < blocks; first += tile) {
                 const bool ok = gemm
                     ? qw3::ported::launch_block_attn_stream_adaptive_gemm_reduce(
-                        bmax, bsum, x + first, off + first, counts + first,
-                        1, tile, tile, first, blocks, 1, 0, 1, 0, 0, 0)
+                        bmax, bsum, x + first * width, off + first, counts + first,
+                        1, tile * width, tile, first, blocks, 1, 0, 1, 0, 0, 0)
                     : qw3::ported::launch_block_attn_stream_adaptive_block_stats_typed(
-                        bmax, bsum, q, false, k + first * dim, qw3::ported::KbarDType::F32,
-                        off + first, counts + first, 0, 1, 1, 1, tile, tile, first, blocks, 1, 1, dim, 1.0f, 0);
+                        bmax, bsum, q, false, k + first * width * dim, qw3::ported::KbarDType::F32,
+                        off + first, counts + first, 0, 1, 1, 1, tile * width, tile, first, blocks, 1, 1, dim, 1.0f, 0);
                 if (!ok) { std::fprintf(stderr, "GC masked stats launch failed\n"); std::exit(1); }
             }
             if (!qw3::ported::launch_block_attn_stream_adaptive_finalize(
@@ -2659,9 +2667,11 @@ static void run_gc_hole_mask_test() {
             std::vector<float> actual(blocks);
             CHECK(cudaMemcpy(actual.data(), score, blocks * sizeof(float), cudaMemcpyDeviceToHost));
             for (uint32_t b = 0; b < blocks; ++b) {
-                const double expected = live[b] ? std::exp(double(logits[b])) / denom : 0;
+                double expected = 0;
+                for (int32_t p = 0; p < enabled[b]; ++p)
+                    expected = std::max(expected, std::exp(double(logits[b * width + p])) / denom);
                 if (!std::isfinite(actual[b]) || std::abs(actual[b] - expected) > 1e-5) {
-                    std::fprintf(stderr, "GC masked softmax mismatch block=%u actual=%g expected=%g\n", b, actual[b], expected);
+                    std::fprintf(stderr, "GC masked softmax mismatch width=%u block=%u actual=%g expected=%g\n", width, b, actual[b], expected);
                     std::exit(1);
                 }
             }
@@ -2670,7 +2680,10 @@ static void run_gc_hole_mask_test() {
     CHECK(cudaFree(q)); CHECK(cudaFree(k)); CHECK(cudaFree(x)); CHECK(cudaFree(score));
     CHECK(cudaFree(bmax)); CHECK(cudaFree(bsum)); CHECK(cudaFree(gmax)); CHECK(cudaFree(gsum));
     CHECK(cudaFree(off)); CHECK(cudaFree(counts));
-    std::printf("[kvmem-gc-mask] PASS\n");
+}
+static void run_gc_hole_mask_test() {
+    for (uint32_t width : {1u, 4u}) run_gc_hole_mask_case(width);
+    std::printf("[kvmem-gc-mask] PASS width=1,4 including unused prototypes\n");
 }
 
 int main(int argc, char **argv) {

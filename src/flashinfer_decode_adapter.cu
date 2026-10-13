@@ -12,6 +12,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <utility>
+#include <vector>
 
 // FlashInfer's generic float <- FP8 vec_cast currently converts one element at
 // a time. Decode consumes K/V as float vectors, so use the hardware packed
@@ -314,19 +316,31 @@ uint32_t plan_batch_decode_chunk_size(uint32_t n_kv_heads,
         Params>;
 
     int dev_id = 0;
-    int num_sm = 0;
-    int num_blocks_per_sm = 0;
     cudaError_t st = cudaGetDevice(&dev_id);
     if (st != cudaSuccess) return 0;
-    st = cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id);
-    if (st != cudaSuccess) return 0;
-    st = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm,
-                                                       kernel,
-                                                       num_threads,
-                                                       smem_size);
-    if (st != cudaSuccess || num_sm <= 0 || num_blocks_per_sm <= 0) return 0;
-    const uint32_t max_grid = static_cast<uint32_t>(num_sm) *
-                              static_cast<uint32_t>(num_blocks_per_sm);
+    const char *cache_raw = std::getenv("QW3_FLASHINFER_VERIFY_PLAN_CACHE");
+    const bool cache_capacity = cache_raw && *cache_raw &&
+        std::strcmp(cache_raw, "0") != 0 && std::strcmp(cache_raw, "false") != 0 &&
+        std::strcmp(cache_raw, "off") != 0 && std::strcmp(cache_raw, "no") != 0;
+    // Occupancy depends on this kernel specialization and device, not on the
+    // current token position. Keep the original partition size and numerics.
+    static thread_local std::vector<std::pair<int, uint32_t>> device_capacity;
+    uint32_t max_grid = 0;
+    if (cache_capacity) {
+        for (const auto &entry : device_capacity) {
+            if (entry.first == dev_id) { max_grid = entry.second; break; }
+        }
+    }
+    if (!max_grid) {
+        int num_sm = 0, num_blocks_per_sm = 0;
+        st = cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id);
+        if (st != cudaSuccess) return 0;
+        st = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm,
+                                                          kernel, num_threads, smem_size);
+        if (st != cudaSuccess || num_sm <= 0 || num_blocks_per_sm <= 0) return 0;
+        max_grid = static_cast<uint32_t>(num_sm) * static_cast<uint32_t>(num_blocks_per_sm);
+        if (cache_capacity) device_capacity.emplace_back(dev_id, max_grid);
+    }
     (void)batch;
     // Match the row-wise SingleDecode partitioning scale. Keeping the same KV
     // chunk size is more important than minimizing batch-decode grid size
@@ -410,13 +424,28 @@ cudaError_t launch_batch_decode_group_size(Params params,
                           begin == b * tiles_per_row;
             }
             if (uniform) {
-                // Preserve FlashInfer's MergeStates numerics while reducing
-                // one merge launch per verifier row to one launch per batch.
-                return flashinfer::MergeStates(tmp_v, tmp_s, o, lse,
-                                               tiles_per_row,
-                                               params.paged_kv.batch_size,
-                                               params.num_qo_heads, HeadDim,
-                                               stream);
+                // MergeStates changes its reduction kernel when seq_len is
+                // larger than num_index_sets. Serial decode always selects
+                // the large-index kernel (seq_len=1); a verifier with e.g.
+                // eight rows and five KV tiles must use that same arithmetic.
+                // Launch it over all rows directly to retain one merge launch.
+                using DTypeO = typename Params::DTypeO;
+                constexpr uint32_t merge_vec = std::max<uint32_t>(16U / sizeof(DTypeO), HeadDim / 32U);
+                constexpr uint32_t merge_bdx = HeadDim / merge_vec;
+                constexpr uint32_t merge_bdy = 128U / merge_bdx;
+                constexpr uint32_t merge_stages = 4;
+                constexpr uint32_t merge_smem = merge_stages * merge_bdy * HeadDim *
+                    sizeof(DTypeO) + 128U * sizeof(float);
+                auto merge = flashinfer::MergeStatesLargeNumIndexSetsKernel<
+                    merge_vec, merge_bdx, merge_bdy, merge_stages, DTypeO, DTypeO>;
+                st = cudaFuncSetAttribute(merge, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                          merge_smem);
+                if (st != cudaSuccess) return st;
+                uint32_t tiles = tiles_per_row, heads = params.num_qo_heads;
+                void *merge_args[] = {&tmp_v, &tmp_s, &o, &lse, &tiles, &heads};
+                return cudaLaunchKernel(reinterpret_cast<void *>(merge),
+                    dim3(params.paged_kv.batch_size, heads), dim3(merge_bdx, merge_bdy),
+                    merge_args, merge_smem, stream);
             }
         }
         for (uint32_t b = 0; b < params.paged_kv.batch_size; ++b) {

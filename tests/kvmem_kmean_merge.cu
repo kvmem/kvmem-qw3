@@ -75,6 +75,10 @@ static void compare(const std::vector<float> &got,
     double max_abs = 0.0;
     size_t worst = 0;
     for (size_t i = 0; i < got.size(); ++i) {
+        if (!std::isfinite(got[i]) || !std::isfinite(want[i])) {
+            std::fprintf(stderr, "FAIL %s at %zu: nonfinite mean\n", label, i);
+            std::exit(1);
+        }
         const double e = std::fabs(static_cast<double>(got[i]) - want[i]);
         if (e > max_abs) {
             max_abs = e;
@@ -124,7 +128,9 @@ static void run_case(uint32_t subblocks) {
     CHECK(cudaMemcpy(d_input, input.data(), input.size() * sizeof(float),
                      cudaMemcpyHostToDevice));
     CHECK(cudaMemset(d_ref, 0, kbar_count * sizeof(float)));
-    CHECK(cudaMemset(d_split, 0, kbar_count * sizeof(float)));
+    // A recycled stage is not zero-initialized. The capture must overwrite
+    // unused tail subblocks as well as populated means.
+    CHECK(cudaMemset(d_split, 0x7f, kbar_count * sizeof(float)));
 
     require_launch(qw3::ported::launch_block_kmean_content_batch(
         d_input, d_ref, 0, blocks, stride, rows, bt, heads, dim, rope_dim,
@@ -206,7 +212,7 @@ static void run_typed_case(qw3::ported::KbarDType dtype,
     CHECK(cudaMemcpy(d_input, input.data(), input.size() * sizeof(float),
                      cudaMemcpyHostToDevice));
     CHECK(cudaMemset(d_ref, 0, kbar_count * sizeof(T)));
-    CHECK(cudaMemset(d_split, 0, kbar_count * sizeof(T)));
+    CHECK(cudaMemset(d_split, 0x7f, kbar_count * sizeof(T)));
 
     require_launch(qw3::ported::launch_block_kmean_content_batch_typed(
         d_input, d_ref, dtype, 0, blocks, stride, rows, bt, heads, dim,
