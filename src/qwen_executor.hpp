@@ -1,5 +1,6 @@
 #include <type_traits>
 #pragma once
+#include "kvmem_action_attention.hpp"
 
 #include "qwen_native.hpp"
 #include "qwen_weights.hpp"
@@ -797,6 +798,22 @@ public:
     // Register newly-appended context tokens with the block store (called after
     // prefill / each committed decode token grows the context). No-op when
     // block-sparse is disabled.
+    void kvmem_action_begin(int32_t open, int32_t close, int32_t think_open,
+                            int32_t think_close, bool thinking);
+    void kvmem_action_end();
+    // Durable named-cache branches restore evidence scores as well as KV/GDN.
+    // Kept separate from transient verifier snapshots: no copies per decode.
+    struct AttentionHistorySnapshot {
+        uint64_t prefill_end = 0, prefill_samples = 0;
+        std::unordered_map<uint64_t, detail::PrefillAttentionScore> prefill;
+        std::vector<double> output;
+        std::vector<uint32_t> window_blocks;
+        std::vector<int32_t> window_bases, window_counts;
+        std::vector<KvMemBlockHandle> window_handles;
+    };
+    AttentionHistorySnapshot kvmem_capture_attention_history() const;
+    void kvmem_restore_cached_window_identity(const AttentionHistorySnapshot &snapshot);
+    void kvmem_restore_attention_history(const AttentionHistorySnapshot &snapshot);
     void kvmem_register_append(uint64_t n_new_tokens);
     // Rewind the block store to exactly `token_pos` tokens after restore_state()
     // has already rewound position/KV-pages/recurrent/window to a prompt-end
@@ -1959,6 +1976,37 @@ private:
     // kernels) unless kvmem_active_ and a representative layer exists.
     void kvmem_recompute_kbar();        // after assembly: rebuild k̄ + reset accum
     void kvmem_score_current_step(uint32_t layer_index, float scale);
+    void kvmem_action_configure(KvMemStoreConfig &cfg);
+    void kvmem_action_prepare(const uint32_t *tokens, uint32_t count, uint64_t base,
+                             bool prefill = false);
+    void kvmem_action_layer_begin(uint32_t layer, uint32_t base, uint32_t count);
+    void kvmem_action_layer_end(uint32_t layer, uint32_t base);
+    void kvmem_action_commit(uint64_t target);
+    KvMemStore::PressureActionScores kvmem_action_pressure_scores() const;
+    bool action_enabled_ = false, action_running_ = false, action_captured_ = false;
+    bool action_pressure_ = false;
+    bool prefill_attention_enabled_ = false, action_capture_prefill_ = false;
+    uint64_t prefill_attention_end_ = 0, prefill_attention_samples_ = 0;
+    uint32_t prefill_attention_interval_ = 1024;
+    uint32_t prefill_attention_stride_ = 32;
+    double prefill_attention_half_life_ = 8192;
+    std::unordered_map<uint64_t, detail::PrefillAttentionScore> prefill_attention_scores_;
+    uint64_t action_capture_rows_ = 0;
+    uint32_t action_capture_first_row_ = 0, action_capture_count_ = 0;
+    uint32_t action_capture_row_step_ = 1, action_captured_layers_ = 0;
+    std::vector<int32_t> action_layers_;
+    double action_decay_ = 0.5;
+    detail::ActionAttentionParser action_parser_;
+    uint64_t action_pending_base_ = 0, action_round_samples_ = 0;
+    uint64_t action_logits_capacity_ = 0, action_mass_capacity_ = 0;
+    uint32_t action_stride_ = 0;
+    std::unique_ptr<DeviceTensor> action_logits_, action_mass_;
+    std::vector<float> action_mass_host_;
+    uint32_t action_blocks_ = 0, action_meta_capacity_ = 0;
+    std::vector<int32_t> action_starts_, action_counts_;
+    std::vector<uint64_t> action_history_;
+    std::unique_ptr<DeviceTensor> action_starts_dev_, action_counts_dev_;
+    std::unordered_map<uint64_t, double> action_round_mass_;
     void kvmem_drain_scores();           // accum -> KvMemStore::accumulate_attn
     int32_t bs_score_layer_ = -1;               // representative standard-attn layer (-1 none)
     uint32_t bs_window_blocks_ = 0;             // blocks in the current window

@@ -185,6 +185,29 @@ void usage(std::ostream &os) {
         "                        0=raw mass, 1=mean density. Default: 0.5.\n"
         "  --kvmem-round-retrieval  Compatibility alias for\n"
         "                        --kvmem-semantic-expansion round.\n"
+        "  --kvmem-action-attention on|off  Sample output attention. Default: off.\n"
+        "  --kvmem-action-scope M   tool-call|non-thinking. Default: tool-call.\n"
+        "  --kvmem-action-layers L last|spread3|all|layer IDs (e.g. 3,31,63).\n"
+        "                        Equal mean across standard layers. Default: spread3.\n"
+        "  --kvmem-action-combine M quota|score. Default: quota. Score combines\n"
+        "                        positive L1-normalized Query/attention scores.\n"
+        "  --kvmem-action-fraction F Attention quota share or score weight,\n"
+        "                        0..1. Default: 0.25; Query uses 1-F.\n"
+        "  --kvmem-action-decay F   Output history decay per eligible response,\n"
+        "                        0..1. Default: 0.5.\n"
+        "  --kvmem-action-interval N  Sample every N eligible output tokens,\n"
+        "                        1..4096. Default: 16.\n"
+        "  --kvmem-action-pressure on|off  Rank capacity recovery by attention.\n"
+        "                        Default: off; requires action attention on.\n"
+        "  --kvmem-prefill-attention on|off  Collect sparse input attention for\n"
+        "                        semantic/pressure fallback without output history.\n"
+        "                        Default: off; requires action attention on.\n"
+        "  --kvmem-prefill-attention-interval N  Input sampling interval in tokens.\n"
+        "                        Default: 1024; also sample near capacity.\n"
+        "  --kvmem-prefill-attention-stride N  Query row interval within sampled\n"
+        "                        chunks; default: 32, 0: last row only; max 64 samples.\n"
+        "  --kvmem-prefill-attention-half-life N  Input EMA half-life in tokens.\n"
+        "                        Default: 8192.\n"
         "  --kvmem-update-mode M  Reselect cadence: interval|step. Default: interval.\n"
         "  --kvmem-opt-stage-out on|off  Proactive lower-tier writeback and\n"
         "                        clean backing. Default: on.\n"
@@ -523,6 +546,33 @@ int main(int argc, char **argv) {
                 engine.prefill_chunk = 0;
             } else if (arg == "--kvmem") {
                 engine.kvmem_enabled = true;
+            } else if (arg == "--kvmem-action-attention" ||
+                       arg == "--kvmem-action-pressure" ||
+                       arg == "--kvmem-prefill-attention") {
+                const std::string value = need(arg);
+                if (value != "on" && value != "off")
+                    throw std::runtime_error(arg + " must be on|off");
+                if (arg == "--kvmem-action-attention") engine.kvmem_attention.enabled = value == "on";
+                else if (arg == "--kvmem-action-pressure") engine.kvmem_attention.pressure = value == "on";
+                else engine.kvmem_attention.prefill = value == "on";
+            } else if (arg == "--kvmem-action-scope") {
+                engine.kvmem_attention.scope = need(arg);
+            } else if (arg == "--kvmem-action-layers") {
+                engine.kvmem_attention.layers = need(arg);
+            } else if (arg == "--kvmem-action-fraction") {
+                engine.kvmem_attention.fraction = parse_float(need(arg), arg);
+            } else if (arg == "--kvmem-action-combine") {
+                engine.kvmem_attention.combine = need(arg);
+            } else if (arg == "--kvmem-action-decay") {
+                engine.kvmem_attention.decay = parse_float(need(arg), arg);
+            } else if (arg == "--kvmem-action-interval") {
+                engine.kvmem_attention.interval = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-prefill-attention-interval") {
+                engine.kvmem_attention.prefill_interval = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-prefill-attention-stride") {
+                engine.kvmem_attention.prefill_stride = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-prefill-attention-half-life") {
+                engine.kvmem_attention.prefill_half_life = parse_float(need(arg), arg);
             } else if (arg == "--kvmem-block-tokens") {
                 engine.kvmem_block_tokens = parse_int(need(arg), arg);
             } else if (arg == "--kvmem-budget") {
@@ -1105,6 +1155,22 @@ int main(int argc, char **argv) {
         }
 
         qw3::detail::normalize_speculative_options(engine);
+        engine.kvmem_attention.validate();
+        if (engine.kvmem_attention.enabled && !engine.kvmem_enabled)
+            throw std::runtime_error("--kvmem-action-attention on requires --kvmem");
+        if (engine.kvmem_attention.enabled &&
+            (engine.kvmem_method != "retrieval" || engine.kvmem_semantic_expansion != "none"))
+            throw std::runtime_error("action attention requires --kvmem-method retrieval and --kvmem-semantic-expansion none");
+        // Historical launch scripts must migrate explicitly; silently ignoring
+        // their old switches would produce a mislabeled attention experiment.
+        for (const char *suffix : {"ACTION_ATTENTION", "ACTION_SCOPE", "ACTION_FRACTION",
+                "ACTION_DECAY", "ACTION_INTERVAL", "ACTION_PRESSURE", "PREFILL_ATTENTION",
+                "PREFILL_ATTENTION_INTERVAL", "PREFILL_ATTENTION_HALF_LIFE"}) {
+            const std::string name = std::string("QW3_KVMEM_") + suffix;
+            if (std::getenv(name.c_str()))
+                throw std::runtime_error(name + " is no longer supported; unset it and use --kvmem-... attention options (see --help)");
+        }
+
 
         if (inspect || dump_tensors) {
             const qw3::GgufFile gguf(engine.model_path);

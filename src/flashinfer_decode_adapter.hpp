@@ -1,4 +1,5 @@
 #pragma once
+#include "flashinfer_attention_capture.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -93,7 +94,8 @@ bool launch_batch_decode_f32q_f16kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        const AttentionCapture *capture = nullptr);
 
 bool launch_batch_decode_f32q_fp8kv_gated(
         float *out,
@@ -123,7 +125,8 @@ bool launch_batch_decode_f32q_fp8kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        const AttentionCapture *capture = nullptr);
 
 bool launch_batch_decode_f32q_f16kv(
         float *out,

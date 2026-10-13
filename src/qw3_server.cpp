@@ -11,6 +11,7 @@
 #include "normalized_byte_spans.hpp"
 #include "kvmem_request_plan.hpp"
 #include "kvmem_refresh_policy.hpp"
+#include "kvmem_file_evidence.hpp"
 #include "multimodal_prefix_cache.hpp"
 #include "multimodal_pin_policy.hpp"
 #include "message_prefix_cache.hpp"
@@ -2129,6 +2130,18 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << yesno(engine.kvmem_raw_k_nvme) << "\n"
               << "  kvmem_query_replay="
               << yesno(cfg.kvmem_query_replay && !cfg.continuous_batching) << "\n"
+              << "  kvmem_action_attention=" << yesno(engine.kvmem_attention.enabled)
+              << " scope=" << engine.kvmem_attention.scope
+              << " layers=" << engine.kvmem_attention.layers
+              << " fraction=" << engine.kvmem_attention.fraction
+              << " combine=" << engine.kvmem_attention.combine
+              << " decay=" << engine.kvmem_attention.decay
+              << " interval=" << engine.kvmem_attention.interval << "\n"
+              << "  kvmem_action_pressure=" << yesno(engine.kvmem_attention.pressure)
+              << " prefill_attention=" << yesno(engine.kvmem_attention.prefill)
+              << " prefill_interval=" << engine.kvmem_attention.prefill_interval
+              << " prefill_stride=" << engine.kvmem_attention.prefill_stride
+              << " prefill_half_life=" << engine.kvmem_attention.prefill_half_life << "\n"
               << "  kvmem_method=" << engine.kvmem_method << "\n"
               << "  kvmem_retrieval_method=" << engine.kvmem_retrieval_method << "\n"
               << "  kvmem_adaptive_gain_1to2="
@@ -2334,7 +2347,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             max_output_tokens = std::min(
                 max_output_tokens, cfg.default_generation.max_tokens);
         }
-        if (engine.kvmem_enabled && engine.kvmem_gen_budget > 0) {
+        // Tier-backed decoding already admits every committed token through
+        // kvmem_prepare_decode_window(). Its generation reserve sizes the
+        // resident pool; it is not a request-wide output limit. Keep the
+        // conservative epoch cap without durable tiers or for the separately
+        // admitted continuous-batching lane, which owns a fixed decode reserve.
+        if (engine.kvmem_enabled && engine.kvmem_gen_budget > 0 &&
+            (cfg.continuous_batching ||
+             (engine.kvmem_cpu_bytes == 0 && engine.kvmem_nvme_bytes == 0))) {
             const uint64_t kvmem_cap = guided_middecode
                 ? static_cast<uint64_t>(engine.kvmem_gen_budget) +
                     static_cast<uint64_t>(
@@ -2480,10 +2500,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                       << " (remaining context)\n";
             g.max_tokens = remaining_ctx;
         }
-        // Ordinarily one turn cannot exceed the physical generation reserve.
-        // Mid-decode guided reselection explicitly starts a new bounded epoch;
-        // cap the request by the configured number of epochs instead of by one
-        // reserve, while the backend still enforces each epoch independently.
+        // Without a durable tier, bound the request to its configured decode
+        // epochs. With CPU/NVMe backing the native capacity guard rolls the
+        // working window as needed, independently of guided-query generation.
+        // Explicit client/server output limits and remaining context still
+        // apply; do not silently cut a tier-backed Write/Edit at gen_budget.
         const uint64_t kvmem_request_output_cap = allow_kvmem_multi_epoch
             ? static_cast<uint64_t>(std::max(0, engine.kvmem_gen_budget)) +
                 static_cast<uint64_t>(
@@ -2493,6 +2514,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             : static_cast<uint64_t>(
                   std::max(0, engine.kvmem_gen_budget));
         if (engine.kvmem_enabled && engine.kvmem_gen_budget > 0 &&
+            (cfg.continuous_batching ||
+             (engine.kvmem_cpu_bytes == 0 && engine.kvmem_nvme_bytes == 0)) &&
             static_cast<uint64_t>(g.max_tokens) > kvmem_request_output_cap) {
             std::cerr << "[qw3-serve] capping request max_tokens from "
                       << g.max_tokens << " to " << kvmem_request_output_cap
@@ -3256,6 +3279,24 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const bool harness_semantic_pins =
             harness.kind != detail::HarnessKind::None &&
             engine.kvmem_enabled;
+        std::optional<detail::KvmemFileEvidencePlan> file_evidence;
+        if (req.contains("kvmem_file_evidence")) {
+            if (!env_flag_enabled("QW3_KVMEM_FILE_EVIDENCE") ||
+                !harness_semantic_pins ||
+                engine.kvmem_semantic_expansion != "message" ||
+                req.contains("kvmem_retrieval_group_spans")) {
+                set_error_response(res, 400,
+                    "file evidence requires enabled harness message retrieval");
+                return;
+            }
+            try {
+                file_evidence = detail::parse_kvmem_file_evidence(
+                    req["kvmem_file_evidence"], req["messages"]);
+            } catch (const std::exception &error) {
+                set_error_response(res, 400, error.what());
+                return;
+            }
+        }
         const bool explicit_retrieval_groups =
             req.contains("kvmem_retrieval_group_spans");
         const bool auto_message_groups =
@@ -3340,7 +3381,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             };
             const size_t trajectory_key = std::hash<std::string>{}(
                 std::to_string(static_cast<int>(harness.kind)) + ":" +
-                message_identity(root_index));
+                message_identity(root_index) +
+                (file_evidence ? ":evidence-scope:" + file_evidence->scope : ""));
             const size_t current_query_key =
                 std::hash<std::string>{}(message_identity(current_index));
             guided_trajectory_key = trajectory_key;
@@ -3393,7 +3435,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                   0,
                                   engine.kvmem_middecode_trigger_tokens))
                             : 0,
-                        decision}, guided_boundary || guided_middecode);
+                        decision, file_evidence && file_evidence->changed},
+                    guided_boundary || guided_middecode);
             harness_refresh_reason = refresh.reason;
             if (refresh.reselect) {
                 private_guided_refresh = refresh.private_query;
@@ -3636,6 +3679,41 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 if (index < 5) ++reason_span_counts[index];
                 semantic_byte_spans.push_back({pin.begin, pin.end});
             }
+            struct EvidenceUnit {
+                size_t message, begin=0, end=0, offset=0, count=0;
+                bool partial=false;
+            };
+            std::vector<EvidenceUnit> evidence_units;
+            if (file_evidence) {
+                for (size_t index : file_evidence->pinned_messages) {
+                    const auto it = std::find_if(rendered_message_spans.begin(),
+                        rendered_message_spans.end(), [index](const auto &span) {
+                            return span.message_index == index;
+                        });
+                    if (it == rendered_message_spans.end() ||
+                        it->segment_begin >= it->segment_end) {
+                        set_error_response(res, 400, "file evidence has no rendered message span");
+                        return;
+                    }
+                    evidence_units.push_back({index,0,0,semantic_byte_spans.size(),1,false});
+                    semantic_byte_spans.push_back({it->segment_begin, it->segment_end});
+                }
+                for (const auto &span : file_evidence->read_spans) {
+                    if (!span.pin) continue;
+                    const auto it=std::find_if(rendered_message_spans.begin(),rendered_message_spans.end(),
+                        [&](const auto &rendered){ return rendered.message_index==span.message; });
+                    if (it==rendered_message_spans.end() || it->content_end<=it->content_begin) {
+                        set_error_response(res,400,"partial evidence has no rendered content"); return;
+                    }
+                    const auto &text=req["messages"][span.message]["content"].get_ref<const std::string &>();
+                    const size_t header=text.find("<content>\n")+10;
+                    const size_t footer=text.rfind("</content>");
+                    evidence_units.push_back({span.message,span.begin,span.end,semantic_byte_spans.size(),3,true});
+                    semantic_byte_spans.push_back({it->segment_begin,it->content_begin+header});
+                    semantic_byte_spans.push_back({it->content_begin+span.begin,it->content_begin+span.end});
+                    semantic_byte_spans.push_back({it->content_begin+footer,it->segment_end});
+                }
+            }
             if (semantic_plan.live_suffix_span.has_value()) {
                 const auto &suffix = *semantic_plan.live_suffix_span;
                 semantic_byte_spans.push_back({suffix.begin, suffix.end});
@@ -3707,6 +3785,18 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         generation_reason(pin.reason)});
             }
 
+            std::vector<std::vector<std::pair<uint32_t,uint32_t>>> evidence_token_spans;
+            for (const auto &unit : evidence_units) {
+                std::vector<std::pair<uint32_t,uint32_t>> mapped_ranges;
+                for (size_t j=0;j<unit.count;++j) {
+                    const auto mapped=map_byte_span(normalized_semantics.spans[unit.offset+j]);
+                    if (!mapped) {
+                        set_error_response(res,500,"file evidence token mapping failed"); return;
+                    }
+                    mapped_ranges.push_back(*mapped);
+                }
+                evidence_token_spans.push_back(std::move(mapped_ranges));
+            }
             std::optional<std::pair<uint32_t, uint32_t>> live_suffix_tokens;
             if (semantic_plan.live_suffix_span.has_value()) {
                 live_suffix_tokens = map_byte_span(
@@ -3814,7 +3904,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             }
             const uint32_t budget_blocks =
                 budget_tokens / block_tokens;
-            const detail::KvmemMandatoryFitResult mandatory_fit =
+            detail::KvmemMandatoryFitResult mandatory_fit =
                 detail::kvmem_fit_mandatory_blocks(
                     detail::KvmemMandatoryFitInput{
                         prompt_blocks,
@@ -3824,6 +3914,30 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         hard_spans,
                         live_first_block,
                         live_end_block});
+            if (file_evidence) {
+                uint32_t admitted = 0, skipped = 0;
+                for (size_t i = 0; i < evidence_token_spans.size(); ++i) {
+                    const auto &unit=evidence_units[i];
+                    std::vector<std::pair<uint32_t,uint32_t>> block_ranges;
+                    for (const auto &[begin,end] : evidence_token_spans[i])
+                        block_ranges.push_back({begin/block_tokens,(end-1)/block_tokens+1});
+                    const bool kept=detail::kvmem_admit_complete_evidence_ranges(
+                        mandatory_fit.hard_blocks,block_ranges,prompt_blocks,budget_blocks,budget_blocks/8);
+                    admitted += kept; skipped += !kept;
+                    const auto [begin,end]=evidence_token_spans[i][unit.partial ? 1 : 0];
+                    std::cerr << (unit.partial ? "[file-evidence-span] tag=" : "[file-evidence-pin] tag=")
+                              << req.value("kvmem_trace_tag",std::string("-"))
+                              << " message=" << unit.message;
+                    if (unit.partial) std::cerr << " content=[" << unit.begin << "," << unit.end << ")";
+                    std::cerr << " tokens=[" << begin << "," << end << ") admitted=" << kept << "\n";
+                }
+                std::cerr << "[file-evidence] scope=" << file_evidence->scope
+                          << " changed=" << file_evidence->changed
+                          << " pins=" << admitted << " skipped=" << skipped
+                          << " excluded_groups=" << file_evidence->excluded_messages.size()
+                          << " hard_blocks=" << mandatory_fit.hard_blocks.size()
+                          << " budget_blocks=" << budget_blocks << "\n";
+            }
             // Executor pins are the fitted hard anchors only. Every omitted
             // source block was still tokenized/prefilled and remains in the
             // KVMem content index as an ordinary retrieval candidate.
@@ -4207,10 +4321,29 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         span.segment_end <= span.segment_begin) {
                         continue;
                     }
+                    if (file_evidence) {
+                        std::vector<detail::KvmemFileEvidencePlan::ReadSpan> parts;
+                        for (const auto &part : file_evidence->read_spans)
+                            if (part.message==span.message_index) parts.push_back(part);
+                        if (!parts.empty()) {
+                            std::sort(parts.begin(),parts.end(),[](const auto &a,const auto &b){return a.begin<b.begin;});
+                            for (const auto &part : parts)
+                                requested.push_back({span.content_begin+part.begin,span.content_begin+part.end});
+                            continue;
+                        }
+                        if (std::binary_search(file_evidence->excluded_messages.begin(),
+                                file_evidence->excluded_messages.end(),span.message_index)) continue;
+                    }
                     requested.push_back(
                         {span.segment_begin, span.segment_end});
                 }
-                if (requested.empty()) {
+                // Native harnesses can legitimately have no completed history
+                // yet (bootstrap, or all evidence in the pinned live suffix).
+                // There is then nothing to retrieve; keep the normal KVMem
+                // request plan and semantic pins. Flat benchmark clients still
+                // need explicit groups instead of silently losing their rounds.
+                if (requested.empty() &&
+                    harness.kind == detail::HarnessKind::None) {
                     set_error_response(
                         res, 400,
                         "message semantic expansion found no historical "
@@ -4294,9 +4427,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 << g.kvmem_retrieval_group_spans.size()
                 << " rounded_boundaries=" << rounded_boundaries
                 << " token_span=["
-                << g.kvmem_retrieval_group_spans.front().begin
+                << (g.kvmem_retrieval_group_spans.empty() ? 0u :
+                    g.kvmem_retrieval_group_spans.front().begin)
                 << ","
-                << g.kvmem_retrieval_group_spans.back().end
+                << (g.kvmem_retrieval_group_spans.empty() ? 0u :
+                    g.kvmem_retrieval_group_spans.back().end)
                 << ") prompt_tokens=" << prompt_token_count << "\n";
         }
 

@@ -1379,6 +1379,29 @@ public:
         return {false, "block_attn_score_step_device requires backend override"};
     }
 
+    // Scope a single paged attention call's optional logit tap. Passing null
+    // disarms it; the ordinary inference kernels remain unchanged otherwise.
+    // Mask bit r refers to first_row + r * row_step in the unsplit call.
+    virtual DeviceStatus attention_capture_set(DeviceTensor *logits,
+            uint64_t rows, uint32_t stride, uint32_t heads, uint32_t first_row = 0,
+            uint32_t row_step = 1) {
+        (void)rows; (void)stride; (void)heads; (void)first_row; (void)row_step;
+        return logits ? DeviceStatus{false, "attention capture requires CUDA FlashInfer"}
+                      : DeviceStatus{true, nullptr};
+    }
+    // Reduce captured, already-computed logits; output [sample, block+tail],
+    // averaged across heads. No query/key multiplication is performed here.
+    virtual DeviceStatus attention_capture_reduce(DeviceTensor &mass,
+            const DeviceTensor &logits, uint64_t rows, uint32_t stride,
+            uint32_t heads, uint32_t base_seq_len, uint32_t blocks,
+            const DeviceTensor &win_base, const DeviceTensor &block_tokens,
+            float weight = 1.0f, bool accumulate = false, uint32_t row_step = 1) {
+        (void)mass; (void)logits; (void)rows; (void)stride; (void)heads;
+        (void)base_seq_len; (void)blocks; (void)win_base; (void)block_tokens;
+        (void)weight; (void)accumulate; (void)row_step;
+        return {false, "attention capture reduction requires CUDA FlashInfer"};
+    }
+
     // Diagnostic-only true attention mass tracing. Recomputes the decode
     // softmax for one query token over a paged KV cache, then aggregates the
     // normalized attention weights by kvmem window block. `mass` is fp32

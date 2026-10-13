@@ -1,4 +1,5 @@
 #include "flashinfer_prefill_adapter.hpp"
+#include "flashinfer_attention_capture.cuh"
 
 #include <flashinfer/attention/default_prefill_params.cuh>
 #include <flashinfer/attention/prefill.cuh>
@@ -337,7 +338,7 @@ bool run_batch_prefill_paged_typed(
         cudaStream_t stream,
         unsigned &threads_out,
         unsigned &blocks_out,
-        bool *plan_cache_hit_out) {
+        bool *plan_cache_hit_out, const AttentionCapture *capture) {
     if (plan_cache_hit_out) *plan_cache_hit_out = false;
     if (out == nullptr || q_f16 == nullptr || o_f16 == nullptr ||
         int_workspace == nullptr || host_int_workspace == nullptr ||
@@ -594,27 +595,35 @@ bool run_batch_prefill_paged_typed(
         params.block_valid_mask = nullptr;
     }
 
+    auto dispatch = [&](auto active, auto variant) {
+        using P = decltype(active);
+        using V = typename decltype(variant)::type;
     cudaError_t st = cudaErrorInvalidValue;
-    if (head_dim == 128) {
-        if (plan_info.cta_tile_q == 16) {
-            st = dispatch_batch_prefill_paged<16, 128, Params, Variant>(
-                params, tmp_v, tmp_s, stream);
-        } else if (plan_info.cta_tile_q == 64) {
-            st = dispatch_batch_prefill_paged<64, 128, Params, Variant>(
-                params, tmp_v, tmp_s, stream);
-        } else if (plan_info.cta_tile_q == 128) {
-            st = dispatch_batch_prefill_paged<128, 128, Params, Variant>(
-                params, tmp_v, tmp_s, stream);
+        if (head_dim == 128) {
+            if (plan_info.cta_tile_q == 16) {
+                st = dispatch_batch_prefill_paged<16, 128, P, V>(
+                    active, tmp_v, tmp_s, stream);
+            } else if (plan_info.cta_tile_q == 64) {
+                st = dispatch_batch_prefill_paged<64, 128, P, V>(
+                    active, tmp_v, tmp_s, stream);
+            } else if (plan_info.cta_tile_q == 128) {
+                st = dispatch_batch_prefill_paged<128, 128, P, V>(
+                    active, tmp_v, tmp_s, stream);
+            }
+        } else if (head_dim == 256) {
+            if (plan_info.cta_tile_q == 16) {
+                st = dispatch_batch_prefill_paged<16, 256, P, V>(
+                    active, tmp_v, tmp_s, stream);
+            } else if (plan_info.cta_tile_q == 64) {
+                st = dispatch_batch_prefill_paged<64, 256, P, V>(
+                    active, tmp_v, tmp_s, stream);
+            }
         }
-    } else if (head_dim == 256) {
-        if (plan_info.cta_tile_q == 16) {
-            st = dispatch_batch_prefill_paged<16, 256, Params, Variant>(
-                params, tmp_v, tmp_s, stream);
-        } else if (plan_info.cta_tile_q == 64) {
-            st = dispatch_batch_prefill_paged<64, 256, Params, Variant>(
-                params, tmp_v, tmp_s, stream);
-        }
-    }
+        return st;
+    };
+    const cudaError_t st = capture && capture->row_mask
+        ? dispatch(CaptureParams<Params>(params, *capture), CaptureTag<false>{})
+        : dispatch(params, DefaultCaptureTag{});
     return st == cudaSuccess;
 }
 
@@ -1177,7 +1186,8 @@ bool launch_batch_prefill_paged_f16q_f16kv_gated(
         uint32_t out_batch_stride,
         float scale,
         cudaStream_t stream,
-        bool *plan_cache_hit_out) {
+        bool *plan_cache_hit_out,
+        const AttentionCapture *capture) {
     unsigned threads = 0, blocks = 0;
     if (!run_batch_prefill_paged_typed<half>(
             out, q_f16, o_f16, int_workspace, host_int_workspace,
@@ -1185,7 +1195,7 @@ bool launch_batch_prefill_paged_f16q_f16kv_gated(
             q, q_stride, k_cache, v_cache, page_indices,
             n_pages, page_size, n_heads, n_kv_heads, head_dim, base_seq_len,
             batch, q_batch_stride, out_batch_stride, scale, stream, threads,
-            blocks, plan_cache_hit_out)) {
+            blocks, plan_cache_hit_out, capture)) {
         return false;
     }
     unpack_gate_kernel<half><<<blocks, threads, 0, stream>>>(
@@ -1219,7 +1229,8 @@ bool launch_batch_prefill_paged_f16q_fp8kv_gated(
         uint32_t out_batch_stride,
         float scale,
         cudaStream_t stream,
-        bool *plan_cache_hit_out) {
+        bool *plan_cache_hit_out,
+        const AttentionCapture *capture) {
     unsigned threads = 0, blocks = 0;
     if (plan_cache_hit_out) *plan_cache_hit_out = false;
     const bool launched =
@@ -1229,7 +1240,7 @@ bool launch_batch_prefill_paged_f16q_fp8kv_gated(
             q, q_stride, k_cache, v_cache, page_indices,
             n_pages, page_size, n_heads, n_kv_heads, head_dim,
             base_seq_len, batch, q_batch_stride, out_batch_stride,
-            scale, stream, threads, blocks, plan_cache_hit_out);
+            scale, stream, threads, blocks, plan_cache_hit_out, capture);
     if (!launched) return false;
     unpack_gate_kernel<half><<<blocks, threads, 0, stream>>>(
         out, o_f16, q, q_stride, batch, n_heads, head_dim,

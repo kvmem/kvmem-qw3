@@ -428,3 +428,13 @@ static_assert(qw3::detail::kvmem_cached_query_replay_boundary(
 static_assert(qw3::detail::kvmem_cached_query_replay_boundary(
     (1ull << 40) + 500, 1882, 1972, 128, (1ull << 40)) ==
     (1ull << 40) + 384);
+
+// DSH evidence request 44 planned 1006 mandatory blocks against A=1152.
+// Reusing old P=139744 as the replay origin pinned 1171 blocks and overflowed
+// A, even though the current live suffix starts at 145088. Cached Q must let
+// prefill advance the replay snapshot to that current boundary.
+static_assert(qw3::detail::kvmem_cached_query_replay_boundary(
+    145088, 41769, 41784, 32, 139744) == 145088);
+static_assert((145814 - qw3::detail::kvmem_cached_query_replay_boundary(
+    145088, 41769, 41784, 32, 139744) + 31) / 32 == 23);
+static_assert((145814 - 139744 + 31) / 32 == 190);

@@ -1,4 +1,6 @@
 #pragma once
+#include "qw3/kvmem_attention.hpp"
+#include <unordered_map>
 #include "qw3/kvmem_gc.hpp"
 #include "qw3/kvmem_repository.hpp"
 #include "qw3/kvmem_repository_gc.hpp"
@@ -29,6 +31,7 @@
 #include <array>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace qw3 {
@@ -71,6 +74,7 @@ struct KvMemBlock {
 
     // Cumulative attention quality (built-in top-k selection signal, #40).
     double   attn_score = 0.0;
+    double   action_score = 0.0;     // mean accepted action attention, decayed per request
     double   profile_score = 0.0;    // window-local cumulative attention heat
     double   retrieval_score = 0.0;  // global retrieval score
 
@@ -296,6 +300,9 @@ struct KvMemStoreConfig {
                                      // 0 => keep no suffix blocks unconditionally
     KvMemMethod select_method = KvMemMethod::Retrieval; // --kvmem-method
     KvMemSelectPolicy select_policy = KvMemSelectPolicy::TopK;
+    KvMemAttentionConfig attention;
+    double action_fraction = 0.0; // opt-in quota share or fused-score weight
+    std::string action_combine = "quota";
     KvMemRetrievalMethod retrieval_method = KvMemRetrievalMethod::MeanK;
     KvMemIndexPlacement index_placement = KvMemIndexPlacement::GPU;
     uint64_t index_staging_bytes = 64ull * 1024ull * 1024ull;
@@ -389,7 +396,7 @@ struct KvMemStoreConfig {
 
 class KvMemStore {
 public:
-    explicit KvMemStore(KvMemStoreConfig cfg) : cfg_(cfg) {}
+    explicit KvMemStore(KvMemStoreConfig cfg);
     KvMemStore(KvMemStoreConfig, std::shared_ptr<KvMemRepository>);
 
     const KvMemStoreConfig &config() const { return cfg_; }
@@ -575,8 +582,13 @@ public:
     // consume ordinary top-k slots; they are never appended beyond the budget.
     // This is used by query replay so its suffix stays present without growing
     // the active RoPE window past `select_budget`.
+    // Optional input-attention fallback, keyed by original history position.
+    // Used only when live history has no positive output attention. Missing
+    // input evidence falls back to Query; no stored output scores are changed.
+    using PrefillSelectionScores = std::unordered_map<uint64_t, double>;
     std::vector<uint32_t> pick_topk_blocks(
-        const std::vector<uint32_t> &mandatory_blocks) const;
+        const std::vector<uint32_t> &mandatory_blocks,
+        const PrefillSelectionScores &prefill_scores = {}) const;
 
     // Select complete variable-length logical groups under the ordinary
     // fixed-physical-block budget. `groups` are half-open token spans in the
@@ -595,16 +607,17 @@ public:
         const std::vector<uint32_t> &mandatory_blocks = {}) const;
 
     // Deterministic working set used only while a long prefill is under memory
-    // pressure. Keep the configured sink prefix, then fill every remaining
-    // budget slot with the newest blocks. This deliberately ignores all
-    // retrieval/profile/attention scores and also ignores `recent_blocks`:
-    // "recent" here means the full newest tail left after reserving the sink.
+    // pressure. Keep sink/mandatory blocks, then optionally rank the supplied
+    // resident candidates by action attention. Fill unused slots with newest
+    // blocks; no Query scoring or separate recent quota is used on this path.
     std::vector<uint32_t> pick_prefill_pressure_blocks() const;
+    using PressureActionScores = std::vector<std::pair<uint32_t, double>>;
     // Same pressure selector with request-scoped mandatory blocks. Mandatory
     // blocks consume ordinary newest-tail slots and never expand the fixed
     // prefill budget.
     std::vector<uint32_t> pick_prefill_pressure_blocks(
-        const std::vector<uint32_t> &mandatory_blocks) const;
+        const std::vector<uint32_t> &mandatory_blocks,
+        const PressureActionScores &action_scores = {}) const;
     struct RepositoryPressureSelection {
         std::vector<uint32_t> blocks;
         std::vector<KvMemRepository::Lease> leases;
@@ -613,7 +626,8 @@ public:
     // set_repository_selection installs their working-set leases. CPU GC may
     // otherwise retire a candidate between the pure selector and installation.
     RepositoryPressureSelection pin_repository_pressure_selection(
-        const std::vector<uint32_t> &mandatory_blocks) const;
+        const std::vector<uint32_t> &mandatory_blocks,
+        const PressureActionScores &action_scores = {}) const;
 
     // Accumulate per-block attention quality (decode side-channel, #40). `scores`
     // is indexed by block_id; entries beyond block_count() are ignored.
@@ -625,6 +639,7 @@ public:
     // score is REPLACED, not added. `scores` is indexed by block_id; entries
     // beyond block_count() are ignored, blocks beyond `scores.size()` are reset
     // to 0 so a shrinking index never leaves stale heat behind.
+    void update_action_scores(const std::vector<double> &mean, double decay);
     void set_attn_scores(const std::vector<double> &scores);
 
     // Explicit retrieval scores for selector plugins. This currently aliases
@@ -688,7 +703,8 @@ private:
     void gc_validate_mandatory(const std::vector<uint32_t> &) const;
     std::vector<uint32_t> pick_prefill_pressure_from(
         const std::vector<uint32_t> &order,
-        const std::vector<uint32_t> &mandatory_blocks) const;
+        const std::vector<uint32_t> &mandatory_blocks,
+        const PressureActionScores &action_scores) const;
     std::shared_ptr<KvMemGc> gc_;
     std::shared_ptr<const KvMemGc::View> gc_view_;
     std::shared_ptr<KvMemGc::Lease> gc_working_lease_;
