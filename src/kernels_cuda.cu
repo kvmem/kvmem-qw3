@@ -22,6 +22,7 @@
 #include "cuda_helpers.cuh"
 #include "dflash_cuda.hpp"
 #include "flashinfer_decode_plan.hpp"
+#include "flashinfer_attention_capture.hpp"
 #include "target_sampling_cuda.hpp"
 #ifdef QW3_ENABLE_FLASHINFER
 #include "flashinfer_vision_adapter.hpp"
@@ -826,7 +827,8 @@ bool launch_batch_prefill_paged_f16q_f16kv_gated(
         uint32_t out_batch_stride,
         float scale,
         cudaStream_t stream,
-        bool *plan_cache_hit_out);
+        bool *plan_cache_hit_out,
+        const AttentionCapture *capture = nullptr);
 
 bool launch_batch_prefill_paged_f16q_fp8kv_gated(
         float *out,
@@ -853,7 +855,8 @@ bool launch_batch_prefill_paged_f16q_fp8kv_gated(
         uint32_t out_batch_stride,
         float scale,
         cudaStream_t stream,
-        bool *plan_cache_hit_out);
+        bool *plan_cache_hit_out,
+        const AttentionCapture *capture = nullptr);
 
 bool launch_batch_prefill_paged_ragged_f16q_f16kv_gated(
         float *out,
@@ -987,7 +990,8 @@ bool launch_batch_decode_f32q_f16kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        const AttentionCapture *capture = nullptr);
 
 bool launch_batch_decode_f32q_fp8kv_gated(
         float *out,
@@ -1017,7 +1021,8 @@ bool launch_batch_decode_f32q_fp8kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        const AttentionCapture *capture = nullptr);
 }
 #endif
 
@@ -7907,6 +7912,50 @@ __device__ __forceinline__ uint32_t kvmem_window_bucket_for_pos(
     const uint32_t base = static_cast<uint32_t>(win_base[idx]);
     const uint32_t n = static_cast<uint32_t>(blk_tokens[idx]);
     return (pos < base + n) ? idx : n_window_blocks;  // final slot = decode tail
+}
+
+// A sampled-row reduction reads logits, never Q or K. One CTA per head.
+__global__ void captured_attention_mass_kernel(float *mass, const float *logits,
+        uint64_t rows, uint32_t stride, uint32_t heads, uint32_t base,
+        uint32_t blocks, const int32_t *starts, const int32_t *counts,
+        float weight, uint32_t row_step) {
+    const uint32_t slot = blockIdx.y, head = blockIdx.x, tid = threadIdx.x;
+    uint64_t remaining = rows;
+    for (uint32_t i = 0; i < slot; ++i) remaining &= remaining - 1;
+    const uint32_t row = __ffsll(remaining) - 1;
+    const uint32_t length = base + row * row_step + 1;
+    const float *x = logits + (uint64_t(slot) * heads + head) * stride;
+    __shared__ float scratch[256];
+    float value = -INFINITY;
+    for (uint32_t i = tid; i < length; i += 256) value = fmaxf(value, x[i]);
+    scratch[tid] = value;
+    __syncthreads();
+    for (uint32_t n = 128; n; n >>= 1) {
+        if (tid < n) scratch[tid] = fmaxf(scratch[tid], scratch[tid+n]);
+        __syncthreads();
+    }
+    const float maximum = scratch[0];
+    __syncthreads();
+    value = 0;
+    for (uint32_t i = tid; i < length; i += 256) value += __expf(x[i] - maximum);
+    scratch[tid] = value;
+    __syncthreads();
+    for (uint32_t n = 128; n; n >>= 1) {
+        if (tid < n) scratch[tid] += scratch[tid+n];
+        __syncthreads();
+    }
+    const float inv = weight / (scratch[0] * heads);
+    // Window blocks are adjacent and cover the assembled prefix; the last
+    // bucket accounts for subsequently appended tokens without mislabeling
+    // their history identity as a selected block.
+    for (uint32_t b = tid; b <= blocks; b += 256) {
+        const uint32_t begin = b < blocks ? starts[b] :
+            (blocks ? starts[blocks-1] + counts[blocks-1] : 0);
+        const uint32_t end = b < blocks ? min(begin + uint32_t(counts[b]), length) : length;
+        float sum = 0;
+        for (uint32_t i = begin; i < end; ++i) sum += __expf(x[i] - maximum);
+        atomicAdd(mass + uint64_t(slot) * (blocks+1) + b, sum * inv);
+    }
 }
 
 template <typename T>
@@ -19026,6 +19075,42 @@ public:
             "cuda block_attn_stream_group_finalize_device");
     }
 
+    DeviceStatus attention_capture_set(DeviceTensor *logits, uint64_t rows,
+            uint32_t stride, uint32_t heads, uint32_t first_row = 0,
+            uint32_t row_step = 1) override {
+#if QW3_ENABLE_FLASHINFER
+        action_capture_ = {};
+        if (!logits) return {true, nullptr};
+        auto &t = as_tensor(*logits);
+        if (!rows || !stride || !heads || !row_step || t.elem_size != sizeof(float) ||
+            uint64_t(first_row) + uint64_t(63 - __builtin_clzll(rows)) * row_step >= stride ||
+            t.count < uint64_t(__builtin_popcountll(rows)) * stride * heads)
+            return {false, "invalid attention capture buffer"};
+        action_capture_ = {t.ptr, rows, stride, heads, 0, first_row, row_step};
+        return {true, nullptr};
+#else
+        return {logits == nullptr, "attention capture requires FlashInfer"};
+#endif
+    }
+
+    DeviceStatus attention_capture_reduce(DeviceTensor &mass,
+            const DeviceTensor &logits, uint64_t rows, uint32_t stride,
+            uint32_t heads, uint32_t base, uint32_t blocks,
+            const DeviceTensor &starts, const DeviceTensor &counts,
+            float weight = 1.0f, bool accumulate = false, uint32_t row_step = 1) override {
+        const uint32_t samples = __builtin_popcountll(rows);
+        auto &out = as_tensor(mass);
+        if (!samples || !heads || !row_step || !std::isfinite(weight) || weight < 0 ||
+            uint64_t(base) + uint64_t(63 - __builtin_clzll(rows)) * row_step + 1 > stride ||
+            out.count < uint64_t(samples) * (blocks+1))
+            return {false, "invalid captured attention reduction shape"};
+        if (!accumulate) { if (auto st = zero_tensor(mass); !st.ok) return st; }
+        captured_attention_mass_kernel<<<dim3(heads,samples),256,0,exec_stream_>>>(
+            out.ptr, as_tensor(logits).ptr, rows, stride, heads, base, blocks,
+            as_tensor(starts).ptr_i32(), as_tensor(counts).ptr_i32(), weight, row_step);
+        return launch_status("captured attention mass reduction");
+    }
+
     DeviceStatus block_attention_mass_paged_device(
                                               DeviceTensor &mass,
                                               const DeviceTensor &q,
@@ -20923,10 +21008,14 @@ public:
                     n_heads, n_kv_heads, head_dim, base_seq_len, first_rows,
                     q_batch_stride, out_batch_stride, scale);
                 if (!status.ok) return status;
-                return attention_prefill_batch_paged_gated_device(
+                const auto saved_capture = action_capture_;
+                action_capture_.row_offset += first_rows;
+                const auto tail_status = attention_prefill_batch_paged_gated_device(
                     tail_out, tail_q, q_stride, k_cache, v_cache, page_indices, n_pages, page_size,
                     n_heads, n_kv_heads, head_dim, base_seq_len + first_rows, batch - first_rows,
                     q_batch_stride, out_batch_stride, scale);
+                action_capture_ = saved_capture;
+                return tail_status;
             }
         }
         if (prefill_attn_kernel_choice() == PrefillAttnKernel::FlashInfer &&
@@ -20983,7 +21072,8 @@ public:
                     qq.ptr, q_stride, kc.ptr, vc.ptr, pages.ptr_i32(),
                     n_pages, page_size, n_heads, n_kv_heads, head_dim,
                     base_seq_len, batch, q_batch_stride, out_batch_stride,
-                    scale, exec_stream_, &plan_cache_hit)
+                    scale, exec_stream_, &plan_cache_hit,
+                    action_capture_.row_mask ? &action_capture_ : nullptr)
                 : flashinfer_adapter::launch_batch_prefill_paged_f16q_f16kv_gated(
                     o.ptr,
                     flashinfer_batch_prefill_q_f16_,
@@ -20998,7 +21088,8 @@ public:
                     qq.ptr, q_stride, kc.ptr, vc.ptr, pages.ptr_i32(),
                     n_pages, page_size, n_heads, n_kv_heads, head_dim,
                     base_seq_len, batch, q_batch_stride, out_batch_stride,
-                    scale, exec_stream_, &plan_cache_hit);
+                    scale, exec_stream_, &plan_cache_hit,
+                    action_capture_.row_mask ? &action_capture_ : nullptr);
             // Even cache hits enqueue H2D reads of the pinned request metadata.
             // Fence every acquired slot, including a partially failed launch,
             // before a subsequent layer/chunk may overwrite its contents.
@@ -21253,10 +21344,14 @@ public:
                             n_heads, n_kv_heads, head_dim, base_seq_len, low,
                             q_batch_stride, out_batch_stride, scale);
                         if (!status.ok) return status;
-                        return attention_decode_batch_paged_gated_device(
+                        const auto saved_capture = action_capture_;
+                        action_capture_.row_offset += low;
+                        const auto tail_status = attention_decode_batch_paged_gated_device(
                             tail_out, tail_q, q_stride, k_cache, v_cache, page_indices, n_pages, page_size,
                             n_heads, n_kv_heads, head_dim, base_seq_len + low, batch - low,
                             q_batch_stride, out_batch_stride, scale);
+                        action_capture_ = saved_capture;
+                        return tail_status;
                     }
                 }
                 const bool cache_plan = batch > 1 && batch <= 8 && !capture_active_ &&
@@ -21341,7 +21436,7 @@ public:
                         page_size, total_tiles,
                         n_heads, n_kv_heads, head_dim, batch,
                         q_batch_stride, out_batch_stride, scale,
-                        exec_stream_)
+                        exec_stream_, action_capture_.row_mask ? &action_capture_ : nullptr)
                     : flashinfer_adapter::launch_batch_decode_f32q_f16kv_gated(
                         o.ptr, flashinfer_batch_decode_o_f16_,
                         flashinfer_batch_decode_tmp_v_,
@@ -21360,7 +21455,7 @@ public:
                         page_size, total_tiles,
                         n_heads, n_kv_heads, head_dim, batch,
                         q_batch_stride, out_batch_stride, scale,
-                        exec_stream_);
+                        exec_stream_, action_capture_.row_mask ? &action_capture_ : nullptr);
                 if (launched) {
                     return launch_status("cuda attention_decode_batch flashinfer paged device decode gated");
                 }
@@ -22755,6 +22850,9 @@ public:
     }
 
 private:
+#if QW3_ENABLE_FLASHINFER
+    flashinfer_adapter::AttentionCapture action_capture_;
+#endif
     LinearBackend linear_backend_ = LinearBackend::Auto;
     std::unique_ptr<TargetSamplerCuda> target_sampler_;
     cublasHandle_t cublas_handle_ = nullptr;

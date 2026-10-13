@@ -1,5 +1,7 @@
 #pragma once
 
+#include "qw3/kvmem_attention.hpp"
+
 #include <cstdint>
 #include <array>
 #include <functional>
@@ -254,7 +256,10 @@ struct EngineOptions {
     // constructed under a wider sink+recent window before the final semantic
     // query contracts the active context back to kvmem_budget.
     int kvmem_prefill_budget = 0;
-    int kvmem_gen_budget = 32768; // GPU pool reserve for generated tokens; also caps max_tokens
+    // GPU pool reserve for generated tokens. Without CPU/NVMe backing it also
+    // caps one decode epoch; tier-backed serving can roll the resident window
+    // and honors the independent request/server output limit instead.
+    int kvmem_gen_budget = 32768;
     int kvmem_interval = 64;      // decode steps between reselections
     // Always-kept prefix/suffix allocation. Negative means derive from the
     // KVMem token budget after block_tokens is known:
@@ -271,6 +276,7 @@ struct EngineOptions {
     // blocks), "h2o" (window-local cumulative attention heat, retention only),
     // or "recency" (sink + recent windows only, no learned signal).
     std::string kvmem_method = "retrieval";
+    KvMemAttentionConfig kvmem_attention;
     std::string kvmem_select_policy = "topk"; // topk or quota
     std::string kvmem_retrieval_method = "mean-k"; // mean-k, per-token, sub-block-mean-k, key-direction-fixed4, key-direction-adaptive
     // Placement of the all-layer Mean-K/Adaptive retrieval index. "gpu"

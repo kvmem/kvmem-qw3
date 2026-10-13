@@ -102,6 +102,7 @@ enum class KvmemHarnessRefreshReason : uint8_t {
     NewUserQuery,
     InitialHeadroom,
     CrossTurnGrowth,
+    EvidenceChanged,
 };
 
 inline const char *kvmem_harness_refresh_reason_name(
@@ -113,6 +114,7 @@ inline const char *kvmem_harness_refresh_reason_name(
     case KvmemHarnessRefreshReason::NewUserQuery: return "new-user-query";
     case KvmemHarnessRefreshReason::InitialHeadroom: return "initial-headroom";
     case KvmemHarnessRefreshReason::CrossTurnGrowth: return "cross-turn-growth";
+    case KvmemHarnessRefreshReason::EvidenceChanged: return "evidence-changed";
     }
     return "unknown";
 }
@@ -128,6 +130,7 @@ struct KvmemHarnessRefreshInput {
     uint64_t selection_budget = 0;
     uint64_t trigger_tokens = 0;
     KvmemCrossTurnRefreshDecision cross_turn;
+    bool evidence_changed = false;
 };
 
 struct KvmemHarnessRefreshDecision {
@@ -238,6 +241,12 @@ inline KvmemHarnessRefreshDecision kvmem_harness_refresh_decision(
     if (!in.same_user_query) {
         out.reselect = true;
         out.reason = KvmemHarnessRefreshReason::NewUserQuery;
+        return out;
+    }
+    if (in.evidence_changed) {
+        out.reselect = true;
+        out.private_query = guided_refresh_enabled;
+        out.reason = KvmemHarnessRefreshReason::EvidenceChanged;
         return out;
     }
     // With private query generation disabled, growth in a stable tool task

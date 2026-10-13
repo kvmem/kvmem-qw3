@@ -1,4 +1,5 @@
 #include "flashinfer_decode_adapter.hpp"
+#include "flashinfer_attention_capture.cuh"
 
 #include <flashinfer/attention/cascade.cuh>
 #include <flashinfer/attention/decode.cuh>
@@ -655,7 +656,8 @@ bool launch_batch_decode_f32q_f16kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const AttentionCapture *capture) {
     if (out == nullptr || o_f16 == nullptr || q == nullptr ||
         k_cache == nullptr || v_cache == nullptr || page_indices == nullptr ||
         page_indptr == nullptr || last_page_len == nullptr ||
@@ -704,14 +706,23 @@ bool launch_batch_decode_f32q_f16kv_gated(
     params.block_valid_mask = nullptr;
 
     (void)cudaGetLastError();
-    cudaError_t st = cudaErrorInvalidValue;
-    if (head_dim == 128) {
-        st = launch_batch_decode_head_dim_dispatch<128, Params, Variant>(
-            params, tmp_v, tmp_s, o_indptr_host, partition_kv, rowwise_merge, stream);
-    } else if (head_dim == 256) {
-        st = launch_batch_decode_head_dim_dispatch<256, Params, Variant>(
-            params, tmp_v, tmp_s, o_indptr_host, partition_kv, rowwise_merge, stream);
-    }
+    auto dispatch = [&](auto active, auto variant) {
+        using P = decltype(active);
+        using V = typename decltype(variant)::type;
+        cudaError_t st = cudaErrorInvalidValue;
+        if (head_dim == 128) {
+            st = launch_batch_decode_head_dim_dispatch<128, P, V>(
+                active, tmp_v, tmp_s, o_indptr_host, partition_kv, rowwise_merge, stream);
+        } else if (head_dim == 256) {
+            st = launch_batch_decode_head_dim_dispatch<256, P, V>(
+                active, tmp_v, tmp_s, o_indptr_host, partition_kv, rowwise_merge, stream);
+        }
+        return st;
+    };
+    // Type tags avoid constructing the device attention closure on the host.
+    const cudaError_t st = capture && capture->row_mask
+        ? dispatch(CaptureParams<Params>(params, *capture), CaptureTag<true>{})
+        : dispatch(params, DefaultCaptureTag{});
     if (st != cudaSuccess) return false;
 
     const uint64_t elems = static_cast<uint64_t>(batch) * n_heads * head_dim;
@@ -751,7 +762,8 @@ bool launch_batch_decode_f32q_fp8kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const AttentionCapture *capture) {
     if (out == nullptr || o_f16 == nullptr || q == nullptr ||
         k_cache == nullptr || v_cache == nullptr || page_indices == nullptr ||
         page_indptr == nullptr || last_page_len == nullptr ||
@@ -800,14 +812,23 @@ bool launch_batch_decode_f32q_fp8kv_gated(
     params.block_valid_mask = nullptr;
 
     (void)cudaGetLastError();
-    cudaError_t st = cudaErrorInvalidValue;
-    if (head_dim == 128) {
-        st = launch_batch_decode_head_dim_dispatch<128, Params, Variant>(
-            params, tmp_v, tmp_s, o_indptr_host, partition_kv, rowwise_merge, stream);
-    } else if (head_dim == 256) {
-        st = launch_batch_decode_head_dim_dispatch<256, Params, Variant>(
-            params, tmp_v, tmp_s, o_indptr_host, partition_kv, rowwise_merge, stream);
-    }
+    auto dispatch = [&](auto active, auto variant) {
+        using P = decltype(active);
+        using V = typename decltype(variant)::type;
+        cudaError_t st = cudaErrorInvalidValue;
+        if (head_dim == 128) {
+            st = launch_batch_decode_head_dim_dispatch<128, P, V>(
+                active, tmp_v, tmp_s, o_indptr_host, partition_kv, rowwise_merge, stream);
+        } else if (head_dim == 256) {
+            st = launch_batch_decode_head_dim_dispatch<256, P, V>(
+                active, tmp_v, tmp_s, o_indptr_host, partition_kv, rowwise_merge, stream);
+        }
+        return st;
+    };
+    // Type tags avoid constructing the device attention closure on the host.
+    const cudaError_t st = capture && capture->row_mask
+        ? dispatch(CaptureParams<Params>(params, *capture), CaptureTag<true>{})
+        : dispatch(params, DefaultCaptureTag{});
     if (st != cudaSuccess) return false;
 
     const uint64_t elems = static_cast<uint64_t>(batch) * n_heads * head_dim;

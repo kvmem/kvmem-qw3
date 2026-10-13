@@ -1,6 +1,7 @@
 #include "qw3/kvmem_store.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -59,8 +60,16 @@ std::vector<KvMemStoragePageSpan> kvmem_storage_page_spans(
     return out;
 }
 
+KvMemStore::KvMemStore(KvMemStoreConfig cfg) : cfg_(std::move(cfg)) {
+    if (!std::isfinite(cfg_.action_fraction) || cfg_.action_fraction < 0 || cfg_.action_fraction > 1)
+        throw std::invalid_argument("action_fraction must be in [0,1]");
+    if (cfg_.action_combine != "quota" && cfg_.action_combine != "score")
+        throw std::invalid_argument("action_combine must be quota|score");
+}
+
 KvMemStore::KvMemStore(KvMemStoreConfig cfg, std::shared_ptr<KvMemRepository> repository)
-    : repository_(std::move(repository)), cfg_(cfg) {
+    : KvMemStore(cfg) {
+    repository_ = std::move(repository);
     if (!repository_ || !cfg.block_tokens || repository_->block_tokens() != cfg.block_tokens ||
         (cfg.repository_blocks && cfg.repository_blocks != repository_->capacity()) ||
         uint64_t(repository_->capacity()) * cfg.block_tokens > INT32_MAX)
@@ -885,6 +894,17 @@ void KvMemStore::accumulate_attn(const std::vector<double> &scores) {
     }
 }
 
+void KvMemStore::update_action_scores(const std::vector<double> &mean, double decay) {
+    if (mean.size() != blocks_.size() || !(decay >= 0 && decay <= 1))
+        throw std::invalid_argument("invalid action attention update");
+    for (size_t i = 0; i < blocks_.size(); ++i) {
+        if (!std::isfinite(mean[i]) || mean[i] < 0)
+            throw std::invalid_argument("nonfinite or negative action attention mass");
+    }
+    for (size_t i = 0; i < blocks_.size(); ++i)
+        if (is_live(i)) blocks_[i].action_score = decay * blocks_[i].action_score + mean[i];
+}
+
 void KvMemStore::set_attn_scores(const std::vector<double> &scores) {
     set_retrieval_scores(scores);
 }
@@ -1025,19 +1045,21 @@ std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks() const {
 }
 
 std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks(
-        const std::vector<uint32_t> &mandatory_blocks) const {
-    return pick_prefill_pressure_from(chronological_ids(), mandatory_blocks);
+        const std::vector<uint32_t> &mandatory_blocks,
+        const PressureActionScores &action_scores) const {
+    return pick_prefill_pressure_from(chronological_ids(), mandatory_blocks, action_scores);
 }
 
 KvMemStore::RepositoryPressureSelection KvMemStore::pin_repository_pressure_selection(
-        const std::vector<uint32_t> &mandatory_blocks) const {
+        const std::vector<uint32_t> &mandatory_blocks,
+        const PressureActionScores &action_scores) const {
     if (!repository_) throw std::logic_error("pinned pressure selection requires bounded repository");
     RepositoryPressureSelection result;
     result.leases = repository_read_leases();
     std::vector<uint32_t> order;
     order.reserve(result.leases.size());
     for (const auto &lease : result.leases) order.push_back(lease.handle().slot);
-    result.blocks = pick_prefill_pressure_from(order, mandatory_blocks);
+    result.blocks = pick_prefill_pressure_from(order, mandatory_blocks, action_scores);
     std::vector<uint8_t> chosen(block_count(), 0);
     for (auto id : result.blocks) chosen[id] = 1;
     result.leases.erase(std::remove_if(result.leases.begin(), result.leases.end(),
@@ -1047,7 +1069,8 @@ KvMemStore::RepositoryPressureSelection KvMemStore::pin_repository_pressure_sele
 
 std::vector<uint32_t> KvMemStore::pick_prefill_pressure_from(
         const std::vector<uint32_t> &order,
-        const std::vector<uint32_t> &mandatory_blocks) const {
+        const std::vector<uint32_t> &mandatory_blocks,
+        const PressureActionScores &action_scores) const {
     const uint32_t n = block_count();
     std::vector<uint32_t> selected;
     if (n == 0) return selected;
@@ -1084,7 +1107,41 @@ std::vector<uint32_t> KvMemStore::pick_prefill_pressure_from(
             "KVMem mandatory prefill selection plus sink blocks exceeds "
             "the configured prefill budget");
     }
+    // The executor supplies only resident, accepted-history candidates. Do not
+    // consult stale Query scores or pull high-scoring cold history onto GPU.
+    std::vector<uint8_t> action_resident;
+    if (!action_scores.empty()) {
+        action_resident.resize(n, 0);
+        std::vector<uint8_t> available(n, 0);
+        for (uint32_t id : order) available[id] = 1;
+        PressureActionScores candidates;
+        candidates.reserve(action_scores.size());
+        for (const auto &[id, score] : action_scores) {
+            if (!std::isfinite(score) || score < 0)
+                throw std::invalid_argument("invalid pressure action score");
+            if (id < n && available[id] && is_live(id)) {
+                action_resident[id] = 1;
+                if (!kept[id] && score > 0) candidates.emplace_back(id, score);
+            }
+        }
+        const auto better = [&](const auto &a, const auto &b) {
+            return a.second != b.second ? a.second > b.second : earlier(b.first, a.first);
+        };
+        // Candidate IDs are unique in the executor; tolerate duplicate callers
+        // without exceeding the budget. Sorting a single resident window also
+        // keeps ties deterministic and avoids scanning historical score arrays.
+        std::sort(candidates.begin(), candidates.end(), better);
+        const uint32_t before_action = kept_count;
+        for (const auto &[id, score] : candidates) {
+            if (kept_count >= budget) break;
+            keep(id);
+        }
+        if (std::getenv("QW3_KVMEM_TRACE"))
+            std::fprintf(stderr, "[action-pressure] candidates=%zu action_added=%u fallback_slots=%u budget=%u\n",
+                candidates.size(), kept_count - before_action, budget - kept_count, budget);
+    }
     for (auto it = order.rbegin(); it != order.rend() && kept_count < budget; ++it) {
+        if (!action_resident.empty() && !action_resident[*it]) continue;
         keep(*it);
     }
     selected.reserve(kept_count);
@@ -1099,7 +1156,8 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks() const {
 }
 
 std::vector<uint32_t> KvMemStore::pick_topk_blocks(
-        const std::vector<uint32_t> &mandatory_blocks) const {
+        const std::vector<uint32_t> &mandatory_blocks,
+        const PrefillSelectionScores &prefill_scores) const {
     const uint32_t n = block_count();
     const auto order = chronological_ids();
     std::vector<uint32_t> selected;
@@ -1136,12 +1194,12 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks(
         keep(order[order.size() - 1 - i]);
     }
 
-    auto take_top = [&](uint32_t quota, auto score_fn) {
+    auto take_top = [&](uint32_t quota, auto score_fn, bool positive_only = false) {
         if (kept_count >= budget || quota == 0) return;
         std::vector<uint32_t> candidates;
         candidates.reserve(n - kept_count);
         for (uint32_t i = 0; i < n; ++i) {
-            if (!kept[i] && is_live(i)) candidates.push_back(i);
+            if (!kept[i] && is_live(i) && (!positive_only || score_fn(blocks_[i]) > 0)) candidates.push_back(i);
         }
         if (candidates.empty()) return;
         const uint32_t need = std::min<uint32_t>(
@@ -1160,6 +1218,70 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks(
         }
         for (uint32_t id : candidates) keep(id);
     };
+
+    if (cfg_.action_fraction > 0 && kept_count < budget) {
+        // Choose one history source before allocating Query slots: a Query
+        // overlap must not make existing output history look like a cold start.
+        const bool use_prefill = !prefill_scores.empty() &&
+            std::none_of(order.begin(), order.end(), [&](uint32_t id) {
+                return is_live(id) && blocks_[id].action_score > 0;
+            });
+        auto attention_score = [&](const KvMemBlock &block) {
+            if (!use_prefill) return block.action_score;
+            const uint64_t key = repository_ ? block.history_pos_start : block.orig_pos_start;
+            const auto it = prefill_scores.find(key);
+            return it == prefill_scores.end() ? 0.0 : it->second;
+        };
+        const uint32_t remaining = budget - kept_count;
+        if (cfg_.action_combine == "score") {
+            // Normalize over the SAME live, unpinned candidate pool. Scaling
+            // each stream by its maximum first keeps positive L1 sums finite
+            // even for very large/small scores. Missing history contributes 0.
+            double qmax = 0, amax = 0, qsum = 0, asum = 0;
+            uint32_t qpositive = 0, apositive = 0;
+            for (uint32_t id : order) if (!kept[id]) {
+                const double q = blocks_[id].retrieval_score;
+                const double a = attention_score(blocks_[id]);
+                if (!std::isfinite(q) || !std::isfinite(a) || a < 0)
+                    throw std::runtime_error("KVMem score fusion received invalid scores");
+                qmax = std::max(qmax, q); amax = std::max(amax, a);
+                qpositive += q > 0; apositive += a > 0;
+            }
+            for (uint32_t id : order) if (!kept[id]) {
+                if (qmax > 0) qsum += std::max(0.0, blocks_[id].retrieval_score) / qmax;
+                if (amax > 0) asum += attention_score(blocks_[id]) / amax;
+            }
+            const double aw = asum > 0 ? (qsum > 0 ? cfg_.action_fraction : 1.0) : 0;
+            const double qw = qsum > 0 ? 1.0 - aw : 0;
+            std::vector<double> fused(n, 0);
+            for (uint32_t id : order) if (!kept[id]) {
+                fused[id] = (qw > 0 ? qw * (std::max(0.0, blocks_[id].retrieval_score) / qmax) / qsum : 0) +
+                            (aw > 0 ? aw * (attention_score(blocks_[id]) / amax) / asum : 0);
+            }
+            if (qsum > 0 || asum > 0)
+                take_top(remaining, [&](const KvMemBlock &b) { return fused[b.block_id]; });
+            else
+                take_top(remaining, [](const KvMemBlock &b) { return b.retrieval_score; });
+            if (std::getenv("QW3_KVMEM_TRACE"))
+                std::fprintf(stderr, "[action-fusion] normalization=positive-l1 query_weight=%.6f attention_weight=%.6f query_positive=%u attention_positive=%u candidates=%zu total=%u attention_source=%s\n",
+                    qw, aw, qpositive, apositive, order.size()-(budget-remaining), kept_count,
+                    use_prefill ? "prefill" : "output");
+            for (uint32_t id : order) if (kept[id]) selected.push_back(id);
+            return selected;
+        }
+        const uint32_t action_quota = static_cast<uint32_t>(remaining * cfg_.action_fraction);
+        take_top(remaining - action_quota, [](const KvMemBlock &b) { return b.retrieval_score; });
+        const uint32_t before_action = kept_count;
+        take_top(action_quota, attention_score, true);
+        const uint32_t action_kept = kept_count - before_action;
+        take_top(budget - kept_count, [](const KvMemBlock &b) { return b.retrieval_score; });
+        if (std::getenv("QW3_KVMEM_TRACE"))
+            std::fprintf(stderr, "[action-selection] query_quota=%u action_quota=%u action_added=%u total=%u attention_source=%s\n",
+                         remaining-action_quota, action_quota, action_kept, kept_count,
+                         use_prefill ? "prefill" : "output");
+        for (uint32_t id : order) if (kept[id]) selected.push_back(id);
+        return selected;
+    }
 
     if (cfg_.select_policy == KvMemSelectPolicy::Quota && kept_count < budget) {
         uint32_t remaining = budget - kept_count;

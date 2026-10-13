@@ -1807,6 +1807,14 @@ QwenExecutor::KvStateSnapshot QwenExecutor::kv_state_snapshot() const {
 }
 
 void QwenExecutor::reset_state() {
+    action_running_ = false;
+    action_capture_prefill_ = false;
+    action_capture_rows_ = 0;
+    prefill_attention_scores_.clear();
+    prefill_attention_end_ = prefill_attention_samples_ = 0;
+    action_parser_.candidate.clear();
+    action_parser_.mask = 0;
+    (void)backend_.attention_capture_set(nullptr, 0, 0, 0);
     kvmem_blend_restore();
     kvmem_blend_tokens_.clear();
     kvmem_blend_pending_ = false;
@@ -7371,6 +7379,7 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
         return report;
     }
     ensure_scratch();
+    kvmem_action_prepare(&token_id, 1, position_);
 
     const QwenConfig &cfg = model_.config();
     const uint32_t head_k_dim = cfg.head_k_dim();
@@ -7591,6 +7600,7 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
                     pages_dev, pages_count, kv_page_size()));
                 record(report, "layer." + std::to_string(il) + ".kv_append_paged");
 
+                kvmem_action_layer_begin(il, attn_pos, 1);
                 require_status(backend_.attention_decode_batch_paged_gated_device(
                     *mid_, *q_, 2 * standard_head_dim,
                     attention_k_cache(il), v_cache(il),
@@ -7599,6 +7609,7 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
                     attn_pos, 1,
                     standard_n_heads * 2 * standard_head_dim,
                     standard_n_heads * standard_head_dim, scale));
+                kvmem_action_layer_end(il, attn_pos);
                 record(report, "layer." + std::to_string(il) + ".attention_sdpa_paged");
             } else {
                 require_status(backend_.kv_append(
@@ -8142,6 +8153,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         const bool chunk_bs = kvmem_active_;
         if (chunk_bs && !kvmem_blend_active_) kvmem_extend_window_for_decode_n(batch, base_pos);
         const uint32_t attn_base_pos = chunk_bs ? window_query_pos_ : checked_local_position(base_pos);
+        kvmem_action_prepare(tokens.data() + chunk_off, batch, base_pos, !mtp_single_chunk);
         // RoPE position for this chunk's Q/K (and the matching capture de-RoPE):
         // under the no-re-RoPE experiment use the TRUE base_pos so the window keeps
         // true positions; append-slot + (length-based) attention mask stay on
@@ -8644,6 +8656,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                 // reuses that prefix and is substantially faster; the Ampere
                 // node profile opts into it after parity/performance canaries.
                 // Real prompt prefill remains on the prefill path either way.
+                kvmem_action_layer_begin(il, attn_base_pos, batch);
                 const bool mtp_verify_paged_prefill =
                     mtp_single_chunk && batch > 1 && batch <= 8 &&
                     env_flag_enabled("QW3_EXPERIMENTAL_MTP_VERIFY_PAGED_PREFILL");
@@ -8666,6 +8679,10 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                         standard_head_dim, attn_base_pos, batch,
                         q_stride_buf, mid_stride, scale);
                     if (!attn_st.ok) {
+                        if (action_captured_ && std::binary_search(action_layers_.begin(), action_layers_.end(), int32_t(il))) {
+                            (void)backend_.attention_capture_set(nullptr, 0, 0, 0);
+                            require_status(attn_st);
+                        }
                         if (std::getenv("QW3_DEBUG_PREFILL_PLAN")) {
                             static int fb_dbg = 0;
                             if (fb_dbg < 4) {
@@ -8685,6 +8702,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                             q_stride_buf, mid_stride, scale));
                     }
                 }
+                kvmem_action_layer_end(il, attn_base_pos);
                 if (record_ops) record(report, "layer." + std::to_string(il) + ".attention_sdpa_batch_paged");
             } else {
                 require_status(backend_.attention_decode_batch_gated(
@@ -10800,6 +10818,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             "of the KV page size (" + std::to_string(page_size) + ")");
     }
     KvMemStoreConfig effective = cfg;
+    kvmem_action_configure(effective);
     const KvmemNumaPlacement numa =
         kvmem_resolve_numa_placement(backend_, effective.numa_policy);
     if (effective.numa_policy.rfind("node:", 0) == 0 &&
@@ -12385,6 +12404,9 @@ void QwenExecutor::kvmem_register_append(uint64_t n_new_tokens) {
 void QwenExecutor::kvmem_register_until(uint64_t target_pos) {
     if (!kvmem_enabled_ || !block_store_) return;
     if (target_pos <= kvmem_registered_pos_) return;
+    // This is the shared acceptance point, including accepted batched replay
+    // that registers internally before advancing the executor's position.
+    kvmem_action_commit(target_pos);
     if (block_store_->has_repository()) {
         if (!kvmem_repository_append_ || target_pos < block_store_->history_end() ||
             target_pos > kvmem_repository_append_->end())
@@ -12953,6 +12975,13 @@ void QwenExecutor::kvmem_truncate_repository(uint64_t token_pos) {
 }
 
 void QwenExecutor::kvmem_truncate_to(uint64_t token_pos) {
+    if (token_pos < prefill_attention_end_) {
+        // Rewritten prompt suffixes must not leave evidence from a future branch.
+        prefill_attention_scores_.clear();
+        prefill_attention_end_ = token_pos;
+        action_capture_prefill_ = false;
+        action_capture_rows_ = 0;
+    }
     kvmem_blend_restore();
     if (block_store_ && kvmem_blend_ratio_ > 0) {
         for (auto it = kvmem_blend_tokens_.begin(); it != kvmem_blend_tokens_.end();) {
@@ -13010,15 +13039,43 @@ void QwenExecutor::kvmem_truncate_to(uint64_t token_pos) {
         }
         if (d.nvme_slot >= 0 && kvmem_nvme_tier_) kvmem_nvme_tier_->release_block(d.block_id);
     }
-    // Invalidate the per-session selection indices so a stale index over the old
-    // (larger) block count cannot survive. The warm-resume pressure selection and
-    // the post-suffix semantic selection rebuild over the corrected block table.
-    // Position/KV/recurrent/window are NOT touched here.
+    // Score caches cover the old history, but these host vectors identify the
+    // sparse physical window that restore_state deliberately keeps alive. A
+    // short KeepSelected append may not assemble another window: clearing its
+    // identities would attribute every selected key to recent contiguous
+    // history in action capture / capacity recovery. When action tracking is
+    // enabled, retain the surviving prefix, trimming only rows beyond the
+    // restored window or history boundary. Disabled tracking keeps its prior
+    // index invalidation behavior.
     bs_score_ready_ = false;
-    bs_window_blocks_ = 0;
-    bs_window_block_ids_.clear();
-    bs_win_base_host_.clear();
-    bs_blk_tokens_host_.clear();
+    uint32_t surviving_window_blocks = 0;
+    uint32_t prefix_end = 0;
+    if (action_enabled_ && kvmem_active_) {
+        for (uint32_t w = 0; w < bs_window_blocks_; ++w) {
+            const uint32_t base = bs_win_base_host_.at(w);
+            if (base >= window_query_pos_) break;
+            const uint32_t id = bs_window_block_ids_.at(w);
+            if (!block_store_->is_live(id) || base != prefix_end) {
+                throw std::logic_error("truncated sparse window lost its prefix identity");
+            }
+            const uint32_t old_tokens = bs_blk_tokens_host_.at(w);
+            const uint32_t tokens = std::min<uint32_t>(
+                old_tokens, std::min<uint32_t>(
+                    block_store_->blocks().at(id).n_tokens,
+                    window_query_pos_ - base));
+            if (tokens == 0) break;
+            bs_blk_tokens_host_[w] = static_cast<int32_t>(tokens);
+            prefix_end = base + tokens;
+            ++surviving_window_blocks;
+            if (tokens < old_tokens) break;
+        }
+    }
+    bs_window_blocks_ = surviving_window_blocks;
+    bs_window_block_ids_.resize(surviving_window_blocks);
+    bs_win_base_host_.resize(surviving_window_blocks);
+    bs_blk_tokens_host_.resize(surviving_window_blocks);
+    bs_window_repository_handles_.resize(std::min<size_t>(
+        surviving_window_blocks, bs_window_repository_handles_.size()));
     g_content_ready_ = false;
     g_query_ready_ = false;
     g_indexed_blocks_ = 0;
@@ -16896,12 +16953,13 @@ uint32_t QwenExecutor::kvmem_reselect_prefill_pressure() {
     kvmem_prepare_content_index_before_first_selection();
     const std::vector<uint32_t> mandatory =
         kvmem_materialize_mandatory_blocks();
+    const auto action_scores = kvmem_action_pressure_scores();
     auto pressure = block_store_->has_repository()
-        ? block_store_->pin_repository_pressure_selection(mandatory)
+        ? block_store_->pin_repository_pressure_selection(mandatory, action_scores)
         : KvMemStore::RepositoryPressureSelection{};
     const std::vector<uint32_t> selected =
         block_store_->has_repository() ? pressure.blocks
-                                     : block_store_->pick_prefill_pressure_blocks(mandatory);
+                                     : block_store_->pick_prefill_pressure_blocks(mandatory, action_scores);
     if (std::getenv("QW3_KVMEM_TRACE")) {
         const uint32_t n = block_store_->block_count();
         const uint32_t sink = std::min<uint32_t>(
@@ -21056,6 +21114,13 @@ uint32_t QwenExecutor::kvmem_set_bounded_recent_pin(
 }
 
 std::vector<uint32_t> QwenExecutor::kvmem_selection_with_pin() {
+    KvMemStore::PrefillSelectionScores prefill_scores;
+    if (prefill_attention_enabled_ && block_store_->config().action_fraction > 0 &&
+        !(action_running_ && action_round_samples_)) {
+        prefill_scores.reserve(prefill_attention_scores_.size());
+        for (const auto &[position, score] : prefill_attention_scores_)
+            if (score.mean() > 0) prefill_scores.emplace(position, score.mean());
+    }
     const bool round_ready =
         block_store_->config().semantic_expansion !=
             KvMemSemanticExpansion::None &&
@@ -21066,7 +21131,7 @@ std::vector<uint32_t> QwenExecutor::kvmem_selection_with_pin() {
         kvmem_qc_pin_from_block_ == UINT64_MAX &&
         kvmem_oracle_token_spans_.empty() &&
         kvmem_mandatory_token_spans_.empty()) {
-        return block_store_->pick_topk_blocks();
+        return block_store_->pick_topk_blocks({}, prefill_scores);
     }
     std::vector<uint32_t> mandatory =
         kvmem_materialize_mandatory_blocks();
@@ -21100,7 +21165,7 @@ std::vector<uint32_t> QwenExecutor::kvmem_selection_with_pin() {
             dense_groups.emplace_back(checked_local_position(begin), checked_local_position(end));
         return block_store_->pick_semantic_groups(dense_groups, kvmem_round_group_scores_, mandatory);
     }
-    return block_store_->pick_topk_blocks(mandatory);
+    return block_store_->pick_topk_blocks(mandatory, prefill_scores);
 }
 
 // During prefill at every normal-attention layer: build the per-layer content
@@ -26624,6 +26689,10 @@ NativeExecutorReport QwenExecutor::replay_tokens_with_mtp_prefix(
                 report.missing_kernels = std::move(target.missing_kernels);
                 break;
             }
+
+            // This path replays the already accepted prefix after rollback.
+            // Commit each row before scratch is reused by the next row.
+            kvmem_action_commit(position_);
 
             if (rebuild_prefix) {
                 const double t0 = steady_seconds();

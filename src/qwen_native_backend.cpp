@@ -283,7 +283,11 @@ constexpr KvmemQueryLifecycle kvmem_query_lifecycle(
     KvmemQueryLifecycle out;
     out.requested = valid_query_span && selection_budget > 0 &&
         (reselection_enabled || prepare_only);
-    out.prepare = out.requested && warm_capture && source_index_supported;
+    // A deferred request can refresh during decode even when prefix caching
+    // is disabled. Explicit preparation owns Q/index capture independently of
+    // whether the request will save a warm checkpoint.
+    out.prepare = out.requested && (warm_capture || prepare_only) &&
+        source_index_supported;
     out.select_active = out.requested && reselection_enabled &&
         logical_prompt_tokens > selection_budget;
     return out;
@@ -301,6 +305,14 @@ static_assert(kvmem_query_lifecycle(
     true, 229574, 229376, false, true, true, true).prepare);
 static_assert(!kvmem_query_lifecycle(
     true, 229574, 229376, false, true, true, true).select_active);
+static_assert(kvmem_query_lifecycle(
+    true, 229574, 229376, false, true, false, true).capture_active());
+static_assert(!kvmem_query_lifecycle(
+    true, 229574, 229376, false, true, false, true).select_active);
+static_assert(!kvmem_query_lifecycle(
+    false, 229574, 229376, false, true, false, true).capture_active());
+static_assert(!kvmem_query_lifecycle(
+    true, 229574, 229376, false, true, false, false).capture_active());
 
 // Vector-position counterpart of the executor's RoPE range diagnostic. The
 // continuous-batching paths feed ragged position arrays directly to CUDA, so
@@ -2042,6 +2054,9 @@ public:
         }
         options_ = options;
         detail::normalize_speculative_options(options_);
+        options_.kvmem_attention.validate();
+        if (options_.kvmem_attention.enabled && !options_.kvmem_enabled)
+            throw std::invalid_argument("--kvmem-action-attention on requires --kvmem");
         if (!options_.dflash_model_path.empty() &&
             (options_.native_mtp_trace || mtp_trace_enabled(options_) || mtp_speculate_enabled(options_) ||
              mtp_prefix_enabled(options_) || (options_.native_mtp_chain_set && options_.native_mtp_chain > 0)))
@@ -3774,6 +3789,8 @@ public:
                          const GenerationOptions &options,
                          const CancellableTokenCallback &on_text) override {
         std::unique_lock<std::mutex> request_lock(request_setup_mu_);
+        if (options.continuous_batching && options_.kvmem_attention.enabled)
+            throw std::invalid_argument("action attention currently requires --no-continuous-batching");
         if (!options.kvmem_prefix_cache_key.empty() &&
             (!valid_local_kvmem_cache_id(options.kvmem_prefix_cache_key) ||
              !options_.kvmem_enabled || !options.continuous_batching ||
@@ -4308,6 +4325,7 @@ private:
         int64_t expires_at = 0;
         QwenExecutor::StateSnapshot executor_state;
         QwenExecutor::StateSnapshot api_boundary_state;
+        QwenExecutor::AttentionHistorySnapshot attention_history;
         uint32_t api_boundary_pos = 0;
         std::vector<uint32_t> api_tail_tokens;
         std::vector<uint32_t> session_tokens;
@@ -4370,6 +4388,17 @@ private:
         mix_u64(static_cast<uint64_t>(options.kvmem_middecode_trigger_tokens));
         mix_u64(static_cast<uint64_t>(options.kvmem_middecode_max_refreshes));
         mix_string(options.kvmem_retrieval_method);
+        const auto &attention = options.kvmem_attention;
+        mix_u64(attention.enabled); mix_string(attention.scope);
+        mix_string(attention.combine);
+        for (double value : {attention.fraction, attention.decay, attention.prefill_half_life}) {
+            uint64_t bits = 0;
+            static_assert(sizeof(bits) == sizeof(value));
+            std::memcpy(&bits, &value, sizeof(bits));
+            mix_u64(bits);
+        }
+        mix_u64(attention.interval); mix_u64(attention.pressure);
+        mix_u64(attention.prefill); mix_u64(attention.prefill_interval);
         mix_string(options.kvmem_index_placement);
         mix_u64(position);
         mix_u64(input_embedding_fingerprint);
@@ -4558,6 +4587,7 @@ private:
         bool scope_open = true;
         try {
             executor_->capture_state(next.executor_state);
+            next.attention_history = executor_->kvmem_capture_attention_history();
             next.api_boundary_state = kvmem_api_boundary_ckpt_.ready
                 ? clone_milestone_state_snapshot(kvmem_api_boundary_ckpt_)
                 : QwenExecutor::StateSnapshot{};
@@ -4583,11 +4613,15 @@ private:
             executor_->set_input_embedding_overrides(
                 entry.input_embedding_overrides, entry.session_tokens,
                 entry.input_mrope_positions);
+            executor_->kvmem_restore_cached_window_identity(entry.attention_history);
             executor_->restore_state(entry.executor_state);
             executor_->kvmem_truncate_to(entry.position);
             if (!entry.selected_blocks.empty()) {
-                (void)executor_->kvmem_set_selection(entry.selected_blocks);
+                // Query re-selection can re-bake resident keys in another
+                // window frame. Restore from immutable K even on a GPU hit.
+                (void)executor_->kvmem_set_selection(entry.selected_blocks, true);
             }
+            executor_->kvmem_restore_attention_history(entry.attention_history);
             kvmem_api_boundary_pos_ = entry.api_boundary_pos;
             kvmem_api_tail_tokens_ = entry.api_tail_tokens;
             kvmem_api_tokens_ = entry.session_tokens;
@@ -9933,7 +9967,12 @@ private:
     // cross-request interference.
     void configure_executor_kvmem(QwenExecutor &exec) const {
         if (!options_.kvmem_enabled) return;
+        if (options_.kvmem_attention.enabled &&
+            (env_flag_enabled("QW3_CONTINUOUS_BATCHING") ||
+             !options_.kvmem_archive_dir.empty()))
+            throw std::invalid_argument("action attention currently requires --no-continuous-batching and online (non-archive) KVMem");
         KvMemStoreConfig bs_cfg;
+        bs_cfg.attention = options_.kvmem_attention;
         bs_cfg.repository_blocks = options_.kvmem_repository_blocks;
         if (options_.kvmem_repository_gc_mode == "off")
             bs_cfg.repository_gc_mode = KvMemRepositoryGc::Mode::Off;
@@ -11444,7 +11483,8 @@ private:
             options.kvmem_query_end > options.kvmem_query_begin,
             uint64_t(prompt.size()), sel_budget,
             options.kvmem_reselect_mode != KvMemReselectMode::Off,
-            options.kvmem_prepare_query_only,
+            options.kvmem_prepare_query_only ||
+                options.kvmem_middecode_trigger_tokens != 0,
             /*warm_capture=*/true, qc_source_index_supported);
         // Preparation needs the same checkpoint safety properties as active
         // selection: a post-query checkpoint must restore Q, and its source
@@ -12622,7 +12662,8 @@ private:
             options.kvmem_query_end > options.kvmem_query_begin,
             static_cast<uint64_t>(prompt_tokens.size()), kvmem_sel_budget,
             options.kvmem_reselect_mode != KvMemReselectMode::Off,
-            options.kvmem_prepare_query_only,
+            options.kvmem_prepare_query_only ||
+                options.kvmem_middecode_trigger_tokens != 0,
             warm_capture, qc_source_index_supported);
         const bool qc_select_active = qc.select_active;
         const bool qc_prepare = qc.prepare;
@@ -13696,6 +13737,9 @@ private:
         const int32_t eos = tokenizer_->eos_id();
         ThinkingBudgetState budget;
         budget_init(budget, options);
+        executor_->kvmem_action_begin(tokenizer_->token_id("<tool_call>"),
+            tokenizer_->token_id("</tool_call>"), tokenizer_->token_id("<think>"),
+            tokenizer_->token_id("</think>"), options.thinking_open);
         const int32_t seed_argmax = step.argmax_token >= 0 ? step.argmax_token : eos;
         uint32_t next_token = static_cast<uint32_t>(pick_next(seed_argmax));
         next_token = budget_apply(budget, next_token);
@@ -13792,6 +13836,7 @@ private:
         }
 #endif
         // Flush any trailing partial block's mean into the content index.
+        executor_->kvmem_action_end();
         executor_->kvmem_decode_capture_finalize();
         const bool end_index_finalized =
             executor_->kvmem_finalize_content_index_from_raw_k(
@@ -14300,7 +14345,8 @@ private:
             options.kvmem_query_end > options.kvmem_query_begin,
             logical_prompt_tokens, kvmem_sel_budget,
             options.kvmem_reselect_mode != KvMemReselectMode::Off,
-            options.kvmem_prepare_query_only,
+            options.kvmem_prepare_query_only ||
+                options.kvmem_middecode_trigger_tokens != 0,
             kvmem_warm_capture, qc_source_index_supported);
         const bool qc_select_active = qc.select_active;
         const bool qc_prepare = qc.prepare;
@@ -18008,6 +18054,9 @@ private:
 
         ThinkingBudgetState budget;
         budget_init(budget, options);
+        executor_->kvmem_action_begin(tokenizer_->token_id("<tool_call>"),
+            tokenizer_->token_id("</tool_call>"), tokenizer_->token_id("<think>"),
+            tokenizer_->token_id("</think>"), options.thinking_open);
         QwenExecutor::StateSnapshot thinking_boundary;
         std::vector<uint32_t> thinking_summary_prefix, thinking_summary_suffix, thinking_private_prompt;
         bool thinking_closed_pending = false;
@@ -18161,6 +18210,8 @@ private:
         // verify over the window stays authoritative, so a draft/window mismatch
         // only lowers acceptance, never correctness.
         const bool use_sequential_verifier = !dflash && mtp_verify_sequential_enabled();
+        if (use_sequential_verifier && options_.kvmem_attention.enabled)
+            throw std::invalid_argument("action attention requires batched target verification");
         const MtpTransactionalReplayMode transactional_replay_mode =
             !dflash && !use_sequential_verifier
                 ? mtp_transactional_replay_mode()
@@ -19668,6 +19719,11 @@ private:
         gen_tokens = retained;
         generated.clear();
         if (compacted) {
+            // No action has been published before the thinking boundary.
+            // Re-enter thinking while replaying its accepted replacement.
+            executor_->kvmem_action_begin(tokenizer_->token_id("<tool_call>"),
+                tokenizer_->token_id("</tool_call>"), tokenizer_->token_id("<think>"),
+                tokenizer_->token_id("</think>"), true);
             mtp_seen.clear();
             if (mtp_need_logits_pick) {
                 for (uint32_t token : prompt_tokens) ++mtp_seen[token];
@@ -19740,6 +19796,8 @@ private:
         maybe_capture_postselection_checkpoint();
         maybe_capture_decode_checkpoint();
         const double t_decode_end = wall_seconds();
+
+        executor_->kvmem_action_end();
 
         // kvmem prefix cache: record this request's end as the warm resume point.
         // warm_log = prompt + emitted tokens, resized down to the executor

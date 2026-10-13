@@ -135,6 +135,7 @@ add_library(qw3_core
     src/qwen_native_backend.cpp
     src/qwen_executor.cpp
     src/kvmem_blend.cpp
+    src/kvmem_action_attention.cpp
     src/qwen_weights.cpp
     src/qwen_config.cpp
     src/kvmem_store.cpp
@@ -298,6 +299,8 @@ if(QW3_BUILD_TESTS)
         add_test(NAME qw3-speculative-cli
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/speculative_cli_test.py
                     $<TARGET_FILE:qw3>)
+        add_test(NAME qw3-kvmem-attention-cli
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/kvmem_attention_cli_test.py $<TARGET_FILE:qw3>)
     endif()
     add_executable(qw3-completion-stop-buffer tests/completion_stop_buffer_test.cpp)
     target_include_directories(qw3-completion-stop-buffer PRIVATE src)
@@ -377,6 +380,10 @@ if(QW3_BUILD_TESTS)
 
     add_test(NAME qw3-prompt-render COMMAND qw3-prompt-render)
 
+    add_executable(qw3-kvmem-action-attention tests/kvmem_action_attention_test.cpp)
+    target_link_libraries(qw3-kvmem-action-attention PRIVATE qw3_core)
+    target_include_directories(qw3-kvmem-action-attention PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME qw3-kvmem-action-attention COMMAND qw3-kvmem-action-attention)
     add_executable(qw3-kvmem-store tests/kvmem_store_test.cpp)
     target_link_libraries(qw3-kvmem-store PRIVATE qw3_core)
     add_test(NAME qw3-kvmem-store COMMAND qw3-kvmem-store)
@@ -435,6 +442,11 @@ if(QW3_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME qw3-kvmem-refresh-policy
         COMMAND qw3-kvmem-refresh-policy)
+
+    add_executable(qw3-kvmem-file-evidence tests/kvmem_file_evidence_test.cpp)
+    target_include_directories(qw3-kvmem-file-evidence PRIVATE src)
+    target_include_directories(qw3-kvmem-file-evidence SYSTEM PRIVATE third_party)
+    add_test(NAME qw3-kvmem-file-evidence COMMAND qw3-kvmem-file-evidence)
 
     add_executable(qw3-dflash-deferred-refresh-policy
         tests/dflash_deferred_refresh_test.cpp)
@@ -566,6 +578,11 @@ if(QW3_BUILD_TESTS)
             ENVIRONMENT "QW3_PREFILL_ATTN=mma-gqa-v2;QW3_PREFILL_ATTN_MIN_BATCH=1;QW3_DECODE_ATTN=native"
             LABELS "cuda;native_attention" TIMEOUT 180)
         if(QW3_ENABLE_FLASHINFER)
+            add_executable(qw3-action-attention-capture tests/action_attention_capture.cu)
+            target_link_libraries(qw3-action-attention-capture PRIVATE qw3_core)
+            set_property(TARGET qw3-action-attention-capture PROPERTY CUDA_STANDARD 17)
+            add_test(NAME qw3-action-attention-capture COMMAND qw3-action-attention-capture)
+            set_tests_properties(qw3-action-attention-capture PROPERTIES LABELS "cuda" TIMEOUT 180)
             add_executable(qw3-flashinfer-decode-gqa tests/flashinfer_decode_gqa.cu)
             add_executable(qw3-flashinfer-verify-plan-cache tests/flashinfer_verify_plan_cache.cu)
             target_link_libraries(qw3-flashinfer-verify-plan-cache PRIVATE qw3_core)
@@ -621,6 +638,9 @@ if(QW3_BUILD_TESTS)
         target_link_libraries(qw3-kvmem-repository-index PRIVATE qw3_core)
         add_test(NAME qw3-kvmem-repository-index COMMAND qw3-kvmem-repository-index)
         add_executable(qw3-kvmem-repository-model-probe tests/kvmem_repository_model_probe.cpp)
+        add_executable(qw3-kvmem-action-model-probe tests/kvmem_action_model_probe.cpp)
+        target_include_directories(qw3-kvmem-action-model-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(qw3-kvmem-action-model-probe PRIVATE qw3_core)
         add_executable(qw3-kvmem-blend-model-probe tests/kvmem_blend_model_probe.cpp)
         add_executable(qw3-kvmem-mix-rows tests/kvmem_mix_rows_test.cu)
         target_link_libraries(qw3-kvmem-mix-rows PRIVATE qw3_core)
