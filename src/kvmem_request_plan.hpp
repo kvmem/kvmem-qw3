@@ -304,9 +304,9 @@ inline KvMemRequestPlan kvmem_draft_request_plan(
 
 struct KvmemRequestCheckpointInput {
     bool warm_state_available = false;
-    uint32_t resume_position = 0;
+    uint64_t resume_position = 0;
     bool prompt_checkpoint = false;
-    uint32_t common_prefix = 0;
+    uint64_t common_prefix = 0;
 };
 
 // Finalize the same plan before device.begin(), restore_state(), reset_state(),

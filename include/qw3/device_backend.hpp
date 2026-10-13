@@ -1,4 +1,5 @@
 #pragma once
+#include "qw3/target_sampling.hpp"
 
 #include <cstdint>
 #include <mutex>
@@ -401,6 +402,35 @@ public:
         return {};
     }
 
+    // Optional wide verifier that retains serial decode's Q8_1 quantization
+    // and four-warp reduction. Callers retain the small-tile reference when
+    // unavailable; a generic prefill GEMM is not numerically interchangeable.
+    virtual bool supports_q8_verify_fanout() const { return false; }
+    virtual DeviceStatus q8_verify_fanout(DeviceTensor *const *outs,
+                                         const DeviceWeight *const *weights,
+                                         const uint32_t *out_strides,
+                                         uint32_t n, const DeviceTensor &x,
+                                         uint32_t batch, uint32_t in_stride) {
+        (void)outs; (void)weights; (void)out_strides; (void)n; (void)x;
+        (void)batch; (void)in_stride;
+        return {false, "wide Q8 verifier fanout unavailable"};
+    }
+
+    // Experimental INT8 tensor-core verifier. It preserves decode's Q8_1
+    // integer values and half-rounded scales, but changes FP32 reduction.
+    // Kept separate from the bit-exact wide API so draft callers cannot opt
+    // into different arithmetic through a process-global backend switch.
+    virtual bool supports_q8_verify_mma() const { return false; }
+    virtual DeviceStatus q8_verify_fanout_mma(DeviceTensor *const *outs,
+                                             const DeviceWeight *const *weights,
+                                             const uint32_t *out_strides,
+                                             uint32_t n, const DeviceTensor &x,
+                                             uint32_t batch, uint32_t in_stride) {
+        (void)outs; (void)weights; (void)out_strides; (void)n; (void)x;
+        (void)batch; (void)in_stride;
+        return {false, "INT8 MMA Q8 verifier unavailable"};
+    }
+
     // Run several batched Q8_0 matmuls that share the same input batch. Backends
     // can reuse input-side staging/quantization work across projections.
     // `out_strides[i]` is the row stride for `outs[i]`.
@@ -607,6 +637,28 @@ public:
         }
         return {};
     }
+    // Independent DFlash blocks share weights, but each GEMM must retain the
+    // private request's shape/reduction. Merging the row dimension changes
+    // cuBLAS arithmetic and can change a later BF16 rounding and proposal.
+    virtual DeviceStatus dflash_linear_blocks(DeviceTensor &out,
+                                              const DeviceWeight &weight,
+                                              const DeviceTensor &input,
+                                              uint32_t blocks, uint32_t rows) {
+        if (!blocks || !rows || input.dtype != DeviceTensorDType::F32 ||
+            out.dtype != DeviceTensorDType::F32 ||
+            input.count / blocks / rows < weight.cols ||
+            out.count / blocks / rows < weight.rows)
+            return {false, "invalid DFlash linear blocks"};
+        for (uint32_t b = 0; b < blocks; ++b) {
+            auto x = tensor_view(const_cast<DeviceTensor &>(input), uint64_t(b) * rows * weight.cols * 4,
+                                 uint64_t(rows) * weight.cols, 4, DeviceTensorDType::F32, "draft-linear-x");
+            auto y = tensor_view(out, uint64_t(b) * rows * weight.rows * 4,
+                                 uint64_t(rows) * weight.rows, 4, DeviceTensorDType::F32, "draft-linear-y");
+            if (!x || !y) return {false, "invalid DFlash linear block view"};
+            if (auto s = linear_matmul(*y, weight, *x, rows, weight.cols, weight.rows); !s.ok) return s;
+        }
+        return {};
+    }
     virtual DeviceStatus linear_matmul_add(DeviceTensor &out,
                                            const DeviceTensor &residual,
                                            DeviceTensor &matmul_tmp,
@@ -620,6 +672,65 @@ public:
             return st;
         }
         return add(out, residual, matmul_tmp);
+    }
+
+    virtual bool supports_target_sampling() const { return false; }
+    virtual DeviceStatus sample_target_rows(const DeviceTensor &, const DeviceSamplingRequest &,
+                                            DeviceSamplingResult &) {
+        return {false, "GPU target sampling requires CUDA"};
+    }
+
+    // DFlash 2 operators. Activations are contiguous FP32; token IDs are I32.
+    // Conv dynamic: [rows, 2, taps, hidden/group]; base: [2, taps, hidden].
+    // Rows are split into independent blocks (including each anchor).
+    // Pack one target layer into [row, tap, hidden] FP32 features. The source
+    // may be FP32 or BF16 and have a larger row stride than the hidden width.
+    virtual DeviceStatus dflash_capture_features(
+            DeviceTensor &, const DeviceTensor &, uint32_t, uint32_t,
+            uint32_t, uint32_t, uint32_t) {
+        return {false, "DFlash feature capture not implemented"};
+    }
+
+    virtual DeviceStatus dflash_grouped_conv(
+            DeviceTensor &, const DeviceTensor &, const DeviceTensor &,
+            const DeviceWeight &, uint32_t /*rows*/, uint32_t /*hidden*/,
+            uint32_t /*block*/, uint32_t /*taps*/, uint32_t /*group*/, uint32_t /*side*/) {
+        return {false, "DFlash grouped convolution requires CUDA"};
+    }
+    // Q: [queries, heads, dim], KV: [keys, kv_heads, dim]. Query rows are
+    // aligned to the tail of KV; the symmetric sliding mask is non-causal.
+    virtual DeviceStatus dflash_attention(
+            DeviceTensor &, const DeviceTensor &, const DeviceTensor &, const DeviceTensor &,
+            uint32_t /*queries*/, uint32_t /*keys*/, uint32_t /*heads*/,
+            uint32_t /*kv_heads*/, uint32_t /*dim*/, uint32_t /*window*/) {
+        return {false, "DFlash attention requires CUDA"};
+    }
+    // Independent request caches, common query block width. Metadata is
+    // caller-owned scratch (six I32 elements per request for CUDA pointers and
+    // key count); the backend validates and uploads it before launching.
+    virtual DeviceStatus dflash_attention_batch(
+            DeviceTensor &, const DeviceTensor &, DeviceTensor &,
+            const DeviceTensor *const *, const DeviceTensor *const *, const uint32_t *,
+            uint32_t /*blocks*/, uint32_t /*queries*/, uint32_t /*heads*/,
+            uint32_t /*kv_heads*/, uint32_t /*dim*/, uint32_t /*window*/) {
+        return {false, "batched DFlash attention requires CUDA"};
+    }
+    // Output planes: [rows, top_k]; scratch planes:
+    // [rows, ceil(vocab/4096), top_k]. Ties use ascending vocabulary ID.
+    virtual DeviceStatus dflash_topk(
+            DeviceTensor &, DeviceTensor &, const DeviceTensor &, DeviceTensor &, DeviceTensor &,
+            uint32_t /*rows*/, uint32_t /*vocab*/, uint32_t /*top_k*/) {
+        return {false, "DFlash top-k requires CUDA"};
+    }
+    // Conditional path selection. Hidden is already projected to selector
+    // rank. Uniforms are independent [0,1) draws per block/position; returned
+    // probabilities correspond to the candidate IDs and chosen predecessor.
+    virtual DeviceStatus dflash_select(
+            DeviceTensor &, DeviceTensor &, const DeviceTensor &, const DeviceTensor &,
+            const DeviceTensor &, const DeviceWeight &, const DeviceWeight &,
+            const DeviceTensor &, const DeviceTensor &, uint32_t /*blocks*/,
+            uint32_t /*positions*/, uint32_t /*top_k*/, uint32_t /*rank*/, float /*temperature*/) {
+        return {false, "DFlash selector requires CUDA"};
     }
 
     virtual DeviceStatus rms_norm(DeviceTensor &out, const DeviceTensor &x, const DeviceWeight &weight, float eps) = 0;
@@ -1266,6 +1377,29 @@ public:
         (void)accum; (void)q; (void)kbar; (void)q_stride; (void)n_blocks;
         (void)n_heads; (void)n_kv_heads; (void)head_dim; (void)scale;
         return {false, "block_attn_score_step_device requires backend override"};
+    }
+
+    // Scope a single paged attention call's optional logit tap. Passing null
+    // disarms it; the ordinary inference kernels remain unchanged otherwise.
+    // Mask bit r refers to first_row + r * row_step in the unsplit call.
+    virtual DeviceStatus attention_capture_set(DeviceTensor *logits,
+            uint64_t rows, uint32_t stride, uint32_t heads, uint32_t first_row = 0,
+            uint32_t row_step = 1) {
+        (void)rows; (void)stride; (void)heads; (void)first_row; (void)row_step;
+        return logits ? DeviceStatus{false, "attention capture requires CUDA FlashInfer"}
+                      : DeviceStatus{true, nullptr};
+    }
+    // Reduce captured, already-computed logits; output [sample, block+tail],
+    // averaged across heads. No query/key multiplication is performed here.
+    virtual DeviceStatus attention_capture_reduce(DeviceTensor &mass,
+            const DeviceTensor &logits, uint64_t rows, uint32_t stride,
+            uint32_t heads, uint32_t base_seq_len, uint32_t blocks,
+            const DeviceTensor &win_base, const DeviceTensor &block_tokens,
+            float weight = 1.0f, bool accumulate = false, uint32_t row_step = 1) {
+        (void)mass; (void)logits; (void)rows; (void)stride; (void)heads;
+        (void)base_seq_len; (void)blocks; (void)win_base; (void)block_tokens;
+        (void)weight; (void)accumulate; (void)row_step;
+        return {false, "attention capture reduction requires CUDA FlashInfer"};
     }
 
     // Diagnostic-only true attention mass tracing. Recomputes the decode
@@ -2785,6 +2919,19 @@ public:
                                   uint64_t count) {
         (void)dst; (void)src; (void)src_offset; (void)count;
         return {false, "copy_d2d not implemented for this backend"};
+    }
+
+    // Mix packed old rows into recomputed, paged K/V. physical_rows contains
+    // caller-validated I32 row indices; old K/V are packed in that same order.
+    // Arithmetic is FP32, with a single cast back to the cache dtype. alpha=1
+    // preserves recomputed bytes, alpha=0 restores old bytes exactly.
+    virtual DeviceStatus mix_kv_rows(DeviceTensor &k, DeviceTensor &v,
+                                     const DeviceTensor &old_k, const DeviceTensor &old_v,
+                                     const DeviceTensor &physical_rows,
+                                     uint32_t rows, uint32_t width, float alpha) {
+        (void)k; (void)v; (void)old_k; (void)old_v; (void)physical_rows;
+        (void)rows; (void)width; (void)alpha;
+        return {false, "mix_kv_rows requires backend support"};
     }
 
     // Offset-aware device-to-device copy. Counts are in tensor elements.

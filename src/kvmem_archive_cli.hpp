@@ -85,6 +85,7 @@ struct KvMemArchiveRunConfig {
     float temperature = 0.0f;
     float top_p = 1.0f;
     int top_k = 0;
+    SamplingFilterOrder sampling_filter_order = SamplingFilterOrder::Joint;
     int thinking_budget = 0;
     QuestionFormat question_format = QuestionFormat::Raw;
     // Default off. The mutually-exclusive CLI selectors either retain top

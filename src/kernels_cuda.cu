@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +20,10 @@
 #include <vector>
 
 #include "cuda_helpers.cuh"
+#include "dflash_cuda.hpp"
+#include "flashinfer_decode_plan.hpp"
+#include "flashinfer_attention_capture.hpp"
+#include "target_sampling_cuda.hpp"
 #ifdef QW3_ENABLE_FLASHINFER
 #include "flashinfer_vision_adapter.hpp"
 #endif
@@ -62,6 +67,8 @@ bool launch_quantize_q8_1(
         const float *x, void *y_q8_1,
         uint32_t batch, uint32_t cols, uint32_t stride_x_row,
         cudaStream_t stream);
+bool launch_repack_q8_1_mmq(const void *q8_1, void *q8_1_mmq,
+                          uint32_t batch, uint32_t cols, cudaStream_t stream);
 bool launch_mmvq_q8_0(
         const uint8_t *weight, const void *y_q8_1, float *dst,
         uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
@@ -118,6 +125,10 @@ bool launch_mmq_q8_0_medium(
         const uint8_t *weight, const void *y_q8_1_mmq, float *dst,
         uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
         cudaStream_t stream);
+bool launch_mmq_q8_0_verify_small(
+        const uint8_t *weight, const void *y_q8_1_mmq, float *dst,
+        uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
+        uint32_t m_warps, cudaStream_t stream);
 
 // Q8_1_MMQ activation staging — required by MMQ v4 kernel (144 B/block,
 // super-block-major × j-minor). Falls back to Q8_1 (36 B) for v2/v3.
@@ -816,7 +827,8 @@ bool launch_batch_prefill_paged_f16q_f16kv_gated(
         uint32_t out_batch_stride,
         float scale,
         cudaStream_t stream,
-        bool *plan_cache_hit_out);
+        bool *plan_cache_hit_out,
+        const AttentionCapture *capture = nullptr);
 
 bool launch_batch_prefill_paged_f16q_fp8kv_gated(
         float *out,
@@ -843,7 +855,8 @@ bool launch_batch_prefill_paged_f16q_fp8kv_gated(
         uint32_t out_batch_stride,
         float scale,
         cudaStream_t stream,
-        bool *plan_cache_hit_out);
+        bool *plan_cache_hit_out,
+        const AttentionCapture *capture = nullptr);
 
 bool launch_batch_prefill_paged_ragged_f16q_f16kv_gated(
         float *out,
@@ -977,7 +990,8 @@ bool launch_batch_decode_f32q_f16kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        const AttentionCapture *capture = nullptr);
 
 bool launch_batch_decode_f32q_fp8kv_gated(
         float *out,
@@ -1007,7 +1021,8 @@ bool launch_batch_decode_f32q_fp8kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        const AttentionCapture *capture = nullptr);
 }
 #endif
 
@@ -1396,6 +1411,22 @@ __device__ float fp16_to_f32_device(uint16_t h) {
     return f;
 }
 
+// Diagnostic only: preserve tensor lifetime/precision and report large owned
+// allocations alongside device-wide usage. Workspace traces cover allocations
+// managed directly by the backend rather than through CudaTensor.
+void trace_cuda_tensor_allocation(const char *event, const std::string &label,
+                                  uint64_t bytes) {
+    static const bool enabled = env_flag_enabled_local("QW3_CUDA_TENSOR_ALLOC_TRACE", false);
+    if (!enabled || bytes < (1ULL << 20)) return;
+    size_t free_bytes = 0, total_bytes = 0;
+    const cudaError_t status = cudaMemGetInfo(&free_bytes, &total_bytes);
+    std::fprintf(stderr,
+        "[cuda-tensor-allocation] event=%s label=%s bytes=%llu device_used_bytes=%llu status=%d\n",
+        event, label.c_str(), static_cast<unsigned long long>(bytes),
+        static_cast<unsigned long long>(status == cudaSuccess ? total_bytes - free_bytes : 0),
+        static_cast<int>(status));
+}
+
 struct CudaTensor final : DeviceTensor {
     float *ptr = nullptr;
     std::string label;
@@ -1443,6 +1474,7 @@ struct CudaTensor final : DeviceTensor {
                           cudaGetErrorString(err));
             throw std::runtime_error(msg);
         }
+        trace_cuda_tensor_allocation("allocate", label, bytes);
         if (zero_initialize) {
             if (g_tensor_init_stream) {
                 cudaMemsetAsync(ptr, 0, bytes, g_tensor_init_stream);
@@ -1476,7 +1508,10 @@ struct CudaTensor final : DeviceTensor {
         owns_ptr = false;
     }
     ~CudaTensor() override {
-        if (ptr && owns_ptr) cudaFree(ptr);
+        if (ptr && owns_ptr) {
+            cudaFree(ptr);
+            trace_cuda_tensor_allocation("free", label, count * static_cast<uint64_t>(elem_size));
+        }
         if (scale) cudaFree(scale);
     }
     // Attach a Q8 scale plane. `n` int8 elements grouped into rows of
@@ -3638,6 +3673,8 @@ __global__ void deltanet_kernel(float *core,
         __syncthreads();
     }
     const float delta = (v[j] - scratch[0]) * b;
+    // All warps must consume the reduction before scratch[0] is reused.
+    __syncthreads();
     row[tid] += delta * k[tid];
     scratch[tid] = row[tid] * q[tid];
     __syncthreads();
@@ -3703,9 +3740,13 @@ __global__ void recurrent_conv_batch_kernel(float *out,         // [T, *] stride
 
     for (uint32_t t = 0; t < T; ++t) {
         const float cur = proj[t * proj_stride + c];
-        float acc = w_buf[CONV_K - 1] * cur;
+        // Match single-token decode's oldest-to-newest accumulation. Changing
+        // the FMA order can cross a BF16 residual / Q8 quantization boundary
+        // during speculative verification even for a one-token batch.
+        float acc = 0.0f;
         #pragma unroll
         for (uint32_t k = 0; k + 1 < CONV_K; ++k) acc += w_buf[k] * st_buf[k];
+        acc += w_buf[CONV_K - 1] * cur;
         out[t * out_stride + c] = acc / (1.0f + expf(-acc));
         // Shift state window.
         #pragma unroll
@@ -3752,8 +3793,7 @@ __global__ void recurrent_conv_prefill_parallel_kernel(
     for (uint32_t k = 0; k < CONV_K; ++k) w_buf[k] = w[k];
 
     for (uint32_t t = t_begin; t < t_end; ++t) {
-        float acc = w_buf[CONV_K - 1] *
-                    proj[static_cast<uint64_t>(t) * proj_stride + c];
+        float acc = 0.0f;
         #pragma unroll
         for (uint32_t k = 0; k + 1 < CONV_K; ++k) {
             const int64_t source_t =
@@ -3763,6 +3803,8 @@ __global__ void recurrent_conv_prefill_parallel_kernel(
                 : initial[source_t + (CONV_K - 1)];
             acc += w_buf[k] * x;
         }
+        acc += w_buf[CONV_K - 1] *
+               proj[static_cast<uint64_t>(t) * proj_stride + c];
         out[static_cast<uint64_t>(t) * out_stride + c] =
             acc / (1.0f + expf(-acc));
     }
@@ -3846,11 +3888,12 @@ __global__ void recurrent_conv_prefill_parallel_lazy_fp8_kernel(
         const float current = recurrent_lazy_fp8_value(
             raw, activation_scales, weight_scales,
             raw_stride, row_offset, t, c);
-        float acc = w_buf[CONV_K - 1] * current;
+        float acc = 0.0f;
         #pragma unroll
         for (uint32_t i = 0; i + 1 < CONV_K; ++i) {
             acc += w_buf[i] * history[i];
         }
+        acc += w_buf[CONV_K - 1] * current;
         out[static_cast<uint64_t>(t) * out_stride + c] =
             acc / (1.0f + expf(-acc));
         #pragma unroll
@@ -4059,9 +4102,10 @@ __global__ void recurrent_conv_independent_batch_kernel(
     if (b >= B || c >= conv_dim) return;
     const float *w = conv_w + c * CONV_K;
     float *st = state + static_cast<uint64_t>(b) * state_stride + c * (CONV_K - 1);
-    float acc = w[CONV_K - 1] * proj[static_cast<uint64_t>(b) * proj_stride + c];
+    float acc = 0.0f;
     #pragma unroll
     for (uint32_t k = 0; k + 1 < CONV_K; ++k) acc += w[k] * st[k];
+    acc += w[CONV_K - 1] * proj[static_cast<uint64_t>(b) * proj_stride + c];
     out[static_cast<uint64_t>(b) * out_stride + c] =
         acc / (1.0f + expf(-acc));
     #pragma unroll
@@ -4102,9 +4146,10 @@ __global__ void recurrent_conv_ragged_batch_kernel(
     for (uint32_t k = 0; k < CONV_K; ++k) w_buf[k] = w[k];
     for (uint32_t t = begin; t < end; ++t) {
         const float cur = proj[static_cast<uint64_t>(t) * proj_stride + c];
-        float acc = w_buf[CONV_K - 1] * cur;
+        float acc = 0.0f;
         #pragma unroll
         for (uint32_t k = 0; k + 1 < CONV_K; ++k) acc += w_buf[k] * st_buf[k];
+        acc += w_buf[CONV_K - 1] * cur;
         out[static_cast<uint64_t>(t) * out_stride + c] =
             acc / (1.0f + expf(-acc));
         #pragma unroll
@@ -4264,6 +4309,7 @@ __global__ void deltanet_batch_kernel(float *core,                  // [T, *] st
             __syncthreads();
         }
         const float delta = (v_j - scratch[0]) * b;
+        __syncthreads(); // Finish the broadcast before reusing scratch.
         row_val += delta * k;
         scratch[tid] = row_val * q;
         __syncthreads();
@@ -4512,6 +4558,7 @@ __global__ void deltanet_independent_batch_kernel(
         __syncthreads();
     }
     const float delta = (v_j - scratch[0]) * beta_sigmoid;
+    __syncthreads(); // Finish the broadcast before reusing scratch.
     row_val += delta * k;
     row[tid] = row_val;
 
@@ -4594,6 +4641,7 @@ __global__ void deltanet_ragged_batch_kernel(
             __syncthreads();
         }
         const float delta = (v_j - scratch[0]) * beta_sigmoid;
+        __syncthreads(); // Finish the broadcast before reusing scratch.
         row_val += delta * k;
         scratch[tid] = row_val * q;
         __syncthreads();
@@ -7866,6 +7914,50 @@ __device__ __forceinline__ uint32_t kvmem_window_bucket_for_pos(
     return (pos < base + n) ? idx : n_window_blocks;  // final slot = decode tail
 }
 
+// A sampled-row reduction reads logits, never Q or K. One CTA per head.
+__global__ void captured_attention_mass_kernel(float *mass, const float *logits,
+        uint64_t rows, uint32_t stride, uint32_t heads, uint32_t base,
+        uint32_t blocks, const int32_t *starts, const int32_t *counts,
+        float weight, uint32_t row_step) {
+    const uint32_t slot = blockIdx.y, head = blockIdx.x, tid = threadIdx.x;
+    uint64_t remaining = rows;
+    for (uint32_t i = 0; i < slot; ++i) remaining &= remaining - 1;
+    const uint32_t row = __ffsll(remaining) - 1;
+    const uint32_t length = base + row * row_step + 1;
+    const float *x = logits + (uint64_t(slot) * heads + head) * stride;
+    __shared__ float scratch[256];
+    float value = -INFINITY;
+    for (uint32_t i = tid; i < length; i += 256) value = fmaxf(value, x[i]);
+    scratch[tid] = value;
+    __syncthreads();
+    for (uint32_t n = 128; n; n >>= 1) {
+        if (tid < n) scratch[tid] = fmaxf(scratch[tid], scratch[tid+n]);
+        __syncthreads();
+    }
+    const float maximum = scratch[0];
+    __syncthreads();
+    value = 0;
+    for (uint32_t i = tid; i < length; i += 256) value += __expf(x[i] - maximum);
+    scratch[tid] = value;
+    __syncthreads();
+    for (uint32_t n = 128; n; n >>= 1) {
+        if (tid < n) scratch[tid] += scratch[tid+n];
+        __syncthreads();
+    }
+    const float inv = weight / (scratch[0] * heads);
+    // Window blocks are adjacent and cover the assembled prefix; the last
+    // bucket accounts for subsequently appended tokens without mislabeling
+    // their history identity as a selected block.
+    for (uint32_t b = tid; b <= blocks; b += 256) {
+        const uint32_t begin = b < blocks ? starts[b] :
+            (blocks ? starts[blocks-1] + counts[blocks-1] : 0);
+        const uint32_t end = b < blocks ? min(begin + uint32_t(counts[b]), length) : length;
+        float sum = 0;
+        for (uint32_t i = begin; i < end; ++i) sum += __expf(x[i] - maximum);
+        atomicAdd(mass + uint64_t(slot) * (blocks+1) + b, sum * inv);
+    }
+}
+
 template <typename T>
 __global__ void block_attention_mass_paged_kernel(float *mass,
                                                   const float *q,
@@ -8068,7 +8160,14 @@ __global__ void block_kmean_content_batch_kernel(const float *k_batch,
     const uint32_t sub_tokens = (blk_tokens + n_subblocks - 1) / n_subblocks;
     const uint32_t blk_lo = j * blk_tokens;
     const uint32_t r_lo = blk_lo + sb * sub_tokens;
-    if (r_lo >= batch) return;
+    const uint64_t blk = (kbar_block_base + j) * n_subblocks + sb;
+    const uint64_t out = (blk * gridDim.y + h) * head_dim + d;
+    if (r_lo >= batch) {
+        // Capture overwrites the whole destination block, including unused
+        // subblocks in a partial tail. Staging may contain an older block.
+        kbar[out] = static_cast<KbarT>(0.0f);
+        return;
+    }
     uint32_t r_hi = r_lo + sub_tokens;
     const uint32_t blk_hi = blk_lo + blk_tokens;
     if (r_hi > blk_hi) r_hi = blk_hi;   // last sub-block stops at the block end
@@ -8102,9 +8201,7 @@ __global__ void block_kmean_content_batch_kernel(const float *k_batch,
     }
     const uint32_t n = r_hi - r_lo;
     const float inv = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
-    const uint64_t blk = (kbar_block_base + j) * n_subblocks + sb;
-    kbar[(blk * gridDim.y + h) * head_dim + d] =
-        static_cast<KbarT>(acc * inv);
+    kbar[out] = static_cast<KbarT>(acc * inv);
 }
 
 // Fixed-4 Key-direction prototype capture. Unlike equal-width sub-blocks, the
@@ -8642,7 +8739,14 @@ __global__ void block_kmean_content_batch_merge_kernel(
     const uint32_t incoming_hi = incoming_lo + batch;
     const uint32_t overlap_lo = max(sb_lo, incoming_lo);
     const uint32_t overlap_hi = min(sb_hi, incoming_hi);
-    if (overlap_lo >= overlap_hi) return;
+    const uint64_t blk = (kbar_block_base + j) * n_subblocks + sb;
+    const uint64_t out = (blk * gridDim.y + h) * head_dim + d;
+    if (overlap_lo >= overlap_hi) {
+        // Keep already captured prefix subblocks; clear only rows beyond the
+        // new tail, which may otherwise retain an unrelated staged mean.
+        if (sb_lo >= incoming_hi) kbar[out] = static_cast<KbarT>(0.0f);
+        return;
+    }
 
     // Only the first destination block can contain an existing prefix. This
     // generic intersection naturally yields zero for later blocks/sub-blocks.
@@ -8680,8 +8784,6 @@ __global__ void block_kmean_content_batch_merge_kernel(
         acc += deroped;
     }
     const uint32_t added = r_hi - r_lo;
-    const uint64_t blk = (kbar_block_base + j) * n_subblocks + sb;
-    const uint64_t out = (blk * gridDim.y + h) * head_dim + d;
     const float prior_sum = prior > 0
         ? static_cast<float>(kbar[out]) * static_cast<float>(prior) : 0.0f;
     kbar[out] = static_cast<KbarT>(
@@ -9716,6 +9818,21 @@ struct Fp8LtPlan {
     }
 };
 
+struct DFlashLtPlan {
+    uint64_t outputs = 0, inputs = 0;
+    uint32_t request_rows = 0, total_rows = 0;
+    bool supported = false;
+    cublasLtMatmulDesc_t operation = nullptr;
+    cublasLtMatrixLayout_t weight = nullptr, input = nullptr, output = nullptr;
+    cublasLtMatmulAlgo_t algorithm{};
+    ~DFlashLtPlan() {
+        if (output) cublasLtMatrixLayoutDestroy(output);
+        if (input) cublasLtMatrixLayoutDestroy(input);
+        if (weight) cublasLtMatrixLayoutDestroy(weight);
+        if (operation) cublasLtMatmulDescDestroy(operation);
+    }
+};
+
 __global__ void scatter_bf16_rows_kernel(
         void *dst_raw,
         bool dst_bf16,
@@ -9925,6 +10042,25 @@ __global__ void vision_bf16_compact_heads_kernel(
                     head * padded_head_dim + lane];
 }
 
+template <typename T>
+__global__ void mix_kv_rows_kernel(T *k, T *v, const T *old_k, const T *old_v,
+                                  const int32_t *physical_rows, uint64_t count,
+                                  uint32_t width, uint64_t capacity_rows, float alpha) {
+    const uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t row = static_cast<uint32_t>(physical_rows[i / width]);
+    if (row >= capacity_rows) return;
+    const uint64_t at = uint64_t(row) * width + i % width;
+    if (alpha == 0) {
+        k[at] = old_k[i]; v[at] = old_v[i];
+    } else {
+        k[at] = T(__fadd_rn(__fmul_rn(alpha, float(k[at])),
+                          __fmul_rn(1.0f - alpha, float(old_k[i]))));
+        v[at] = T(__fadd_rn(__fmul_rn(alpha, float(v[at])),
+                          __fmul_rn(1.0f - alpha, float(old_v[i]))));
+    }
+}
+
 class CudaDeviceBackend final : public DeviceBackend {
     static constexpr uint32_t kFlashInferBatchPrefillHostSlots = 8;
     static constexpr uint32_t kHostEmbeddingSlots = 2;
@@ -9970,6 +10106,7 @@ public:
         }
         if (host_embedding_argmax_) cudaFreeHost(host_embedding_argmax_);
         fp8_lt_plans_.clear();
+        dflash_lt_plans_.clear();
         if (cublas_handle_) cublasDestroy(cublas_handle_);
         if (cublaslt_handle_) cublasLtDestroy(cublaslt_handle_);
         if (cublaslt_workspace_) cudaFree(cublaslt_workspace_);
@@ -10413,6 +10550,8 @@ public:
 
     DeviceStatus replay_graph() override {
         if (!graph_instance_) return {false, "no captured graph to replay"};
+        // A captured metadata upload can overwrite the shared decode workspace.
+        flashinfer_decode_plan_uploaded_ = false;
         cudaError_t st = cudaGraphLaunch(graph_instance_, exec_stream_);
         if (st != cudaSuccess) {
             (void)cudaGetLastError();
@@ -11685,6 +11824,111 @@ public:
         return launch_status("cuda q8_0_matvec_fanout");
     }
 
+    bool supports_q8_verify_fanout() const override {
+        // Experimental until operator, model and timing gates close. This
+        // opt-in only affects Q8VerificationMath, never ordinary prefill GEMM.
+        const char *value = std::getenv("QW3_Q8_VERIFY_WIDE");
+        return value && std::strcmp(value, "1") == 0 &&
+            matvec_kernel_choice() == MatvecKernel::Ported;
+    }
+
+    DeviceStatus q8_verify_fanout(DeviceTensor *const *outs,
+                                  const DeviceWeight *const *weights,
+                                  const uint32_t *out_strides,
+                                  uint32_t n, const DeviceTensor &x,
+                                  uint32_t batch, uint32_t in_stride) override {
+        return q8_verify_fanout_impl(outs, weights, out_strides, n, x, batch, in_stride, false);
+    }
+
+    bool supports_q8_verify_mma() const override {
+        return matvec_kernel_choice() == MatvecKernel::Ported;
+    }
+
+    DeviceStatus q8_verify_fanout_mma(DeviceTensor *const *outs,
+                                      const DeviceWeight *const *weights,
+                                      const uint32_t *out_strides,
+                                      uint32_t n, const DeviceTensor &x,
+                                      uint32_t batch, uint32_t in_stride) override {
+        return q8_verify_fanout_impl(outs, weights, out_strides, n, x, batch, in_stride, true);
+    }
+
+    DeviceStatus q8_verify_fanout_impl(DeviceTensor *const *outs,
+                                      const DeviceWeight *const *weights,
+                                      const uint32_t *out_strides,
+                                      uint32_t n, const DeviceTensor &x,
+                                      uint32_t batch, uint32_t in_stride, bool mma) {
+        if (!n || !batch) return {};
+        if (n > 4 || x.dtype != DeviceTensorDType::F32)
+            return {false, "Q8 wide fanout requires one to four F32 outputs"};
+        const uint64_t cols = weights[0]->cols;
+        if (!cols || cols > UINT32_MAX || cols % 32 || in_stride < cols ||
+            x.count < uint64_t(batch) * in_stride)
+            return {false, "invalid Q8 wide fanout input shape"};
+        if (mma && cols % 256)
+            return {false, "Q8 verifier MMA requires aligned weight planes (cols multiple of 256)"};
+        const uint8_t *wptr[4] = {};
+        float *optr[4] = {};
+        uint32_t rows[4] = {}, strides[4] = {};
+        for (uint32_t i = 0; i < n; ++i) {
+            const auto &w = as_weight(*weights[i]);
+            auto &o = as_tensor(*outs[i]);
+            if (w.type != WeightType::Q8_0 || w.cols != cols || !w.rows ||
+                w.rows > UINT32_MAX || out_strides[i] < w.rows ||
+                o.dtype != DeviceTensorDType::F32 ||
+                o.count < uint64_t(batch) * out_strides[i])
+                return {false, "invalid Q8 wide fanout output shape"};
+            wptr[i] = static_cast<const uint8_t *>(w.ptr);
+            optr[i] = o.ptr;
+            rows[i] = static_cast<uint32_t>(w.rows);
+            strides[i] = out_strides[i];
+        }
+        if (auto st = ensure_q8_1_scratch(batch, static_cast<uint32_t>(cols)); !st.ok)
+            return st;
+        if (!ported::launch_quantize_q8_1(as_tensor(x).ptr, q8_1_scratch_, batch,
+                static_cast<uint32_t>(cols), in_stride, exec_stream_))
+            return {false, "wide Q8 verifier quantization failed"};
+        if (mma) {
+            if (auto st = ensure_q8_1_mmq_scratch(std::min(batch, 64u), static_cast<uint32_t>(cols)); !st.ok)
+                return st;
+            const size_t q8_row_bytes = ported::q8_1_scratch_bytes(1, static_cast<uint32_t>(cols));
+            for (uint64_t begin = 0; begin < batch; begin += 64) {
+                const uint32_t width = static_cast<uint32_t>(std::min<uint64_t>(64, batch - begin));
+                // Repack rather than re-quantize: preserve decode's integers
+                // and half-rounded scales for every C1/C2/C4 batch width.
+                const auto *source = static_cast<const uint8_t *>(q8_1_scratch_) + begin * q8_row_bytes;
+                if (!ported::launch_repack_q8_1_mmq(source, q8_1_mmq_scratch_, width,
+                                                  static_cast<uint32_t>(cols), exec_stream_))
+                    return {false, "Q8 verifier MMA activation repack failed"};
+                for (uint32_t i = 0; i < n; ++i) {
+                    // Qualified operator shapes only. Keep the large LM-head
+                    // tile: its weight-bandwidth floor did not benefit here.
+                    const char *small_env = std::getenv("QW3_EXPERIMENTAL_Q8_VERIFY_MMA_SMALL");
+                    const bool small = width <= 8 && small_env && std::strcmp(small_env, "1") == 0 &&
+                        ((rows[i] == 5120 && (cols == 6144 || cols == 17408)) ||
+                         (rows[i] == 17408 && cols == 5120));
+                    const bool launched = small
+                        ? ported::launch_mmq_q8_0_verify_small(wptr[i], q8_1_mmq_scratch_,
+                            optr[i] + begin * strides[i], rows[i], static_cast<uint32_t>(cols),
+                            width, strides[i], rows[i] == 5120 ? 2 : 4, exec_stream_)
+                        : ported::launch_mmq_q8_0_medium(wptr[i], q8_1_mmq_scratch_,
+                            optr[i] + begin * strides[i], rows[i], static_cast<uint32_t>(cols),
+                            width, strides[i], exec_stream_);
+                    if (!launched)
+                        return {false, "Q8 verifier MMA projection failed"};
+                }
+            }
+            return launch_status("cuda exact-input Q8 verifier MMA fanout");
+        }
+        if (!ported::launch_mmvq_q8_0_fanout4_batch(
+                wptr[0], wptr[1], wptr[2], wptr[3], q8_1_scratch_,
+                optr[0], optr[1], optr[2], optr[3],
+                rows[0], rows[1], rows[2], rows[3],
+                static_cast<uint32_t>(cols), batch,
+                strides[0], strides[1], strides[2], strides[3], exec_stream_))
+            return {false, "wide Q8 verifier fanout launch failed"};
+        return launch_status("cuda wide Q8 verifier fanout");
+    }
+
     // Batched fanout: n weights × one shared activation of `batch` rows. The
     // base-class default loops q8_0_matmul, which RE-QUANTIZES the activation
     // to Q8_1 once per weight (n times) and launches n MMVQ kernels. Here we
@@ -12654,6 +12898,28 @@ public:
         const auto &wu = as_weight(weight_up);
         const auto &input = as_tensor(x);
         if (batch == 0) return {};
+        // Tiny target verification must use decode's Q8_1 scales and reduction
+        // order. The general batch-8 GEMM uses FP32 activation scales instead.
+        // Fuse gate/up/SwiGLU while reusing each weight across verifier rows.
+        if (wg.type == WeightType::Q8_0 && wu.type == WeightType::Q8_0 &&
+            batch <= 8 && wg.rows == wu.rows && wg.cols == wu.cols &&
+            wg.cols % 32 == 0 && in_stride >= wg.cols && out_stride >= wg.rows &&
+            input.dtype == DeviceTensorDType::F32 && o.dtype == DeviceTensorDType::F32 &&
+            input.count >= uint64_t(batch) * in_stride &&
+            o.count >= uint64_t(batch) * out_stride &&
+            matvec_kernel_choice() == MatvecKernel::Ported) {
+            if (auto st = ensure_q8_1_scratch(batch, static_cast<uint32_t>(wg.cols)); !st.ok)
+                return st;
+            if (!ported::launch_quantize_q8_1(input.ptr, q8_1_scratch_, batch,
+                    static_cast<uint32_t>(wg.cols), in_stride, exec_stream_))
+                return {false, "batched SwiGLU Q8_1 quantization failed"};
+            if (!ported::launch_mmvq_q8_0_silu_mul(
+                    static_cast<const uint8_t *>(wg.ptr), static_cast<const uint8_t *>(wu.ptr),
+                    q8_1_scratch_, o.ptr, static_cast<uint32_t>(wg.rows),
+                    static_cast<uint32_t>(wg.cols), batch, out_stride, exec_stream_))
+                return {false, "batched Q8 SwiGLU launch failed"};
+            return launch_status("cuda Q8 batched fused SwiGLU");
+        }
 #ifdef QW3_ENABLE_NVFP4
         if (wg.type == WeightType::NVFP4_E2M1 &&
             wu.type == WeightType::NVFP4_E2M1 &&
@@ -12933,6 +13199,40 @@ public:
 #endif
     }
 
+    DeviceStatus dflash_linear_blocks(DeviceTensor &out, const DeviceWeight &weight,
+                                      const DeviceTensor &input,
+                                      uint32_t blocks, uint32_t rows) override {
+        if (weight.format != DeviceWeightFormat::BF16)
+            return DeviceBackend::dflash_linear_blocks(out, weight, input, blocks, rows);
+        if (!blocks || !rows || uint64_t(blocks) * rows > UINT32_MAX ||
+            input.dtype != DeviceTensorDType::F32 || out.dtype != DeviceTensorDType::F32 ||
+            input.count / blocks / rows < weight.cols || out.count / blocks / rows < weight.rows ||
+            weight.cols > INT_MAX || weight.rows > INT_MAX || rows > INT_MAX)
+            return {false, "invalid DFlash BF16 linear blocks"};
+        const auto &w = as_weight(weight);
+        // Convert the concatenated activation once. Keep private GEMM shapes
+        // fixed: a wide GEMM changes reduction rounding as requests arrive/leave.
+        if (auto s = bf16_convert_activation(as_tensor(input).ptr, blocks * rows, w.cols); !s.ok) return s;
+        const char *lt_enabled = std::getenv("QW3_DFLASH_LT_DRAFT");
+        if (lt_enabled && std::strcmp(lt_enabled, "1") == 0 && blocks > 1 && blocks <= 32 && rows > 1 && rows <= 8) {
+            DFlashLtPlan *plan = nullptr;
+            if (auto s = dflash_lt_plan(w.rows, w.cols, rows, blocks * rows, plan); !s.ok) return s;
+            if (plan->supported) {
+                const float alpha = 1, beta = 0;
+                return cublas_status(cublasLtMatmul(cublaslt_handle_, plan->operation,
+                    &alpha, w.ptr, plan->weight, x_bf16_workspace_, plan->input,
+                    &beta, as_tensor(out).ptr, plan->output, as_tensor(out).ptr, plan->output,
+                    &plan->algorithm, cublaslt_workspace_, cublaslt_workspace_bytes_, exec_stream_),
+                    "DFlash fixed-plan joint GEMM");
+            }
+        }
+        for (uint32_t b = 0; b < blocks; ++b) {
+            if (auto s = bf16_matmul_converted(as_tensor(out).ptr + uint64_t(b) * rows * w.rows,
+                    w, rows, w.cols, w.rows, x_bf16_workspace_ + uint64_t(b) * rows * w.cols); !s.ok) return s;
+        }
+        return {};
+    }
+
     DeviceStatus q8_0_matmul(DeviceTensor &out,
                              const DeviceWeight &weight,
                              const DeviceTensor &x,
@@ -12943,6 +13243,19 @@ public:
         auto &o = as_tensor(out);
         const auto &input = as_tensor(x);
         if (batch == 0) return {};
+        if (w.type == WeightType::F32) {
+            if (!cublas_handle_ || o.dtype != DeviceTensorDType::F32 ||
+                input.dtype != DeviceTensorDType::F32 || in_stride < w.cols || out_stride < w.rows ||
+                input.count < uint64_t(batch) * in_stride || o.count < uint64_t(batch) * out_stride ||
+                w.rows > INT_MAX || w.cols > INT_MAX || batch > INT_MAX ||
+                in_stride > INT_MAX || out_stride > INT_MAX)
+                return {false, "FP32 linear shape/dtype mismatch"};
+            const float alpha = 1, beta = 0;
+            return cublas_status(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+                int(w.rows), int(batch), int(w.cols), &alpha, static_cast<const float *>(w.ptr),
+                int(w.cols), input.ptr, int(in_stride), &beta, o.ptr, int(out_stride)),
+                "DFlash FP32 reference linear");
+        }
         if (w.type == WeightType::BF16) {
             return bf16_matmul(o.ptr, w, input.ptr, batch, in_stride, out_stride);
         }
@@ -13127,7 +13440,8 @@ private:
                                        const CudaWeight &w,
                                        uint32_t batch,
                                        uint32_t in_stride,
-                                       uint32_t out_stride) {
+                                       uint32_t out_stride,
+                                       const __nv_bfloat16 *converted_input = nullptr) {
         const float alpha = 1.0f;
         const float beta = 0.0f;
         return cublas_status(
@@ -13135,7 +13449,7 @@ private:
                          static_cast<int>(w.rows), static_cast<int>(batch),
                          static_cast<int>(w.cols), &alpha,
                          w.ptr, CUDA_R_16BF, static_cast<int>(w.cols),
-                         x_bf16_workspace_, CUDA_R_16BF, static_cast<int>(in_stride),
+                         converted_input ? converted_input : x_bf16_workspace_, CUDA_R_16BF, static_cast<int>(in_stride),
                          &beta, out_ptr, CUDA_R_32F, static_cast<int>(out_stride),
                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
             "cublasGemmEx bf16 linear");
@@ -13210,6 +13524,62 @@ private:
             return ensure_mixed_bf16_output(out_count);
         }
         return {};
+    }
+
+    DeviceStatus dflash_lt_plan(uint64_t outputs, uint64_t inputs, uint32_t request_rows,
+                                uint32_t total_rows, DFlashLtPlan *&result) {
+        for (const auto &p : dflash_lt_plans_) {
+            if (p->outputs == outputs && p->inputs == inputs && p->request_rows == request_rows &&
+                p->total_rows == total_rows) { result = p.get(); return {}; }
+        }
+        // Share the existing device handle/workspace; all operations use exec_stream_.
+        if (auto s = ensure_cublaslt_fp8(); !s.ok) return s;
+        auto plan = std::make_unique<DFlashLtPlan>();
+        plan->outputs = outputs; plan->inputs = inputs;
+        plan->request_rows = request_rows; plan->total_rows = total_rows;
+        cublasLtMatmulPreference_t preference = nullptr;
+        DeviceStatus status{};
+        const auto check = [&](cublasStatus_t s, const char *label) {
+            if (s == CUBLAS_STATUS_SUCCESS) return true;
+            status = cublas_status(s, label); return false;
+        };
+        do {
+            if (!check(cublasLtMatmulDescCreate(&plan->operation, CUBLAS_COMPUTE_32F, CUDA_R_32F), "DFlash Lt descriptor")) break;
+            const cublasOperation_t trans = CUBLAS_OP_T;
+            if (!check(cublasLtMatmulDescSetAttribute(plan->operation, CUBLASLT_MATMUL_DESC_TRANSA,
+                &trans, sizeof(trans)), "DFlash Lt transpose")) break;
+            if (!check(cublasLtMatrixLayoutCreate(&plan->weight, CUDA_R_16BF, inputs, outputs, inputs), "DFlash Lt weights")) break;
+            if (!check(cublasLtMatrixLayoutCreate(&plan->input, CUDA_R_16BF, inputs, request_rows, inputs), "DFlash Lt input")) break;
+            if (!check(cublasLtMatrixLayoutCreate(&plan->output, CUDA_R_32F, outputs, request_rows, outputs), "DFlash Lt output")) break;
+            if (!check(cublasLtMatmulPreferenceCreate(&preference), "DFlash Lt preference")) break;
+            if (!check(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &cublaslt_workspace_bytes_, sizeof(cublaslt_workspace_bytes_)), "DFlash Lt workspace")) break;
+            cublasLtMatmulHeuristicResult_t heuristic{}; int found = 0;
+            // Crucially, choose tile/reduction/split-K from one request. Only
+            // the matrix extent changes when peers join, never the algorithm.
+            if (!check(cublasLtMatmulAlgoGetHeuristic(cublaslt_handle_, plan->operation, plan->weight,
+                plan->input, plan->output, plan->output, preference, 1, &heuristic, &found), "DFlash Lt private heuristic")) break;
+            if (!found || heuristic.state != CUBLAS_STATUS_SUCCESS) break;
+            plan->algorithm = heuristic.algo;
+            const uint64_t wide = total_rows;
+            if (!check(cublasLtMatrixLayoutSetAttribute(plan->input, CUBLASLT_MATRIX_LAYOUT_COLS,
+                &wide, sizeof(wide)), "DFlash Lt wide input")) break;
+            if (!check(cublasLtMatrixLayoutSetAttribute(plan->output, CUBLASLT_MATRIX_LAYOUT_COLS,
+                &wide, sizeof(wide)), "DFlash Lt wide output")) break;
+            cublasLtMatmulHeuristicResult_t usable{};
+            const auto checked = cublasLtMatmulAlgoCheck(cublaslt_handle_, plan->operation, plan->weight,
+                plan->input, plan->output, plan->output, &plan->algorithm, &usable);
+            plan->supported = checked == CUBLAS_STATUS_SUCCESS && usable.state == CUBLAS_STATUS_SUCCESS &&
+                              usable.workspaceSize <= cublaslt_workspace_bytes_;
+        } while (false);
+        if (preference) cublasLtMatmulPreferenceDestroy(preference);
+        if (!status.ok) return status;
+        const char *trace = std::getenv("QW3_DFLASH_LT_TRACE");
+        if (trace && std::strcmp(trace, "1") == 0)
+            std::fprintf(stderr, "dflash_lt_plan outputs=%llu inputs=%llu width=%u requests=%u status=%s\n",
+                static_cast<unsigned long long>(outputs), static_cast<unsigned long long>(inputs),
+                request_rows, total_rows / request_rows, plan->supported ? "shared" : "fallback");
+        result = plan.get(); dflash_lt_plans_.push_back(std::move(plan)); return {};
     }
 
     DeviceStatus ensure_cublaslt_fp8() {
@@ -15133,6 +15503,146 @@ private:
         return launch_status("cuda q8_0_matvec");
     }
 public:
+
+    DeviceStatus dflash_capture_features(
+            DeviceTensor &out, const DeviceTensor &hidden, uint32_t rows,
+            uint32_t width, uint32_t stride, uint32_t taps, uint32_t tap) override {
+        if (!rows || !width || !taps || tap >= taps || stride < width ||
+            out.dtype != DeviceTensorDType::F32 ||
+            (hidden.dtype != DeviceTensorDType::F32 && hidden.dtype != DeviceTensorDType::BF16) ||
+            uint64_t(rows) * taps * width > out.count ||
+            uint64_t(rows - 1) * stride + width > hidden.count)
+            return {false, "invalid DFlash feature capture shape or type"};
+        return cuda_status(dflash_cuda::capture_features(as_tensor(out).ptr,
+            as_tensor(hidden).ptr, hidden.dtype == DeviceTensorDType::BF16,
+            rows, width, stride, taps, tap, exec_stream_), "DFlash feature capture");
+    }
+
+    DeviceStatus dflash_grouped_conv(
+            DeviceTensor &out, const DeviceTensor &input, const DeviceTensor &dynamic,
+            const DeviceWeight &base, uint32_t rows, uint32_t hidden,
+            uint32_t block, uint32_t taps, uint32_t group, uint32_t side) override {
+        if (!rows) return {};
+        const auto &w = as_weight(base);
+        if (!hidden || !block || !taps || !group || hidden % group || side > 1 ||
+            out.dtype != DeviceTensorDType::F32 || input.dtype != DeviceTensorDType::F32 ||
+            dynamic.dtype != DeviceTensorDType::F32 || w.type != WeightType::F32 ||
+            out.count < uint64_t(rows) * hidden || input.count < uint64_t(rows) * hidden ||
+            dynamic.count < uint64_t(rows) * 2 * taps * (hidden / group) ||
+            w.rows * w.cols < uint64_t(2) * taps * hidden ||
+            as_tensor(out).ptr == as_tensor(input).ptr)
+            return {false, "invalid DFlash convolution shape/dtype or aliased input/output"};
+        return cuda_status(dflash_cuda::grouped_conv(as_tensor(out).ptr, as_tensor(input).ptr,
+            as_tensor(dynamic).ptr, static_cast<const float *>(w.ptr),
+            rows, hidden, block, taps, group, side, exec_stream_), "DFlash grouped convolution");
+    }
+
+    DeviceStatus dflash_attention(
+            DeviceTensor &out, const DeviceTensor &q, const DeviceTensor &k, const DeviceTensor &v,
+            uint32_t queries, uint32_t keys, uint32_t heads,
+            uint32_t kv_heads, uint32_t dim, uint32_t window) override {
+        if (!queries) return {};
+        if (!heads || !kv_heads || heads % kv_heads || !dim || !window ||
+            keys < queries || keys > 8192 || window > 8192 ||
+            out.dtype != DeviceTensorDType::F32 || q.dtype != DeviceTensorDType::F32 ||
+            k.dtype != DeviceTensorDType::F32 || v.dtype != DeviceTensorDType::F32 ||
+            out.count < uint64_t(queries) * heads * dim || q.count < uint64_t(queries) * heads * dim ||
+            k.count < uint64_t(keys) * kv_heads * dim || v.count < uint64_t(keys) * kv_heads * dim)
+            return {false, "invalid DFlash attention shape/dtype"};
+        return cuda_status(dflash_cuda::attention(as_tensor(out).ptr, as_tensor(q).ptr,
+            as_tensor(k).ptr, as_tensor(v).ptr, queries, keys, heads, kv_heads, dim,
+            window, exec_stream_), "DFlash sliding attention");
+    }
+
+    DeviceStatus dflash_attention_batch(
+            DeviceTensor &out, const DeviceTensor &q, DeviceTensor &metadata,
+            const DeviceTensor *const *keys, const DeviceTensor *const *values,
+            const uint32_t *lengths, uint32_t blocks, uint32_t queries,
+            uint32_t heads, uint32_t kv_heads, uint32_t dim, uint32_t window) override {
+        if (!blocks || !queries) return {};
+        if (!keys || !values || !lengths || blocks > 65535 || !heads ||
+            !kv_heads || heads % kv_heads || !dim || !window || window > 8192 ||
+            out.dtype != DeviceTensorDType::F32 || q.dtype != DeviceTensorDType::F32 ||
+            metadata.dtype != DeviceTensorDType::I32 || metadata.count < uint64_t(blocks) * 6 ||
+            out.count < uint64_t(blocks) * queries * heads * dim ||
+            q.count < uint64_t(blocks) * queries * heads * dim)
+            return {false, "invalid batched DFlash attention shape/dtype"};
+        std::vector<dflash_cuda::AttentionRequest> requests(blocks);
+        uint32_t max_keys = 0;
+        for (uint32_t i = 0; i < blocks; ++i) {
+            if (!keys[i] || !values[i] || lengths[i] < queries || lengths[i] > 8192 ||
+                keys[i]->dtype != DeviceTensorDType::F32 || values[i]->dtype != DeviceTensorDType::F32 ||
+                keys[i]->count < uint64_t(lengths[i]) * kv_heads * dim ||
+                values[i]->count < uint64_t(lengths[i]) * kv_heads * dim)
+                return {false, "invalid independent DFlash attention cache"};
+            requests[i] = {as_tensor(*keys[i]).ptr, as_tensor(*values[i]).ptr, lengths[i], 0};
+            max_keys = std::max(max_keys, lengths[i]);
+        }
+        // Synchronous uploader owns host-vector lifetime and stream ordering.
+        // The caller keeps the device metadata alive through the shared batch.
+        if (auto st = copy_bytes_from_host(metadata, 0, requests.data(),
+                requests.size() * sizeof(requests[0])); !st.ok) return st;
+        return cuda_status(dflash_cuda::attention_batch(as_tensor(out).ptr, as_tensor(q).ptr,
+            reinterpret_cast<const dflash_cuda::AttentionRequest *>(as_tensor(metadata).ptr_i32()),
+            blocks, queries, max_keys, heads, kv_heads, dim, window, exec_stream_),
+            "DFlash independent-cache batched attention");
+    }
+
+    bool supports_target_sampling() const override { return true; }
+    DeviceStatus sample_target_rows(const DeviceTensor &logits, const DeviceSamplingRequest &request,
+                                    DeviceSamplingResult &result) override {
+        if (logits.dtype != DeviceTensorDType::F32 ||
+            logits.count < (uint64_t(request.drafts.size()) + 1) * request.vocab)
+            return {false, "invalid GPU target sampling logits"};
+        if (!target_sampler_) target_sampler_ = std::make_unique<TargetSamplerCuda>();
+        return cuda_status(target_sampler_->run(as_tensor(logits).ptr, request, result, exec_stream_),
+                           "GPU target sampling");
+    }
+
+    DeviceStatus dflash_topk(
+            DeviceTensor &ids, DeviceTensor &values, const DeviceTensor &logits,
+            DeviceTensor &scratch_ids, DeviceTensor &scratch_values,
+            uint32_t rows, uint32_t vocab, uint32_t top_k) override {
+        if (!rows) return {};
+        const uint64_t parts = (uint64_t(vocab) + 4095) / 4096;
+        if (!top_k || top_k > 32 || vocab < top_k || parts * top_k > 4096 ||
+            ids.dtype != DeviceTensorDType::I32 || scratch_ids.dtype != DeviceTensorDType::I32 ||
+            values.dtype != DeviceTensorDType::F32 || logits.dtype != DeviceTensorDType::F32 ||
+            scratch_values.dtype != DeviceTensorDType::F32 ||
+            ids.count < uint64_t(rows) * top_k || values.count < uint64_t(rows) * top_k ||
+            logits.count < uint64_t(rows) * vocab ||
+            scratch_ids.count < uint64_t(rows) * parts * top_k ||
+            scratch_values.count < uint64_t(rows) * parts * top_k)
+            return {false, "invalid DFlash top-k shape/dtype"};
+        return cuda_status(dflash_cuda::topk(as_tensor(ids).ptr_i32(), as_tensor(values).ptr,
+            as_tensor(logits).ptr, as_tensor(scratch_ids).ptr_i32(), as_tensor(scratch_values).ptr,
+            rows, vocab, top_k, exec_stream_), "DFlash top-k");
+    }
+
+    DeviceStatus dflash_select(
+            DeviceTensor &tokens, DeviceTensor &probs, const DeviceTensor &candidates,
+            const DeviceTensor &unary, const DeviceTensor &hidden, const DeviceWeight &predecessor,
+            const DeviceWeight &successor, const DeviceTensor &anchors, const DeviceTensor &uniforms,
+            uint32_t blocks, uint32_t positions, uint32_t top_k, uint32_t rank, float temperature) override {
+        if (!blocks || !positions) return {};
+        const uint64_t rows = uint64_t(blocks) * positions;
+        const auto &p = as_weight(predecessor), &s = as_weight(successor);
+        if (!top_k || top_k > 32 || !rank || !std::isfinite(temperature) || temperature < 0 ||
+            p.type != s.type || (p.type != WeightType::BF16 && p.type != WeightType::F32) ||
+            p.cols != rank || s.cols != rank || p.rows != s.rows || p.rows < top_k ||
+            tokens.dtype != DeviceTensorDType::I32 || candidates.dtype != DeviceTensorDType::I32 ||
+            anchors.dtype != DeviceTensorDType::I32 || probs.dtype != DeviceTensorDType::F32 ||
+            unary.dtype != DeviceTensorDType::F32 || hidden.dtype != DeviceTensorDType::F32 ||
+            uniforms.dtype != DeviceTensorDType::F32 || tokens.count < rows ||
+            probs.count < rows * top_k || candidates.count < rows * top_k || unary.count < rows * top_k ||
+            hidden.count < rows * rank || anchors.count < blocks || uniforms.count < rows)
+            return {false, "invalid DFlash selector shape/dtype"};
+        return cuda_status(dflash_cuda::select(as_tensor(tokens).ptr_i32(), as_tensor(probs).ptr,
+            as_tensor(candidates).ptr_i32(), as_tensor(unary).ptr, as_tensor(hidden).ptr,
+            p.ptr, s.ptr, p.type == WeightType::BF16, as_tensor(anchors).ptr_i32(),
+            as_tensor(uniforms).ptr, blocks, positions, top_k, rank, temperature,
+            exec_stream_), "DFlash candidate selector");
+    }
 
     DeviceStatus rms_norm(DeviceTensor &out, const DeviceTensor &x, const DeviceWeight &weight, float eps) override {
         auto &o = as_tensor(out);
@@ -18565,6 +19075,42 @@ public:
             "cuda block_attn_stream_group_finalize_device");
     }
 
+    DeviceStatus attention_capture_set(DeviceTensor *logits, uint64_t rows,
+            uint32_t stride, uint32_t heads, uint32_t first_row = 0,
+            uint32_t row_step = 1) override {
+#if QW3_ENABLE_FLASHINFER
+        action_capture_ = {};
+        if (!logits) return {true, nullptr};
+        auto &t = as_tensor(*logits);
+        if (!rows || !stride || !heads || !row_step || t.elem_size != sizeof(float) ||
+            uint64_t(first_row) + uint64_t(63 - __builtin_clzll(rows)) * row_step >= stride ||
+            t.count < uint64_t(__builtin_popcountll(rows)) * stride * heads)
+            return {false, "invalid attention capture buffer"};
+        action_capture_ = {t.ptr, rows, stride, heads, 0, first_row, row_step};
+        return {true, nullptr};
+#else
+        return {logits == nullptr, "attention capture requires FlashInfer"};
+#endif
+    }
+
+    DeviceStatus attention_capture_reduce(DeviceTensor &mass,
+            const DeviceTensor &logits, uint64_t rows, uint32_t stride,
+            uint32_t heads, uint32_t base, uint32_t blocks,
+            const DeviceTensor &starts, const DeviceTensor &counts,
+            float weight = 1.0f, bool accumulate = false, uint32_t row_step = 1) override {
+        const uint32_t samples = __builtin_popcountll(rows);
+        auto &out = as_tensor(mass);
+        if (!samples || !heads || !row_step || !std::isfinite(weight) || weight < 0 ||
+            uint64_t(base) + uint64_t(63 - __builtin_clzll(rows)) * row_step + 1 > stride ||
+            out.count < uint64_t(samples) * (blocks+1))
+            return {false, "invalid captured attention reduction shape"};
+        if (!accumulate) { if (auto st = zero_tensor(mass); !st.ok) return st; }
+        captured_attention_mass_kernel<<<dim3(heads,samples),256,0,exec_stream_>>>(
+            out.ptr, as_tensor(logits).ptr, rows, stride, heads, base, blocks,
+            as_tensor(starts).ptr_i32(), as_tensor(counts).ptr_i32(), weight, row_step);
+        return launch_status("captured attention mass reduction");
+    }
+
     DeviceStatus block_attention_mass_paged_device(
                                               DeviceTensor &mass,
                                               const DeviceTensor &q,
@@ -19256,7 +19802,11 @@ public:
     DeviceStatus ensure_flashinfer_batch_decode_workspace(uint64_t o_elems,
                                                           uint64_t tmp_v_elems,
                                                           uint64_t tmp_s_elems,
-                                                          uint64_t meta_i32_elems) {
+                                                          uint64_t meta_i32_elems,
+                                                          bool preserve_decode_plan = false) {
+        // All other users of this shared metadata workspace invalidate the
+        // cached upload, even if its allocation does not grow.
+        if (!preserve_decode_plan) flashinfer_decode_plan_uploaded_ = false;
         if (o_elems > flashinfer_batch_decode_o_f16_capacity_) {
             if (flashinfer_batch_decode_o_f16_) cudaFree(flashinfer_batch_decode_o_f16_);
             flashinfer_batch_decode_o_f16_ = nullptr;
@@ -19298,6 +19848,7 @@ public:
             flashinfer_batch_decode_tmp_s_capacity_ = tmp_s_elems;
         }
         if (meta_i32_elems > flashinfer_batch_decode_meta_i32_capacity_) {
+            flashinfer_decode_plan_uploaded_ = false;
             if (flashinfer_batch_decode_meta_i32_) cudaFree(flashinfer_batch_decode_meta_i32_);
             flashinfer_batch_decode_meta_i32_ = nullptr;
             flashinfer_batch_decode_meta_i32_capacity_ = 0;
@@ -19865,13 +20416,8 @@ public:
                         return {false, "flashinfer fp8 MTP decode launcher refused"};
                     }
                 }
-                constexpr unsigned threads = 256;
-                const unsigned blocks =
-                    static_cast<unsigned>((o_elems + threads - 1) / threads);
-                apply_attn_gate_kernel<<<dim3(batch, blocks), threads, 0,
-                                         exec_stream_>>>(
-                    o.ptr, qq.ptr, q_stride, n_heads, head_dim,
-                    q_batch_stride, out_batch_stride);
+                // This operation is ungated. The gated wrapper applies the
+                // sigmoid once after this attention output is complete.
                 return launch_status(
                     "cuda attention_decode_batch flashinfer fp8 split-k rows");
             }
@@ -20430,6 +20976,48 @@ public:
         }
 
 #if QW3_ENABLE_FLASHINFER
+        // SM120, FP8 KV, Q tile 64 and head_dim 256 use a 32-token KV tile.
+        // A fully masked extra tile still changes softmax/merge rounding.
+        // Preserve each serial row's tile count by splitting a crossing batch.
+        // Backend calls acquire separate pinned metadata slots; no host buffer
+        // is rewritten while its preceding asynchronous upload is in flight.
+        if (env_flag_enabled_local("QW3_EXPERIMENTAL_FP8_STABLE_PREFILL", false) &&
+            kc.is_fp8_kv() && vc.is_fp8_kv() && head_dim == 256 &&
+            n_heads == 24 && n_kv_heads == 4 && (page_size == 16 || page_size == 32) &&
+            batch > 1 && batch <= 8) {
+            constexpr uint32_t kv_tile = 32;
+            const uint32_t first_rows = kv_tile - base_seq_len % kv_tile;
+            if (first_rows < batch) {
+                const uint64_t q_offset = uint64_t(first_rows) * q_batch_stride;
+                const uint64_t out_offset = uint64_t(first_rows) * out_batch_stride;
+                if (qq.elem_size != sizeof(float) || o.elem_size != sizeof(float) ||
+                    q_offset >= qq.count || out_offset >= o.count)
+                    return {false, "stable prefill tile split tensor bounds invalid"};
+                static thread_local bool reported = false;
+                if (!reported) {
+                    std::fprintf(stderr, "[stable-prefill-tile-split] base=%u batch=%u first_rows=%u kv_tile=32\n",
+                                 base_seq_len, batch, first_rows);
+                    reported = true;
+                }
+                CudaTensor tail_q(const_cast<CudaTensor &>(qq), q_offset * sizeof(float),
+                    qq.count - q_offset, sizeof(float), DeviceTensorDType::F32, "stable tile tail Q");
+                CudaTensor tail_out(o, out_offset * sizeof(float), o.count - out_offset,
+                    sizeof(float), DeviceTensorDType::F32, "stable tile tail O");
+                auto status = attention_prefill_batch_paged_gated_device(
+                    out, q, q_stride, k_cache, v_cache, page_indices, n_pages, page_size,
+                    n_heads, n_kv_heads, head_dim, base_seq_len, first_rows,
+                    q_batch_stride, out_batch_stride, scale);
+                if (!status.ok) return status;
+                const auto saved_capture = action_capture_;
+                action_capture_.row_offset += first_rows;
+                const auto tail_status = attention_prefill_batch_paged_gated_device(
+                    tail_out, tail_q, q_stride, k_cache, v_cache, page_indices, n_pages, page_size,
+                    n_heads, n_kv_heads, head_dim, base_seq_len + first_rows, batch - first_rows,
+                    q_batch_stride, out_batch_stride, scale);
+                action_capture_ = saved_capture;
+                return tail_status;
+            }
+        }
         if (prefill_attn_kernel_choice() == PrefillAttnKernel::FlashInfer &&
             (kc.is_fp16() || kc.is_fp8_kv()) &&
             (head_dim == 128 || head_dim == 256)) {
@@ -20484,7 +21072,8 @@ public:
                     qq.ptr, q_stride, kc.ptr, vc.ptr, pages.ptr_i32(),
                     n_pages, page_size, n_heads, n_kv_heads, head_dim,
                     base_seq_len, batch, q_batch_stride, out_batch_stride,
-                    scale, exec_stream_, &plan_cache_hit)
+                    scale, exec_stream_, &plan_cache_hit,
+                    action_capture_.row_mask ? &action_capture_ : nullptr)
                 : flashinfer_adapter::launch_batch_prefill_paged_f16q_f16kv_gated(
                     o.ptr,
                     flashinfer_batch_prefill_q_f16_,
@@ -20499,7 +21088,8 @@ public:
                     qq.ptr, q_stride, kc.ptr, vc.ptr, pages.ptr_i32(),
                     n_pages, page_size, n_heads, n_kv_heads, head_dim,
                     base_seq_len, batch, q_batch_stride, out_batch_stride,
-                    scale, exec_stream_, &plan_cache_hit);
+                    scale, exec_stream_, &plan_cache_hit,
+                    action_capture_.row_mask ? &action_capture_ : nullptr);
             // Even cache hits enqueue H2D reads of the pinned request metadata.
             // Fence every acquired slot, including a partially failed launch,
             // before a subsequent layer/chunk may overwrite its contents.
@@ -20690,95 +21280,142 @@ public:
         }
 
 #if QW3_ENABLE_FLASHINFER
+        // Isolated experiment: serial and batch verification must use the same
+        // fixed prefill math. Never silently fall back after selecting it.
+        if (env_flag_enabled_local("QW3_EXPERIMENTAL_FP8_STABLE_PREFILL", false) &&
+            kc.is_fp8_kv() && vc.is_fp8_kv() && head_dim == 256 &&
+            n_heads == 24 && n_kv_heads == 4 && (page_size == 16 || page_size == 32) && batch <= 8) {
+            if (capture_active_)
+                return {false, "stable prefill diagnostic does not support CUDA graph capture"};
+            if (prefill_attn_kernel_choice() != PrefillAttnKernel::FlashInfer)
+                return {false, "stable prefill diagnostic requires FlashInfer prefill"};
+            static thread_local bool reported[9] = {};
+            if (!reported[batch]) {
+                std::fprintf(stderr, "[stable-prefill-dispatch] batch=%u page_size=%u heads=%u kv_heads=%u head_dim=%u kv_dtype=fp8\n",
+                             batch, page_size, n_heads, n_kv_heads, head_dim);
+                reported[batch] = true;
+            }
+            return attention_prefill_batch_paged_gated_device(
+                out, q, q_stride, k_cache, v_cache, page_indices, n_pages, page_size,
+                n_heads, n_kv_heads, head_dim, base_seq_len, batch,
+                q_batch_stride, out_batch_stride, scale);
+        }
         if (decode_flashinfer_attention_enabled() &&
             (kc.is_fp16() || kc.is_fp8_kv()) &&
             (head_dim == 128 || head_dim == 256)) {
-            const uint32_t chunk_size = kc.is_fp8_kv()
-                ? flashinfer_adapter::batch_decode_f32q_fp8kv_chunk_size(
-                    n_heads, n_kv_heads, head_dim, batch, max_seq_len)
-                : flashinfer_adapter::batch_decode_f32q_f16kv_chunk_size(
-                    n_heads, n_kv_heads, head_dim, batch, max_seq_len);
+            const auto chunk_for_length = [&](uint32_t length) {
+                return kc.is_fp8_kv()
+                    ? flashinfer_adapter::batch_decode_f32q_fp8kv_chunk_size(
+                        n_heads, n_kv_heads, head_dim, batch, length)
+                    : flashinfer_adapter::batch_decode_f32q_f16kv_chunk_size(
+                        n_heads, n_kv_heads, head_dim, batch, length);
+            };
+            const uint32_t chunk_size = chunk_for_length(max_seq_len);
             const bool partition_kv = flashinfer_batch_decode_partition_enabled();
             if (chunk_size > 0) {
-                std::vector<int32_t> page_indptr(batch + 1, 0);
-                std::vector<int32_t> last_page_len(batch, 0);
-                std::vector<int32_t> request_indices;
-                std::vector<int32_t> kv_tile_indices;
-                std::vector<int32_t> o_indptr(batch + 1, 0);
-                uint32_t total_page_indices = 0;
-                for (uint32_t b = 0; b < batch; ++b) {
-                    const uint32_t seq_len = base_seq_len + b + 1;
-                    const uint32_t pages_for_request = std::max<uint32_t>(
-                        (seq_len + page_size - 1) / page_size, 1U);
-                    page_indptr[b] = static_cast<int32_t>(total_page_indices);
-                    total_page_indices += pages_for_request;
-                    const uint32_t used_in_last =
-                        seq_len - (pages_for_request - 1U) * page_size;
-                    last_page_len[b] = static_cast<int32_t>(used_in_last);
-
-                    o_indptr[b] = static_cast<int32_t>(request_indices.size());
-                    const uint32_t tiles = partition_kv
-                        ? std::max<uint32_t>((seq_len + chunk_size - 1) / chunk_size, 1U)
-                        : 1U;
-                    for (uint32_t t = 0; t < tiles; ++t) {
-                        request_indices.push_back(static_cast<int32_t>(b));
-                        kv_tile_indices.push_back(static_cast<int32_t>(t));
+                // The serial planner uses each row's causal length. A verifier
+                // spanning a chunk-size transition must not apply its last
+                // row's partition to earlier rows: the changed reduction order
+                // perturbs their output and the recurrent state. Split only at
+                // these transitions, retaining batched kernels within each run.
+                if (partition_kv && batch > 1) {
+                    const uint32_t first_chunk = chunk_for_length(base_seq_len + 1);
+                    if (!first_chunk) return {false, "FlashInfer first-row partition planning failed"};
+                    if (first_chunk != chunk_size) {
+                        uint32_t low = 1, high = batch - 1;
+                        while (low < high) {
+                            const uint32_t middle = low + (high - low + 1) / 2;
+                            if (chunk_for_length(base_seq_len + middle) == first_chunk) low = middle;
+                            else high = middle - 1;
+                        }
+                        const uint64_t q_offset = uint64_t(low) * q_batch_stride;
+                        const uint64_t out_offset = uint64_t(low) * out_batch_stride;
+                        if (qq.elem_size != sizeof(float) || o.elem_size != sizeof(float) ||
+                            q_offset >= qq.count || out_offset >= o.count) {
+                            return {false, "FlashInfer partition split tensor bounds invalid"};
+                        }
+                        // Views borrow storage; construction does not mutate Q.
+                        CudaTensor tail_q(const_cast<CudaTensor &>(qq), q_offset * sizeof(float),
+                            qq.count - q_offset, sizeof(float), DeviceTensorDType::F32, "partition tail Q");
+                        CudaTensor tail_out(o, out_offset * sizeof(float), o.count - out_offset,
+                            sizeof(float), DeviceTensorDType::F32, "partition tail O");
+                        auto status = attention_decode_batch_paged_gated_device(
+                            out, q, q_stride, k_cache, v_cache, page_indices, n_pages, page_size,
+                            n_heads, n_kv_heads, head_dim, base_seq_len, low,
+                            q_batch_stride, out_batch_stride, scale);
+                        if (!status.ok) return status;
+                        const auto saved_capture = action_capture_;
+                        action_capture_.row_offset += low;
+                        const auto tail_status = attention_decode_batch_paged_gated_device(
+                            tail_out, tail_q, q_stride, k_cache, v_cache, page_indices, n_pages, page_size,
+                            n_heads, n_kv_heads, head_dim, base_seq_len + low, batch - low,
+                            q_batch_stride, out_batch_stride, scale);
+                        action_capture_ = saved_capture;
+                        return tail_status;
                     }
                 }
-                page_indptr[batch] = static_cast<int32_t>(total_page_indices);
-                o_indptr[batch] = static_cast<int32_t>(request_indices.size());
-                const uint32_t total_tiles = static_cast<uint32_t>(request_indices.size());
-
-                std::vector<int32_t> meta;
-                const uint64_t page_indices_offset = 0;
-                if (batch > 1) {
-                    meta.resize(total_page_indices, 0);
-                }
-                const uint64_t page_indptr_offset = meta.size();
-                meta.insert(meta.end(), page_indptr.begin(), page_indptr.end());
-                const uint64_t last_page_len_offset = meta.size();
-                meta.insert(meta.end(), last_page_len.begin(), last_page_len.end());
-                const uint64_t request_indices_offset = meta.size();
-                meta.insert(meta.end(), request_indices.begin(), request_indices.end());
-                const uint64_t kv_tile_indices_offset = meta.size();
-                meta.insert(meta.end(), kv_tile_indices.begin(), kv_tile_indices.end());
-                const uint64_t o_indptr_offset = meta.size();
-                meta.insert(meta.end(), o_indptr.begin(), o_indptr.end());
-                const uint64_t kv_chunk_size_offset = meta.size();
-                meta.push_back(static_cast<int32_t>(chunk_size));
+                const bool cache_plan = batch > 1 && batch <= 8 && !capture_active_ &&
+                    env_flag_enabled_local("QW3_FLASHINFER_VERIFY_PLAN_CACHE", false);
+                detail::FlashinferDecodePlan transient_plan;
+                auto &plan = cache_plan ? flashinfer_decode_plan_ : transient_plan;
+                const bool changed = plan.update(base_seq_len, batch, page_size,
+                                                 chunk_size, partition_kv);
+                if (changed) flashinfer_decode_plan_uploaded_ = false;
+                const uint32_t total_tiles = plan.total_tiles;
+                const auto &o_indptr = plan.output_indptr;
+                const uint64_t page_indptr_offset = plan.page_indptr_offset;
+                const uint64_t last_page_len_offset = plan.last_page_len_offset;
+                const uint64_t request_indices_offset = plan.request_indices_offset;
+                const uint64_t kv_tile_indices_offset = plan.kv_tile_indices_offset;
+                const uint64_t o_indptr_offset = plan.output_indptr_offset;
+                const uint64_t kv_chunk_size_offset = plan.chunk_size_offset;
 
                 const uint64_t o_elems_batch =
                     static_cast<uint64_t>(batch) * n_heads * head_dim;
                 const uint64_t tmp_v_elems = partition_kv
-                    ? static_cast<uint64_t>(total_tiles) * n_heads * head_dim
-                    : 0;
+                    ? static_cast<uint64_t>(total_tiles) * n_heads * head_dim : 0;
                 const uint64_t tmp_s_elems = partition_kv
-                    ? static_cast<uint64_t>(total_tiles) * n_heads
-                    : 0;
+                    ? static_cast<uint64_t>(total_tiles) * n_heads : 0;
                 if (auto st = ensure_flashinfer_batch_decode_workspace(
                         o_elems_batch, tmp_v_elems, tmp_s_elems,
-                        static_cast<uint64_t>(meta.size())); !st.ok) {
+                        plan.storage_elements(), cache_plan); !st.ok) {
                     return st;
                 }
-                if (auto st = cuda_status(
-                        cudaMemcpyAsync(flashinfer_batch_decode_meta_i32_,
-                                        meta.data(),
-                                        meta.size() * sizeof(int32_t),
-                                        cudaMemcpyHostToDevice,
-                                        exec_stream_),
-                        "flashinfer paged device decode metadata copy"); !st.ok) {
-                    return st;
+                if (!cache_plan || !flashinfer_decode_plan_uploaded_) {
+                    // The reference retains the old full upload. The cached
+                    // path only uploads shape metadata once across layers;
+                    // physical page IDs are gathered anew below on every call.
+                    std::vector<int32_t> reference_upload;
+                    const int32_t *host = plan.metadata.data();
+                    uint64_t offset = plan.page_indptr_offset;
+                    uint64_t count = plan.metadata.size();
+                    if (!cache_plan) {
+                        reference_upload.assign(offset, 0);
+                        reference_upload.insert(reference_upload.end(),
+                                                plan.metadata.begin(), plan.metadata.end());
+                        host = reference_upload.data();
+                        count = reference_upload.size();
+                        offset = 0;
+                    }
+                    if (auto st = cuda_status(
+                            cudaMemcpyAsync(flashinfer_batch_decode_meta_i32_ + offset,
+                                            host, count * sizeof(int32_t),
+                                            cudaMemcpyHostToDevice, exec_stream_),
+                            "flashinfer paged device decode metadata copy"); !st.ok) {
+                        flashinfer_decode_plan_uploaded_ = false;
+                        return st;
+                    }
+                    flashinfer_decode_plan_uploaded_ = cache_plan;
                 }
 
                 int32_t *meta_d = flashinfer_batch_decode_meta_i32_;
                 const int32_t *fi_page_indices = pages.ptr_i32();
                 if (batch > 1) {
                     expand_flashinfer_page_indices_kernel<<<batch, 128, 0, exec_stream_>>>(
-                        meta_d + page_indices_offset, pages.ptr_i32(),
-                        meta_d + page_indptr_offset, batch);
+                        meta_d, pages.ptr_i32(), meta_d + page_indptr_offset, batch);
                     if (auto st = launch_status("flashinfer paged device page index expand");
                         !st.ok) return st;
-                    fi_page_indices = meta_d + page_indices_offset;
+                    fi_page_indices = meta_d;
                 }
                 const bool launched = kc.is_fp8_kv()
                     ? flashinfer_adapter::launch_batch_decode_f32q_fp8kv_gated(
@@ -20799,7 +21436,7 @@ public:
                         page_size, total_tiles,
                         n_heads, n_kv_heads, head_dim, batch,
                         q_batch_stride, out_batch_stride, scale,
-                        exec_stream_)
+                        exec_stream_, action_capture_.row_mask ? &action_capture_ : nullptr)
                     : flashinfer_adapter::launch_batch_decode_f32q_f16kv_gated(
                         o.ptr, flashinfer_batch_decode_o_f16_,
                         flashinfer_batch_decode_tmp_v_,
@@ -20818,7 +21455,7 @@ public:
                         page_size, total_tiles,
                         n_heads, n_kv_heads, head_dim, batch,
                         q_batch_stride, out_batch_stride, scale,
-                        exec_stream_);
+                        exec_stream_, action_capture_.row_mask ? &action_capture_ : nullptr);
                 if (launched) {
                     return launch_status("cuda attention_decode_batch flashinfer paged device decode gated");
                 }
@@ -22035,6 +22672,40 @@ public:
                            "packed KV slab D2H");
     }
 
+    DeviceStatus mix_kv_rows(DeviceTensor &k, DeviceTensor &v,
+                             const DeviceTensor &old_k, const DeviceTensor &old_v,
+                             const DeviceTensor &physical_rows,
+                             uint32_t rows, uint32_t width, float alpha) override {
+        if (!std::isfinite(alpha) || alpha < 0 || alpha > 1)
+            return {false, "mix_kv_rows alpha must be in [0,1]"};
+        const uint64_t count = uint64_t(rows) * width;
+        if (physical_rows.dtype != DeviceTensorDType::I32 || physical_rows.count < rows ||
+            width == 0 || count > old_k.count || count > old_v.count ||
+            k.count != v.count || k.count % width != 0 || count > k.count ||
+            k.dtype != v.dtype || k.dtype != old_k.dtype || k.dtype != old_v.dtype)
+            return {false, "mix_kv_rows invalid shape or dtype"};
+        if (k.dtype != DeviceTensorDType::F32 && k.dtype != DeviceTensorDType::F16 &&
+            k.dtype != DeviceTensorDType::BF16 && k.dtype != DeviceTensorDType::FP8_E4M3)
+            return {false, "mix_kv_rows unsupported KV dtype"};
+        if (rows == 0 || alpha == 1) return {};
+        const auto *indices = reinterpret_cast<const int32_t *>(as_tensor(physical_rows).ptr);
+        const unsigned blocks = static_cast<unsigned>((count + 255) / 256);
+#define QW3_MIX_KV(T) mix_kv_rows_kernel<<<blocks, 256, 0, exec_stream_>>>( \
+            reinterpret_cast<T *>(as_tensor(k).ptr), reinterpret_cast<T *>(as_tensor(v).ptr), \
+            reinterpret_cast<const T *>(as_tensor(old_k).ptr), \
+            reinterpret_cast<const T *>(as_tensor(old_v).ptr), \
+            indices, count, width, k.count / width, alpha)
+        switch (k.dtype) {
+        case DeviceTensorDType::F32: QW3_MIX_KV(float); break;
+        case DeviceTensorDType::F16: QW3_MIX_KV(__half); break;
+        case DeviceTensorDType::BF16: QW3_MIX_KV(__nv_bfloat16); break;
+        case DeviceTensorDType::FP8_E4M3: QW3_MIX_KV(__nv_fp8_e4m3); break;
+        default: break;
+        }
+#undef QW3_MIX_KV
+        return launch_status("mix_kv_rows");
+    }
+
     DeviceStatus copy_d2d(DeviceTensor &dst,
                           const DeviceTensor &src,
                           uint64_t src_offset,
@@ -22179,12 +22850,17 @@ public:
     }
 
 private:
+#if QW3_ENABLE_FLASHINFER
+    flashinfer_adapter::AttentionCapture action_capture_;
+#endif
     LinearBackend linear_backend_ = LinearBackend::Auto;
+    std::unique_ptr<TargetSamplerCuda> target_sampler_;
     cublasHandle_t cublas_handle_ = nullptr;
     cublasLtHandle_t cublaslt_handle_ = nullptr;
     void *cublaslt_workspace_ = nullptr;
     size_t cublaslt_workspace_bytes_ = 0;
     std::vector<std::unique_ptr<Fp8LtPlan>> fp8_lt_plans_;
+    std::vector<std::unique_ptr<DFlashLtPlan>> dflash_lt_plans_;
     uint64_t *rows_buf_ = nullptr;
     uint32_t  rows_buf_capacity_ = 0;
     uint32_t *embedding_scatter_dst_rows_ = nullptr;
@@ -22289,6 +22965,8 @@ private:
     uint64_t flashinfer_batch_decode_tmp_s_capacity_ = 0;  // elements
     int32_t *flashinfer_batch_decode_meta_i32_ = nullptr;
     uint64_t flashinfer_batch_decode_meta_i32_capacity_ = 0;  // elements
+    detail::FlashinferDecodePlan flashinfer_decode_plan_;
+    bool flashinfer_decode_plan_uploaded_ = false;
     __half *flashinfer_batch_prefill_q_f16_ = nullptr;
     uint64_t flashinfer_batch_prefill_q_f16_capacity_ = 0;  // elements
     __half *flashinfer_batch_prefill_o_f16_ = nullptr;

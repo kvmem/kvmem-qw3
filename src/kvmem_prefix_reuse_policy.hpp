@@ -4,6 +4,83 @@
 
 namespace qw3::detail {
 
+// A speculative cycle commits the current token plus up to `drafts` tokens.
+// Stop at the next physical block boundary when a replay snapshot is due;
+// otherwise repeated MTP jumps can skip every safe post-selection origin.
+constexpr uint32_t kvmem_checkpoint_draft_limit(
+        uint64_t position, uint32_t block_tokens, uint32_t drafts,
+        bool checkpoint_due) {
+    if (!checkpoint_due || block_tokens == 0) return drafts;
+    const uint32_t gap = block_tokens - position % block_tokens;
+    return drafts < gap ? drafts : gap - 1;
+}
+
+// Warm sessions need an aligned checkpoint in the current selection. A
+// periodic reselect between that checkpoint and EOS invalidates P while M can
+// remain unaligned. Schedule periodic updates at the first block boundary at
+// or after their interval; explicit pressure recovery remains independent.
+constexpr bool kvmem_periodic_reselect_boundary_due(
+        uint64_t position, uint64_t last_reselect, uint32_t interval,
+        uint32_t block_tokens) {
+    const uint32_t bt = block_tokens ? block_tokens : 1;
+    const uint32_t gap = interval ? interval : 1;
+    return position >= last_reselect && position - last_reselect >= gap &&
+        position % bt == 0;
+}
+
+// A speculative acceptance can otherwise jump over the scheduled boundary.
+// Clamp when the next boundary is due or this cycle could cross the
+// interval threshold (including configurations smaller than a draft cycle).
+constexpr bool kvmem_periodic_reselect_align_drafts(
+        uint64_t position, uint64_t last_reselect, uint32_t interval,
+        uint32_t block_tokens, uint32_t requested_drafts) {
+    if (position < last_reselect || block_tokens == 0) return false;
+    const uint64_t elapsed = position - last_reselect;
+    const uint32_t gap = interval ? interval : 1;
+    const uint32_t boundary_distance = block_tokens - position % block_tokens;
+    return elapsed >= gap || gap - elapsed <= boundary_distance ||
+        gap - elapsed <= uint64_t(requested_drafts) + 1;
+}
+
+// The rendered message header can begin in the block BEFORE its scoring Q.
+// A fresh Q needs a checkpoint no later than both boundaries; otherwise an
+// unaligned M can skip the only reachable state for the complete live replay.
+constexpr uint64_t kvmem_replay_capture_begin(uint64_t query_begin,
+                                             uint64_t replay_begin,
+                                             uint64_t replay_end) {
+    return replay_end > replay_begin && replay_begin < query_begin
+        ? replay_begin : query_begin;
+}
+
+// A live tool-result header can follow Q by only a few template tokens. Its
+// aligned block may therefore start INSIDE Q. Replay the complete preceding
+// block instead, so the post-selection boundary is also a legal future P.
+// A boundary at zero is handled by the existing initial-query path.
+constexpr uint64_t kvmem_complete_query_replay_boundary(
+        uint64_t requested_begin, uint64_t query_begin,
+        uint64_t query_end, uint32_t block_tokens) {
+    const uint32_t bt = block_tokens ? block_tokens : 1;
+    const uint64_t boundary = requested_begin / bt * bt;
+    const uint64_t before_query = query_begin / bt * bt;
+    return before_query > 0 && boundary > before_query && boundary < query_end
+        ? before_query : boundary;
+}
+
+// A cached scoring Q does not make all tokens after its old P/M checkpoint a
+// live transaction. Ingest completed tool history before capturing the current
+// live suffix boundary, keeping the restored checkpoint as the earliest
+// reachable origin. Otherwise an old P can turn several bounded tool results
+// into one mandatory suffix larger than the selection budget. The complete
+// source remains indexed; only the post-selection replay origin advances.
+constexpr uint64_t kvmem_cached_query_replay_boundary(
+        uint64_t requested_begin, uint64_t query_begin,
+        uint64_t query_end, uint32_t block_tokens,
+        uint64_t resume_position) {
+    const uint64_t live_boundary = kvmem_complete_query_replay_boundary(
+        requested_begin, query_begin, query_end, block_tokens);
+    return live_boundary > resume_position ? live_boundary : resume_position;
+}
+
 // Stage P before one complete branch-sensitive tail block.  Agent harnesses
 // rewrite a small suffix of the prior live assistant turn when it becomes
 // history (for example, the generated empty-think marker may disappear).  The
@@ -16,15 +93,15 @@ namespace qw3::detail {
 // tail, but exact-LCP admission will reject it if that tail actually changes;
 // unlike an unaligned prompt-end fallback, it remains a legal semantic replay
 // origin when the tail is unchanged.
-constexpr uint32_t kvmem_branch_safe_prompt_checkpoint_split(
-        uint32_t prompt_end, uint32_t prefill_base,
+constexpr uint64_t kvmem_branch_safe_prompt_checkpoint_split(
+        uint64_t prompt_end, uint64_t prefill_base,
         uint32_t block_tokens) {
     constexpr uint32_t kShortTailGuard = 4;
     if (prompt_end <= prefill_base) return 0;
     const uint32_t bt = block_tokens == 0 ? 1 : block_tokens;
-    uint32_t split = 0;
+    uint64_t split = 0;
     if (prompt_end > bt) {
-        const uint32_t last_boundary = ((prompt_end - 1) / bt) * bt;
+        const uint64_t last_boundary = ((prompt_end - 1) / bt) * bt;
         // The last boundary can itself fall inside the rewritten branch tail.
         // Retreat exactly one complete block to make it branch-safe.
         split = last_boundary >= bt ? last_boundary - bt : 0;
@@ -37,9 +114,8 @@ constexpr uint32_t kvmem_branch_safe_prompt_checkpoint_split(
     // forward without re-prefilling or replacing it with an unaligned prompt-end
     // fallback.
     if (split < prefill_base) {
-        const uint64_t aligned =
-            ((static_cast<uint64_t>(prefill_base) + bt - 1) / bt) * bt;
-        return aligned < prompt_end ? static_cast<uint32_t>(aligned) : 0;
+        const uint64_t gap = (bt - prefill_base % bt) % bt;
+        return gap < prompt_end - prefill_base ? prefill_base + gap : 0;
     }
     if (split >= prompt_end) return 0;
     return split;
@@ -54,17 +130,25 @@ constexpr uint32_t kvmem_branch_safe_prompt_checkpoint_split(
 // `prefill_base == replay_boundary` is intentional.  A warm continuation has
 // already restored that state, so the caller can capture it again without
 // consuming another token and keep it as the next turn's safe P checkpoint.
-constexpr uint32_t kvmem_query_safe_prompt_checkpoint_split(
-        uint32_t prompt_end, uint32_t prefill_base,
-        uint32_t block_tokens, uint32_t query_begin,
-        uint32_t query_end) {
-    const uint32_t split = kvmem_branch_safe_prompt_checkpoint_split(
+constexpr uint64_t kvmem_query_safe_prompt_checkpoint_split(
+        uint64_t prompt_end, uint64_t prefill_base,
+        uint32_t block_tokens, uint64_t query_begin,
+        uint64_t query_end) {
+    const uint64_t split = kvmem_branch_safe_prompt_checkpoint_split(
         prompt_end, prefill_base, block_tokens);
     if (query_end <= query_begin) return split;
     const uint32_t bt = block_tokens == 0 ? 1 : block_tokens;
-    const uint32_t replay_boundary = (query_begin / bt) * bt;
+    const uint64_t replay_boundary = (query_begin / bt) * bt;
     if (split > replay_boundary && split < query_end &&
         replay_boundary >= prefill_base && replay_boundary < prompt_end) {
+        if (replay_boundary == 0 && query_end < prompt_end) {
+            // A short system prefix can put the first message header in block
+            // zero. There is no useful pre-query P; use a complete-Q aligned
+            // boundary in the final template tail if one actually exists.
+            const uint64_t gap = (bt - query_end % bt) % bt;
+            if (gap < prompt_end - query_end && query_end + gap >= prefill_base)
+                return query_end + gap;
+        }
         return replay_boundary;
     }
     return split;
@@ -85,7 +169,7 @@ struct KvmemPrefixReuseSafety {
 };
 
 constexpr KvmemPrefixReuseSafety kvmem_prefix_reuse_safety(
-        uint32_t logical_prompt_tokens, uint32_t selection_budget,
+        uint64_t logical_prompt_tokens, uint32_t selection_budget,
         bool query_capture_active, bool per_token_source_index,
         bool end_resumable, bool end_source_index_ready,
         bool prompt_resumable, bool prompt_source_index_ready) {
@@ -124,23 +208,34 @@ constexpr bool kvmem_checkpoint_selection_compatible(
     return checkpoint_generation == current_generation;
 }
 
+// A server may replay from the live tool suffix, whose aligned beginning
+// falls inside an earlier scoring query. Such an origin is valid for the
+// current replay but cannot replace a reusable P: it contains only part of Q.
+constexpr bool kvmem_checkpoint_outside_query(
+        uint64_t position, uint64_t query_begin, uint64_t query_end,
+        uint32_t block_tokens) {
+    const uint32_t bt = block_tokens == 0 ? 1 : block_tokens;
+    return query_end <= query_begin || position <= (query_begin / bt) * bt ||
+        position >= query_end;
+}
+
 // A durable query snapshot is valid only for the same public task span and
 // while every prompt token used to derive it remains inside the exact LCP.  A
 // normal query snapshot depends only on query_end.  A private guided rewrite
 // depends on the whole prompt visible to that rewrite, so source_end is the
 // prompt end of the refresh request.
 constexpr bool kvmem_warm_query_snapshot_coordinates_match(
-        bool stashed, uint32_t stored_begin, uint32_t stored_end,
-        uint32_t stored_source_end, uint32_t requested_begin,
-        uint32_t requested_end) {
+        bool stashed, uint64_t stored_begin, uint64_t stored_end,
+        uint64_t stored_source_end, uint64_t requested_begin,
+        uint64_t requested_end) {
     return stashed && stored_begin == requested_begin &&
         stored_end == requested_end && stored_source_end >= stored_end;
 }
 
 constexpr bool kvmem_warm_query_snapshot_reusable(
-        bool stashed, uint32_t stored_begin, uint32_t stored_end,
-        uint32_t stored_source_end, uint32_t requested_begin,
-        uint32_t requested_end, uint32_t common_prefix) {
+        bool stashed, uint64_t stored_begin, uint64_t stored_end,
+        uint64_t stored_source_end, uint64_t requested_begin,
+        uint64_t requested_end, uint64_t common_prefix) {
     return kvmem_warm_query_snapshot_coordinates_match(
                stashed, stored_begin, stored_end, stored_source_end,
                requested_begin, requested_end) &&
@@ -191,17 +286,17 @@ constexpr uint32_t kvmem_query_storage_rows(
 // that distinction explicit instead of treating every query-capture request as
 // a replay request.
 constexpr bool kvmem_post_query_replay_checkpoint_aligned(
-        bool semantic_replay, uint32_t checkpoint,
-        uint32_t query_boundary_ceiling, uint32_t block_tokens) {
+        bool semantic_replay, uint64_t checkpoint,
+        uint64_t query_boundary_ceiling, uint32_t block_tokens) {
     const uint32_t bt = block_tokens == 0 ? 1 : block_tokens;
     return !semantic_replay || checkpoint <= query_boundary_ceiling ||
         checkpoint % bt == 0;
 }
 
-constexpr uint32_t kvmem_warm_query_snapshot_source_end(
+constexpr uint64_t kvmem_warm_query_snapshot_source_end(
         bool guided_query, bool inherited_snapshot,
-        uint32_t prompt_tokens, uint32_t inherited_source_end,
-        uint32_t query_end) {
+        uint64_t prompt_tokens, uint64_t inherited_source_end,
+        uint64_t query_end) {
     if (guided_query) return prompt_tokens;
     if (inherited_snapshot) return inherited_source_end;
     return query_end;

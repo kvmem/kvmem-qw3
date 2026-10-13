@@ -254,7 +254,8 @@ def post_completion(base_url: str,
                     prompt: str,
                     max_tokens: int,
                     ignore_eos: bool,
-                    timeout_s: float) -> BenchRequest:
+                    timeout_s: float,
+                    sampling: Optional[dict] = None) -> BenchRequest:
     parsed = urllib.parse.urlparse(base_url)
     conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout_s)
     payload = {
@@ -262,6 +263,8 @@ def post_completion(base_url: str,
         "max_tokens": max_tokens,
         "temperature": 0,
     }
+    if sampling:
+        payload.update(sampling)
     if ignore_eos:
         payload["ignore_eos"] = True
     body = json.dumps(payload, ensure_ascii=False)
@@ -455,7 +458,8 @@ def send_requests(base_url: str,
                   max_tokens: int,
                   ignore_eos: bool,
                   timeout_s: int,
-                  concurrent: bool) -> tuple[float, List[BenchRequest]]:
+                  concurrent: bool,
+                  sampling: Optional[dict] = None) -> tuple[float, List[BenchRequest]]:
     request_start = time.monotonic()
     requests: List[BenchRequest] = []
     if concurrent:
@@ -469,6 +473,7 @@ def send_requests(base_url: str,
                     max_tokens,
                     ignore_eos,
                     float(timeout_s),
+                    sampling,
                 )
                 for name, prompt in prompts.items()
             ]
@@ -479,7 +484,7 @@ def send_requests(base_url: str,
             requests.append(
                 post_completion(
                     base_url, name, prompt, max_tokens, ignore_eos,
-                    float(timeout_s))
+                    float(timeout_s), sampling)
             )
     return time.monotonic() - request_start, requests
 
@@ -499,7 +504,8 @@ def run_variant(*,
                 trace: bool,
                 timing: bool,
                 ignore_eos: bool,
-                extra_args: Sequence[str]) -> BenchRun:
+                extra_args: Sequence[str],
+                sampling: Optional[dict] = None) -> BenchRun:
     env = make_env(variant, max_active, trace, timing)
     variant_args = list(variant.args) + list(extra_args)
     cmd = make_command(
@@ -523,7 +529,7 @@ def run_variant(*,
         cbr.wait_for_health(base_url, timeout_s=min(120.0, float(timeout_s)))
         request_wall_s, requests = send_requests(
             base_url, prompts, max_tokens, ignore_eos, timeout_s,
-            variant.concurrent
+            variant.concurrent, sampling
         )
     finally:
         log = terminate_drained_server(proc, log_chunks, log_threads)
@@ -708,7 +714,8 @@ def run_reused_variant_matrix(*,
                               trace: bool,
                               timing: bool,
                               ignore_eos: bool,
-                              extra_args: Sequence[str]) -> List[BenchRun]:
+                              extra_args: Sequence[str],
+                              sampling: Optional[dict] = None) -> List[BenchRun]:
     max_concurrency = max(concurrency_levels)
     env = make_env(variant, max(max_active, max_concurrency), trace, timing)
     variant_args = list(variant.args) + list(extra_args)
@@ -735,7 +742,7 @@ def run_reused_variant_matrix(*,
                 prompts = synthetic_prompts_for_target(concurrency, input_target)
                 wall_s, requests = send_requests(
                     base_url, prompts, max_tokens, ignore_eos, timeout_s,
-                    variant.concurrent
+                    variant.concurrent, sampling
                 )
                 pending.append((input_target, wall_s, requests))
                 print(
@@ -834,6 +841,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="prompt names from continuous_batching_regression.py",
     )
     ap.add_argument("--max-tokens", type=int, default=64)
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--top-k", type=int, default=20)
+    ap.add_argument("--seed", type=int, default=1000)
     ap.add_argument("--ctx", type=int, default=2048)
     ap.add_argument(
         "--ctx-sizes",
@@ -895,6 +906,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="extra argument passed to qw3 serve; repeat for multiple args",
     )
     args = ap.parse_args(argv)
+    sampling = {"temperature": args.temperature, "top_p": args.top_p,
+                "top_k": args.top_k, "seed": args.seed}
 
     binary = Path(args.qw3)
     model = Path(args.model)
@@ -935,6 +948,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     timing=args.timing,
                     ignore_eos=args.ignore_eos,
                     extra_args=args.extra_arg,
+                    sampling=sampling,
                 )
                 runs.extend(matrix_runs)
                 for run in matrix_runs:
@@ -986,6 +1000,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             timing=args.timing,
                             ignore_eos=args.ignore_eos,
                             extra_args=args.extra_arg,
+                            sampling=sampling,
                         )
                         run.input_target_tokens = input_target
                         runs.append(run)
@@ -1046,6 +1061,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     timing=args.timing,
                     ignore_eos=args.ignore_eos,
                     extra_args=args.extra_arg,
+                    sampling=sampling,
                 )
                 runs.append(run)
                 failed = [r for r in run.requests if not r.ok]
@@ -1096,6 +1112,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "timing": args.timing,
             "ignore_eos": args.ignore_eos,
             "variants": args.variants,
+            "sampling": sampling,
         },
         "runs": [asdict(run) for run in runs],
     }

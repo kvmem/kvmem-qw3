@@ -1788,12 +1788,13 @@ __global__ void mmq_q8_0_v7_kernel(
 // proportionally and drops a medium-batch matmul toward the HBM weight-read
 // floor (the regime MTP verify / low-concurrency draft lands in).
 //
-// M side is fixed at 64 rows (4 warps × 16-row stripes), identical to v7.
-// N_TILE ∈ {16,32,64}; NW = N_TILE/8 N-sub-tiles. All N_TILE are multiples of
+// Default M side is 64 rows (4 warps × 16-row stripes), identical to v7.
+// The small verification entry also supports 16/32 rows and N_TILE=8.
+// Medium N_TILE ∈ {16,32,64}; NW = N_TILE/8 N-sub-tiles. All N_TILE are multiples of
 // 8 so the swizzle collapse (row&7 == gid for N0=n*8) is preserved.
 
-template <int N_TILE, bool need_check>
-__launch_bounds__(V2_THREADS, 2)
+template <int N_TILE, bool need_check, int M_WARPS = V2_NWARPS>
+__launch_bounds__(M_WARPS * V2_WARP, 2)
 __global__ void mmq_q8_0_vmed_kernel(
         const uint8_t          * __restrict__ wq,
         const block_q8_1_mmq_t * __restrict__ ya,
@@ -1804,17 +1805,20 @@ __global__ void mmq_q8_0_vmed_kernel(
         uint32_t                  stride_y_sb,
         uint32_t                  stride_dst_row)
 {
-    constexpr int NW          = N_TILE / 8;
-    constexpr int Y_QS_PASSES = (N_TILE * 8) / V2_THREADS;  // 1 / 2 / 4
+    constexpr int NW = N_TILE / 8;
+    constexpr int CTA_THREADS = M_WARPS * V2_WARP;
+    constexpr int CTA_ROWS = M_WARPS * V1_M_TILE;
+    constexpr int Y_QS_PASSES = (N_TILE * 8 + CTA_THREADS - 1) / CTA_THREADS;
+    static_assert(M_WARPS == 1 || M_WARPS == 2 || M_WARPS == 4);
 
-    __shared__ __align__(16) int8_t W_qs_buf[V7_STAGES][V7M_M_PER_CTA][V7M_K_STRIDE];
-    __shared__ float                W_d_buf [V7_STAGES][V7M_M_PER_CTA][V7M_NSUB];
+    __shared__ __align__(16) int8_t W_qs_buf[V7_STAGES][CTA_ROWS][V7M_K_STRIDE];
+    __shared__ float                W_d_buf [V7_STAGES][CTA_ROWS][V7M_NSUB];
     __shared__ __align__(16) int8_t Y_qs_buf[V7_STAGES][N_TILE][V7M_K_STRIDE];
     __shared__ float                Y_d_buf [V7_STAGES][N_TILE][V7M_NSUB];
 
     const int n_blocks  = static_cast<int>(cols / MMQ_QK);
     const int n_sblocks = static_cast<int>(cols / V7M_K_STRIDE);
-    const int row0  = static_cast<int>(blockIdx.x) * V7M_M_PER_CTA;
+    const int row0  = static_cast<int>(blockIdx.x) * CTA_ROWS;
     const int col00 = static_cast<int>(blockIdx.y) * N_TILE;
 
     const int warp_id = static_cast<int>(threadIdx.y);
@@ -1834,7 +1838,7 @@ __global__ void mmq_q8_0_vmed_kernel(
         // W_qs: 64 rows × 128 B = 8192 B = 512 cp.async.16 / 128 threads = 4/thread.
         #pragma unroll
         for (int p = 0; p < 4; ++p) {
-            const int flat   = p * V2_THREADS + tid;
+            const int flat   = p * CTA_THREADS + tid;
             const int rl     = flat >> 3;
             const int chunk  = flat & 7;
             const int row    = row0 + rl;
@@ -1855,7 +1859,8 @@ __global__ void mmq_q8_0_vmed_kernel(
         // Y_qs: N_TILE rows × 128 B → N_TILE*8 cp.async.16 = Y_QS_PASSES/thread.
         #pragma unroll
         for (int p = 0; p < Y_QS_PASSES; ++p) {
-            const int flat   = p * V2_THREADS + tid;
+            const int flat   = p * CTA_THREADS + tid;
+            if (flat >= N_TILE * 8) continue;
             const int bl     = flat >> 3;
             const int chunk  = flat & 7;
             const int batch_idx = col00 + bl;
@@ -1875,7 +1880,7 @@ __global__ void mmq_q8_0_vmed_kernel(
         // W_d: 64 rows × 4 sub = 256 ; 2 passes.
         #pragma unroll
         for (int p = 0; p < 2; ++p) {
-            const int flat = p * V2_THREADS + tid;
+            const int flat = p * CTA_THREADS + tid;
             const int rl   = flat >> 2;
             const int sub  = flat & 3;
             const int row  = row0 + rl;
@@ -1890,7 +1895,7 @@ __global__ void mmq_q8_0_vmed_kernel(
         }
         // Y_d: N_TILE rows × 4 sub = N_TILE*4 values (guard the partial pass at N_TILE=16).
         #pragma unroll
-        for (int base = 0; base < N_TILE * 4; base += V2_THREADS) {
+        for (int base = 0; base < N_TILE * 4; base += CTA_THREADS) {
             const int flat = base + tid;
             if (flat < N_TILE * 4) {
                 const int bl   = flat >> 2;
@@ -2549,3 +2554,31 @@ bool launch_mmq_q8_0_medium(
 
 } // namespace ported
 } // namespace qw3
+
+namespace qw3::ported {
+// Small target-verification tile; same integer dot and FP32 accumulation order
+// as vmed. Callers provide the already quantized 144-byte MMQ activation format.
+bool launch_mmq_q8_0_verify_small(const uint8_t *weight, const void *input, float *dst,
+        uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride,
+        uint32_t m_warps, cudaStream_t stream) {
+    if (!rows || !cols || !batch || batch > 8 || stride < rows || cols % V7M_K_STRIDE ||
+        (m_warps != 1 && m_warps != 2 && m_warps != 4)) return false;
+    const auto *ya = reinterpret_cast<const block_q8_1_mmq_t *>(input);
+    auto launch = [&](auto W) {
+        constexpr int warps = decltype(W)::value;
+        constexpr int tile_rows = warps * V1_M_TILE;
+        const dim3 grid((rows + tile_rows - 1) / tile_rows, 1, 1);
+        const dim3 block(V2_WARP, warps, 1);
+        if (rows % tile_rows || batch % 8)
+            mmq_q8_0_vmed_kernel<8, true, warps><<<grid, block, 0, stream>>>(
+                weight, ya, dst, rows, cols, batch, batch, stride);
+        else
+            mmq_q8_0_vmed_kernel<8, false, warps><<<grid, block, 0, stream>>>(
+                weight, ya, dst, rows, cols, batch, batch, stride);
+    };
+    if (m_warps == 1) launch(std::integral_constant<int, 1>{});
+    else if (m_warps == 2) launch(std::integral_constant<int, 2>{});
+    else launch(std::integral_constant<int, 4>{});
+    return true;
+}
+} // namespace qw3::ported

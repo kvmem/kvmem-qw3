@@ -212,7 +212,27 @@ static void test_heat_aware_replacement_before_logical_full() {
     CHECK(t.used_slots() == 2);
 }
 
+static void test_reused_identity_forgets_heat() {
+    PinnedKvTierConfig cfg;
+    cfg.total_bytes = 128; cfg.slot_bytes = 64;
+    cfg.cache_policy = PinnedKvCachePolicy::HeatAware;
+    PinnedKvTier t(cfg);
+    for (int i = 0; i < 8; ++i) {
+        t.begin_selection_epoch(); t.record_selected(1);
+    }
+    CHECK(t.place_block(1).slot >= 0);
+    t.forget_block(1);
+    CHECK(t.block_slot(1) == -1);
+    CHECK(t.place_block(2).slot >= 0);
+    CHECK(t.place_block(3).slot >= 0);
+    t.record_selected(2); t.record_selected(3);
+    // New content under physical id 1 is cold, despite old content's heat.
+    CHECK(t.place_block_evicting(1).slot == -1);
+    CHECK(t.block_slot(2) >= 0 && t.block_slot(3) >= 0);
+}
+
 int main() {
+    test_reused_identity_forgets_heat();
     test_sizing();
     test_disabled();
     test_place_release();

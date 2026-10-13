@@ -1,13 +1,17 @@
 #include "server.hpp"
+#include "speculative_options.hpp"
 #include "request_cancellation.hpp"
+#include "completion_stop_buffer.hpp"
 
 #include "anthropic_adapter.hpp"
 #include "native_request_json.hpp"
 #include "native_message_preparation.hpp"
 #include "env_flags.hpp"
 #include "harness_semantics.hpp"
+#include "normalized_byte_spans.hpp"
 #include "kvmem_request_plan.hpp"
 #include "kvmem_refresh_policy.hpp"
+#include "kvmem_file_evidence.hpp"
 #include "multimodal_prefix_cache.hpp"
 #include "multimodal_pin_policy.hpp"
 #include "message_prefix_cache.hpp"
@@ -139,7 +143,7 @@ struct ServerTtftTracker {
         std::cerr << std::fixed << std::setprecision(6)
                   << "[qw3-server-ttft]"
                   << " rid=" << rid
-                  << " route=" << route
+                  << " dispatch=" << route
                   << " stream=" << (streaming ? 1 : 0)
                   << " model_token_seen=" << (first_model_seen ? 1 : 0)
                   << " server_ttft_ms=" << server_ttft_ms
@@ -198,6 +202,20 @@ std::string bytes_gib_label(uint64_t bytes) {
 
 bool serve_continuous_batch_request_supported(const GenerationOptions &g,
                                                bool kvmem_enabled) {
+    if (g.thinking_compaction_enabled() &&
+        !(kvmem_enabled && env_flag_enabled("QW3_EXPERIMENTAL_BOUNDED_CONTINUOUS") &&
+          env_flag_enabled("QW3_CONTINUOUS_KVMEM_CONTROLLER") &&
+          env_flag_enabled("QW3_CONTINUOUS_KVMEM_COOPERATIVE_PREFILL"))) return false;
+    if (kvmem_enabled && env_flag_enabled("QW3_CONTINUOUS_KVMEM_SESSION_REUSE") &&
+        env_flag_enabled("QW3_CONTINUOUS_KVMEM_CONTROLLER")) {
+        // Opt-in complete controller owns each request's query, pins and
+        // refresh state. Semantic-budget and transcript experiments retain
+        // their existing serialized route.
+        return g.max_tokens >= 0 &&
+               g.kvmem_semantic_budget == 0 && g.kvmem_replay_query_spans.empty() &&
+               g.kvmem_oracle_token_spans.empty() && g.kvmem_inline_refresh == KvMemInlineRefreshMode::Off &&
+               g.kvmem_prefill_window_mode != KvMemPrefillWindowMode::SemanticChunk;
+    }
     // Request-local budgets mutate the single executor's selection policy for
     // the duration of a request. Keep them on the serialized plain/frozen path
     // until continuous batching has a per-row budget field.
@@ -226,6 +244,26 @@ bool valid_kvmem_cache_id(const std::string &id) {
     return std::all_of(id.begin(), id.end(), [](unsigned char c) {
         return std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == ':';
     });
+}
+
+bool parse_continuous_kvmem_cache_key(const json &req, GenerationOptions &g,
+                                    bool kvmem_enabled, std::string &error) {
+    if (!req.contains("kvmem_prefix_cache_key")) return true;
+    const auto &key = req["kvmem_prefix_cache_key"];
+    if (!key.is_string() || !valid_kvmem_cache_id(key.get<std::string>())) {
+        error = "kvmem_prefix_cache_key must be 1..128 letters, digits, '.', '_', '-' or ':'";
+        return false;
+    }
+    if (!kvmem_enabled || !g.continuous_batching ||
+        !env_flag_enabled("QW3_CONTINUOUS_KVMEM_SESSION_REUSE") ||
+        !env_flag_enabled("QW3_KVMEM_PREFIX_CACHE") ||
+        !g.kvmem_session_id.empty() || !g.kvmem_cache_load_id.empty() || !g.kvmem_cache_save_id.empty() ||
+        !g.input_embedding_overrides.empty() || !g.input_mrope_positions.empty()) {
+        error = "kvmem_prefix_cache_key requires enabled continuous KVMem full-history text requests";
+        return false;
+    }
+    g.kvmem_prefix_cache_key = key.get<std::string>();
+    return true;
 }
 
 bool parse_bounded_json_u64(const json &value, uint64_t min_value,
@@ -1706,6 +1744,10 @@ bool apply_stops(std::string &text, const std::vector<std::string> &stops) {
     return false;
 }
 
+size_t generation_budget_used(size_t visible, const GenerationOptions &g) {
+    return visible + (g.thinking_summary_stats ? g.thinking_summary_stats->discarded_tokens : 0);
+}
+
 const char *generation_finish_reason(bool stop_matched,
                                      size_t completion_tokens,
                                      int max_tokens) {
@@ -1737,7 +1779,27 @@ std::vector<std::string> parse_stops(const json &req) {
 } // namespace
 
 int run_server(EngineOptions engine, ServerConfig cfg) {
+    detail::normalize_speculative_options(engine);
     engine.native_heavy = true;
+    const bool bounded_repository = engine.kvmem_repository_blocks != 0;
+    if (bounded_repository) {
+        if (!engine.kvmem_enabled || (cfg.continuous_batching &&
+            !env_flag_enabled("QW3_EXPERIMENTAL_BOUNDED_CONTINUOUS")))
+            throw std::invalid_argument("bounded KVMem serving requires --kvmem; continuous requests require QW3_EXPERIMENTAL_BOUNDED_CONTINUOUS");
+        cfg.kvmem_prefix_cache = true;
+        cfg.kvmem_query_replay = true;
+    }
+    // The HTTP rendering/span helpers still use request-local u32 offsets.
+    // This protocol bound is independent of the physical repository, while
+    // the backend's historical coordinates are u64. Keep it explicit rather
+    // than allowing casts to wrap on an oversized complete transcript.
+    const uint64_t request_context_limit = bounded_repository
+        ? uint64_t(UINT32_MAX) : uint64_t(std::max(1, engine.ctx_size));
+    const auto remaining_output_capacity = [&](uint64_t occupied) {
+        return occupied < request_context_limit
+            ? static_cast<int>(std::min<uint64_t>(
+                request_context_limit - occupied, std::numeric_limits<int>::max())) : 0;
+    };
     if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
     if (cfg.max_active <= 0) throw std::runtime_error("--max-active must be > 0");
     if (cfg.max_pending <= 0) throw std::runtime_error("--max-pending must be > 0");
@@ -1823,9 +1885,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             "--kvmem-guided-reselect requires --kvmem and "
             "--kvmem-query-conditioned");
     }
-    if ((guided_boundary || guided_middecode) && !mtp_enabled) {
+    if ((guided_boundary || guided_middecode) && !mtp_enabled && engine.dflash_model_path.empty()) {
         throw std::runtime_error(
-            "--kvmem-guided-reselect currently requires --mtp-chain > 0");
+            "--kvmem-guided-reselect requires --mtp-chain > 0 or --dflash-model");
     }
     if (guided_middecode &&
         engine.kvmem_middecode_trigger_tokens >= engine.kvmem_gen_budget) {
@@ -1857,7 +1919,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                      "kvmem prefix caching disabled\n";
         cfg.kvmem_prefix_cache = false;
     }
-    if (cfg.kvmem_prefix_cache && cfg.continuous_batching) {
+    if (cfg.kvmem_prefix_cache && cfg.continuous_batching &&
+        !env_flag_enabled("QW3_CONTINUOUS_KVMEM_SESSION_REUSE")) {
         std::cerr << "[qw3-serve] note: --kvmem-prefix-cache applies to the plain "
                      "(non-continuous-batching) serve route; it is inert while "
                      "--continuous-batching is active\n";
@@ -1895,9 +1958,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             setenv_value("QW3_PREFIX_CACHE_MAX_PAGES", 0);
         }
     }
-    // kvmem single-request prefix cache: plain-route warm reuse. Requires kvmem;
-    // inert on the CB path (only generate_plain / generate_mtp on the shared
-    // executor read it). Tracing left to QW3_KVMEM_PREFIX_CACHE_TRACE opt-in.
+    // Plain-route warm reuse, plus explicitly keyed complete-history CB
+    // requests when the session-reuse experiment is enabled.
     setenv_bool("QW3_KVMEM_PREFIX_CACHE",
                 cfg.kvmem_prefix_cache && engine.kvmem_enabled);
     setenv_bool("QW3_KVMEM_QUERY_REPLAY",
@@ -1982,6 +2044,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                            : std::string("auto(ctx)"))
               << "\n"
               << "  mtp_chain=" << engine.native_mtp_chain << "\n"
+              << "  speculative_method="
+              << (!engine.dflash_model_path.empty() ? "dflash2" : mtp_enabled ? "mtp" : "none") << "\n"
+              << "  dflash_model=" << engine.dflash_model_path << "\n"
               << "  mtp_policy=" << engine.mtp_policy << "\n"
               << "  mtp_adaptive_min_chain="
               << (engine.mtp_adaptive_min_chain > 0
@@ -2024,6 +2089,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                       : std::string("0(disabled)"))
               << "\n"
               << "  kvmem=" << yesno(engine.kvmem_enabled) << "\n"
+              << "  thinking_summary=" << cfg.thinking_summary_default << "\n"
+              << "  thinking_summary_tokens=" << cfg.thinking_summary_tokens_default << "\n"
+              << "  thinking_summary_min_tokens=" << cfg.thinking_summary_min_tokens_default << "\n"
               << "  kvmem_block_tokens=" << engine.kvmem_block_tokens << "\n"
               << "  kvmem_budget=" << engine.kvmem_budget << "\n"
               << "  kvmem_prefill_budget="
@@ -2062,6 +2130,18 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << yesno(engine.kvmem_raw_k_nvme) << "\n"
               << "  kvmem_query_replay="
               << yesno(cfg.kvmem_query_replay && !cfg.continuous_batching) << "\n"
+              << "  kvmem_action_attention=" << yesno(engine.kvmem_attention.enabled)
+              << " scope=" << engine.kvmem_attention.scope
+              << " layers=" << engine.kvmem_attention.layers
+              << " fraction=" << engine.kvmem_attention.fraction
+              << " combine=" << engine.kvmem_attention.combine
+              << " decay=" << engine.kvmem_attention.decay
+              << " interval=" << engine.kvmem_attention.interval << "\n"
+              << "  kvmem_action_pressure=" << yesno(engine.kvmem_attention.pressure)
+              << " prefill_attention=" << yesno(engine.kvmem_attention.prefill)
+              << " prefill_interval=" << engine.kvmem_attention.prefill_interval
+              << " prefill_stride=" << engine.kvmem_attention.prefill_stride
+              << " prefill_half_life=" << engine.kvmem_attention.prefill_half_life << "\n"
               << "  kvmem_method=" << engine.kvmem_method << "\n"
               << "  kvmem_retrieval_method=" << engine.kvmem_retrieval_method << "\n"
               << "  kvmem_adaptive_gain_1to2="
@@ -2260,14 +2340,21 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     });
 
     svr.Get("/v1/models", [&](const httplib::Request &, httplib::Response &res) {
-        const int context_window = std::max(1, engine.ctx_size);
-        int max_output_tokens = context_window;
+        const uint64_t context_window = request_context_limit;
+        int max_output_tokens = remaining_output_capacity(0);
         if (cfg.default_max_tokens_set &&
             cfg.default_generation.max_tokens > 0) {
             max_output_tokens = std::min(
                 max_output_tokens, cfg.default_generation.max_tokens);
         }
-        if (engine.kvmem_enabled && engine.kvmem_gen_budget > 0) {
+        // Tier-backed decoding already admits every committed token through
+        // kvmem_prepare_decode_window(). Its generation reserve sizes the
+        // resident pool; it is not a request-wide output limit. Keep the
+        // conservative epoch cap without durable tiers or for the separately
+        // admitted continuous-batching lane, which owns a fixed decode reserve.
+        if (engine.kvmem_enabled && engine.kvmem_gen_budget > 0 &&
+            (cfg.continuous_batching ||
+             (engine.kvmem_cpu_bytes == 0 && engine.kvmem_nvme_bytes == 0))) {
             const uint64_t kvmem_cap = guided_middecode
                 ? static_cast<uint64_t>(engine.kvmem_gen_budget) +
                     static_cast<uint64_t>(
@@ -2293,6 +2380,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                        {"context_length", context_window},
                                        {"max_output_tokens", max_output_tokens},
                                        {"max_tokens", max_output_tokens}}})}};
+        if (bounded_repository) {
+            out["data"][0]["kvmem_repository_tokens"] = engine.ctx_size;
+            out["data"][0]["kvmem_repository_gc"] = engine.kvmem_repository_gc_mode;
+        }
         res.set_content(dump_json(out), "application/json");
     });
 
@@ -2376,11 +2467,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
         const uint64_t occupied = archive_prefix_tokens +
             static_cast<uint64_t>(prompt_token_count);
-        const int remaining_ctx = occupied <
-                static_cast<uint64_t>(std::max(1, engine.ctx_size))
-            ? static_cast<int>(
-                  static_cast<uint64_t>(engine.ctx_size) - occupied)
-            : 0;
+        const int remaining_ctx = remaining_output_capacity(occupied);
         bool has_max_tokens = false;
         int requested_max_tokens = 0;
         std::string max_tokens_error;
@@ -2413,10 +2500,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                       << " (remaining context)\n";
             g.max_tokens = remaining_ctx;
         }
-        // Ordinarily one turn cannot exceed the physical generation reserve.
-        // Mid-decode guided reselection explicitly starts a new bounded epoch;
-        // cap the request by the configured number of epochs instead of by one
-        // reserve, while the backend still enforces each epoch independently.
+        // Without a durable tier, bound the request to its configured decode
+        // epochs. With CPU/NVMe backing the native capacity guard rolls the
+        // working window as needed, independently of guided-query generation.
+        // Explicit client/server output limits and remaining context still
+        // apply; do not silently cut a tier-backed Write/Edit at gen_budget.
         const uint64_t kvmem_request_output_cap = allow_kvmem_multi_epoch
             ? static_cast<uint64_t>(std::max(0, engine.kvmem_gen_budget)) +
                 static_cast<uint64_t>(
@@ -2426,6 +2514,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             : static_cast<uint64_t>(
                   std::max(0, engine.kvmem_gen_budget));
         if (engine.kvmem_enabled && engine.kvmem_gen_budget > 0 &&
+            (cfg.continuous_batching ||
+             (engine.kvmem_cpu_bytes == 0 && engine.kvmem_nvme_bytes == 0)) &&
             static_cast<uint64_t>(g.max_tokens) > kvmem_request_output_cap) {
             std::cerr << "[qw3-serve] capping request max_tokens from "
                       << g.max_tokens << " to " << kvmem_request_output_cap
@@ -2440,6 +2530,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         g.top_p = req.value("top_p", g.top_p);
         g.top_k = req.value("top_k", g.top_k);
         g.min_p = req.value("min_p", g.min_p);
+        g.sampling_filter_order = parse_sampling_filter_order(req.value(
+            "sampling_filter_order", std::string(sampling_filter_order_name(g.sampling_filter_order))));
         g.presence_penalty = req.value("presence_penalty", g.presence_penalty);
         g.repetition_penalty = req.value("repetition_penalty", g.repetition_penalty);
         g.seed = req.value("seed", g.seed);
@@ -2448,6 +2540,25 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         g.recover_thinking_eos = req.value("recover_thinking_eos", enable_thinking);
         g.thinking_budget = req.value("thinking_budget", cfg.thinking_budget_default);
         if (g.thinking_budget < 0) g.thinking_budget = 0;
+        const auto summary_tokens = req.value("thinking_summary_tokens",
+            int64_t(cfg.thinking_summary_tokens_default));
+        const auto summary_min = req.value("thinking_summary_min_tokens",
+            int64_t(cfg.thinking_summary_min_tokens_default));
+        if (summary_tokens < 0 || summary_tokens > 1024 ||
+            summary_min < 0 || summary_min > INT32_MAX) {
+            throw std::invalid_argument("thinking summary tokens must be in [0,1024] and minimum in [0,INT32_MAX]");
+        }
+        g.thinking_summary_tokens = static_cast<uint32_t>(summary_tokens);
+        g.thinking_summary_min_tokens = static_cast<uint32_t>(summary_min);
+        g.thinking_summary = req.value("thinking_summary", cfg.thinking_summary_default);
+        // Preserve the legacy request override: explicit tokens=0 disables
+        // compaction unless the new boolean explicitly requests natural mode.
+        if (req.contains("thinking_summary_tokens") && !req.contains("thinking_summary"))
+            g.thinking_summary = summary_tokens != 0;
+        if (req.contains("thinking_summary") && !g.thinking_summary)
+            g.thinking_summary_tokens = 0;
+        if (g.thinking_compaction_enabled())
+            g.thinking_summary_stats = std::make_shared<GenerationOptions::ThinkingSummaryStats>();
 
         const bool has_guided_thinking =
             req.contains("kvmem_query_guided_thinking_max_tokens");
@@ -3168,6 +3279,24 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const bool harness_semantic_pins =
             harness.kind != detail::HarnessKind::None &&
             engine.kvmem_enabled;
+        std::optional<detail::KvmemFileEvidencePlan> file_evidence;
+        if (req.contains("kvmem_file_evidence")) {
+            if (!env_flag_enabled("QW3_KVMEM_FILE_EVIDENCE") ||
+                !harness_semantic_pins ||
+                engine.kvmem_semantic_expansion != "message" ||
+                req.contains("kvmem_retrieval_group_spans")) {
+                set_error_response(res, 400,
+                    "file evidence requires enabled harness message retrieval");
+                return;
+            }
+            try {
+                file_evidence = detail::parse_kvmem_file_evidence(
+                    req["kvmem_file_evidence"], req["messages"]);
+            } catch (const std::exception &error) {
+                set_error_response(res, 400, error.what());
+                return;
+            }
+        }
         const bool explicit_retrieval_groups =
             req.contains("kvmem_retrieval_group_spans");
         const bool auto_message_groups =
@@ -3202,8 +3331,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 harness.kind, prompt, control_prefix_end,
                 rendered_message_spans);
         }
-        if (archive_prefix_tokens + prompt_token_count >=
-            static_cast<uint64_t>(std::max(1, engine.ctx_size))) {
+        if (archive_prefix_tokens + prompt_token_count >= request_context_limit) {
             set_error_response(
                 res,
                 413,
@@ -3211,7 +3339,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     std::to_string(archive_prefix_tokens) +
                     " prompt_tokens=" +
                     std::to_string(prompt_token_count) +
-                    " ctx=" + std::to_string(engine.ctx_size));
+                    " request_limit=" + std::to_string(request_context_limit));
             return;
         }
         const bool above_selection_budget =
@@ -3253,7 +3381,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             };
             const size_t trajectory_key = std::hash<std::string>{}(
                 std::to_string(static_cast<int>(harness.kind)) + ":" +
-                message_identity(root_index));
+                message_identity(root_index) +
+                (file_evidence ? ":evidence-scope:" + file_evidence->scope : ""));
             const size_t current_query_key =
                 std::hash<std::string>{}(message_identity(current_index));
             guided_trajectory_key = trajectory_key;
@@ -3306,7 +3435,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                   0,
                                   engine.kvmem_middecode_trigger_tokens))
                             : 0,
-                        decision}, guided_boundary || guided_middecode);
+                        decision, file_evidence && file_evidence->changed},
+                    guided_boundary || guided_middecode);
             harness_refresh_reason = refresh.reason;
             if (refresh.reselect) {
                 private_guided_refresh = refresh.private_query;
@@ -3542,10 +3672,55 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 return GenerationOptions::KvMemPinnedReason::CurrentQuery;
             };
             size_t reason_span_counts[5] = {0, 0, 0, 0, 0};
+            std::vector<detail::TextByteSpan> semantic_byte_spans;
+            semantic_byte_spans.reserve(semantic_plan.spans.size() + 1);
             for (const detail::HarnessByteSpan &pin : semantic_plan.spans) {
                 const size_t index = static_cast<size_t>(pin.reason);
                 if (index < 5) ++reason_span_counts[index];
+                semantic_byte_spans.push_back({pin.begin, pin.end});
             }
+            struct EvidenceUnit {
+                size_t message, begin=0, end=0, offset=0, count=0;
+                bool partial=false;
+            };
+            std::vector<EvidenceUnit> evidence_units;
+            if (file_evidence) {
+                for (size_t index : file_evidence->pinned_messages) {
+                    const auto it = std::find_if(rendered_message_spans.begin(),
+                        rendered_message_spans.end(), [index](const auto &span) {
+                            return span.message_index == index;
+                        });
+                    if (it == rendered_message_spans.end() ||
+                        it->segment_begin >= it->segment_end) {
+                        set_error_response(res, 400, "file evidence has no rendered message span");
+                        return;
+                    }
+                    evidence_units.push_back({index,0,0,semantic_byte_spans.size(),1,false});
+                    semantic_byte_spans.push_back({it->segment_begin, it->segment_end});
+                }
+                for (const auto &span : file_evidence->read_spans) {
+                    if (!span.pin) continue;
+                    const auto it=std::find_if(rendered_message_spans.begin(),rendered_message_spans.end(),
+                        [&](const auto &rendered){ return rendered.message_index==span.message; });
+                    if (it==rendered_message_spans.end() || it->content_end<=it->content_begin) {
+                        set_error_response(res,400,"partial evidence has no rendered content"); return;
+                    }
+                    const auto &text=req["messages"][span.message]["content"].get_ref<const std::string &>();
+                    const size_t header=text.find("<content>\n")+10;
+                    const size_t footer=text.rfind("</content>");
+                    evidence_units.push_back({span.message,span.begin,span.end,semantic_byte_spans.size(),3,true});
+                    semantic_byte_spans.push_back({it->segment_begin,it->content_begin+header});
+                    semantic_byte_spans.push_back({it->content_begin+span.begin,it->content_begin+span.end});
+                    semantic_byte_spans.push_back({it->content_begin+footer,it->segment_end});
+                }
+            }
+            if (semantic_plan.live_suffix_span.has_value()) {
+                const auto &suffix = *semantic_plan.live_suffix_span;
+                semantic_byte_spans.push_back({suffix.begin, suffix.end});
+            }
+            const auto normalized_semantics = detail::normalize_byte_spans(
+                prompt, semantic_byte_spans);
+            const auto &normalized_prompt = normalized_semantics.text;
 
             std::vector<size_t> token_bytes;
             token_bytes.reserve(prompt_token_ids.size() + 1);
@@ -3554,15 +3729,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             bool decode_matches = true;
             for (int32_t token : prompt_token_ids) {
                 const std::string piece = decode_usage(token);
-                if (decoded_bytes + piece.size() > prompt.size() ||
-                    prompt.compare(decoded_bytes, piece.size(), piece) != 0) {
+                if (decoded_bytes + piece.size() > normalized_prompt.size() ||
+                    normalized_prompt.compare(decoded_bytes, piece.size(), piece) != 0) {
                     decode_matches = false;
                     break;
                 }
                 decoded_bytes += piece.size();
                 token_bytes.push_back(decoded_bytes);
             }
-            if (!decode_matches || decoded_bytes != prompt.size()) {
+            if (!decode_matches || decoded_bytes != normalized_prompt.size()) {
                 set_error_response(
                     res, 500,
                     "could not map harness semantic spans through tokenizer "
@@ -3570,9 +3745,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 return;
             }
 
-            auto map_byte_span = [&](const detail::HarnessByteSpan &span)
+            auto map_byte_span = [&](const detail::TextByteSpan &span)
                     -> std::optional<std::pair<uint32_t, uint32_t>> {
-                if (span.begin >= span.end || span.end > prompt.size()) {
+                if (span.begin >= span.end || span.end > normalized_prompt.size()) {
                     return std::nullopt;
                 }
                 const auto begin_it = std::upper_bound(
@@ -3594,8 +3769,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     static_cast<uint32_t>(token_end));
             };
 
-            for (const detail::HarnessByteSpan &pin : semantic_plan.spans) {
-                const auto mapped = map_byte_span(pin);
+            for (size_t i = 0; i < semantic_plan.spans.size(); ++i) {
+                const auto &pin = semantic_plan.spans[i];
+                const auto mapped = map_byte_span(normalized_semantics.spans[i]);
                 if (!mapped.has_value()) {
                     set_error_response(
                         res, 500,
@@ -3609,10 +3785,22 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         generation_reason(pin.reason)});
             }
 
+            std::vector<std::vector<std::pair<uint32_t,uint32_t>>> evidence_token_spans;
+            for (const auto &unit : evidence_units) {
+                std::vector<std::pair<uint32_t,uint32_t>> mapped_ranges;
+                for (size_t j=0;j<unit.count;++j) {
+                    const auto mapped=map_byte_span(normalized_semantics.spans[unit.offset+j]);
+                    if (!mapped) {
+                        set_error_response(res,500,"file evidence token mapping failed"); return;
+                    }
+                    mapped_ranges.push_back(*mapped);
+                }
+                evidence_token_spans.push_back(std::move(mapped_ranges));
+            }
             std::optional<std::pair<uint32_t, uint32_t>> live_suffix_tokens;
             if (semantic_plan.live_suffix_span.has_value()) {
                 live_suffix_tokens = map_byte_span(
-                    *semantic_plan.live_suffix_span);
+                    normalized_semantics.spans.back());
                 if (!live_suffix_tokens.has_value()) {
                     set_error_response(
                         res, 500,
@@ -3716,7 +3904,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             }
             const uint32_t budget_blocks =
                 budget_tokens / block_tokens;
-            const detail::KvmemMandatoryFitResult mandatory_fit =
+            detail::KvmemMandatoryFitResult mandatory_fit =
                 detail::kvmem_fit_mandatory_blocks(
                     detail::KvmemMandatoryFitInput{
                         prompt_blocks,
@@ -3726,6 +3914,30 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         hard_spans,
                         live_first_block,
                         live_end_block});
+            if (file_evidence) {
+                uint32_t admitted = 0, skipped = 0;
+                for (size_t i = 0; i < evidence_token_spans.size(); ++i) {
+                    const auto &unit=evidence_units[i];
+                    std::vector<std::pair<uint32_t,uint32_t>> block_ranges;
+                    for (const auto &[begin,end] : evidence_token_spans[i])
+                        block_ranges.push_back({begin/block_tokens,(end-1)/block_tokens+1});
+                    const bool kept=detail::kvmem_admit_complete_evidence_ranges(
+                        mandatory_fit.hard_blocks,block_ranges,prompt_blocks,budget_blocks,budget_blocks/8);
+                    admitted += kept; skipped += !kept;
+                    const auto [begin,end]=evidence_token_spans[i][unit.partial ? 1 : 0];
+                    std::cerr << (unit.partial ? "[file-evidence-span] tag=" : "[file-evidence-pin] tag=")
+                              << req.value("kvmem_trace_tag",std::string("-"))
+                              << " message=" << unit.message;
+                    if (unit.partial) std::cerr << " content=[" << unit.begin << "," << unit.end << ")";
+                    std::cerr << " tokens=[" << begin << "," << end << ") admitted=" << kept << "\n";
+                }
+                std::cerr << "[file-evidence] scope=" << file_evidence->scope
+                          << " changed=" << file_evidence->changed
+                          << " pins=" << admitted << " skipped=" << skipped
+                          << " excluded_groups=" << file_evidence->excluded_messages.size()
+                          << " hard_blocks=" << mandatory_fit.hard_blocks.size()
+                          << " budget_blocks=" << budget_blocks << "\n";
+            }
             // Executor pins are the fitted hard anchors only. Every omitted
             // source block was still tokenized/prefilled and remains in the
             // KVMem content index as an ordinary retrieval candidate.
@@ -3874,8 +4086,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         plan_input.keep_selected = planned_keep_selected;
         plan_input.logical_prompt_tokens = logical_prompt_tokens;
         plan_input.request_prompt_tokens = prompt_token_count;
-        plan_input.context_limit_tokens = static_cast<uint64_t>(
-            std::max(1, engine.ctx_size));
+        plan_input.context_limit_tokens = request_context_limit;
         plan_input.selection_budget_tokens = static_cast<uint64_t>(
             std::max(0, engine.kvmem_budget));
         plan_input.generation_budget_tokens = static_cast<uint64_t>(
@@ -4090,19 +4301,49 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 const size_t final_query =
                     last_query_index_for_template(
                         req["messages"], harness.kind);
+                // A single user task can accumulate many tool observations.
+                // The scoring query stays pinned at the user intent, while
+                // historical evidence extends up to the current live suffix.
+                // Do not drop those same-turn tool/image messages merely
+                // because they follow the last user message.
+                const size_t history_end_message =
+                    harness_semantic_plan &&
+                        harness_semantic_plan->live_suffix_message_begin_index
+                    ? *harness_semantic_plan->live_suffix_message_begin_index
+                    : final_query;
                 requested.reserve(rendered_message_spans.size());
                 for (const RenderedMessageSpan &span :
                      rendered_message_spans) {
                     // The final user query is pinned/replayed independently and
                     // must not become a historical retrieval candidate.
-                    if (span.message_index >= final_query ||
+                    if (span.message_index >= history_end_message ||
+                        span.message_index == final_query ||
                         span.segment_end <= span.segment_begin) {
                         continue;
+                    }
+                    if (file_evidence) {
+                        std::vector<detail::KvmemFileEvidencePlan::ReadSpan> parts;
+                        for (const auto &part : file_evidence->read_spans)
+                            if (part.message==span.message_index) parts.push_back(part);
+                        if (!parts.empty()) {
+                            std::sort(parts.begin(),parts.end(),[](const auto &a,const auto &b){return a.begin<b.begin;});
+                            for (const auto &part : parts)
+                                requested.push_back({span.content_begin+part.begin,span.content_begin+part.end});
+                            continue;
+                        }
+                        if (std::binary_search(file_evidence->excluded_messages.begin(),
+                                file_evidence->excluded_messages.end(),span.message_index)) continue;
                     }
                     requested.push_back(
                         {span.segment_begin, span.segment_end});
                 }
-                if (requested.empty()) {
+                // Native harnesses can legitimately have no completed history
+                // yet (bootstrap, or all evidence in the pinned live suffix).
+                // There is then nothing to retrieve; keep the normal KVMem
+                // request plan and semantic pins. Flat benchmark clients still
+                // need explicit groups instead of silently losing their rounds.
+                if (requested.empty() &&
+                    harness.kind == detail::HarnessKind::None) {
                     set_error_response(
                         res, 400,
                         "message semantic expansion found no historical "
@@ -4112,6 +4353,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 }
             }
 
+            std::vector<detail::TextByteSpan> group_byte_spans;
+            group_byte_spans.reserve(requested.size());
+            for (const auto &group : requested)
+                group_byte_spans.push_back({group.begin, group.end});
+            const auto normalized_groups = detail::normalize_byte_spans(
+                prompt, group_byte_spans);
+            const auto &normalized_prompt = normalized_groups.text;
             std::vector<size_t> token_bytes;
             token_bytes.reserve(prompt_token_ids.size() + 1);
             token_bytes.push_back(0);
@@ -4120,15 +4368,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             for (int32_t token : prompt_token_ids) {
                 const std::string piece =
                     decode_usage(token);
-                if (decoded_bytes + piece.size() > prompt.size() ||
-                    prompt.compare(decoded_bytes, piece.size(), piece) != 0) {
+                if (decoded_bytes + piece.size() > normalized_prompt.size() ||
+                    normalized_prompt.compare(decoded_bytes, piece.size(), piece) != 0) {
                     decode_matches = false;
                     break;
                 }
                 decoded_bytes += piece.size();
                 token_bytes.push_back(decoded_bytes);
             }
-            if (!decode_matches || decoded_bytes != prompt.size()) {
+            if (!decode_matches || decoded_bytes != normalized_prompt.size()) {
                 set_error_response(
                     res, 500,
                     "could not map semantic group byte spans through tokenizer "
@@ -4136,8 +4384,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 return;
             }
 
-            uint32_t rounded_boundaries = 0;
-            for (const RequestedGroup &group : requested) {
+            size_t rounded_boundaries = normalized_groups.rounded_boundaries;
+            for (const auto &group : normalized_groups.spans) {
                 const auto begin_it = std::upper_bound(
                     token_bytes.begin(), token_bytes.end(),
                     group.begin);
@@ -4179,9 +4427,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 << g.kvmem_retrieval_group_spans.size()
                 << " rounded_boundaries=" << rounded_boundaries
                 << " token_span=["
-                << g.kvmem_retrieval_group_spans.front().begin
+                << (g.kvmem_retrieval_group_spans.empty() ? 0u :
+                    g.kvmem_retrieval_group_spans.front().begin)
                 << ","
-                << g.kvmem_retrieval_group_spans.back().end
+                << (g.kvmem_retrieval_group_spans.empty() ? 0u :
+                    g.kvmem_retrieval_group_spans.back().end)
                 << ") prompt_tokens=" << prompt_token_count << "\n";
         }
 
@@ -5142,8 +5392,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 std::move(aligned_groups);
             prompt_token_ids = std::move(aligned_tokens);
             prompt_token_count = prompt_token_ids.size();
-            if (archive_prefix_tokens + prompt_token_count >=
-                static_cast<uint64_t>(std::max(1, engine.ctx_size))) {
+            if (archive_prefix_tokens + prompt_token_count >= request_context_limit) {
                 set_error_response(
                     res, 413,
                     "archive prefix plus round-padded prompt exceeds KV context: "
@@ -5152,13 +5401,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         " "
                     "prompt_tokens=" +
                         std::to_string(prompt_token_count) +
-                        " ctx=" + std::to_string(engine.ctx_size));
+                        " request_limit=" + std::to_string(request_context_limit));
                 return;
             }
-            const int remaining_ctx = std::max(
-                1, engine.ctx_size -
-                       static_cast<int>(archive_prefix_tokens) -
-                       static_cast<int>(prompt_token_count));
+            const int remaining_ctx = remaining_output_capacity(
+                archive_prefix_tokens + prompt_token_count);
             if (g.max_tokens > remaining_ctx) {
                 std::cerr
                     << "[qw3-serve] capping request max_tokens from "
@@ -5224,6 +5471,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             !kvmem_cache_request &&
             serve_continuous_batching_enabled() &&
             serve_continuous_batch_request_supported(g, engine.kvmem_enabled);
+        std::string cache_key_error;
+        if (!parse_continuous_kvmem_cache_key(req, g, engine.kvmem_enabled, cache_key_error)) {
+            set_error_response(res, 400, cache_key_error);
+            return;
+        }
         const std::string route = kvmem_cache_request
             ? ("cache-" + kvmem_cache_operation)
             : (kvmem_session_request
@@ -5241,6 +5493,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const std::string id = gen_id("chatcmpl-");
         const int64_t created = unix_now();
         const uint64_t rid = ++req_counter;
+        // Dispatch and speculation are separate: a serialized request can run
+        // DFlash/MTP. Runtime acceptance/fallback remains in native summaries.
+        std::cerr << "[qw3-server-dispatch] rid=" << rid << " dispatch=" << route
+                  << " speculation_configured="
+                  << (!engine.dflash_model_path.empty() ? "dflash"
+                      : engine.native_mtp_speculate ? "mtp" : "none")
+                  << " dispatch_fallback_reason="
+                  << (fallback_reason.empty() ? "none" : fallback_reason) << "\n";
         // The native Messages wrapper uses this exact count after preparation;
         // it must not encode every screenshot once just to count, then again
         // in the actual request path.
@@ -5571,6 +5831,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
 
                             generate_request([&](const std::string &piece) {
                                 if (stopped || client_closed) return false;
+                                if (piece.empty() && g.thinking_compaction_enabled()) {
+                                    service_tool_stream();
+                                    return !stopped && !client_closed;
+                                }
                                 ++completion_tokens;
                                 acc += piece;
                                 std::string emit = take_complete_utf8(utf8_pending, piece);
@@ -5647,7 +5911,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                           << completion_tokens
                                           << " prompt_tokens="
                                           << prompt_token_count
-                                          << " route=" << route
+                                          << " dispatch=" << route
                                           << " buffered_tool="
                                           << (buffering_tool ? "true" : "false")
                                           << " client_closed=true\n";
@@ -5737,7 +6001,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                             json{{"content", split.content}});
                                     }
                                     send_done(generation_finish_reason(
-                                        stopped, completion_tokens, g.max_tokens));
+                                        stopped, generation_budget_used(completion_tokens, g), g.max_tokens));
                                 }
                             } else {
                                 if (forced_tool_request) {
@@ -5750,13 +6014,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 }
                                 finish_text_stream();
                                 send_done(generation_finish_reason(
-                                    stopped, completion_tokens, g.max_tokens));
+                                    stopped, generation_budget_used(completion_tokens, g), g.max_tokens));
                             }
                             std::cerr << "[qw3-serve] #" << rid
                                       << " chat(stream tools) chars=" << acc.size()
                                       << " completion_tokens=" << completion_tokens
                                       << " prompt_tokens=" << prompt_token_count
-                                      << " route=" << route
+                                      << " dispatch=" << route
                                       << " buffered_tool=" << (buffering_tool ? "true" : "false")
                                       << " incremental_tool="
                                       << (incremental.streaming() ? "true" : "false")
@@ -5773,6 +6037,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         }
                         generate_request([&](const std::string &piece) {
                             if (stopped || client_closed) return false;
+                            if (piece.empty() && g.thinking_compaction_enabled()) {
+                                if (std::chrono::steady_clock::now() - last_stream_write >=
+                                    std::chrono::seconds(2)) send_delta(json::object());
+                                return !stopped && !client_closed;
+                            }
                             ++completion_tokens;
                             acc += piece;
                             std::string emit = take_complete_utf8(utf8_pending, piece);
@@ -5795,12 +6064,12 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         });
                         finish_text_stream();
                         send_done(generation_finish_reason(
-                            stopped, completion_tokens, g.max_tokens));
+                            stopped, generation_budget_used(completion_tokens, g), g.max_tokens));
                         std::cerr << "[qw3-serve] #" << rid
                                   << " chat(stream) completion_tokens="
                                   << completion_tokens
                                   << " prompt_tokens=" << prompt_token_count
-                                  << " route=" << route
+                                  << " dispatch=" << route
                                   << (client_closed ? " client_closed=true" : "")
                                   << "\n";
                         const auto request_end =
@@ -5850,6 +6119,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         auto engine_end = engine_start;
         ServerTtftTracker ttft(server_request_start);
         auto consume_piece = [&](const std::string &piece) {
+            if (piece.empty() && g.thinking_compaction_enabled()) return;
             ttft.observe_model_piece(piece);
             ++completion_tokens;
             text += piece;
@@ -5900,9 +6170,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         std::cerr << "[qw3-serve] #" << rid << " chat chars=" << text.size()
                   << " completion_tokens=" << completion_tokens
                   << " prompt_tokens=" << prompt_token_count
-                  << " route=" << route;
+                  << " dispatch=" << route;
         if (!fallback_reason.empty()) {
-            std::cerr << " fallback_reason=" << fallback_reason;
+            std::cerr << " dispatch_fallback_reason=" << fallback_reason;
         }
         std::cerr << " " << ms << "ms\n";
         const std::vector<json> tool_calls = parse_tool_calls_xml(text, tools);
@@ -5942,7 +6212,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             message["reasoning_content"] = split.reasoning;
         }
         std::string finish = generation_finish_reason(
-            stopped, completion_tokens, g.max_tokens);
+            stopped, generation_budget_used(completion_tokens, g), g.max_tokens);
         if (!tool_calls.empty()) {
             std::cerr << "[qw3-serve] #" << rid
                       << " tool_calls=" << tool_calls_debug_summary(tool_calls)
@@ -6323,8 +6593,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const size_t prompt_token_count = exact_prompt_tokens.empty()
             ? encode_usage(prompt).size()
             : exact_prompt_tokens.size();
-        if (archive_prefix_tokens + prompt_token_count >=
-            static_cast<uint64_t>(std::max(1, engine.ctx_size))) {
+        if (archive_prefix_tokens + prompt_token_count >= request_context_limit) {
             set_error_response(
                 res,
                 413,
@@ -6332,7 +6601,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     std::to_string(archive_prefix_tokens) +
                     " prompt_tokens=" +
                     std::to_string(prompt_token_count) +
-                    " ctx=" + std::to_string(engine.ctx_size));
+                    " request_limit=" + std::to_string(request_context_limit));
             return;
         }
         const bool enable_thinking =
@@ -6593,6 +6862,36 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             g.kvmem_query_begin = static_cast<uint32_t>(begin);
             g.kvmem_query_end = static_cast<uint32_t>(end);
         }
+        // Raw completions have no agent-harness classification. An explicit
+        // query span still needs the configured guided retrieval lifecycle,
+        // just like a query-bearing chat request. Prefill-only ingestion must
+        // remain query-blind and must not generate a private query.
+        const bool raw_guided_query = bounded_repository && engine.kvmem_enabled &&
+            engine.kvmem_query_conditioned && g.max_tokens > 0 &&
+            g.kvmem_reselect_mode != KvMemReselectMode::Off &&
+            g.kvmem_query_end > g.kvmem_query_begin &&
+            prompt_token_count > static_cast<size_t>(engine.kvmem_budget);
+        if (raw_guided_query && guided_boundary &&
+            !req.contains("kvmem_query_guided_thinking_max_tokens") &&
+            !req.contains("kvmem_query_guided_query_max_tokens") &&
+            !req.contains("kvmem_query_guided_direct")) {
+            g.kvmem_query_guided_thinking_max_tokens =
+                static_cast<uint32_t>(engine.kvmem_guided_thinking_tokens);
+            g.kvmem_query_guided_query_max_tokens =
+                static_cast<uint32_t>(engine.kvmem_guided_query_tokens);
+        }
+        if (raw_guided_query && guided_middecode) {
+            g.kvmem_middecode_trigger_tokens =
+                static_cast<uint32_t>(engine.kvmem_middecode_trigger_tokens);
+            g.kvmem_middecode_steady_trigger_tokens =
+                static_cast<uint32_t>(engine.kvmem_middecode_trigger_tokens);
+            g.kvmem_middecode_max_refreshes =
+                static_cast<uint32_t>(engine.kvmem_middecode_max_refreshes);
+            g.kvmem_middecode_query_max_tokens =
+                static_cast<uint32_t>(engine.kvmem_guided_query_tokens);
+            g.kvmem_middecode_epoch_limit_tokens =
+                static_cast<uint32_t>(engine.kvmem_gen_budget);
+        }
         if (g.kvmem_reselect_mode == KvMemReselectMode::Force &&
             g.kvmem_query_end <= g.kvmem_query_begin) {
             set_error_response(
@@ -6625,6 +6924,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             !kvmem_session_request && !kvmem_cache_request &&
             serve_continuous_batching_enabled() &&
             serve_continuous_batch_request_supported(g, engine.kvmem_enabled);
+        std::string cache_key_error;
+        if (!parse_continuous_kvmem_cache_key(req, g, engine.kvmem_enabled, cache_key_error)) {
+            set_error_response(res, 400, cache_key_error);
+            return;
+        }
         const std::string route = kvmem_cache_request
             ? ("cache-" + kvmem_cache_operation)
             : (kvmem_session_request
@@ -6637,6 +6941,123 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const std::string id = gen_id("cmpl-");
         const int64_t created = unix_now();
         const uint64_t rid = ++req_counter;
+        // Dispatch and speculation are separate: a serialized request can run
+        // DFlash/MTP. Runtime acceptance/fallback remains in native summaries.
+        std::cerr << "[qw3-server-dispatch] rid=" << rid << " dispatch=" << route
+                  << " speculation_configured="
+                  << (!engine.dflash_model_path.empty() ? "dflash"
+                      : engine.native_mtp_speculate ? "mtp" : "none")
+                  << " dispatch_fallback_reason="
+                  << (fallback_reason.empty() ? "none" : fallback_reason) << "\n";
+
+        if (req.value("stream", false)) {
+            const bool include_usage = req.contains("stream_options") &&
+                req["stream_options"].is_object() &&
+                req["stream_options"].value("include_usage", false);
+            struct CompletionStreamRequest {
+                std::string prompt;
+                GenerationOptions options;
+            };
+            const auto request = std::make_shared<const CompletionStreamRequest>(
+                CompletionStreamRequest{std::move(prompt), std::move(g)});
+            res.set_header("Cache-Control", "no-cache");
+            res.set_header("X-Accel-Buffering", "no");
+            res.set_chunked_content_provider("text/event-stream",
+                [&, request, stops, id, created, rid, server_request_start,
+                 include_usage, prompt_token_count, route, kvmem_session_request,
+                 kvmem_session_reset, kvmem_cache_request, kvmem_cache_id]
+                (size_t, httplib::DataSink &sink) {
+                    auto g = request->options;
+                    std::unique_lock<std::mutex> lock(gen_mu, std::defer_lock);
+                    if (!g.continuous_batching) lock.lock();
+                    bool client_closed = false;
+                    detail::CompletionStopBuffer stop_buffer(stops);
+                    const auto original_cancel = g.should_cancel;
+                    g.should_cancel = [&] {
+                        return client_closed || stop_buffer.stopped() ||
+                            (original_cancel && original_cancel());
+                    };
+                    size_t completion_tokens = 0;
+                    std::string utf8_pending;
+                    ServerTtftTracker ttft(server_request_start);
+                    auto send_raw = [&](const std::string &wire) {
+                        if (client_closed || (sink.is_writable && !sink.is_writable()) ||
+                            !sink.write(wire.data(), wire.size())) {
+                            client_closed = true;
+                            return false;
+                        }
+                        return true;
+                    };
+                    auto chunk = [&](const std::string &text, const json &reason) {
+                        return json{{"id", id}, {"object", "text_completion"},
+                            {"created", created}, {"model", model_id},
+                            {"choices", json::array({json{{"index", 0},
+                                {"text", text}, {"logprobs", nullptr},
+                                {"finish_reason", reason}}})}};
+                    };
+                    auto emit = [&](const std::string &text) {
+                        if (text.empty()) return !client_closed;
+                        const bool sent = send_raw("data: " + dump_json(chunk(text, nullptr)) + "\n\n");
+                        if (sent) ttft.observe_visible_output();
+                        return sent;
+                    };
+                    auto consume = [&](const std::string &piece) {
+                        if (g.should_cancel()) return false;
+                        ++completion_tokens;
+                        ttft.observe_model_piece(piece);
+                        const auto safe = stop_buffer.push(piece);
+                        if (!emit(take_complete_utf8(utf8_pending, safe))) return false;
+                        return !g.should_cancel();
+                    };
+                    try {
+                        ttft.start_engine(std::chrono::steady_clock::now());
+                        if (kvmem_session_request) {
+                            eng.generate_session_stream(request->prompt, g,
+                                [&](const std::string &piece) { (void)consume(piece); },
+                                kvmem_session_reset);
+                        } else {
+                            eng.generate_stream_cancellable(request->prompt, g, consume);
+                        }
+                        if (!client_closed) {
+                            emit(take_complete_utf8(utf8_pending, stop_buffer.finish()));
+                            emit(flush_utf8_pending(utf8_pending, false));
+                            json done = chunk("", generation_finish_reason(
+                                stop_buffer.stopped(), generation_budget_used(completion_tokens, g), g.max_tokens));
+                            done["timing"] = ttft.timing_json(std::chrono::steady_clock::now());
+                            if (kvmem_cache_request) {
+                                const auto info = eng.kvmem_local_cache_info(kvmem_cache_id);
+                                if (!info.found) throw std::runtime_error(
+                                    "KVMem local cache operation completed without metadata");
+                                done["kvmem_cache"] = kvmem_cache_info_json(info);
+                            }
+                            send_raw("data: " + dump_json(done) + "\n\n");
+                            if (include_usage) {
+                                json usage{{"id", id}, {"object", "text_completion"},
+                                    {"created", created}, {"model", model_id},
+                                    {"choices", json::array()},
+                                    {"usage", usage_json(prompt_token_count, completion_tokens)}};
+                                send_raw("data: " + dump_json(usage) + "\n\n");
+                            }
+                            if (send_raw("data: [DONE]\n\n")) sink.done();
+                        }
+                        std::cerr << "[qw3-serve] #" << rid
+                                  << " completion(stream) completion_tokens=" << completion_tokens
+                                  << " prompt_tokens=" << prompt_token_count << " dispatch=" << route
+                                  << " client_closed=" << (client_closed ? "true" : "false") << "\n";
+                        ttft.log(rid, route, true, std::chrono::steady_clock::now());
+                        return !client_closed;
+                    } catch (const std::exception &error) {
+                        json failure = chunk("", "error");
+                        failure["error"] = error.what();
+                        send_raw("data: " + dump_json(failure) + "\n\n");
+                        sink.done();
+                        std::cerr << "[qw3-serve] #" << rid << " completion(stream) error="
+                                  << error.what() << "\n";
+                        return false;
+                    }
+                });
+            return;
+        }
 
         std::string text;
         size_t completion_tokens = 0;
@@ -6692,9 +7113,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                   << text.size()
                   << " completion_tokens=" << completion_tokens
                   << " prompt_tokens=" << prompt_token_count
-                  << " route=" << route;
+                  << " dispatch=" << route;
         if (!fallback_reason.empty()) {
-            std::cerr << " fallback_reason=" << fallback_reason;
+            std::cerr << " dispatch_fallback_reason=" << fallback_reason;
         }
         std::cerr << "\n";
         const auto response_build_at = std::chrono::steady_clock::now();
@@ -6710,7 +7131,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             {"choices", json::array({json{
                 {"index", 0}, {"text", text}, {"logprobs", nullptr},
                 {"finish_reason", generation_finish_reason(
-                    stopped, completion_tokens, g.max_tokens)}}})},
+                    stopped, generation_budget_used(completion_tokens, g), g.max_tokens)}}})},
             {"usage", usage_json(prompt_token_count, completion_tokens)},
             {"timing", std::move(timing)}};
         if (kvmem_cache_request) {

@@ -1,6 +1,7 @@
 #include "qw3/kvmem_store.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -27,6 +28,674 @@ uint32_t ceil_percent(uint32_t value, uint32_t percent) {
 }
 
 }  // namespace
+
+std::vector<KvMemStoragePageSpan> kvmem_storage_page_spans(
+        const std::vector<KvMemStorageSpan> &spans, uint32_t page_size,
+        uint32_t window_begin) {
+    if (!page_size) throw std::invalid_argument("KVMem page size is zero");
+    std::vector<KvMemStoragePageSpan> out;
+    out.reserve(spans.size());
+    uint64_t window = window_begin;
+    uint64_t history = spans.empty() ? 0 : spans.front().history_begin;
+    for (const auto &span : spans) {
+        if (!span.token_count || span.history_begin != history ||
+            history > UINT64_MAX - span.token_count ||
+            uint64_t(span.storage_begin) + span.token_count > INT32_MAX ||
+            window + span.token_count > INT32_MAX ||
+            span.storage_begin % page_size != window % page_size ||
+            (!out.empty() && window % page_size != 0))
+            throw std::invalid_argument("KVMem storage/window page alignment or range mismatch");
+        const uint32_t first = span.storage_begin / page_size;
+        const uint32_t count = static_cast<uint32_t>(
+            (uint64_t(span.storage_begin) + span.token_count + page_size - 1) / page_size) - first;
+        const uint32_t win_page = static_cast<uint32_t>(window / page_size);
+        if (!out.empty() && out.back().storage_page + out.back().page_count == first &&
+            out.back().window_page + out.back().page_count == win_page)
+            out.back().page_count += count;
+        else
+            out.push_back({first, win_page, count});
+        history += span.token_count;
+        window += span.token_count;
+    }
+    return out;
+}
+
+KvMemStore::KvMemStore(KvMemStoreConfig cfg) : cfg_(std::move(cfg)) {
+    if (!std::isfinite(cfg_.action_fraction) || cfg_.action_fraction < 0 || cfg_.action_fraction > 1)
+        throw std::invalid_argument("action_fraction must be in [0,1]");
+    if (cfg_.action_combine != "quota" && cfg_.action_combine != "score")
+        throw std::invalid_argument("action_combine must be quota|score");
+}
+
+KvMemStore::KvMemStore(KvMemStoreConfig cfg, std::shared_ptr<KvMemRepository> repository)
+    : KvMemStore(cfg) {
+    repository_ = std::move(repository);
+    if (!repository_ || !cfg.block_tokens || repository_->block_tokens() != cfg.block_tokens ||
+        (cfg.repository_blocks && cfg.repository_blocks != repository_->capacity()) ||
+        uint64_t(repository_->capacity()) * cfg.block_tokens > INT32_MAX)
+        throw std::invalid_argument("invalid bounded KVMem physical address capacity");
+    if (cfg.gc.max_live_blocks && !cfg.repository_blocks)
+        throw std::invalid_argument("legacy GC cannot own a reusable KVMem slot directory");
+    blocks_.resize(repository_->capacity());
+    repository_resident_leases_.resize(repository_->capacity());
+    repository_gc_flags_.resize(repository_->capacity());
+    repository_history_nodes_.reserve(repository_->capacity());
+    for (uint32_t i = 0; i < block_count(); ++i) blocks_[i].block_id = i;
+    // Each physical slot owns one map node, whether installed or free. Later
+    // recycling extracts/reinserts that node without allocating a history log.
+    for (uint32_t i = 0; i < block_count(); ++i) {
+        auto it = repository_history_.emplace(i, KvMemBlockHandle{}).first;
+        repository_history_nodes_.push_back(repository_history_.extract(it));
+    }
+}
+
+void KvMemStore::attach_gc(std::shared_ptr<KvMemGc> gc) {
+    if (repository_ && gc)
+        throw std::invalid_argument("legacy GC cannot own a reusable KVMem slot directory");
+    gc_ = std::move(gc);
+    if (gc_) gc_->set_recent_blocks(cfg_.recent_blocks);
+    gc_view_ = gc_ ? gc_->read_view() : nullptr;
+}
+
+void KvMemStore::attach_repository_gc(std::shared_ptr<KvMemRepositoryGc> gc) {
+    require_no_repository_append();
+    if (gc && (!repository_ || gc->repository() != repository_))
+        throw std::invalid_argument("KVMem GC belongs to a different repository");
+    if (repository_gc_ && repository_gc_ != gc) repository_gc_->stop();
+    repository_gc_ = std::move(gc);
+    if (!repository_gc_) return;
+    repository_gc_->set_history_end(total_tokens_);
+    for (uint32_t i = 0; i < block_count(); ++i) repository_sync_gc(i);
+}
+
+void KvMemStore::set_repository_gc_flags(KvMemBlockHandle h, uint32_t mask, uint32_t values) {
+    auto lease = validate_repository_mutation(h.slot, h.generation);
+    if (!lease) throw std::logic_error("KVMem repository GC flags require bounded mode");
+    constexpr uint32_t allowed = KvMemGc::RawBacked | KvMemGc::ValueBacked | KvMemRepositoryGc::Indexed |
+        KvMemGc::Anchor | KvMemGc::Mandatory | KvMemGc::Duplicate | KvMemGc::Superseded;
+    if (mask & ~allowed) throw std::invalid_argument("KVMem automatic GC protection flags cannot be overridden");
+    auto &flags = repository_gc_flags_[h.slot];
+    flags = (flags & ~mask) | (values & mask);
+    repository_sync_gc(h.slot);
+}
+
+void KvMemStore::repository_sync_gc(uint32_t slot, bool used) {
+    if (!repository_gc_) return;
+    auto lease = repository_->try_pin(repository_handle(slot));
+    if (!lease) return;
+    const auto &b = blocks_[slot];
+    const uint32_t flags = repository_gc_flags_[slot] | KvMemGc::Registered |
+        (b.n_tokens == cfg_.block_tokens ? KvMemGc::Sealed : 0u) |
+        (b.tier == KvTier::GPU ? KvMemGc::Gpu : 0u) | (b.in_flight ? KvMemGc::Io : 0u) |
+        (b.in_working_set || sink_block(slot) ? KvMemGc::Mandatory : 0u);
+    repository_gc_->publish(lease, flags, used);
+}
+
+KvMemBlockHandle KvMemStore::repository_handle(uint32_t slot) const {
+    if (!repository_ || slot >= block_count()) return {};
+    return {slot, blocks_[slot].repository_generation};
+}
+
+bool KvMemStore::is_live(uint32_t id) const {
+    if (id >= block_count()) return false;
+    if (repository_) return bool(repository_->try_pin(repository_handle(id)));
+    return !gc_ || (gc_view_ && gc_->is_live(id, gc_view_));
+}
+
+bool KvMemStore::earlier(uint32_t a, uint32_t b) const {
+    if (!repository_) return a < b;
+    const auto &x = blocks_[a], &y = blocks_[b];
+    if (x.history_pos_start != y.history_pos_start) return x.history_pos_start < y.history_pos_start;
+    return x.logical_id < y.logical_id;
+}
+
+bool KvMemStore::sink_block(uint32_t id) const {
+    return repository_ ? blocks_[id].history_pos_start < uint64_t(cfg_.sink_blocks) * cfg_.block_tokens
+                       : id < cfg_.sink_blocks;
+}
+
+std::vector<uint32_t> KvMemStore::chronological_ids() const {
+    std::vector<uint32_t> ids;
+    ids.reserve(block_count());
+    if (repository_) {
+        for (const auto &[begin, h] : repository_history_) {
+            (void)begin;
+            if (repository_->try_pin(h)) ids.push_back(h.slot);
+        }
+    } else {
+        for (uint32_t id = 0; id < block_count(); ++id) ids.push_back(id);
+    }
+    return ids;
+}
+
+void KvMemStore::register_repository_block(KvMemRepository::Lease lease, uint32_t baked_pos) {
+    require_no_repository_append();
+    const uint32_t valid = lease ? lease.record().token_count : 0;
+    install_repository_block(std::move(lease), baked_pos, valid);
+}
+
+void KvMemStore::require_no_repository_append() const {
+    if (repository_append_pending_)
+        throw std::logic_error("KVMem store mutation during an unfinished append");
+}
+
+void KvMemStore::install_repository_block(KvMemRepository::Lease lease, uint32_t baked_pos,
+                                         uint32_t valid_tokens) {
+    if (!repository_ || !lease)
+        throw std::invalid_argument("bounded KVMem append requires a repository lease");
+    auto verified = repository_->try_pin(lease.handle());
+    if (!verified || &verified.record() != &lease.record())
+        throw std::invalid_argument("KVMem block lease is stale or belongs to another repository");
+    const auto &r = lease.record();
+    if (!r.token_count || r.token_count > cfg_.block_tokens || r.token_begin % cfg_.block_tokens ||
+        !valid_tokens || valid_tokens > r.token_count || uint64_t(baked_pos) + valid_tokens > INT32_MAX)
+        throw std::invalid_argument("invalid bounded KVMem token range or local RoPE position");
+    const uint32_t slot = r.handle.slot;
+    if (repository_resident_leases_[slot] ||
+        blocks_[slot].repository_generation == r.handle.generation)
+        throw std::logic_error("KVMem repository slot already installed");
+    if (repository_history_.count(r.token_begin))
+        throw std::logic_error("KVMem history position already installed");
+    auto &node = repository_history_nodes_[slot];
+    if (node.empty()) node = repository_history_.extract(blocks_[slot].history_pos_start);
+    if (node.empty()) throw std::logic_error("KVMem repository directory node missing");
+    node.key() = r.token_begin;
+    node.mapped() = r.handle;
+    repository_history_.insert(std::move(node));
+    KvMemBlock b;
+    b.block_id = slot;
+    b.orig_pos_start = slot * cfg_.block_tokens;
+    b.n_tokens = valid_tokens;
+    b.dirty_gpu = true;
+    b.baked_pos = baked_pos;
+    b.repository_generation = r.handle.generation;
+    b.logical_id = r.logical_id;
+    b.history_pos_start = r.token_begin;
+    blocks_[slot] = b;
+    repository_gc_flags_[slot] = 0; // never inherit backing/index validity from the old generation
+    total_tokens_ = std::max(total_tokens_, r.token_begin + valid_tokens);
+    repository_resident_leases_[slot] = std::move(lease);
+    if (repository_gc_) repository_gc_->set_history_end(total_tokens_);
+    repository_sync_gc(slot);
+}
+
+std::vector<KvMemRepository::Lease> KvMemStore::repository_read_leases() const {
+    std::vector<KvMemRepository::Lease> leases;
+    if (!repository_) return leases;
+    leases.reserve(block_count());
+    for (const auto &[begin, h] : repository_history_) {
+        (void)begin;
+        auto lease = repository_->try_pin(h);
+        if (lease) leases.push_back(std::move(lease));
+    }
+    return leases;
+}
+
+KvMemStorageRead KvMemStore::repository_storage_read(uint64_t begin, uint32_t count) const {
+    if (!repository_) throw std::logic_error("KVMem storage mapping requires bounded repository");
+    if (begin > UINT64_MAX - count) throw std::overflow_error("KVMem history interval overflow");
+    KvMemStorageRead out;
+    const uint64_t end = begin + count;
+    if (count == 0) return out;
+    auto it = repository_history_.upper_bound(begin);
+    if (it != repository_history_.begin()) --it;
+    uint64_t covered = begin;
+    while (covered < end && it != repository_history_.end()) {
+        const auto [first, h] = *it++;
+        auto lease = repository_->try_pin(h);
+        if (!lease) break;
+        const auto &b = blocks_[h.slot];
+        const uint64_t last = first + b.n_tokens;
+        if (first > covered || last <= covered) break;
+        const uint32_t take = static_cast<uint32_t>(std::min(last, end) - covered);
+        out.spans.push_back({covered, b.orig_pos_start + static_cast<uint32_t>(covered - first), take, h});
+        out.leases.push_back(std::move(lease));
+        covered += take;
+    }
+    if (covered != end)
+        throw std::runtime_error("KVMem required-history-deleted: missing or uncommitted storage interval");
+    return out;
+}
+
+KvMemStore::RepositoryAppend::~RepositoryAppend() {
+    if (owner_) owner_->repository_append_pending_ = false;
+    // Reservation destructors retire unpublished bundles; outstanding IO
+    // clones keep them alive until actual completion before CPU reclaim.
+}
+
+std::vector<KvMemRepository::Lease> KvMemStore::RepositoryAppend::io_leases() const {
+    if (!owner_) throw std::logic_error("KVMem append already finished");
+    std::vector<KvMemRepository::Lease> leases;
+    leases.reserve(reservations_.size() + (tail_ ? 1 : 0));
+    if (tail_) leases.push_back(tail_.clone());
+    for (const auto &r : reservations_) leases.push_back(r.lease());
+    return leases;
+}
+
+bool KvMemStore::RepositoryAppend::extend(uint32_t count) {
+    if (!owner_) throw std::logic_error("KVMem append already finished");
+    if (count <= count_) return true;
+    auto &s = *owner_;
+    const uint32_t B = s.cfg_.block_tokens;
+    if (begin_ > UINT64_MAX - count || uint64_t(baked_begin_) + count > INT32_MAX)
+        throw std::invalid_argument("KVMem append extension interval overflow");
+    const uint64_t new_end = begin_ + count;
+    if ((new_end - 1) / B > (UINT64_MAX - B) / B)
+        throw std::overflow_error("KVMem append extension block overflow");
+    const uint64_t old_reserved_end = ((end() - 1) / B + 1) * B;
+    const uint32_t needed = new_end <= old_reserved_end ? 0 :
+        ceil_div_u32(static_cast<uint32_t>(new_end - old_reserved_end), B);
+    if (s.repository_->ready_slots() < needed) return false;
+    spans_.reserve(spans_.size() + needed);
+    reservations_.reserve(reservations_.size() + needed);
+    const size_t previous_spans = spans_.size();
+    for (uint64_t pos = old_reserved_end; pos < new_end; pos += B) {
+        auto r = s.repository_->try_reserve(pos, B);
+        if (!r) throw std::logic_error("KVMem append producer lost ready capacity");
+        const auto h = r.record().handle;
+        spans_.push_back({pos, h.slot * B, static_cast<uint32_t>(std::min<uint64_t>(B, new_end - pos)), h});
+        reservations_.push_back(std::move(r));
+    }
+    auto &last = spans_[previous_spans - 1];
+    last.token_count = static_cast<uint32_t>(std::min(new_end, old_reserved_end) - last.history_begin);
+    count_ = count;
+    return true;
+}
+
+KvMemStorageRead KvMemStore::RepositoryAppend::storage_write(uint64_t begin, uint32_t count) const {
+    if (!owner_ || begin < begin_ || begin > end() || count > end() - begin)
+        throw std::invalid_argument("KVMem write view outside prepared append");
+    KvMemStorageRead out;
+    if (!count) return out;
+    const uint64_t stop = begin + count;
+    for (size_t i = 0; i < spans_.size(); ++i) {
+        const auto &span = spans_[i];
+        const uint64_t first = std::max(begin, span.history_begin);
+        const uint64_t last = std::min(stop, span.history_begin + span.token_count);
+        if (first >= last) continue;
+        out.spans.push_back({first, span.storage_begin + static_cast<uint32_t>(first - span.history_begin),
+                             static_cast<uint32_t>(last - first), span.handle});
+        out.leases.push_back(tail_ && i == 0 ? tail_.clone() : reservations_[i - (tail_ ? 1 : 0)].lease());
+    }
+    return out;
+}
+
+std::vector<std::pair<uint32_t, uint32_t>> KvMemStore::RepositoryAppend::discarded_page_ranges(
+        uint32_t accepted, uint32_t page_size) const {
+    if (!owner_ || accepted > count_ || !page_size || owner_->cfg_.block_tokens % page_size)
+        throw std::invalid_argument("invalid KVMem speculative page cleanup");
+    const uint64_t kept_end = begin_ + accepted;
+    std::vector<std::pair<uint32_t, uint32_t>> out;
+    for (const auto &span : spans_) {
+        const uint64_t end = span.history_begin + span.token_count;
+        if (end <= kept_end) continue;
+        const uint64_t storage_end = uint64_t(span.storage_begin) + span.token_count;
+        const uint64_t storage_begin = uint64_t(span.storage_begin) +
+            (kept_end > span.history_begin ? kept_end - span.history_begin : 0);
+        const uint32_t first = static_cast<uint32_t>((storage_begin + page_size - 1) / page_size);
+        const uint32_t last = static_cast<uint32_t>((storage_end + page_size - 1) / page_size);
+        if (last <= first) continue;
+        if (!out.empty() && uint64_t(out.back().first) + out.back().second == first)
+            out.back().second += last - first;
+        else out.emplace_back(first, last - first);
+    }
+    return out;
+}
+
+std::unique_ptr<KvMemStore::RepositoryAppend> KvMemStore::prepare_repository_append(
+        uint32_t count, uint32_t baked_begin) {
+    require_no_repository_append();
+    if (!repository_ || !count || total_tokens_ > UINT64_MAX - count ||
+        uint64_t(baked_begin) + count > INT32_MAX)
+        throw std::invalid_argument("invalid KVMem append history/local interval");
+    const uint32_t B = cfg_.block_tokens;
+    const uint64_t begin = total_tokens_, end = begin + count;
+    const uint32_t tail_offset = static_cast<uint32_t>(begin % B);
+    const uint32_t tail_take = tail_offset ? std::min(count, B - tail_offset) : 0;
+    const uint32_t needed = ceil_div_u32(count - tail_take, B);
+    // Leave room for the immutable full-block extent of the final reservation.
+    if (needed && (end - 1) / B > (UINT64_MAX - B) / B)
+        throw std::overflow_error("KVMem reserved block interval overflow");
+    if (repository_->ready_slots() < needed) return nullptr;
+    auto append = std::unique_ptr<RepositoryAppend>(new RepositoryAppend(*this));
+    append->begin_ = begin;
+    append->count_ = count;
+    append->baked_begin_ = baked_begin;
+    append->spans_.reserve(needed + (tail_take ? 1 : 0));
+    append->reservations_.reserve(needed);
+    if (tail_take) {
+        auto it = repository_history_.find(begin - tail_offset);
+        if (it == repository_history_.end() || !(append->tail_ = repository_->try_pin(it->second)))
+            throw std::runtime_error("KVMem append tail unavailable");
+        const auto &r = append->tail_.record();
+        const auto &b = blocks_[r.handle.slot];
+        if (b.n_tokens != tail_offset || b.tier != KvTier::GPU ||
+            b.baked_pos + tail_offset != baked_begin || r.token_count < tail_offset + tail_take)
+            throw std::logic_error("KVMem append tail extent/residency/RoPE mismatch");
+        append->spans_.push_back({begin, b.orig_pos_start + tail_offset, tail_take, r.handle});
+    }
+    for (uint64_t pos = begin + tail_take; pos < end; pos += B) {
+        auto reservation = repository_->try_reserve(pos, B);
+        if (!reservation) throw std::logic_error("KVMem ready capacity changed on single append producer");
+        const auto h = reservation.record().handle;
+        append->spans_.push_back({pos, h.slot * B, static_cast<uint32_t>(std::min<uint64_t>(B, end - pos)), h});
+        append->reservations_.push_back(std::move(reservation));
+    }
+    repository_append_pending_ = true;
+    return append;
+}
+
+void KvMemStore::RepositoryAppend::commit(uint32_t accepted) {
+    if (!owner_ || accepted > count_) throw std::invalid_argument("invalid KVMem append commit");
+    auto &s = *owner_;
+    if (s.total_tokens_ != begin_) throw std::logic_error("KVMem history changed during append");
+    const uint64_t end = begin_ + accepted;
+    size_t index = 0;
+    if (tail_) {
+        const auto &span = spans_[index++];
+        auto &b = s.blocks_[span.handle.slot];
+        b.n_tokens += std::min(span.token_count, accepted);
+        if (accepted) { b.dirty_gpu = true; b.ssd_clean = false; }
+        if (accepted) {
+            s.repository_gc_flags_[span.handle.slot] &=
+                ~(KvMemGc::RawBacked | KvMemGc::ValueBacked | KvMemRepositoryGc::Indexed);
+            s.repository_sync_gc(span.handle.slot);
+        }
+    }
+    for (auto &r : reservations_) {
+        const auto &span = spans_[index++];
+        if (span.history_begin >= end) continue;
+        const uint32_t valid = static_cast<uint32_t>(std::min<uint64_t>(span.token_count, end - span.history_begin));
+        s.install_repository_block(r.commit(),
+            baked_begin_ + static_cast<uint32_t>(span.history_begin - begin_), valid);
+    }
+    s.total_tokens_ = end;
+    if (s.repository_gc_) s.repository_gc_->set_history_end(end);
+    s.repository_append_pending_ = false;
+    owner_ = nullptr;
+    reservations_.clear(); // cancelled MTP suffix returns via the CPU reclaimer
+    tail_.reset();
+}
+
+KvMemStorageRead KvMemStore::repository_slot_read(uint32_t first, uint32_t count,
+                                                 const RepositoryAppend *prepared) const {
+    if (!repository_ || first > block_count() || count > block_count() - first)
+        throw std::invalid_argument("KVMem physical read outside bounded directory");
+    if (prepared && prepared->owner_ != this)
+        throw std::invalid_argument("KVMem physical read has a foreign/completed reservation");
+    auto writes = prepared ? prepared->io_leases() : std::vector<KvMemRepository::Lease>{};
+    std::sort(writes.begin(), writes.end(), [](const auto &a, const auto &b) {
+        return a.handle().slot < b.handle().slot;
+    });
+    std::vector<KvMemStorageSpan> spans = prepared ? prepared->spans() : std::vector<KvMemStorageSpan>{};
+    std::sort(spans.begin(), spans.end(), [](const auto &a, const auto &b) {
+        return a.handle.slot < b.handle.slot;
+    });
+    KvMemStorageRead out;
+    out.spans.reserve(count); out.leases.reserve(count);
+    auto write = std::lower_bound(writes.begin(), writes.end(), first,
+        [](const auto &a, uint32_t b) { return a.handle().slot < b; });
+    auto span = std::lower_bound(spans.begin(), spans.end(), first,
+        [](const auto &a, uint32_t b) { return a.handle.slot < b; });
+    for (uint32_t id = first; id < first + count; ++id) {
+        KvMemRepository::Lease lease;
+        uint32_t valid = 0;
+        if (write != writes.end() && write->handle().slot == id) {
+            if (span == spans.end() || span->handle != write->handle())
+                throw std::logic_error("KVMem prepared physical read lost its extent");
+            valid = span->storage_begin % cfg_.block_tokens + span->token_count;
+            lease = std::move(*write++); ++span;
+        } else {
+            lease = repository_->try_pin(repository_handle(id));
+            if (!lease) continue;
+            valid = blocks_[id].n_tokens;
+        }
+        if (!valid || valid > cfg_.block_tokens)
+            throw std::logic_error("KVMem physical read has invalid token coverage");
+        out.spans.push_back({lease.record().token_begin, id * cfg_.block_tokens, valid, lease.handle()});
+        out.leases.push_back(std::move(lease));
+    }
+    return out;
+}
+
+std::vector<uint32_t> KvMemStore::history_span_blocks(uint64_t begin, uint64_t end,
+                                                     bool require_complete) const {
+    std::vector<uint32_t> ids;
+    if (end <= begin) return ids;
+    uint64_t covered = begin;
+    auto visit = [&](uint32_t id) {
+        if (!is_live(id)) return;
+        const auto &b = blocks_[id];
+        const uint64_t first = repository_ ? b.history_pos_start : b.orig_pos_start;
+        const uint64_t last = first + b.n_tokens;
+        if (last <= begin || first >= end) return;
+        if (require_complete && first > covered)
+            throw std::runtime_error("KVMem required-history-deleted: missing token interval");
+        ids.push_back(id);
+        covered = std::max(covered, std::min(end, last));
+    };
+    if (repository_) {
+        auto it = repository_history_.upper_bound(begin);
+        if (it != repository_history_.begin()) --it;
+        for (; it != repository_history_.end() && it->first < end; ++it) visit(it->second.slot);
+    } else {
+        for (const auto id : chronological_ids()) visit(id);
+    }
+    if (require_complete && covered < end)
+        throw std::runtime_error("KVMem required-history-deleted: missing token suffix");
+    return ids;
+}
+
+std::vector<KvMemRepository::Lease> KvMemStore::repository_checkpoint_leases() const {
+    std::vector<KvMemRepository::Lease> leases;
+    if (!repository_) return leases;
+    for (const auto &b : blocks_) {
+        if (!b.repository_generation || !b.n_tokens || (!b.in_working_set && b.tier != KvTier::GPU)) continue;
+        auto lease = repository_->try_pin(repository_handle(b.block_id));
+        if (!lease) throw std::runtime_error("KVMem checkpoint requires a missing repository block");
+        leases.push_back(std::move(lease));
+    }
+    return leases;
+}
+
+std::shared_ptr<KvMemStore::RepositoryCheckpoint> KvMemStore::repository_checkpoint(uint64_t position,
+                                                                                bool pin_working_set) {
+    if (!repository_ || position > total_tokens_)
+        throw std::invalid_argument("KVMem checkpoint exceeds committed repository history");
+    auto free = std::find_if(repository_checkpoints_.begin(), repository_checkpoints_.end(),
+        [](const auto &p) { return p.expired(); });
+    if (free == repository_checkpoints_.end())
+        throw std::runtime_error("KVMem bounded checkpoint capacity exhausted");
+    auto snapshot = std::make_shared<RepositoryCheckpoint>();
+    snapshot->repository_ = repository_;
+    snapshot->position_ = position;
+    if (pin_working_set) protect_repository_checkpoint(snapshot);
+    *free = snapshot;
+    return snapshot;
+}
+
+void KvMemStore::protect_repository_checkpoint(const std::shared_ptr<RepositoryCheckpoint> &snapshot) {
+    if (!repository_checkpoint_valid(snapshot))
+        throw std::runtime_error("KVMem cannot pin an invalid checkpoint");
+    auto leases = repository_checkpoint_leases();
+    leases.erase(std::remove_if(leases.begin(), leases.end(), [&](const auto &lease) {
+        return lease.record().token_begin >= snapshot->position_;
+    }), leases.end());
+    snapshot->leases_ = std::move(leases);
+}
+
+bool KvMemStore::repository_checkpoint_valid(const std::shared_ptr<RepositoryCheckpoint> &s) const {
+    if (!repository_ || !s || !s->valid_ || s->repository_ != repository_ ||
+        s->position_ > total_tokens_) return false;
+    for (const auto &lease : s->leases_) {
+        const auto h = lease.handle();
+        if (repository_handle(h.slot) != h || !repository_->try_pin(h)) return false;
+    }
+    return true;
+}
+
+KvMemStore::RepositoryRewind::~RepositoryRewind() {
+    if (owner_) owner_->repository_append_pending_ = false;
+}
+
+std::unique_ptr<KvMemStore::RepositoryRewind> KvMemStore::prepare_repository_rewind(uint64_t position) {
+    require_no_repository_append();
+    if (!repository_ || position > total_tokens_)
+        throw std::invalid_argument("KVMem rewind exceeds committed history");
+    auto rewind = std::unique_ptr<RepositoryRewind>(new RepositoryRewind(*this));
+    rewind->position_ = position;
+    if (position != total_tokens_) {
+        const auto B = cfg_.block_tokens;
+        const uint64_t boundary = position - position % B;
+        auto it = repository_history_.lower_bound(boundary);
+        if (position % B && (it == repository_history_.end() || it->first != boundary ||
+                !repository_->try_pin(it->second)))
+            throw std::runtime_error("KVMem rewind partial tail has been deleted");
+        for (; it != repository_history_.end(); ++it) {
+            const auto h = it->second;
+            auto lease = repository_->try_pin(h);
+            if (!lease) continue; // historical GC holes remain holes
+            const auto &b = blocks_[h.slot];
+            if (b.in_flight)
+                throw std::logic_error("KVMem rewind requires completed KV transfers");
+            const uint32_t keep = b.history_pos_start < position
+                ? static_cast<uint32_t>(position - b.history_pos_start) : 0;
+            if (keep > b.n_tokens)
+                throw std::logic_error("KVMem rewind partial tail extent mismatch");
+            if (keep == b.n_tokens) continue;
+            rewind->captured_.spans.push_back({b.history_pos_start, b.orig_pos_start, b.n_tokens, h});
+            rewind->captured_.leases.push_back(std::move(lease));
+            rewind->discarded_.push_back({b.history_pos_start + keep, b.orig_pos_start + keep,
+                                         b.n_tokens - keep, h});
+        }
+    }
+    repository_append_pending_ = true;
+    return rewind;
+}
+
+void KvMemStore::RepositoryRewind::commit() {
+    if (!owner_) throw std::logic_error("KVMem rewind already finished");
+    auto &s = *owner_;
+    // Do this before exposing the shorter tail, and never revive these objects
+    // when another branch grows back through the discarded checkpoint position.
+    for (auto &entry : s.repository_checkpoints_) {
+        if (auto checkpoint = entry.lock(); checkpoint && checkpoint->position_ > position_) {
+            checkpoint->valid_ = false;
+            checkpoint->leases_.clear();
+        }
+    }
+    for (const auto &span : captured_.spans) {
+        auto &b = s.blocks_[span.handle.slot];
+        if (b.history_pos_start < position_) {
+            b.n_tokens = static_cast<uint32_t>(position_ - b.history_pos_start);
+            b.dirty_gpu = true;
+            b.ssd_clean = false;
+            s.repository_gc_flags_[b.block_id] &=
+                ~(KvMemGc::RawBacked | KvMemGc::ValueBacked | KvMemRepositoryGc::Indexed);
+            s.repository_sync_gc(b.block_id);
+        } else {
+            // captured_ still pins the payload through foreground page cleanup.
+            s.repository_->retire(span.handle);
+            s.repository_resident_leases_[b.block_id].reset();
+            b.n_tokens = 0;
+            b.in_working_set = false;
+            s.repository_gc_flags_[b.block_id] = 0;
+        }
+    }
+    // Also remove stale directory nodes whose payload GC already reclaimed.
+    // Their storage generations are not touched; the physical slot may belong
+    // to a later lease until that generation's ordinary reclaim completes.
+    auto it = s.repository_history_.lower_bound(position_);
+    while (it != s.repository_history_.end()) {
+        const auto current = it++;
+        const auto slot = current->second.slot;
+        s.repository_history_nodes_[slot] = s.repository_history_.extract(current);
+    }
+    s.total_tokens_ = position_;
+    s.repository_scores_pending_ = false;
+    s.repository_score_handles_.clear();
+    if (s.repository_gc_) s.repository_gc_->set_history_end(position_);
+    s.repository_append_pending_ = false;
+    owner_ = nullptr;
+}
+
+KvMemRepositoryScoreFrame KvMemStore::repository_score_frame(
+        const std::vector<KvMemIndexStamp> &index, uint64_t boundary, bool mask_kept) const {
+    if (!repository_ || index.size() != block_count())
+        throw std::invalid_argument("KVMem score index has no fixed repository directory");
+    KvMemRepositoryScoreFrame frame;
+    frame.leases = repository_read_leases();
+    frame.enabled.assign(block_count(), 0);
+    std::vector<uint32_t> chronological;
+    chronological.reserve(frame.leases.size());
+    for (const auto &lease : frame.leases) {
+        const auto h = lease.handle();
+        const auto &b = blocks_[h.slot];
+        if (b.history_pos_start >= boundary) continue;
+        const uint32_t expected = static_cast<uint32_t>(
+            std::min<uint64_t>(b.n_tokens, boundary - b.history_pos_start));
+        if (!expected || index[h.slot].handle != h || index[h.slot].tokens != expected)
+            throw std::runtime_error("KVMem index generation or token coverage mismatch");
+        frame.enabled[h.slot] = 1;
+        chronological.push_back(h.slot);
+    }
+    // Slot reuse destroys the numerical ordering of sink/recent bands. Mask
+    // their historical order, never [0,sink) / [capacity-recent,capacity).
+    const auto n = chronological.size();
+    const auto sink = std::min<size_t>(cfg_.sink_blocks, n);
+    const auto recent = std::min<size_t>(cfg_.recent_blocks, n);
+    if (mask_kept && n > budget_blocks() && sink + recent < n) {
+        for (size_t i = 0; i < sink; ++i) frame.enabled[chronological[i]] = 0;
+        for (size_t i = n - recent; i < n; ++i) frame.enabled[chronological[i]] = 0;
+    }
+    return frame;
+}
+
+void KvMemStore::set_repository_retrieval_scores(
+        const std::vector<KvMemBlockHandle> &handles, const std::vector<double> &scores) {
+    require_no_repository_append();
+    if (!repository_ || handles.size() != scores.size())
+        throw std::invalid_argument("invalid bounded KVMem score frame");
+    std::vector<KvMemRepository::Lease> leases;
+    leases.reserve(handles.size());
+    std::vector<uint8_t> seen(block_count(), 0);
+    for (const auto h : handles) {
+        if (h != repository_handle(h.slot) || !h.generation)
+            throw std::runtime_error("KVMem score frame contains a stale block generation");
+        auto l = repository_->try_pin(h);
+        if (!l || seen[h.slot]) throw std::runtime_error("KVMem score frame has missing or duplicate blocks");
+        seen[h.slot] = 1; leases.push_back(std::move(l));
+    }
+    for (auto &b : blocks_) b.attn_score = b.retrieval_score = 0;
+    for (size_t i = 0; i < handles.size(); ++i) {
+        auto &b = blocks_[handles[i].slot];
+        b.attn_score = b.retrieval_score = scores[i];
+    }
+    repository_score_handles_ = handles;
+    repository_scores_pending_ = true;
+}
+
+void KvMemStore::accumulate_repository_attn(
+        const std::vector<KvMemBlockHandle> &handles, const std::vector<double> &scores) {
+    require_no_repository_append();
+    if (!repository_ || handles.size() != scores.size())
+        throw std::invalid_argument("invalid bounded KVMem attention frame");
+    std::vector<KvMemRepository::Lease> leases;
+    leases.reserve(handles.size());
+    std::vector<uint8_t> seen(block_count(), 0);
+    for (auto h : handles) {
+        auto lease = validate_repository_mutation(h.slot, h.generation);
+        if (seen[h.slot]) throw std::invalid_argument("duplicate KVMem attention block");
+        seen[h.slot] = 1; leases.push_back(std::move(lease));
+    }
+    // Validate the entire original window before modifying any heat. The
+    // accumulator belongs to these generations, never their replacement slots.
+    for (size_t i = 0; i < handles.size(); ++i) {
+        auto &b = blocks_[handles[i].slot];
+        b.profile_score += scores[i];
+        b.attn_score = b.profile_score;
+    }
+}
 
 void KvMemStore::set_runtime_select_budget(uint32_t tokens) {
     if (tokens == 0) {
@@ -155,6 +824,9 @@ KvMemKeepAllocation resolve_kvmem_keep_allocation(
 }
 
 void KvMemStore::register_append(uint32_t n_new_tokens) {
+    if (repository_) throw std::logic_error("bounded KVMem append requires explicit repository allocation");
+    if (total_tokens_ + n_new_tokens > UINT32_MAX)
+        throw std::overflow_error("legacy KVMem history position overflow");
     if (n_new_tokens == 0) return;
     const uint32_t bt = cfg_.block_tokens;
 
@@ -188,6 +860,7 @@ void KvMemStore::register_append(uint32_t n_new_tokens) {
 }
 
 std::vector<KvMemDroppedBlock> KvMemStore::truncate_to(uint32_t token_pos) {
+    if (repository_) throw std::logic_error("bounded KVMem rewind requires a versioned repository transaction");
     std::vector<KvMemDroppedBlock> dropped;
     if (token_pos >= total_tokens_) return dropped;
     // Pop fully-past blocks from the back, then shrink the trailing partial one.
@@ -212,6 +885,7 @@ std::vector<KvMemDroppedBlock> KvMemStore::truncate_to(uint32_t token_pos) {
 }
 
 void KvMemStore::accumulate_attn(const std::vector<double> &scores) {
+    if (repository_) throw std::logic_error("bounded KVMem scores require block generations");
     const uint32_t n = std::min<uint32_t>(static_cast<uint32_t>(scores.size()),
                                           block_count());
     for (uint32_t i = 0; i < n; ++i) {
@@ -220,11 +894,23 @@ void KvMemStore::accumulate_attn(const std::vector<double> &scores) {
     }
 }
 
+void KvMemStore::update_action_scores(const std::vector<double> &mean, double decay) {
+    if (mean.size() != blocks_.size() || !(decay >= 0 && decay <= 1))
+        throw std::invalid_argument("invalid action attention update");
+    for (size_t i = 0; i < blocks_.size(); ++i) {
+        if (!std::isfinite(mean[i]) || mean[i] < 0)
+            throw std::invalid_argument("nonfinite or negative action attention mass");
+    }
+    for (size_t i = 0; i < blocks_.size(); ++i)
+        if (is_live(i)) blocks_[i].action_score = decay * blocks_[i].action_score + mean[i];
+}
+
 void KvMemStore::set_attn_scores(const std::vector<double> &scores) {
     set_retrieval_scores(scores);
 }
 
 void KvMemStore::set_retrieval_scores(const std::vector<double> &scores) {
+    if (repository_) throw std::logic_error("bounded KVMem scores require block generations");
     const uint32_t n = block_count();
     for (uint32_t i = 0; i < n; ++i) {
         blocks_[i].retrieval_score = (i < scores.size()) ? scores[i] : 0.0;
@@ -232,10 +918,34 @@ void KvMemStore::set_retrieval_scores(const std::vector<double> &scores) {
     }
 }
 
+KvMemRepository::Lease KvMemStore::validate_repository_mutation(uint32_t id, uint64_t generation) const {
+    // Completion of an older batch may overlap a prepared append. Versioned
+    // tier/index flags do not change the append's historical directory or
+    // token extents; structural mutations still require no pending append.
+    if (!repository_) return {};
+    const KvMemBlockHandle h{id, generation};
+    if (!generation || h != repository_handle(id))
+        throw std::runtime_error("KVMem metadata update requires the current block generation");
+    auto lease = repository_->try_pin(h);
+    if (!lease) throw std::runtime_error("KVMem metadata update refers to a retired block");
+    return lease;
+}
+
 void KvMemStore::set_block_tier(uint32_t block_id, KvTier tier,
-                                int32_t cpu_slot, int32_t nvme_slot) {
+                                int32_t cpu_slot, int32_t nvme_slot, uint64_t generation) {
+    auto mutation = validate_repository_mutation(block_id, generation);
     if (block_id >= block_count()) return;
     KvMemBlock &b = blocks_[block_id];
+    if (repository_) {
+        if (!is_live(block_id)) throw std::runtime_error("KVMem tier change requires a live block");
+        if (tier == KvTier::GPU && !repository_resident_leases_[block_id]) {
+            auto lease = repository_->try_pin(repository_handle(block_id));
+            if (!lease) throw std::runtime_error("KVMem stage-in block retired");
+            repository_resident_leases_[block_id] = std::move(lease);
+        }
+        if (tier != KvTier::GPU && !b.in_working_set)
+            repository_resident_leases_[block_id].reset();
+    }
     if (gc_ && b.tier == KvTier::GPU && tier != KvTier::GPU) gc_->used(block_id);
     b.tier = tier;
     if (cfg_.optimize_stage_out) {
@@ -248,7 +958,12 @@ void KvMemStore::set_block_tier(uint32_t block_id, KvTier tier,
             b.cpu_slot = cpu_slot;
             if (nvme_slot >= 0) b.nvme_slot = nvme_slot;
         }
+        if (repository_ && tier == KvTier::CPU && cpu_slot >= 0 && !b.in_flight) {
+            b.dirty_gpu = false; // synchronous stage-out has completed
+            repository_gc_flags_[block_id] |= KvMemGc::ValueBacked;
+        }
         if (gc_) gc_sync_block(block_id);
+        repository_sync_gc(block_id);
         return;
     }
     if (tier == KvTier::GPU) {
@@ -262,35 +977,57 @@ void KvMemStore::set_block_tier(uint32_t block_id, KvTier tier,
         b.ssd_clean = tier == KvTier::SSD && nvme_slot >= 0;
     }
     if (gc_) gc_sync_block(block_id);
+    repository_sync_gc(block_id);
 }
 
-void KvMemStore::set_block_cpu_copy(uint32_t block_id, int32_t cpu_slot) {
+void KvMemStore::set_block_cpu_copy(uint32_t block_id, int32_t cpu_slot, uint64_t generation) {
+    auto mutation = validate_repository_mutation(block_id, generation);
     if (block_id >= block_count()) return;
     blocks_[block_id].cpu_slot = cpu_slot;
+    if (repository_ && cpu_slot >= 0) blocks_[block_id].dirty_gpu = false;
     if (gc_) gc_sync_block(block_id);
+    if (repository_) {
+        const auto &b = blocks_[block_id];
+        const bool backed = !b.dirty_gpu && !b.in_flight && (cpu_slot >= 0 || b.ssd_clean);
+        auto &flags = repository_gc_flags_[block_id];
+        flags = (flags & ~KvMemGc::ValueBacked) | (backed ? KvMemGc::ValueBacked : 0u);
+        repository_sync_gc(block_id);
+    }
 }
 
 void KvMemStore::set_block_ssd_backing(uint32_t block_id, int32_t nvme_slot,
-                                       bool clean) {
+                                       bool clean, uint64_t generation) {
+    auto mutation = validate_repository_mutation(block_id, generation);
     if (block_id >= block_count()) return;
     KvMemBlock &b = blocks_[block_id];
     b.nvme_slot = nvme_slot;
     b.ssd_clean = clean && nvme_slot >= 0;
+    if (repository_ && b.ssd_clean) b.dirty_gpu = false;
     if (gc_) gc_sync_block(block_id);
+    if (repository_) {
+        const bool backed = !b.dirty_gpu && !b.in_flight && (b.cpu_slot >= 0 || b.ssd_clean);
+        auto &flags = repository_gc_flags_[block_id];
+        flags = (flags & ~KvMemGc::ValueBacked) | (backed ? KvMemGc::ValueBacked : 0u);
+        repository_sync_gc(block_id);
+    }
 }
 
-void KvMemStore::set_block_io_in_flight(uint32_t block_id, bool in_flight) {
+void KvMemStore::set_block_io_in_flight(uint32_t block_id, bool in_flight, uint64_t generation) {
+    auto mutation = validate_repository_mutation(block_id, generation);
     if (block_id >= block_count()) return;
     blocks_[block_id].in_flight = in_flight;
     if (gc_) gc_sync_block(block_id);
+    repository_sync_gc(block_id);
 }
 
-void KvMemStore::set_block_baked_pos(uint32_t block_id, int64_t baked_pos) {
+void KvMemStore::set_block_baked_pos(uint32_t block_id, int64_t baked_pos, uint64_t generation) {
+    auto mutation = validate_repository_mutation(block_id, generation);
     if (block_id >= block_count()) return;
     blocks_[block_id].baked_pos = baked_pos;
 }
 
-void KvMemStore::record_block_rerope(uint32_t block_id, int64_t baked_pos) {
+void KvMemStore::record_block_rerope(uint32_t block_id, int64_t baked_pos, uint64_t generation) {
+    auto mutation = validate_repository_mutation(block_id, generation);
     if (block_id >= block_count()) return;
     KvMemBlock &block = blocks_[block_id];
     if (block.baked_pos != baked_pos) {
@@ -308,20 +1045,53 @@ std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks() const {
 }
 
 std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks(
-        const std::vector<uint32_t> &mandatory_blocks) const {
+        const std::vector<uint32_t> &mandatory_blocks,
+        const PressureActionScores &action_scores) const {
+    return pick_prefill_pressure_from(chronological_ids(), mandatory_blocks, action_scores);
+}
+
+KvMemStore::RepositoryPressureSelection KvMemStore::pin_repository_pressure_selection(
+        const std::vector<uint32_t> &mandatory_blocks,
+        const PressureActionScores &action_scores) const {
+    if (!repository_) throw std::logic_error("pinned pressure selection requires bounded repository");
+    RepositoryPressureSelection result;
+    result.leases = repository_read_leases();
+    std::vector<uint32_t> order;
+    order.reserve(result.leases.size());
+    for (const auto &lease : result.leases) order.push_back(lease.handle().slot);
+    result.blocks = pick_prefill_pressure_from(order, mandatory_blocks, action_scores);
+    std::vector<uint8_t> chosen(block_count(), 0);
+    for (auto id : result.blocks) chosen[id] = 1;
+    result.leases.erase(std::remove_if(result.leases.begin(), result.leases.end(),
+        [&](const auto &lease) { return !chosen[lease.handle().slot]; }), result.leases.end());
+    return result;
+}
+
+std::vector<uint32_t> KvMemStore::pick_prefill_pressure_from(
+        const std::vector<uint32_t> &order,
+        const std::vector<uint32_t> &mandatory_blocks,
+        const PressureActionScores &action_scores) const {
     const uint32_t n = block_count();
     std::vector<uint32_t> selected;
     if (n == 0) return selected;
     gc_validate_mandatory(mandatory_blocks);
+    // A worker can rescue a transiently retired record after the snapshot.
+    // Such a newly visible slot is not part of this pinned candidate set.
+    if (repository_ && !mandatory_blocks.empty()) {
+        std::vector<uint8_t> available(n, 0);
+        for (auto id : order) available[id] = 1;
+        for (auto id : mandatory_blocks)
+            if (!available.at(id))
+                throw std::runtime_error("KVMem mandatory block is outside the pressure snapshot");
+    }
 
     const uint32_t budget = prefill_budget_blocks();
-    if (budget == 0 || n <= budget) {
-        selected.reserve(n);
-        for (uint32_t i = 0; i < n; ++i) if (is_live(i)) selected.push_back(i);
+    if (budget == 0 || order.size() <= budget) {
+        selected.reserve(order.size());
+        for (uint32_t id : order) if (is_live(id)) selected.push_back(id);
         return selected;
     }
 
-    const uint32_t sink = std::min({cfg_.sink_blocks, budget, n});
     std::vector<uint8_t> kept(n, 0);
     uint32_t kept_count = 0;
     auto keep = [&](uint32_t id) {
@@ -330,18 +1100,52 @@ std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks(
             ++kept_count;
         }
     };
-    for (uint32_t id = 0; id < sink; ++id) keep(id);
+    for (uint32_t id : order) if (sink_block(id) && kept_count < budget) keep(id);
     for (uint32_t id : mandatory_blocks) keep(id);
     if (kept_count > budget) {
         throw std::runtime_error(
             "KVMem mandatory prefill selection plus sink blocks exceeds "
             "the configured prefill budget");
     }
-    for (uint32_t id = n; id > 0 && kept_count < budget; --id) {
-        keep(id - 1);
+    // The executor supplies only resident, accepted-history candidates. Do not
+    // consult stale Query scores or pull high-scoring cold history onto GPU.
+    std::vector<uint8_t> action_resident;
+    if (!action_scores.empty()) {
+        action_resident.resize(n, 0);
+        std::vector<uint8_t> available(n, 0);
+        for (uint32_t id : order) available[id] = 1;
+        PressureActionScores candidates;
+        candidates.reserve(action_scores.size());
+        for (const auto &[id, score] : action_scores) {
+            if (!std::isfinite(score) || score < 0)
+                throw std::invalid_argument("invalid pressure action score");
+            if (id < n && available[id] && is_live(id)) {
+                action_resident[id] = 1;
+                if (!kept[id] && score > 0) candidates.emplace_back(id, score);
+            }
+        }
+        const auto better = [&](const auto &a, const auto &b) {
+            return a.second != b.second ? a.second > b.second : earlier(b.first, a.first);
+        };
+        // Candidate IDs are unique in the executor; tolerate duplicate callers
+        // without exceeding the budget. Sorting a single resident window also
+        // keeps ties deterministic and avoids scanning historical score arrays.
+        std::sort(candidates.begin(), candidates.end(), better);
+        const uint32_t before_action = kept_count;
+        for (const auto &[id, score] : candidates) {
+            if (kept_count >= budget) break;
+            keep(id);
+        }
+        if (std::getenv("QW3_KVMEM_TRACE"))
+            std::fprintf(stderr, "[action-pressure] candidates=%zu action_added=%u fallback_slots=%u budget=%u\n",
+                candidates.size(), kept_count - before_action, budget - kept_count, budget);
+    }
+    for (auto it = order.rbegin(); it != order.rend() && kept_count < budget; ++it) {
+        if (!action_resident.empty() && !action_resident[*it]) continue;
+        keep(*it);
     }
     selected.reserve(kept_count);
-    for (uint32_t id = 0; id < n; ++id) {
+    for (uint32_t id : order) {
         if (kept[id]) selected.push_back(id);
     }
     return selected;
@@ -352,33 +1156,34 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks() const {
 }
 
 std::vector<uint32_t> KvMemStore::pick_topk_blocks(
-        const std::vector<uint32_t> &mandatory_blocks) const {
+        const std::vector<uint32_t> &mandatory_blocks,
+        const PrefillSelectionScores &prefill_scores) const {
     const uint32_t n = block_count();
+    const auto order = chronological_ids();
     std::vector<uint32_t> selected;
     if (n == 0) return selected;
     gc_validate_mandatory(mandatory_blocks);
 
     const uint32_t budget = budget_blocks();
-    if (budget == 0 || n <= budget) {
+    if (budget == 0 || order.size() <= budget) {
         // Everything fits: select all in order.
         selected.reserve(n);
-        for (uint32_t i = 0; i < n; ++i) if (is_live(i)) selected.push_back(i);
+        for (uint32_t id : order) if (is_live(id)) selected.push_back(id);
         return selected;
     }
 
     // Always-keep windows: first `sink_blocks` and last `recent_blocks`.
-    const uint32_t sink = std::min(cfg_.sink_blocks, n);
     // Zero is literal: do not reserve any suffix blocks.  Earlier versions used
     // zero as an implicit "auto = budget/4", which made a 200K-token budget
     // silently pin 50K tokens and was both surprising and hard to control.
-    const uint32_t recent = std::min(cfg_.recent_blocks, n);
+    const uint32_t recent = std::min<uint32_t>(cfg_.recent_blocks, order.size());
 
     std::vector<bool> kept(n, false);
     uint32_t kept_count = 0;
     auto keep = [&](uint32_t id) {
         if (id < n && is_live(id) && !kept[id]) { kept[id] = true; ++kept_count; }
     };
-    for (uint32_t i = 0; i < sink && kept_count < budget; ++i) keep(i);
+    for (uint32_t id : order) if (sink_block(id) && kept_count < budget) keep(id);
     for (uint32_t id : mandatory_blocks) keep(id);
     if (kept_count > budget) {
         throw std::runtime_error(
@@ -386,15 +1191,15 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks(
             "configured selection budget");
     }
     for (uint32_t i = 0; i < recent && kept_count < budget; ++i) {
-        keep(n - 1 - i);
+        keep(order[order.size() - 1 - i]);
     }
 
-    auto take_top = [&](uint32_t quota, auto score_fn) {
+    auto take_top = [&](uint32_t quota, auto score_fn, bool positive_only = false) {
         if (kept_count >= budget || quota == 0) return;
         std::vector<uint32_t> candidates;
         candidates.reserve(n - kept_count);
         for (uint32_t i = 0; i < n; ++i) {
-            if (!kept[i] && is_live(i)) candidates.push_back(i);
+            if (!kept[i] && is_live(i) && (!positive_only || score_fn(blocks_[i]) > 0)) candidates.push_back(i);
         }
         if (candidates.empty()) return;
         const uint32_t need = std::min<uint32_t>(
@@ -404,7 +1209,7 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks(
             const double sa = score_fn(blocks_[a]);
             const double sb = score_fn(blocks_[b]);
             if (sa != sb) return sa > sb;
-            return a > b;
+            return earlier(b, a);
         };
         if (need < candidates.size()) {
             std::nth_element(candidates.begin(), candidates.begin() + need,
@@ -413,6 +1218,70 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks(
         }
         for (uint32_t id : candidates) keep(id);
     };
+
+    if (cfg_.action_fraction > 0 && kept_count < budget) {
+        // Choose one history source before allocating Query slots: a Query
+        // overlap must not make existing output history look like a cold start.
+        const bool use_prefill = !prefill_scores.empty() &&
+            std::none_of(order.begin(), order.end(), [&](uint32_t id) {
+                return is_live(id) && blocks_[id].action_score > 0;
+            });
+        auto attention_score = [&](const KvMemBlock &block) {
+            if (!use_prefill) return block.action_score;
+            const uint64_t key = repository_ ? block.history_pos_start : block.orig_pos_start;
+            const auto it = prefill_scores.find(key);
+            return it == prefill_scores.end() ? 0.0 : it->second;
+        };
+        const uint32_t remaining = budget - kept_count;
+        if (cfg_.action_combine == "score") {
+            // Normalize over the SAME live, unpinned candidate pool. Scaling
+            // each stream by its maximum first keeps positive L1 sums finite
+            // even for very large/small scores. Missing history contributes 0.
+            double qmax = 0, amax = 0, qsum = 0, asum = 0;
+            uint32_t qpositive = 0, apositive = 0;
+            for (uint32_t id : order) if (!kept[id]) {
+                const double q = blocks_[id].retrieval_score;
+                const double a = attention_score(blocks_[id]);
+                if (!std::isfinite(q) || !std::isfinite(a) || a < 0)
+                    throw std::runtime_error("KVMem score fusion received invalid scores");
+                qmax = std::max(qmax, q); amax = std::max(amax, a);
+                qpositive += q > 0; apositive += a > 0;
+            }
+            for (uint32_t id : order) if (!kept[id]) {
+                if (qmax > 0) qsum += std::max(0.0, blocks_[id].retrieval_score) / qmax;
+                if (amax > 0) asum += attention_score(blocks_[id]) / amax;
+            }
+            const double aw = asum > 0 ? (qsum > 0 ? cfg_.action_fraction : 1.0) : 0;
+            const double qw = qsum > 0 ? 1.0 - aw : 0;
+            std::vector<double> fused(n, 0);
+            for (uint32_t id : order) if (!kept[id]) {
+                fused[id] = (qw > 0 ? qw * (std::max(0.0, blocks_[id].retrieval_score) / qmax) / qsum : 0) +
+                            (aw > 0 ? aw * (attention_score(blocks_[id]) / amax) / asum : 0);
+            }
+            if (qsum > 0 || asum > 0)
+                take_top(remaining, [&](const KvMemBlock &b) { return fused[b.block_id]; });
+            else
+                take_top(remaining, [](const KvMemBlock &b) { return b.retrieval_score; });
+            if (std::getenv("QW3_KVMEM_TRACE"))
+                std::fprintf(stderr, "[action-fusion] normalization=positive-l1 query_weight=%.6f attention_weight=%.6f query_positive=%u attention_positive=%u candidates=%zu total=%u attention_source=%s\n",
+                    qw, aw, qpositive, apositive, order.size()-(budget-remaining), kept_count,
+                    use_prefill ? "prefill" : "output");
+            for (uint32_t id : order) if (kept[id]) selected.push_back(id);
+            return selected;
+        }
+        const uint32_t action_quota = static_cast<uint32_t>(remaining * cfg_.action_fraction);
+        take_top(remaining - action_quota, [](const KvMemBlock &b) { return b.retrieval_score; });
+        const uint32_t before_action = kept_count;
+        take_top(action_quota, attention_score, true);
+        const uint32_t action_kept = kept_count - before_action;
+        take_top(budget - kept_count, [](const KvMemBlock &b) { return b.retrieval_score; });
+        if (std::getenv("QW3_KVMEM_TRACE"))
+            std::fprintf(stderr, "[action-selection] query_quota=%u action_quota=%u action_added=%u total=%u attention_source=%s\n",
+                         remaining-action_quota, action_quota, action_kept, kept_count,
+                         use_prefill ? "prefill" : "output");
+        for (uint32_t id : order) if (kept[id]) selected.push_back(id);
+        return selected;
+    }
 
     if (cfg_.select_policy == KvMemSelectPolicy::Quota && kept_count < budget) {
         uint32_t remaining = budget - kept_count;
@@ -441,7 +1310,7 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks(
             });
         }
         selected.reserve(kept_count);
-        for (uint32_t i = 0; i < n; ++i) {
+        for (uint32_t i : order) {
             if (kept[i]) selected.push_back(i);
         }
         return selected;
@@ -461,7 +1330,7 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks(
             if (blocks_[a].attn_score != blocks_[b].attn_score) {
                 return blocks_[a].attn_score > blocks_[b].attn_score;
             }
-            return a > b;
+            return earlier(b, a);
         };
         if (need < candidates.size()) {
             std::nth_element(candidates.begin(), candidates.begin() + need,
@@ -472,7 +1341,7 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks(
     }
 
     selected.reserve(kept_count);
-    for (uint32_t i = 0; i < n; ++i) {
+    for (uint32_t i : order) {
         if (kept[i]) selected.push_back(i);
     }
     return selected;
@@ -482,6 +1351,10 @@ std::vector<uint32_t> KvMemStore::pick_semantic_groups(
         const std::vector<std::pair<uint32_t, uint32_t>> &groups,
         const std::vector<double> &group_scores,
         const std::vector<uint32_t> &mandatory_blocks) const {
+    if (repository_) {
+        std::vector<std::pair<uint64_t, uint64_t>> spans(groups.begin(), groups.end());
+        return pick_repository_semantic_groups(spans, group_scores, mandatory_blocks);
+    }
     const uint32_t n = block_count();
     std::vector<uint32_t> selected;
     if (n == 0) return selected;
@@ -598,18 +1471,112 @@ std::vector<uint32_t> KvMemStore::pick_semantic_groups(
     return selected;
 }
 
+std::vector<uint32_t> KvMemStore::pick_repository_semantic_groups(
+        const std::vector<std::pair<uint64_t, uint64_t>> &groups,
+        const std::vector<double> &scores, const std::vector<uint32_t> &mandatory) const {
+    if (!repository_ || groups.size() != scores.size())
+        throw std::invalid_argument("invalid bounded KVMem group scores");
+    gc_validate_mandatory(mandatory);
+    const auto order = chronological_ids();
+    const uint32_t budget = budget_blocks();
+    if (!budget || order.size() <= budget) return order;
+    std::vector<uint8_t> kept(block_count(), 0);
+    uint32_t count = 0;
+    auto keep = [&](uint32_t id) { if (!kept[id]) { kept[id] = 1; ++count; } };
+    for (uint32_t id : order) if (sink_block(id) && count < budget) keep(id);
+    for (uint32_t id : mandatory) keep(id);
+    if (count > budget) throw std::runtime_error("KVMem mandatory semantic group union exceeds budget");
+    for (size_t i = 0; i < order.size() && i < cfg_.recent_blocks && count < budget; ++i)
+        keep(order[order.size() - 1 - i]);
+    std::vector<size_t> ranked;
+    ranked.reserve(groups.size());
+    for (size_t i = 0; i < groups.size(); ++i) ranked.push_back(i);
+    std::sort(ranked.begin(), ranked.end(), [&](size_t a, size_t b) {
+        if (scores[a] != scores[b]) return scores[a] > scores[b];
+        return a > b;
+    });
+    for (auto g : ranked) {
+        const auto span = groups[g];
+        if (span.second <= span.first || span.first >= total_tokens_) continue;
+        std::vector<uint32_t> ids;
+        try {
+            ids = history_span_blocks(span.first, std::min(span.second, total_tokens_), true);
+        } catch (const std::runtime_error &) {
+            // A group with deleted history cannot silently become a partial
+            // group by substituting a new generation at the same slot.
+            continue;
+        }
+        uint32_t needed = 0;
+        for (auto id : ids) needed += !kept[id];
+        if (needed > budget - count) continue;
+        for (auto id : ids) keep(id);
+        if (count == budget) break;
+    }
+    std::vector<uint32_t> result;
+    for (auto id : order) if (kept[id]) result.push_back(id);
+    return result;
+}
+
 KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids,
                                     bool force_raw_refresh) {
+    if (repository_) throw std::logic_error("bounded KVMem selection requires block generations");
+    return set_selection_impl(std::move(selected_ids), force_raw_refresh);
+}
+
+KvMemPlan KvMemStore::set_repository_selection(
+        const std::vector<KvMemBlockHandle> &handles, bool force_raw_refresh) {
+    require_no_repository_append();
+    if (!repository_) throw std::logic_error("KVMem repository selection requires bounded mode");
+    std::vector<KvMemRepository::Lease> next;
+    next.reserve(handles.size());
+    std::vector<uint32_t> ids;
+    ids.reserve(handles.size());
+    for (const auto h : handles) {
+        if (h != repository_handle(h.slot) || !h.generation)
+            throw std::runtime_error("KVMem selection contains a stale generation");
+        auto l = repository_->try_pin(h);
+        if (!l) throw std::runtime_error("KVMem selection contains a retired block");
+        ids.push_back(h.slot); next.push_back(std::move(l));
+    }
+    auto old = std::make_shared<std::vector<KvMemRepository::Lease>>(repository_checkpoint_leases());
+    auto plan = set_selection_impl(std::move(ids), force_raw_refresh);
+    plan.repository_previous_window = std::move(old);
+    for (const auto &b : blocks_) {
+        if (!b.in_working_set && b.tier != KvTier::GPU)
+            repository_resident_leases_[b.block_id].reset();
+    }
+    for (auto &l : next) repository_resident_leases_[l.handle().slot] = std::move(l);
+    if (repository_gc_) {
+        for (const auto &b : blocks_) repository_sync_gc(b.block_id, b.in_working_set);
+        if (repository_scores_pending_) {
+            auto event = std::make_shared<KvMemRepositoryGc::Scores>();
+            event->sequence = ++repository_score_sequence_;
+            event->step = repository_gc_->step();
+            event->entries.reserve(repository_score_handles_.size());
+            for (const auto h : repository_score_handles_)
+                if (h == repository_handle(h.slot) && is_live(h.slot) &&
+                    (repository_gc_flags_[h.slot] & KvMemRepositoryGc::Indexed)) {
+                    const auto &b = blocks_[h.slot];
+                    event->entries.push_back({h, b.retrieval_score, b.in_working_set});
+                }
+            repository_gc_->submit_scores(std::move(event));
+            repository_scores_pending_ = false;
+        }
+    }
+    return plan;
+}
+
+KvMemPlan KvMemStore::set_selection_impl(std::vector<uint32_t> selected_ids,
+                                       bool force_raw_refresh) {
     // Sort + dedupe so window order is deterministic (ascending block_id =
     // original chronological order: sink first ... recent last).
-    std::sort(selected_ids.begin(), selected_ids.end());
-    selected_ids.erase(std::unique(selected_ids.begin(), selected_ids.end()),
-                       selected_ids.end());
     // Drop out-of-range IDs defensively (external selector could be stale).
     selected_ids.erase(
         std::remove_if(selected_ids.begin(), selected_ids.end(),
                        [&](uint32_t id) { return id >= block_count(); }),
         selected_ids.end());
+    std::sort(selected_ids.begin(), selected_ids.end(), [&](uint32_t a, uint32_t b) { return earlier(a, b); });
+    selected_ids.erase(std::unique(selected_ids.begin(), selected_ids.end()), selected_ids.end());
 
     KvMemPlan plan;
     if (gc_) {
@@ -624,6 +1591,7 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids,
     for (uint32_t id : selected_ids) now_selected[id] = true;
     std::vector<bool> was_in_working_set(block_count(), false);
     for (const KvMemBlock &b : blocks_) {
+        if (repository_ && !is_live(b.block_id)) continue;
         was_in_working_set[b.block_id] = b.in_working_set;
         if (b.in_working_set && now_selected[b.block_id]) {
             ++plan.selection_overlap_blocks;
@@ -637,6 +1605,8 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids,
     // Their cache pages keep whatever bake they currently hold (baked_pos
     // unchanged); a future re-selection will de-rotate from there.
     for (auto &b : blocks_) {
+        if (repository_ && !is_live(b.block_id)) continue;
+        if (repository_ && !now_selected[b.block_id]) b.in_working_set = false;
         if (b.tier == KvTier::GPU &&
             (!now_selected[b.block_id] || force_full_reload)) {
             plan.stage_out.push_back(b.block_id);
@@ -732,8 +1702,12 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids,
 }
 
 void KvMemStore::clear_working_set() {
+    require_no_repository_append();
     for (auto &b : blocks_) {
         b.in_working_set = false;
+        if (repository_ && b.tier != KvTier::GPU)
+            repository_resident_leases_[b.block_id].reset();
+        repository_sync_gc(b.block_id);
     }
 }
 
@@ -747,11 +1721,16 @@ void KvMemStore::gc_sync_block(uint32_t id) {
     gc_->update_flags(id, mask, flags);
 }
 void KvMemStore::gc_validate_mandatory(const std::vector<uint32_t> &ids) const {
-    if (!gc_) return;
-    for (uint32_t id : ids) if (id < block_count() && !is_live(id))
+    if (!gc_ && !repository_) return;
+    for (uint32_t id : ids) if ((repository_ || id < block_count()) && !is_live(id))
         throw std::runtime_error("KVMem GC: mandatory/checkpoint block was deleted");
 }
 void KvMemStore::gc_begin_step() {
+    if (repository_gc_) {
+        repository_gc_->begin_step();
+        for (const auto &b : blocks_)
+            if (b.in_working_set || b.tier == KvTier::GPU) repository_sync_gc(b.block_id, true);
+    }
     if (!gc_) return;
     gc_->begin_step();
     gc_view_ = gc_->read_view();

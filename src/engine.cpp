@@ -1,5 +1,6 @@
 #include "backend.hpp"
 #include "qw3/qw3.hpp"
+#include "speculative_options.hpp"
 
 #include <stdexcept>
 #include <utility>
@@ -12,6 +13,7 @@ struct Engine::Impl {
 };
 
 Engine::Engine(EngineOptions options) : impl_(std::make_unique<Impl>()) {
+    detail::normalize_speculative_options(options);
     impl_->options = std::move(options);
     impl_->backend = make_qwen_native_backend();
     impl_->backend->load(impl_->options);
