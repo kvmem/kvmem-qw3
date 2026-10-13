@@ -36,8 +36,8 @@ KVMem 参数使用。原有采样、会话复用等功能的开关继续独立�
 
 以下 2026-09-22/23 内容为旧版继承父上下文的摘要分支及其历史测试记录；其中
 “仅串行”和“摘要失败恢复结束快照”不描述新版。历史质量与性能数字不能用作
-独立摘要或并发版本的验证结果。新版本验证记录见
-[独立摘要验证](thinking_summary_isolation_20260929.md)。
+独立摘要或并发版本的验证结果。新版本验证记录为本地实验报告
+`thinking_summary_isolation_20260929.md`，不随源码发布。
 
 2026-09-22。实现默认关闭。当前策略为 thinking ≥ 1,024 tokens 才摘要，摘要自然结束。下文区分新版验证与旧版 DeepSWE 结果；任务质量与性能必须独立对照。
 
@@ -69,7 +69,7 @@ KVMem 参数使用。原有采样、会话复用等功能的开关继续独立�
 - 流式生成在原 thinking 和摘要计算期间通过空进度回调维持心跳并检测断连；空进度不算 completion token。客户端可见 reasoning 的首 token 会变晚，TTFT 必须如实计入。
 - 原始 thinking 已消耗的主模型生成预算仍计入 `max_tokens`。成功压缩不会赠送额外答案 token；HTTP `finish_reason=length` 使用可见 token 加 discarded token 判定。摘要分支的额外生成开销单独统计。
 - 当前只压缩新生成的一轮 thinking。不会自动重写或回收启用前已经存在的旧 thinking。
-- 输出修复版的 `[thinking-summary-output]` JSON 日志保存原始摘要、停止原因和屏蔽次数，供诊断而不发送给客户端；指标解析器排除此载荷内可能引用的日志文本。格式约束不保证语义准确，任务质量仍依赖 DeepSWE verifier。详见 [输出修复验证与新版批次](thinking_summary_output_fix_20260922.md)。
+- 输出修复版的 `[thinking-summary-output]` JSON 日志保存原始摘要、停止原因和屏蔽次数，供诊断而不发送给客户端；指标解析器排除此载荷内可能引用的日志文本。格式约束不保证语义准确，任务质量仍依赖 DeepSWE verifier。本地输出修复验证记录为 `thinking_summary_output_fix_20260922.md`，不随源码发布。
 
 ## 配置
 
@@ -113,7 +113,7 @@ python3 scripts/kvmem_eval/run_thinking_compaction_deepswe.py \
 
 本次修复后实际运行目录为 `benchmark/thinking_compaction_deepswe_20260922_v2`；原目录保留首次失败及修复验证证据。v2 的 `actual-start.json` 记录了首个 agent 容器与成功的真实 Anthropic 请求，`state.json` 跟踪进度，任务完成后写入 `results.json` 和 `comparison.json`。请勿向正在计时的服务发送额外探测请求。
 
-首个 `psd-tools-blend-range-api` 完整 pair 已结束：两组 verifier 均为 F2P 45/45、P2P 979/979，服务错误为 0。baseline→summary 的 agent 耗时为 2431.099→2643.288 秒（+8.73%）；末次请求 live 为 8252→6452（−21.81%），ready 为 8130→9930，总容量均为 16384 槽位。日志 CPU bytes 下降 26.87%，GPU KV bytes 增加 3.54%。成功压缩 29 次，直接少保留 32424 个 thinking tokens；另有短 thinking 原文重放 75 次、无效摘要回退 17 次、准入条件不满足跳过 13 次。首个样本体现为仓库占用减少，但没有加速或降低 GPU KV bytes。完整原始证据和指标解释见 [首对报告](../benchmark/thinking_compaction_deepswe_20260922_v2/first-pair-report.md)。旧批次已按用户要求立即停止：保留 3 个完整 trial，termenv baseline 中途停止，不纳入完成耗时或配对比较。
+首个 `psd-tools-blend-range-api` 完整 pair 已结束：两组 verifier 均为 F2P 45/45、P2P 979/979，服务错误为 0。baseline→summary 的 agent 耗时为 2431.099→2643.288 秒（+8.73%）；末次请求 live 为 8252→6452（−21.81%），ready 为 8130→9930，总容量均为 16384 槽位。日志 CPU bytes 下降 26.87%，GPU KV bytes 增加 3.54%。成功压缩 29 次，直接少保留 32424 个 thinking tokens；另有短 thinking 原文重放 75 次、无效摘要回退 17 次、准入条件不满足跳过 13 次。首个样本体现为仓库占用减少，但没有加速或降低 GPU KV bytes。完整原始证据和指标解释保存在本地 `benchmark/thinking_compaction_deepswe_20260922_v2/first-pair-report.md`，不随源码发布。旧批次已按用户要求立即停止：保留 3 个完整 trial，termenv baseline 中途停止，不纳入完成耗时或配对比较。
 
 工作树后续加入 `rejection_reason` / `summary_stop_token` 诊断，区分 token-limit、空输出及 chat/thinking/tool/fence 标记；不放宽原有接受条件。原 v2 冻结二进制不变，新增诊断供后续复现使用。`postlaunch-diagnostics-check.json` 记录该诊断版本的主机检查和构建结果。`pause_zero_compaction_after_pair.py` 原用于首对结束仍零压缩时暂停诊断；首对已发生 29 次压缩，守卫记录 `continue`。后续策略切换已停止旧 supervisor 和 agent 容器，详见 `policy-stop.json`。
 
@@ -151,4 +151,4 @@ Qwen3.8 官方默认保留历史 thinking，强调 agent 决策连续性与减�
 
 独立查看刚完成的未压缩 psd-tools baseline：137 段 / 74,880 tokens；1K 触发 17 段（12.41%），覆盖 66.86% 的 thinking tokens。用户据此选定 1K。该比例是候选原文覆盖量，不是压缩后节省率；质量及耗时收益仍由新对照检验。
 
-原始统计和可复现脚本见 [distribution.json](../benchmark/kvmem_thinking_gc_design_20260922/token_length_distribution/distribution.json) 及同目录 `analyze.py`。这是文本重新分词，排除了模板/closing 等，不完全等同于实际生成 token 边界；旧轨迹包含失败，非随机样本。
+原始统计和分析脚本保存在本地 `benchmark/kvmem_thinking_gc_design_20260922/token_length_distribution/distribution.json` 及同目录 `analyze.py`，不随源码发布。这是文本重新分词，排除了模板/closing 等，不完全等同于实际生成 token 边界；旧轨迹包含失败，非随机样本。
