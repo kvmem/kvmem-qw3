@@ -23,6 +23,8 @@ Paper link: <https://arxiv.org/abs/2609.04852>
   kernels, KV cache, and memory lifecycle.
 - **KV memory for agents:** retain contextualized KV blocks across GPU, host
   RAM, and NVMe, then retrieve a bounded working set for the current query.
+- **Optional attention scores:** combine query relevance with sampled attention
+  from generated output or prompt prefill when selecting the working set.
 - **Hybrid-model specialization:** kernels and execution paths are designed for
   Qwen's DeltaNet-plus-attention `qwen35` architecture.
 - **Local API serving:** expose OpenAI-compatible completions and an
@@ -434,6 +436,118 @@ installation. An above-budget request should show query replay, a non-fallback
 retrieval scorer, and tier movement. A successful short chat request proves
 HTTP and generation health, but does not prove that sparse KVMem retrieval ran.
 
+### Add attention scores to retrieval
+
+KVMem can also record which historical blocks the model attends to, and use
+that evidence alongside the current Query score. This is an opt-in policy for
+the CUDA + FlashInfer build, serialized serving, online KVMem, and ordinary
+block retrieval (`--kvmem-method retrieval --kvmem-semantic-expansion none`).
+It supports plain target decoding and batched DFlash verification. Select
+`--no-continuous-batching`; archive mode and message/round semantic expansion
+are currently incompatible with attention collection.
+
+There are two separate attention signals:
+
+- **Generated output:** `--kvmem-action-scope non-thinking` samples answers,
+  code, and tool-call content outside thinking boundaries. `tool-call` samples
+  only tool-call content. Only accepted target tokens contribute; rejected
+  speculative tokens, private Query generation, and replay are excluded.
+  After a response with samples, each block's history becomes
+  `decay * previous_score + mean_sampled_attention_mass`. A response without
+  samples leaves output history unchanged.
+- **Prompt prefill:** `--kvmem-prefill-attention on` supplies a cold-start
+  signal before any output history exists. It samples causal Query rows from
+  ordinary input chunks, including user input and tool results. Mass and
+  visible exposure decay with token distance, and the score is their ratio,
+  so repeated exposure alone does not increase importance. This signal only
+  scores keys visible in the sampled GPU window.
+
+The collector taps QK logits already computed by FlashInfer, then reduces the
+sampled rows to normalized attention mass per historical block. It averages
+across all query heads and takes an equal mean across the selected standard
+attention layers; GDN layers are excluded. It does not launch a second QK
+calculation. Sample storage, reduction, and score updates have a measurable
+cost; sampling controls let you trade density for overhead.
+
+The following example uses a 36K selected window, a 16K generation reserve,
+and a **50% Query + 50% attention score blend**:
+
+```bash
+./build-flashinfer/qw3 serve \
+  --model "${QW3_MODEL}" \
+  --host 127.0.0.1 --port 8080 \
+  --ctx 262144 --kv-dtype fp8 \
+  --prefill-chunk 1024 --mtp-chain 0 \
+  --no-continuous-batching \
+  --kvmem --kvmem-block-tokens 32 \
+  --kvmem-budget 36864 --kvmem-prefill-budget 36864 \
+  --kvmem-gen-budget 16384 \
+  --kvmem-sink-tokens 1312 --kvmem-recent-tokens 0 \
+  --kvmem-method retrieval --kvmem-retrieval-method mean-k \
+  --kvmem-semantic-expansion none \
+  --kvmem-query-conditioned --kvmem-update-mode step \
+  --kvmem-index-placement gpu \
+  --kvmem-gpu-memory-ratio 0.90 --kvmem-cpu-gb 16 \
+  --kvmem-action-attention on \
+  --kvmem-action-scope non-thinking \
+  --kvmem-action-layers spread3 --kvmem-action-interval 16 \
+  --kvmem-action-combine score --kvmem-action-fraction 0.5 \
+  --kvmem-action-decay 0.5 \
+  --kvmem-action-pressure on \
+  --kvmem-prefill-attention on \
+  --kvmem-prefill-attention-interval 1024 \
+  --kvmem-prefill-attention-stride 32 \
+  --kvmem-prefill-attention-half-life 8192
+```
+
+Send requests through the same API as the preceding KVMem example. The
+generation reserve sizes the resident KV pool; with CPU/NVMe backing and
+serialized serving, it is independent of the request's output-token limit.
+Attention collection does not itself enable private guided-query generation.
+
+Sink, recent, and mandatory blocks retain precedence within the fixed budget.
+The remaining slots are selected according to the path and combination mode:
+
+| Selection path | Policy |
+| --- | --- |
+| Normal retrieval, `--kvmem-action-combine score` | Normalize positive Query and attention scores separately to sum to one over the same unprotected candidates, then rank once by `(1-fraction) * Query + fraction * attention`. The example uses equal weights. |
+| Normal retrieval, `--kvmem-action-combine quota` | Allocate `1-fraction` of the remaining slots to Query first, then `fraction` to positive attention scores among unselected blocks. Unfilled attention slots fall back to Query. |
+| Capacity recovery, `--kvmem-action-pressure on` | Rank remaining resident candidates by attention, without Query scoring. Use prefill scores when output evidence is unavailable, then fill unused slots with recent resident blocks. This path does not fetch cold history. |
+
+Normal retrieval prefers positive committed output history. Without that
+history, it can use prefill scores; if attention is unavailable, it falls back
+to Query. Score fusion gives the available signal full weight when only one
+signal is positive. Capacity recovery can also use accepted output samples
+from the response currently being generated. The prefill and output histories
+remain separate.
+
+Key controls and their defaults:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--kvmem-action-attention`, `--kvmem-action-pressure`, `--kvmem-prefill-attention` | `off` | Enable collection, attention-based capacity recovery, and input collection independently. The latter two require output collection to be enabled. |
+| `--kvmem-action-scope` | `tool-call` | Use `non-thinking` to include ordinary answers as well as tool calls. |
+| `--kvmem-action-layers` | `spread3` | First, lower-middle, and last standard attention layers; Qwen3.8-27B uses `3,31,63`. Also accepts `last`, `all`, or explicit IDs such as `3,31,63`. |
+| `--kvmem-action-interval` | `16` | Sample the first eligible generated token, then one every 16 eligible tokens. |
+| `--kvmem-action-combine`, `--kvmem-action-fraction` | `quota`, `0.25` | Choose slot allocation or normalized score fusion, and the attention share/weight. |
+| `--kvmem-action-decay` | `0.5` | Retain half the previous output score when a sampled response is committed. |
+| `--kvmem-prefill-attention-interval` | `1024` | Observe input chunks at this token interval; near-capacity observation can override a larger interval. |
+| `--kvmem-prefill-attention-stride` | `32` | Sample one Query row every 32 tokens within an observed chunk, anchored at the chunk end. `0` selects only the final row. |
+| `--kvmem-prefill-attention-half-life` | `8192` | Token-distance half-life for prefill mass and exposure. |
+
+With the example's 1024-token chunks and stride 32, each observed chunk
+samples rows `31,63,...,1023`. Each capture supports at most 64 Query rows;
+denser settings require a smaller prefill chunk or a larger stride. Use the
+CLI options for attention configuration; legacy `QW3_KVMEM_ACTION_*` and
+`QW3_KVMEM_PREFILL_ATTENTION*` settings are rejected with a migration message.
+
+For an above-budget request, `QW3_KVMEM_TRACE=1` exposes `[action-fusion]` or
+`[action-selection]`, `[prefill-attention]`, and `[action-pressure]` when those
+paths run. Check the selected attention source and actual weights or quotas;
+enabling collection alone does not prove it affected selection. Attention
+scores are experimental and do not guarantee better recall or fewer tool
+errors. See [sampling, decay, acceptance, and validation details](docs/kvmem_action_attention.md).
+
 ## Optional NVFP4 profile
 
 NVFP4 is the memory-efficient weight path for NVIDIA SM120a. It loads a Hugging
@@ -542,6 +656,7 @@ Run `./build/qw3 --help` for the complete current CLI.
 - [Claude Code integration](docs/claude_code.md)
 - [Incremental KVMem sessions](docs/kvmem_incremental_session_api.md)
 - [Semantic-group retrieval](docs/kvmem_semantic_group_retrieval.md)
+- [Sampled attention scores for KVMem](docs/kvmem_action_attention.md)
 - [Native CUDA vision frontend](docs/multimodal_cuda.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 
