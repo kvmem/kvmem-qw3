@@ -38,6 +38,7 @@ public:
         }
     }
     ~SharedKvPagePool() override {
+        if (!release_on_destroy_) return;
         // Pinned prefix pages remain owned by the parent's cache until eviction.
         parent_.release_physical_pages(private_);
         parent_.release_physical_pages(pages_);
@@ -82,6 +83,12 @@ public:
         return resident_ - uint32_t(free_.size()) + uint32_t(private_.size());
     }
     uint32_t total_pages() const override { return resident_ + reserve_; }
+    uint32_t resident_pages() const { return resident_; }
+    uint32_t reserve_pages() const { return reserve_; }
+    bool has_private_pages() const { return !private_.empty() || transient_; }
+    // Fatal device-drain failure: the parent arena keeps these IDs allocated
+    // until backend teardown. Returning them could race an outstanding DMA.
+    void quarantine_until_parent_teardown() noexcept { release_on_destroy_ = false; }
     uint32_t physical_page_capacity() const override { return parent_.physical_page_capacity(); }
     void set_transient_allocation(bool enabled) override { transient_ = enabled; }
 private:
@@ -93,5 +100,6 @@ private:
     std::vector<bool> in_use_;
     std::unordered_map<int32_t, uint32_t> slots_;
     bool transient_ = false;
+    bool release_on_destroy_ = true;
 };
 } // namespace qw3

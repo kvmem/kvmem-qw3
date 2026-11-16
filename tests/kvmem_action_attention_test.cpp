@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 using namespace qw3;
 static void check(bool x, const char *why="action attention test failed") { if (!x) throw std::runtime_error(why); }
@@ -116,6 +117,60 @@ static void fused_scores() {
     catch(const std::invalid_argument&) {rejected=true;}
     check(rejected,"invalid fusion mode accepted");
 }
+static void query_history_selection() {
+    const std::vector<double> current={4,3,2,1};
+    const KvMemStore::QuerySelectionScores history={0,0,9,10};
+    const KvMemStore::QuerySelectionScores current_normalized={.4,.3,.2,.1};
+    const KvMemStore::PrefillSelectionScores prefill={{0,8}};
+    for (const std::string combine : {"quota", "score"}) {
+        KvMemStoreConfig c;c.block_tokens=32;c.select_budget=64;
+        c.sink_blocks=c.recent_blocks=0;c.action_fraction=.5;c.action_combine=combine;
+        c.query_history=true;
+        KvMemStore s(c);s.register_append(128);s.set_retrieval_scores(current);
+        // Null is the original Query ranking. A zero-decay update differs only
+        // by a positive normalization factor and must preserve selection.
+        check(s.pick_topk_blocks({}, {}, nullptr)==s.pick_topk_blocks(),"history off changed selection");
+        check(s.pick_topk_blocks({}, {}, &current_normalized)==s.pick_topk_blocks(),"zero-decay Query scale changed selection");
+        check(s.pick_topk_blocks({}, {}, &history)==std::vector<uint32_t>({2,3}),"effective Query history not used");
+        check(s.pick_topk_blocks({},prefill,&history)==std::vector<uint32_t>({0,3}),"Query history bypassed prefill fallback");
+        s.update_action_scores({0,8,0,0},0);
+        check(s.pick_topk_blocks({},prefill,&history)==std::vector<uint32_t>({1,3}),"Query history changed output priority or fusion");
+        check(s.pick_topk_blocks({}, {}, &current_normalized)==s.pick_topk_blocks(),"zero-decay fusion changed selection");
+        check(s.pick_topk_blocks({2},prefill,&history)==std::vector<uint32_t>({2,3}),
+              "history fusion lost mandatory protection");
+        for(size_t i=0;i<current.size();++i) {
+            check(s.blocks()[i].retrieval_score==current[i] && s.blocks()[i].attn_score==current[i],"Query preview overwrote raw scores");
+            check(s.blocks()[i].action_score==(i==1?8:0),"Query preview overwrote output history");
+        }
+        const auto pressure=s.pick_prefill_pressure_blocks({},{{0,1},{1,2},{2,3},{3,4}});
+        (void)s.pick_topk_blocks({},prefill,&history);
+        check(s.pick_prefill_pressure_blocks({},{{0,1},{1,2},{2,3},{3,4}})==pressure,"Query history changed pressure policy");
+    }
+    KvMemStoreConfig c;c.block_tokens=32;c.select_budget=64;c.sink_blocks=c.recent_blocks=0;
+    KvMemStore s(c);s.register_append(128);s.set_retrieval_scores(current);
+    check(s.pick_topk_blocks({}, {}, &history)==std::vector<uint32_t>({2,3}),"plain TopK ignored Query history");
+    check(s.pick_topk_blocks({}, {}, &current_normalized)==s.pick_topk_blocks(),"plain zero-decay equivalence");
+    check(s.pick_topk_blocks({0}, {}, &history)==std::vector<uint32_t>({0,3}),"Query history displaced mandatory block");
+    for (auto bad : std::vector<KvMemStore::QuerySelectionScores>{{1},{0,0,0,-1},{0,0,0,std::numeric_limits<double>::quiet_NaN()}}) {
+        bool rejected=false;
+        try { (void)s.pick_topk_blocks({}, {}, &bad); } catch(const std::invalid_argument&) { rejected=true; }
+        check(rejected,"invalid Query override accepted");
+    }
+    for (unsigned mode=0;mode<8;++mode) {
+        auto bad=c;bad.query_history=true;
+        if(mode==0) bad.query_history_decay=-.1;
+        if(mode==1) bad.query_history_decay=std::numeric_limits<double>::quiet_NaN();
+        if(mode==2) bad.select_method=KvMemMethod::H2O;
+        if(mode==3) bad.retrieval_method=KvMemRetrievalMethod::PerToken;
+        if(mode==4) bad.select_policy=KvMemSelectPolicy::Quota;
+        if(mode==5) bad.semantic_expansion=KvMemSemanticExpansion::Message;
+        if(mode==6) bad.prototype_mode=KvMemPrototypeMode::KeyDirectionAdaptive;
+        if(mode==7) {bad.action_combine="score";bad.action_fraction=1;}
+        bool rejected=false;
+        try { KvMemStore invalid(bad); } catch(const std::invalid_argument&) { rejected=true; }
+        check(rejected,"unsupported Query history config accepted");
+    }
+}
 int main() {
     std::vector<int32_t> standard;
     for (int32_t i=3;i<64;i+=4) standard.push_back(i);
@@ -133,6 +188,7 @@ int main() {
     input_history_identity();
     non_thinking_parser();
     fused_scores();
+    query_history_selection();
     detail::PrefillAttentionScore old, fresh;
     for(unsigned i=0;i<100;++i) old.observe(.2,.5);
     fresh.observe(.2,.5);
@@ -193,5 +249,5 @@ int main() {
     try { s.pick_prefill_pressure_blocks({1,2,3,4,5},resident); }
     catch(const std::runtime_error&) { rejected=true; }
     check(rejected);
-    std::cout << "PASS attention parsers; selection: fallback, quota, normalized score fusion, scale invariance, protected budget, source precedence, decay\n";
+    std::cout << "PASS attention parsers; selection: Query history overrides, fallback, quota, normalized score fusion, scale invariance, protected budget, source precedence, decay\n";
 }

@@ -1,5 +1,6 @@
 #pragma once
 #include "qw3/kvmem_attention.hpp"
+#include "qw3/kvmem_mismatch.hpp"
 #include <unordered_map>
 #include "qw3/kvmem_gc.hpp"
 #include "qw3/kvmem_repository.hpp"
@@ -301,6 +302,9 @@ struct KvMemStoreConfig {
     KvMemMethod select_method = KvMemMethod::Retrieval; // --kvmem-method
     KvMemSelectPolicy select_policy = KvMemSelectPolicy::TopK;
     KvMemAttentionConfig attention;
+    KvMemMismatchConfig mismatch;
+    bool query_history = false;
+    double query_history_decay = 0.5;
     double action_fraction = 0.0; // opt-in quota share or fused-score weight
     std::string action_combine = "quota";
     KvMemRetrievalMethod retrieval_method = KvMemRetrievalMethod::MeanK;
@@ -586,9 +590,14 @@ public:
     // Used only when live history has no positive output attention. Missing
     // input evidence falls back to Query; no stored output scores are changed.
     using PrefillSelectionScores = std::unordered_map<uint64_t, double>;
+    // Transient effective Query ranking, indexed by block_id. The caller must
+    // validate historical identities/generations before constructing this view.
+    // Null keeps the original ranking; raw retrieval/action scores are unchanged.
+    using QuerySelectionScores = std::vector<double>;
     std::vector<uint32_t> pick_topk_blocks(
         const std::vector<uint32_t> &mandatory_blocks,
-        const PrefillSelectionScores &prefill_scores = {}) const;
+        const PrefillSelectionScores &prefill_scores = {},
+        const QuerySelectionScores *query_scores = nullptr) const;
 
     // Select complete variable-length logical groups under the ordinary
     // fixed-physical-block budget. `groups` are half-open token spans in the

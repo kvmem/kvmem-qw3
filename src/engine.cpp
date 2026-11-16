@@ -83,6 +83,14 @@ bool Engine::erase_kvmem_local_cache(const std::string &id) {
     return impl_->backend->erase_kvmem_local_cache(id);
 }
 
+KvMemSessionInfo Engine::kvmem_session_info(const std::string &id) {
+    return impl_->backend->kvmem_session_info(id);
+}
+
+bool Engine::erase_kvmem_session(const std::string &id) {
+    return impl_->backend->erase_kvmem_session(id);
+}
+
 std::string render_qwen3_chat_prompt(const std::string &system,
                                      const std::string &user,
                                      bool enable_thinking) {

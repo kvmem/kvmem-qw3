@@ -1,6 +1,8 @@
 #pragma once
 
 #include "qw3/kvmem_attention.hpp"
+#include "qw3/kvmem_mismatch.hpp"
+#include "qw3/kvmem_mandatory.hpp"
 
 #include <cstdint>
 #include <array>
@@ -277,6 +279,10 @@ struct EngineOptions {
     // or "recency" (sink + recent windows only, no learned signal).
     std::string kvmem_method = "retrieval";
     KvMemAttentionConfig kvmem_attention;
+    KvMemMismatchConfig kvmem_mismatch;
+    bool kvmem_query_history = false; // cross-request Query relevance history
+    double kvmem_query_history_decay = 0.5;
+    KvMemMandatoryConfig kvmem_mandatory;
     std::string kvmem_select_policy = "topk"; // topk or quota
     std::string kvmem_retrieval_method = "mean-k"; // mean-k, per-token, sub-block-mean-k, key-direction-fixed4, key-direction-adaptive
     // Placement of the all-layer Mean-K/Adaptive retrieval index. "gpu"
@@ -338,6 +344,9 @@ struct EngineOptions {
     int kvmem_guided_query_tokens = 256; // hard-capped to 4096 by CLI/server
     int kvmem_middecode_trigger_tokens = 28672;
     int kvmem_middecode_max_refreshes = 2;
+    // -1 retains the automatic tail (including an open emergency epoch).
+    // Explicit >=0 overrides that policy; 0 disables generated-tail pins.
+    int kvmem_middecode_recent_tokens = -1;
     // Re-prefill the query suffix against the just-selected semantic window.
     // Enabled by default for query-conditioned mean-k; the first-pass query is
     // still used for retrieval scoring, while decode consumes the replayed KV.
@@ -361,6 +370,12 @@ struct EngineOptions {
     // block capacity; cumulative history is independent. Zero is legacy mode.
     uint32_t kvmem_repository_blocks = 0;
     std::string kvmem_repository_gc_mode = "delete"; // off|shadow|delete
+    // Opt-in process-local session histories, independent of active GPU slots.
+    // Zero preserves the legacy idle-executor cache and its eviction policy.
+    uint32_t kvmem_session_capacity = 0;
+    // Additional CPU budget for exact suspended target/MTP GPU-page images.
+    // History tier quotas remain governed by kvmem_cpu_bytes/nvme_bytes.
+    uint64_t kvmem_session_swap_bytes = 0;
     // Legacy CPU background retirement; keeps ctx admission and storage reservation.
     uint32_t kvmem_gc_max_blocks = 0;
     bool kvmem_gc_shadow = false;
@@ -393,6 +408,10 @@ const char *sampling_filter_order_name(SamplingFilterOrder order);
 struct GenerationOptions {
     // Thread-safe transport/request cancellation, checked between GPU chunks.
     std::function<bool()> should_cancel;
+    // Optional transport distinction after its token callback returns false:
+    // true means a requested stop sequence completed normally, not cancellation.
+    // Used only by opt-in session memory; should_cancel always takes precedence.
+    std::function<bool()> stream_stopped_successfully;
     int max_tokens = 256;
     float temperature = 0.6f;
     float top_p = 0.95f;
@@ -527,6 +546,9 @@ struct GenerationOptions {
     // the legacy behavior by using kvmem_query_* as the replay span.
     uint64_t kvmem_replay_begin = 0;
     uint64_t kvmem_replay_end = 0;
+    // Harness retention can request only the final block, preserving the
+    // already captured Q instead of expanding replay back to a disabled query.
+    bool kvmem_replay_minimal = false;
     // Experimental query-token pruning. When both values are non-zero, the
     // backend greedily decodes `probe_tokens` from the provisional prompt,
     // measures their attention mass over the original query span, rolls the
@@ -696,6 +718,15 @@ using TokenCallback = std::function<void(const std::string &)>;
 using CancellableTokenCallback =
     std::function<bool(const std::string &)>;
 
+struct KvMemSessionInfo {
+    std::string id;
+    bool found = false;
+    std::string state; // warm | suspended | invalid
+    uint64_t history_tokens = 0;
+    uint64_t swap_bytes = 0;
+    uint64_t retained_device_bytes = 0;
+};
+
 class Engine {
 public:
     explicit Engine(EngineOptions options);
@@ -722,6 +753,10 @@ public:
                                  bool reset);
     KvMemLocalCacheInfo kvmem_local_cache_info(const std::string &id);
     bool erase_kvmem_local_cache(const std::string &id);
+    // Process-local, keyed full-history sessions. Management is serialized
+    // with the continuous worker; a running/queued key cannot be deleted.
+    KvMemSessionInfo kvmem_session_info(const std::string &id);
+    bool erase_kvmem_session(const std::string &id);
     void generate_stream_cancellable(
         const std::string &prompt,
         const GenerationOptions &options,

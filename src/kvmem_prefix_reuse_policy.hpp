@@ -58,11 +58,11 @@ constexpr uint64_t kvmem_replay_capture_begin(uint64_t query_begin,
 // A boundary at zero is handled by the existing initial-query path.
 constexpr uint64_t kvmem_complete_query_replay_boundary(
         uint64_t requested_begin, uint64_t query_begin,
-        uint64_t query_end, uint32_t block_tokens) {
+        uint64_t query_end, uint32_t block_tokens, bool minimal_replay = false) {
     const uint32_t bt = block_tokens ? block_tokens : 1;
     const uint64_t boundary = requested_begin / bt * bt;
     const uint64_t before_query = query_begin / bt * bt;
-    return before_query > 0 && boundary > before_query && boundary < query_end
+    return !minimal_replay && before_query > 0 && boundary > before_query && boundary < query_end
         ? before_query : boundary;
 }
 
@@ -75,9 +75,9 @@ constexpr uint64_t kvmem_complete_query_replay_boundary(
 constexpr uint64_t kvmem_cached_query_replay_boundary(
         uint64_t requested_begin, uint64_t query_begin,
         uint64_t query_end, uint32_t block_tokens,
-        uint64_t resume_position) {
+        uint64_t resume_position, bool minimal_replay = false) {
     const uint64_t live_boundary = kvmem_complete_query_replay_boundary(
-        requested_begin, query_begin, query_end, block_tokens);
+        requested_begin, query_begin, query_end, block_tokens, minimal_replay);
     return live_boundary > resume_position ? live_boundary : resume_position;
 }
 

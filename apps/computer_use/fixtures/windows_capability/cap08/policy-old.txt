@@ -1,3 +1,0 @@
-Effective: 2026-09-01
-Reimbursement: 80% of cost
-Maximum: 100.00

@@ -1,0 +1,84 @@
+{
+  "frozen": true,
+  "status": "frozen_shared_gpu_quality_pilot",
+  "gpu_process_cap_gib": 60,
+  "cpu_kv_cap_gib": 40,
+  "seed": 73,
+  "temperature": 1,
+  "top_p": 0.95,
+  "top_k": 20,
+  "prefill_chunk": 512,
+  "max_output_tokens": 32768,
+  "thinking_budget": 28672,
+  "agent_timeout_s": 0,
+  "task_manifest": "tasks_pilot4.json",
+  "source_sha256": {
+    "run_pilot_arm.py": "f174aa9045fcec08087ec0dd5e94ad24a578d9c2a89af7ba71806e9ec5d1843d",
+    "run_pilot_campaign.py": "9516ef5e8f0f3306fcbc22b054aafb708a3832e4103a81096462ef82cf365a98",
+    "summarize_pilot.py": "fecc3597cadf3459b3279395793f7038124c5fcca0845107ade675bc9fee0592",
+    "trace_proxy.py": "2e6bf30af16cd22cd6c2b9bedb3f09927973575f2836b526ebd41645f3084509",
+    "serve_infllm.py": "9467ac4617a6c3d51833f0dac79663db6ef0d05874be2f1d754464b51ea062ee",
+    "run_model_smoke.py": "a618b49a6e862682cb59066731c8eb629a3ec970e6dcb4e6f9f315c59158c9d9",
+    "native_bridge.cpp": "39bf2c42797f20e3effd3b689c1969f9b5525d341f3dd6b7bc7075205f60b04f",
+    "native_build/qw3": "7284aa9f39728a7ffac44610a25f36b22f633b45d5e90df31d77efadb527a8d6",
+    "native_build/baseline_native_bridge": "675a60bff835a1e52b30ffba98e6a0e364767173167a5cf1e604e46bd115972f",
+    "configs/infllm_32k_candidate.json": "225b91a2c9a6411955d4a6ff078ffeb743b37749c2927057f911877a70bfbcb8",
+    "tasks_pilot4.json": "19899289928f25b2771b23fc779a1046018fe1b39e466f55b97167722196f1a2",
+    "reports/model_weight_sha256_20260912.json": "66af4a550d1761227f02ff9750cb2d85723bba4df13f6b5fb84be05964526aa8",
+    "reports/native_source_manifest.json": "05b2ef214786519f6e58d37146305bfc66d644c6620c275d549d70ecd286fe65",
+    "harness/run_deepswe_cell.sh": "6a651cef773e8a8d9fc05cbe96fb47dbd269f042b5ed7f99ce27725d7765675c",
+    "harness/container_claude_agent.sh": "f93eaa40c1d69e40a5a12856f7c263283911780f0bfece614b0ef3cea800cc13",
+    "kv_baselines/__init__.py": "f5ff007832957be067c62c9a13cc42440b33dfe0d5843f8952464dbdcc88a1fa",
+    "kv_baselines/frontend.py": "786411691903453cdfff09b2f5980af685a145e1c063278b0a029cba51179c8f",
+    "kv_baselines/generation.py": "13309903a35a9dd221604d099c38a7abbd979059d0d86dfdd205815b855bb8c3",
+    "kv_baselines/infllm_adapter.py": "b9f68444661093afb11a7f2df79fad6c0e9d4916692737d906c8a4319e0cc7d2",
+    "kv_baselines/infllm_hybrid.py": "ada2e6a84b878c0f86fad23bca3e9ca6e2201d7746ddadf299697d0cdbe39b68",
+    "kv_baselines/memory.py": "1cbaff723cc5e4e792fe6a1df3d420f0bcb20d74e15ab10e93fdd8d98c360c3e",
+    "kv_baselines/precision.py": "bb3a286bf15dcdef38c6b5a251ec1877518a178a4b219224f0d5dcbbd9b55b00",
+    "kv_baselines/session.py": "369ce3d6a3bec27c7bf1e7d79a86cc98754c49001f52f487de18191b3f6d105f",
+    "kv_baselines/session_state.py": "00b9b3d0bede02db09647420ebf8b6e7b0cc939aca5b738af42cde892068b031",
+    "kv_baselines/upstream.py": "d080efe2144821c9ff7ff966297fe47e0dc8b40d1bf73b1f9fa00ee3fb8b891b"
+  },
+  "quality_scope": "four first DeepSWE tasks, original tools and judges; no injected history; no external agent deadline as in prior local harness",
+  "shared_gpu_policy": "quality/integration only; performance excluded; formal fixed traces must be exclusive",
+  "methods": {
+    "native_dense": {
+      "context_tokens": 65536,
+      "minimum_free_gpu_gib": 59,
+      "history_policy": "Claude Code native auto compaction",
+      "prefix_cache": true,
+      "continuous_batching": true,
+      "max_active": 1
+    },
+    "native_kvmem": {
+      "context_tokens": 524288,
+      "selection_budget": 32768,
+      "generation_budget": 32768,
+      "middecode_trigger_tokens": 16384,
+      "gpu_planning_ratio": 0.98,
+      "scratch_reserve_mib": 1536,
+      "minimum_free_gpu_gib": 60,
+      "history_policy": "full guided query + full replay, CPU history, no NVMe/GC/client compaction"
+    },
+    "infllm": {
+      "context_tokens": 524288,
+      "allocator_cap_gib": 58,
+      "minimum_free_gpu_gib": 60,
+      "config": "configs/infllm_32k_candidate.json",
+      "history_policy": "original InfLLM retrieval/offload/LRU/async + safe incremental adapter, no client compaction"
+    }
+  },
+  "calibration_gates_pending": [],
+  "model_manifest": "reports/model_weight_sha256_20260912.json",
+  "frozen_at": 1789179516.8437388,
+  "validation_limitations": [
+    "Bounded mid-decode smoke emitted a short tool call and did not exercise a mid-generation refresh. Boundary guided query and replay are validated on 62 requests; mid-generation behavior is retained and remains to be observed.",
+    "Shared GPU timing is not eligible for formal performance ratios."
+  ],
+  "calibration_evidence": [
+    "reports/native_pilot_budget_capacity_20260912.json",
+    "reports/infllm_32k_capacity_summary_20260912.json",
+    "reports/native_dense_64k_cached_audit_20260912.json",
+    "reports/decode_controls_summary_20260912.json"
+  ]
+}

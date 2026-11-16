@@ -69,3 +69,21 @@ third_party/openhands-benchmarks/
 # External OSWorld V2 harness/services and their large local VM/assets.
 third_party/OSWorld-V2/
 third_party/OSWorld-GitLab/
+
+# Retained external computer-use data after source migration to kvmem-computer.
+/apps/computer_use/.runtime/
+/apps/computer_use/.venv/
+/apps/computer_use/*.egg-info/
+
+# Local run records, exports, browser profiles, and auxiliary checkouts.
+/runtime/
+/artifacts/
+/exports/
+/draft/
+/.firefox-cla-profile*/
+/.worktrees/
+/:memory:.ses*
+/vllm-dsh-*/
+/third_party/OSWorld-web/
+*.private.yml
+*.private.yaml

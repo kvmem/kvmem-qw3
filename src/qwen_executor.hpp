@@ -1,6 +1,8 @@
 #include <type_traits>
 #pragma once
 #include "kvmem_action_attention.hpp"
+#include "kvmem_mismatch_observer.hpp"
+#include "kvmem_query_history.hpp"
 
 #include "qwen_native.hpp"
 #include "qwen_weights.hpp"
@@ -477,6 +479,20 @@ public:
     // Snapshot of the current physical KV pages (logical order). Used to
     // record a freshly-computed prefix into the cache.
     std::vector<int32_t> kv_physical_pages() const;
+
+    // Opt-in idle-session parking. Only the shared bounded KV reservations are
+    // released; private tensors/recurrent/draft state remain on the device and
+    // must be budgeted separately by the serving cache. Call only after the
+    // request controller has finished. A refused/failed suspend keeps the live
+    // owner; a failed resume keeps the exact host image available for retry.
+    bool kvmem_suspend_idle(uint64_t max_host_bytes);
+    void kvmem_resume_idle();
+    bool kvmem_idle_suspended() const { return bool(kvmem_idle_state_); }
+    uint64_t kvmem_idle_host_bytes() const;
+    uint64_t kvmem_idle_swap_bytes() const { return kvmem_idle_host_bytes(); }
+    uint64_t kvmem_idle_snapshot_bytes() const;
+    uint64_t kvmem_idle_retained_device_bytes() const;
+    uint32_t kvmem_idle_quarantined_pages() const;
     uint32_t kv_page_size_public() const { return kv_pages_.page_size; }
 
     // Conservative per-token batch-scratch footprint in bytes. Used to size
@@ -528,6 +544,13 @@ public:
                               bool preserve_content_index = false,
                               bool capture_content_without_query = false,
                               uint32_t min_query_storage_rows = 0); // before prefill
+    // The backend owns logical input identity/history; physical KV replay and
+    // speculative snapshots must not open or commit another logical round.
+    void kvmem_query_history_begin(detail::KvMemQueryHistory &history,
+                                   uint64_t input_end, uint64_t verified_prefix,
+                                   double decay);
+    void kvmem_query_history_finalize_input();
+    void kvmem_query_history_abort() noexcept;
     uint32_t kvmem_query_expected_tokens() const {
         return kvmem_query_end_ > kvmem_query_begin_
             ? checked_local_position(kvmem_query_end_ - kvmem_query_begin_) : 0;
@@ -991,6 +1014,10 @@ public:
 
 private:
     friend struct KvPageTableTestAccess;
+    void kvmem_require_resident() const {
+        if (kvmem_idle_state_)
+            throw std::logic_error("KVMem idle executor must be resumed before use");
+    }
     struct KvPageTable {
         uint32_t page_size = 16;
         uint32_t max_pages = 0;
@@ -1210,6 +1237,8 @@ private:
     KvCacheStorage *external_kv_cache_ = nullptr;
     KvCacheStorage *external_mtp_kv_cache_ = nullptr;
     std::unique_ptr<KvPhysicalPageAllocator> kvmem_gpu_page_pool_;
+    struct IdleKvState;
+    std::unique_ptr<IdleKvState> kvmem_idle_state_;
     std::unique_ptr<KvPhysicalPageAllocator> isolated_kv_page_pool_;
     std::vector<std::unique_ptr<DeviceTensor>> kvmem_k_cache_storage_;
     std::vector<std::unique_ptr<DeviceTensor>> kvmem_v_cache_storage_;
@@ -1352,6 +1381,19 @@ private:
     bool kvmem_finalize_repository_index(uint64_t tokens);
     void kvmem_rebuild_repository_mean(KvMemStorageRead capture);
     void kvmem_store_scores(const std::vector<double> &scores);
+    void kvmem_query_history_observe(const std::vector<double> &scores,
+                                    uint32_t scored_blocks);
+    const KvMemStore::QuerySelectionScores *kvmem_query_history_selection();
+    detail::KvMemQueryHistory *kvmem_query_history_ = nullptr;
+    bool kvmem_query_history_complete_ = false;
+    struct QueryHistoryBlockIdentity {
+        uint64_t start = 0;
+        uint64_t generation = 0;
+        uint32_t tokens = 0;
+        bool live = false;
+    };
+    std::vector<QueryHistoryBlockIdentity> kvmem_query_history_blocks_;
+    KvMemStore::QuerySelectionScores kvmem_query_history_selection_;
     KvMemPlan kvmem_store_select(const std::vector<uint32_t> &ids,
                                 bool force_raw_refresh = false);
     // Window page table: selected blocks' physical pages in ascending order.
@@ -1976,6 +2018,36 @@ private:
     // kernels) unless kvmem_active_ and a representative layer exists.
     void kvmem_recompute_kbar();        // after assembly: rebuild k̄ + reset accum
     void kvmem_score_current_step(uint32_t layer_index, float scale);
+    void kvmem_mismatch_configure(const KvMemStoreConfig &cfg);
+    void kvmem_mismatch_reset();
+    void kvmem_mismatch_begin(int32_t think_open, int32_t think_close, bool thinking);
+    void kvmem_mismatch_prepare(const uint32_t *, uint32_t, uint64_t, bool);
+    void kvmem_mismatch_capture(uint32_t, const DeviceTensor &, uint32_t, uint32_t,
+                               const DeviceTensor * = nullptr, uint32_t = 0);
+    void kvmem_mismatch_commit(uint64_t);
+    void kvmem_mismatch_index_update(uint64_t, uint32_t);
+    KvMemMismatchConfig mismatch_config_;
+    std::unique_ptr<detail::MismatchObserver> mismatch_observer_;
+    detail::ActionAttentionParser mismatch_parser_;
+    detail::MismatchQueryMean mismatch_query_mean_;
+    std::vector<int32_t> mismatch_layers_;
+    std::vector<std::shared_ptr<const detail::MismatchKeyBlock>> mismatch_index_;
+    std::vector<std::pair<uint32_t,uint32_t>> mismatch_selected_;
+    // Retained policy-fixed prefixes, captured with the same window snapshot.
+    // The accepted append tail is unioned separately by the CPU observer.
+    std::vector<std::pair<uint32_t,uint32_t>> mismatch_mandatory_;
+    std::vector<uint32_t> mismatch_rows_;
+    std::unique_ptr<DeviceTensor> mismatch_q_device_;
+    std::unique_ptr<HostBuffer> mismatch_q_host_;
+    std::unique_ptr<DeviceTransferFence> mismatch_copy_done_;
+    uint64_t mismatch_epoch_=0, mismatch_base_=0, mismatch_committed_=0;
+    uint64_t mismatch_selection_=0, mismatch_tail_begin_=0, mismatch_prefill_last_=0;
+    uint64_t mismatch_skipped_busy_=0;
+    uint64_t mismatch_skipped_query_blocks_=0;
+    uint32_t mismatch_count_=0, mismatch_captured_layers_=0, mismatch_accepted_=0;
+    double mismatch_capture_ms_=0, mismatch_index_update_ms_=0;
+    uint64_t mismatch_index_copy_bytes_=0;
+    bool mismatch_running_=false, mismatch_prefill_=false;
     void kvmem_action_configure(KvMemStoreConfig &cfg);
     void kvmem_action_prepare(const uint32_t *tokens, uint32_t count, uint64_t base,
                              bool prefill = false);

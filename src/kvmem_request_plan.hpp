@@ -47,6 +47,9 @@ struct KvmemMandatoryFitInput {
     std::vector<KvmemMandatoryBlockSpan> hard_spans;
     uint32_t live_begin = 0;
     uint32_t live_end = 0;
+    // Explicit/user replay suffixes retain their existing lifetime. Harness
+    // tool continuations set false: only the final decode-seed block is hard.
+    bool pin_live_suffix = true;
 };
 
 struct KvmemMandatoryFitResult {
@@ -60,10 +63,9 @@ struct KvmemMandatoryFitResult {
     bool capacity_fitted = false;
 };
 
-// Fit protocol continuity into a finite active window without dropping source
-// history. A long live tool body is never an all-or-nothing pin: its envelope
-// head and a bounded contiguous tail remain hard, while the complete middle is
-// left in the ordinary content index for query-conditioned retrieval.
+// Fit required spans into a finite active window without dropping source
+// history. Tool calls/results remain ordinary retrieval candidates when
+// pin_live_suffix is false; a final KV block is required to seed decode/replay.
 inline KvmemMandatoryFitResult kvmem_fit_mandatory_blocks(
         const KvmemMandatoryFitInput &in) {
     KvmemMandatoryFitResult out;
@@ -85,16 +87,36 @@ inline KvmemMandatoryFitResult kvmem_fit_mandatory_blocks(
     for (const auto &span : in.hard_spans) {
         mark_range(raw, span.begin, span.end);
     }
-    if (has_live) mark_range(raw, live_begin, live_end);
+    if (has_live) mark_range(raw,
+        in.pin_live_suffix ? live_begin : live_end - 1, live_end);
     out.raw_mandatory_blocks = static_cast<uint32_t>(std::count(
         raw.begin(), raw.end(), static_cast<uint8_t>(1)));
-    if (out.raw_mandatory_blocks <= in.budget_blocks) {
-        out.hard_blocks.reserve(out.raw_mandatory_blocks);
+    const auto publish = [&](const std::vector<uint8_t> &hard) {
+        out.hard_blocks.reserve(std::min(out.raw_mandatory_blocks, in.budget_blocks));
         for (uint32_t id = 0; id < prompt_blocks; ++id) {
-            if (raw[id]) out.hard_blocks.push_back(id);
+            const bool live = has_live && id >= live_begin && id < live_end;
+            if (hard[id]) {
+                out.hard_blocks.push_back(id);
+                if (live) ++out.fitted_live_blocks;
+            } else if (raw[id] || live) {
+                ++out.soft_retrievable_blocks;
+            }
         }
-        out.fitted_live_blocks = out.raw_live_blocks;
-        out.replay_begin_block = has_live ? live_begin : live_end;
+        out.replay_begin_block = live_end;
+        if (has_live) {
+            if (in.pin_live_suffix) {
+                while (out.replay_begin_block > live_begin &&
+                       hard[out.replay_begin_block - 1])
+                    --out.replay_begin_block;
+            } else {
+                // Even if an explicit policy overlaps the tool tail, never
+                // promote that whole range back into implicit tool replay.
+                out.replay_begin_block = live_end - 1;
+            }
+        }
+    };
+    if (out.raw_mandatory_blocks <= in.budget_blocks) {
+        publish(raw);
         return out;
     }
 
@@ -122,7 +144,7 @@ inline KvmemMandatoryFitResult kvmem_fit_mandatory_blocks(
     // blocks (512 tokens at the production block size) for the call/result
     // envelope and a bounded contiguous recent tail, so replay never
     // reintroduces the complete oversized result after selection.
-    if (has_live) {
+    if (has_live && in.pin_live_suffix) {
         const uint32_t live_head = std::min<uint32_t>(
             16, out.raw_live_blocks);
         const uint32_t desired_tail = std::min(
@@ -138,6 +160,8 @@ inline KvmemMandatoryFitResult kvmem_fit_mandatory_blocks(
         for (uint32_t i = 0; i < live_head; ++i) {
             add_block(live_begin + i);
         }
+    } else if (has_live) {
+        add_block(live_end - 1);
     }
     for (uint32_t id = 0; id < sink && hard_count < hard_limit; ++id) {
         add_block(id);
@@ -183,23 +207,7 @@ inline KvmemMandatoryFitResult kvmem_fit_mandatory_blocks(
         }
     }
 
-    out.hard_blocks.reserve(hard_count);
-    for (uint32_t id = 0; id < prompt_blocks; ++id) {
-        if (hard[id]) out.hard_blocks.push_back(id);
-    }
-    if (has_live) {
-        for (uint32_t id = live_begin; id < live_end; ++id) {
-            if (hard[id]) ++out.fitted_live_blocks;
-        }
-        uint32_t replay = live_end;
-        while (replay > live_begin && hard[replay - 1]) --replay;
-        out.replay_begin_block = replay;
-    } else {
-        out.replay_begin_block = live_end;
-    }
-    out.soft_retrievable_blocks =
-        out.raw_mandatory_blocks > hard_count
-            ? out.raw_mandatory_blocks - hard_count : 0;
+    publish(hard);
     return out;
 }
 

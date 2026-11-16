@@ -77,6 +77,74 @@ int main() {
                 large_suffix_final.incremental_suffix_tokens == 76758,
             "oversized checkpoint suffix bypassed the generation reserve");
 
+    // Frozen DSH request 24: a large Write argument previously made 36,384
+    // tokens mandatory, despite fitting just below A=36,864. Only control/task
+    // blocks and one final decode-seed block now need hard protection.
+    const auto write_continuation = kvmem_fit_mandatory_blocks(
+        KvmemMandatoryFitInput{
+            3430, 1152, 41, 0,
+            {{0, 219, 0}, {219, 220, 1}, {1691, 1693, 1}},
+            2515, 3430, false});
+    require(!write_continuation.capacity_fitted &&
+                write_continuation.raw_live_blocks == 915 &&
+                write_continuation.hard_blocks.size() == 223 &&
+                write_continuation.raw_mandatory_blocks == 223 &&
+                write_continuation.fitted_live_blocks == 1 &&
+                write_continuation.soft_retrievable_blocks == 914 &&
+                write_continuation.replay_begin_block == 3429,
+            "below-budget Write interaction remained mandatory or fully replayed");
+    require(std::binary_search(write_continuation.hard_blocks.begin(),
+                write_continuation.hard_blocks.end(), 1691) &&
+                !std::binary_search(write_continuation.hard_blocks.begin(),
+                write_continuation.hard_blocks.end(), 2515),
+            "tool removal lost current user instruction or retained tool body");
+
+    const auto oversized_tool = kvmem_fit_mandatory_blocks(
+        KvmemMandatoryFitInput{
+            5200, 2048, 32, 164,
+            {{0, 20, 0}}, 100, 5190, false});
+    require(!oversized_tool.capacity_fitted &&
+                oversized_tool.hard_blocks.size() == 33 &&
+                oversized_tool.fitted_live_blocks == 1 &&
+                oversized_tool.soft_retrievable_blocks == 5089 &&
+                oversized_tool.replay_begin_block == 5189,
+            "oversized tool gained implicit head/recent-tail pins");
+
+    const auto tool_with_policy = kvmem_fit_mandatory_blocks(
+        KvmemMandatoryFitInput{
+            40, 16, 2, 8, {{30, 40, 0}}, 10, 40, false});
+    require(tool_with_policy.hard_blocks.size() == 12 &&
+                tool_with_policy.fitted_live_blocks == 10 &&
+                tool_with_policy.replay_begin_block == 39 &&
+                tool_with_policy.soft_retrievable_blocks == 20,
+            "explicit policy protection reintroduced whole tool replay");
+
+    const auto tool_with_oversized_control = kvmem_fit_mandatory_blocks(
+        KvmemMandatoryFitInput{
+            3000, 64, 1000, 8, {{0, 1000, 0}}, 2900, 3000, false});
+    require(tool_with_oversized_control.capacity_fitted &&
+                tool_with_oversized_control.hard_blocks.size() <= 56 &&
+                tool_with_oversized_control.fitted_live_blocks == 1 &&
+                tool_with_oversized_control.replay_begin_block == 2999 &&
+                std::binary_search(tool_with_oversized_control.hard_blocks.begin(),
+                    tool_with_oversized_control.hard_blocks.end(), 2999),
+            "oversized control lost decode seed or implicitly pinned the tool");
+
+    // Independent call/result switches supply only their own hard ranges;
+    // neither may expand the other part through implicit suffix replay.
+    const auto no_parts = kvmem_fit_mandatory_blocks(
+        KvmemMandatoryFitInput{40, 40, 0, 0, {}, 10, 40, false});
+    const auto calls = kvmem_fit_mandatory_blocks(
+        KvmemMandatoryFitInput{40, 40, 0, 0, {{10, 30, 0}}, 10, 40, false});
+    const auto results = kvmem_fit_mandatory_blocks(
+        KvmemMandatoryFitInput{40, 40, 0, 0, {{30, 39, 0}}, 10, 40, false});
+    require(no_parts.hard_blocks == std::vector<uint32_t>{39} &&
+                calls.hard_blocks.size() == 21 && results.hard_blocks.size() == 10 &&
+                !std::binary_search(calls.hard_blocks.begin(), calls.hard_blocks.end(), 30) &&
+                !std::binary_search(results.hard_blocks.begin(), results.hard_blocks.end(), 10) &&
+                calls.replay_begin_block == 39 && results.replay_begin_block == 39,
+            "none/call-only/result-only masks did not keep their independent lifetimes");
+
     const auto fit_70k = kvmem_fit_mandatory_blocks(
         KvmemMandatoryFitInput{
             2200, 2048, 32, 164,

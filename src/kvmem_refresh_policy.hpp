@@ -432,7 +432,10 @@ inline constexpr bool kvmem_middecode_generate_private_query(
 
 inline uint32_t kvmem_middecode_refresh_recent_tokens(
         uint32_t select_budget, uint32_t epoch_tokens,
-        bool emergency_refresh) {
+        bool emergency_refresh, int configured_tokens = -1) {
+    // An explicit suffix budget also applies at emergency boundaries. This
+    // supports controlled retention ablations without silently adding pins.
+    if (configured_tokens >= 0) return static_cast<uint32_t>(configured_tokens);
     const uint32_t normal = kvmem_middecode_recent_tokens(select_budget);
     return emergency_refresh ? std::max(normal, epoch_tokens) : normal;
 }

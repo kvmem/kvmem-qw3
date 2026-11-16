@@ -41,6 +41,7 @@ public:
     DFlashProposal propose(const DeviceWeight &target_head, uint32_t anchor,
                             float temperature, std::mt19937_64 &rng);
     uint32_t context_rows() const { return context_rows_; }
+    uint64_t retained_device_bytes() const;
     uint64_t next_position() const { return next_position_; }
     uint32_t rope_next() const { return rope_next_; }
     const DFlashConfig &config() const { return weights_.config(); }

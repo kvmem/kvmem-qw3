@@ -434,6 +434,115 @@ installation. An above-budget request should show query replay, a non-fallback
 retrieval scorer, and tier movement. A successful short chat request proves
 HTTP and generation health, but does not prove that sparse KVMem retrieval ran.
 
+### Observe window mismatch on the CPU
+
+The experimental `--kvmem-mismatch-log PATH` switch enables a **shadow observer**.
+It never triggers refreshes or changes the selection budget, ranking, or KV state.
+It samples fresh Q from prefill and all accepted output (including thinking), copies those
+small samples to the host, and uses one background CPU worker to score the
+CPU Mean-K index. Private queries, replay, and rejected speculative rows are
+excluded. Output-attention collection can remain off.
+
+Append these options to a serialized, query-conditioned KVMem command:
+
+```bash
+--kvmem-query-conditioned --kvmem-index-placement cpu \
+--kvmem-retrieval-method mean-k \
+--kvmem-mismatch-log /tmp/qw3-mismatch.jsonl \
+--kvmem-mismatch-layers spread3 \
+--kvmem-mismatch-interval 1024 --kvmem-mismatch-samples 4 \
+--kvmem-mismatch-half-life 8192 --kvmem-mismatch-epsilon 0.1
+```
+
+For a denser unified trajectory, add `--kvmem-mismatch-query-mode block-mean`
+and `--kvmem-immutable-k`. This mode averages the content-frame Q of each logical
+KV block (32 tokens with the usual block size), across accepted forward batches.
+Input, thinking, ordinary output and special tokens are included. Interval and
+samples options apply only to the default `sampled` mode. Each completed block
+produces one Query; a prefill batch can therefore produce many observations.
+Partial blocks carry across contiguous calls. A context discontinuity discards
+the unfinished sum; a resumed block records the actual smaller token count.
+Private queries, replay and rejected speculative rows remain excluded.
+CPU backpressure may drop complete observations; `skipped_query_blocks` records
+the count. This does not change the formal attention selector's scope or scores.
+
+For `serve`, use `--no-continuous-batching`. This first implementation supports
+online contiguous Mean-K only, without archive, bounded repository, or GC.
+Existing CPU index placement streams the **formal retrieval scorer** through
+the GPU; only this new diagnostic probe computes its dot products and softmax
+on the CPU. It retains an immutable copy of sampled layers' index blocks and
+an FP32 worker cache; budget host RAM for both. Busy workers drop probes rather
+than accumulate a backlog. Q staging and incremental index snapshots still
+have foreground cost and are included in end-to-end validation.
+
+Q and Mean-K snapshots use FP16 storage. The worker converts cached keys to
+FP32 and uses FP32 dot products (AVX2/FMA when available); softmax reductions
+and the decayed score use FP64. This does not require native CPU FP16 arithmetic.
+
+Schema v3 retains v2's coverage definition: sink participates in the same
+normalization as other retained blocks.
+Each JSONL record reports `coverage` (one minus `missing`), `query_coverage`
+(one value per sampled/averaged Query), `query_positions`, `query_token_counts`,
+`missing` (proxy importance outside the visible window), `debt` (decayed excess
+omission), `cpu_ms`, `capture_ms`, `snapshot_ms`,
+`skipped_busy`, and index coverage. `missing` is computed over causally available
+**complete indexed blocks**, including sink, with equal weighting after each
+Query-head/layer softmax. Selected partial blocks and the newly appended tail
+are accounted for without double counting. Partial-block coverage is a uniform
+within-block approximation. It is not the true attention mass over raw keys;
+`unindexed_tokens` explicitly shows history outside the diagnostic index.
+In block-mean mode each reported position is a completed block endpoint: missing
+decode index rows are supplemented from immutable raw K (FP8/F16/F32), so the
+normalization covers the whole causal history at that endpoint, including sink,
+other protected blocks and the appended tail. `official_indexed_tokens` records
+how far the normal index had progressed. This remains a position-free Mean-K
+proxy, not exact attention over all raw tokens; attention of an averaged Q is
+also not the average of individual token attentions. Old sink-excluding logs
+cannot be converted to this scope retrospectively.
+An empty candidate domain emits `no_candidates` with null scores, never a
+misleading zero. Prefill and output have separate debt/progress state:
+`D = max(0, rho * D + (1-rho) * (missing-epsilon))`, where
+`rho = 2^(-delta_tokens/half_life)`. The first valid observation uses one configured
+interval. Debt resets on a new observer epoch or changed selection generation;
+records retain the sampled window generation even if inference has since moved on.
+
+Schema v3 also reports a conditional random-window baseline for each Query:
+`query_candidate_tokens` (N), `query_visible_tokens` (B),
+`query_mandatory_tokens` (m), `query_mandatory_coverage` (C_M),
+`query_random_coverage` (E), and `query_lift` (L). The reference fixes the
+already-resident sink/recent/request-pin prefixes, any retained unfinished
+boundary, and the accepted append tail, taking their union. Other token slots
+are chosen uniformly without replacement at the same actual visible-token
+budget: `E = C_M + (B-m)/(N-m) * (1-C_M)` and `L = C/E`.
+This is a token-relaxed reference with uniform mass inside a block, not the
+distribution of the actual block selector. N and B are measured per Query;
+neither is inferred from the configured KV budget. Sink remains in both C and E.
+
+Coverage and mandatory mass are averaged over heads/layers before computing
+each Query's baseline and lift. The record-level `random_coverage` averages E
+over the same candidate-valid Queries as `coverage`; record-level `lift` is
+their ratio, not the mean of individual Query ratios. Aligned
+`query_baseline_valid` and `query_baseline_status` fields distinguish valid
+selection observations, full retention, no selectable remainder, and undefined
+cases. A full window has E=L=1 and is labeled as requiring no selection; an
+empty candidate set or a zero baseline never produces a fabricated finite lift.
+The new reductions reuse the observer's logits and add no GPU scoring pass.
+
+Read C, E, and L together: L=2 means twice the conditional random expectation,
+not that the window is sufficient for the task. Appending irrelevant history
+can increase L without increasing C. The baseline is diagnostic only and never
+triggers a refresh. Earlier logs lack the per-Query occupancy and fixed mass
+needed to reconstruct this baseline exactly.
+
+Summarize the measured distribution (prefill and output separately):
+
+```bash
+python3 scripts/kvmem_mismatch_report.py /tmp/qw3-mismatch.jsonl
+```
+
+The report includes mean, median, p90/p95, extrema, and omission histograms.
+Thresholds are exploratory; no automatic refresh threshold is enabled.
+
 ### Add attention scores to retrieval
 
 KVMem can also record which historical blocks the model attends to, and use
@@ -502,6 +611,21 @@ Send requests through the same API as the preceding KVMem example. The
 generation reserve sizes the resident KV pool; with CPU/NVMe backing and
 serialized serving, it is independent of the request's output-token limit.
 Attention collection does not itself enable private guided-query generation.
+
+Optional Query history adds memory to the existing retrieval signal independently
+of attention collection. Add `--kvmem-query-history on` and
+`--kvmem-query-history-decay 0.5` to a query-conditioned, online Mean-K run.
+Each completed input contributes one normalized Query distribution; selection
+uses that distribution plus the decayed parent-input history. Replay and
+regeneration do not count as extra observations. It defaults to off, supports
+ordinary block TopK with either attention combination policy, and requires
+serialized serving. See [Query history and branch semantics](docs/kvmem_query_history.md).
+
+Automatic harness mandatory parts are configurable with
+`--kvmem-mandatory-parts system,root,query,policy` (the default). Add `tool-call`
+or `tool-result` to protect the current call arguments or results independently;
+`all` and `none` support retention ablations. Requests can override these parts.
+See [harness retention configuration](docs/harness_compatibility.md#configure-mandatory-parts).
 
 Sink, recent, and mandatory blocks retain precedence within the fixed budget.
 The remaining slots are selected according to the path and combination mode:
@@ -653,6 +777,7 @@ Run `./build/qw3 --help` for the complete current CLI.
 - [Harness compatibility](docs/harness_compatibility.md)
 - [Claude Code integration](docs/claude_code.md)
 - [Incremental KVMem sessions](docs/kvmem_incremental_session_api.md)
+- [Bounded multi-session KVMem history and active-slot management](docs/kvmem_session_memory.md)
 - [Semantic-group retrieval](docs/kvmem_semantic_group_retrieval.md)
 - [Sampled attention scores for KVMem](docs/kvmem_action_attention.md)
 - [Native CUDA vision frontend](docs/multimodal_cuda.md)

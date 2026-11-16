@@ -65,6 +65,17 @@ KvMemStore::KvMemStore(KvMemStoreConfig cfg) : cfg_(std::move(cfg)) {
         throw std::invalid_argument("action_fraction must be in [0,1]");
     if (cfg_.action_combine != "quota" && cfg_.action_combine != "score")
         throw std::invalid_argument("action_combine must be quota|score");
+    if (!std::isfinite(cfg_.query_history_decay) || cfg_.query_history_decay < 0 || cfg_.query_history_decay > 1)
+        throw std::invalid_argument("query_history_decay must be in [0,1]");
+    if (cfg_.query_history &&
+        (cfg_.select_method != KvMemMethod::Retrieval ||
+         cfg_.retrieval_method != KvMemRetrievalMethod::MeanK ||
+         cfg_.prototype_mode != KvMemPrototypeMode::Contiguous ||
+         cfg_.select_policy != KvMemSelectPolicy::TopK ||
+         cfg_.semantic_expansion != KvMemSemanticExpansion::None))
+        throw std::invalid_argument("Query history requires retrieval, mean-k, topk and semantic expansion none");
+    if (cfg_.query_history && cfg_.action_combine == "score" && cfg_.action_fraction == 1)
+        throw std::invalid_argument("Query history cannot be combined with 100% attention score selection");
 }
 
 KvMemStore::KvMemStore(KvMemStoreConfig cfg, std::shared_ptr<KvMemRepository> repository)
@@ -1157,8 +1168,24 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks() const {
 
 std::vector<uint32_t> KvMemStore::pick_topk_blocks(
         const std::vector<uint32_t> &mandatory_blocks,
-        const PrefillSelectionScores &prefill_scores) const {
+        const PrefillSelectionScores &prefill_scores,
+        const QuerySelectionScores *query_scores) const {
     const uint32_t n = block_count();
+    if (query_scores) {
+        if (query_scores->size() != n)
+            throw std::invalid_argument("Query selection scores must cover the current block table");
+        for (double score : *query_scores)
+            if (!std::isfinite(score) || score < 0)
+                throw std::invalid_argument("Query selection scores must be finite and nonnegative");
+        if (cfg_.select_method != KvMemMethod::Retrieval)
+            throw std::invalid_argument("Query selection scores require retrieval selection");
+    }
+    const auto query_score = [&](const KvMemBlock &block) {
+        return query_scores ? (*query_scores)[block.block_id] : block.retrieval_score;
+    };
+    const auto rank_score = [&](const KvMemBlock &block) {
+        return query_scores ? query_score(block) : block.attn_score;
+    };
     const auto order = chronological_ids();
     std::vector<uint32_t> selected;
     if (n == 0) return selected;
@@ -1240,7 +1267,7 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks(
             double qmax = 0, amax = 0, qsum = 0, asum = 0;
             uint32_t qpositive = 0, apositive = 0;
             for (uint32_t id : order) if (!kept[id]) {
-                const double q = blocks_[id].retrieval_score;
+                const double q = query_score(blocks_[id]);
                 const double a = attention_score(blocks_[id]);
                 if (!std::isfinite(q) || !std::isfinite(a) || a < 0)
                     throw std::runtime_error("KVMem score fusion received invalid scores");
@@ -1248,20 +1275,20 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks(
                 qpositive += q > 0; apositive += a > 0;
             }
             for (uint32_t id : order) if (!kept[id]) {
-                if (qmax > 0) qsum += std::max(0.0, blocks_[id].retrieval_score) / qmax;
+                if (qmax > 0) qsum += std::max(0.0, query_score(blocks_[id])) / qmax;
                 if (amax > 0) asum += attention_score(blocks_[id]) / amax;
             }
             const double aw = asum > 0 ? (qsum > 0 ? cfg_.action_fraction : 1.0) : 0;
             const double qw = qsum > 0 ? 1.0 - aw : 0;
             std::vector<double> fused(n, 0);
             for (uint32_t id : order) if (!kept[id]) {
-                fused[id] = (qw > 0 ? qw * (std::max(0.0, blocks_[id].retrieval_score) / qmax) / qsum : 0) +
+                fused[id] = (qw > 0 ? qw * (std::max(0.0, query_score(blocks_[id])) / qmax) / qsum : 0) +
                             (aw > 0 ? aw * (attention_score(blocks_[id]) / amax) / asum : 0);
             }
             if (qsum > 0 || asum > 0)
                 take_top(remaining, [&](const KvMemBlock &b) { return fused[b.block_id]; });
             else
-                take_top(remaining, [](const KvMemBlock &b) { return b.retrieval_score; });
+                take_top(remaining, query_score);
             if (std::getenv("QW3_KVMEM_TRACE"))
                 std::fprintf(stderr, "[action-fusion] normalization=positive-l1 query_weight=%.6f attention_weight=%.6f query_positive=%u attention_positive=%u candidates=%zu total=%u attention_source=%s\n",
                     qw, aw, qpositive, apositive, order.size()-(budget-remaining), kept_count,
@@ -1270,11 +1297,11 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks(
             return selected;
         }
         const uint32_t action_quota = static_cast<uint32_t>(remaining * cfg_.action_fraction);
-        take_top(remaining - action_quota, [](const KvMemBlock &b) { return b.retrieval_score; });
+        take_top(remaining - action_quota, query_score);
         const uint32_t before_action = kept_count;
         take_top(action_quota, attention_score, true);
         const uint32_t action_kept = kept_count - before_action;
-        take_top(budget - kept_count, [](const KvMemBlock &b) { return b.retrieval_score; });
+        take_top(budget - kept_count, query_score);
         if (std::getenv("QW3_KVMEM_TRACE"))
             std::fprintf(stderr, "[action-selection] query_quota=%u action_quota=%u action_added=%u total=%u attention_source=%s\n",
                          remaining-action_quota, action_quota, action_kept, kept_count,
@@ -1296,18 +1323,14 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks(
             profile_quota = remaining > retrieval_quota ? remaining - retrieval_quota : 0;
         }
 
-        take_top(retrieval_quota, [](const KvMemBlock &b) {
-            return b.retrieval_score;
-        });
+        take_top(retrieval_quota, query_score);
         take_top(profile_quota, [](const KvMemBlock &b) {
             return b.profile_score;
         });
         // Fill any leftover quota with the configured method's combined score
         // so rounding, overlap, or zero explicit quotas still use the budget.
         if (kept_count < budget) {
-            take_top(budget - kept_count, [](const KvMemBlock &b) {
-                return b.attn_score;
-            });
+            take_top(budget - kept_count, rank_score);
         }
         selected.reserve(kept_count);
         for (uint32_t i : order) {
@@ -1324,11 +1347,11 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks(
             if (!kept[i] && is_live(i)) candidates.push_back(i);
         }
         const uint32_t need = budget - kept_count;
-        // Partial sort by attn_score desc; tie-break by recency (higher id) so
-        // selection is deterministic.
+        // Partial sort by the effective rank, preserving historical recency
+        // tie-breaking even when reusable slot IDs are out of order.
         auto better = [&](uint32_t a, uint32_t b) {
-            if (blocks_[a].attn_score != blocks_[b].attn_score) {
-                return blocks_[a].attn_score > blocks_[b].attn_score;
+            if (rank_score(blocks_[a]) != rank_score(blocks_[b])) {
+                return rank_score(blocks_[a]) > rank_score(blocks_[b]);
             }
             return earlier(b, a);
         };

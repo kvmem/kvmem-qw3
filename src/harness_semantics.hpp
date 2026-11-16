@@ -1,5 +1,7 @@
 #pragma once
 
+#include "qw3/kvmem_mandatory.hpp"
+
 #include <cstddef>
 #include <optional>
 #include <string>
@@ -63,6 +65,8 @@ enum class HarnessSpanReason {
     LiveToolTrajectory,
     ProjectPolicy,
     RootTask,
+    ToolCall,
+    ToolResult,
 };
 
 struct HarnessByteSpan {
@@ -78,7 +82,12 @@ struct HarnessSemanticPlan {
     std::optional<size_t> current_query_message_index;
     std::optional<size_t> live_suffix_message_begin_index;
     std::optional<HarnessByteSpan> live_suffix_span;
-    // Historical retrieval candidates end immediately before the live suffix.
+    // Tool calls/results participate in retrieval, including the newest round.
+    // A real user suffix still belongs to the mandatory current instruction.
+    bool live_suffix_is_tool = false;
+    std::vector<HarnessByteSpan> tool_call_spans;
+    std::vector<HarnessByteSpan> tool_result_spans;
+    // Tool continuations include the live round; user requests end before it.
     // Zero means that no conversational boundary could be derived.
     size_t history_end = 0;
     std::vector<HarnessByteSpan> spans;
@@ -95,14 +104,19 @@ bool harness_message_is_meta_only(HarnessKind kind,
 // Build byte-accurate semantic lifetimes from an already-rendered prompt.
 // Stable control, the root task, the exact current instruction, and the latest
 // durable policy frames become bounded mandatory spans. When root and current
-// are the same message only CurrentQuery is emitted. The unfinished tool round is returned
-// separately as live_suffix_span: it is replayed after semantic selection but
-// is never confused with the score-query span or the completed tool history.
+// are the same message only CurrentQuery is emitted. The newest tool round is
+// returned separately for accounting, while its calls/results remain ordinary
+// retrieval candidates. Only a minimal final KV block seeds post-selection
+// generation; the tool round is not an implicit mandatory span.
 HarnessSemanticPlan derive_harness_semantic_plan(
     HarnessKind kind,
     std::string_view prompt,
     size_t control_prefix_end,
     const std::vector<HarnessRenderedMessageSpan> &messages);
+
+// Selecting hard lifetimes never changes query identity or retrieval history.
+std::vector<HarnessByteSpan> select_harness_mandatory_spans(
+    const HarnessSemanticPlan &plan, const KvMemMandatoryConfig &config);
 
 } // namespace detail
 } // namespace qw3

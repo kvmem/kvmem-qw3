@@ -1,0 +1,51 @@
+{
+  "frozen": false,
+  "status": "candidate_requires_capacity_decode_and_frontend_validation",
+  "gpu_process_cap_gib": 60,
+  "cpu_kv_cap_gib": 40,
+  "seed": 73,
+  "temperature": 1,
+  "top_p": 0.95,
+  "top_k": 20,
+  "prefill_chunk": 512,
+  "max_output_tokens": 32768,
+  "thinking_budget": 28672,
+  "agent_timeout_s": 0,
+  "task_manifest": "tasks_pilot4.json",
+  "source_sha256": {},
+  "quality_scope": "four first DeepSWE tasks, original tools and judges; no injected history; no external agent deadline as in prior local harness",
+  "shared_gpu_policy": "quality/integration only; performance excluded; formal fixed traces must be exclusive",
+  "methods": {
+    "native_dense": {
+      "context_tokens": 65536,
+      "minimum_free_gpu_gib": 59,
+      "history_policy": "Claude Code native auto compaction",
+      "prefix_cache": true,
+      "continuous_batching": true,
+      "max_active": 1
+    },
+    "native_kvmem": {
+      "context_tokens": 524288,
+      "selection_budget": 32768,
+      "generation_budget": 32768,
+      "middecode_trigger_tokens": 16384,
+      "gpu_planning_ratio": 0.98,
+      "scratch_reserve_mib": 1536,
+      "minimum_free_gpu_gib": 60,
+      "history_policy": "full guided query + full replay, CPU history, no NVMe/GC/client compaction"
+    },
+    "infllm": {
+      "context_tokens": 524288,
+      "allocator_cap_gib": 58,
+      "minimum_free_gpu_gib": 60,
+      "config": "configs/infllm_32k_candidate.json",
+      "history_policy": "original InfLLM retrieval/offload/LRU/async + safe incremental adapter, no client compaction"
+    }
+  },
+  "calibration_gates_pending": [
+    "native dense 64K prefix-cache control completing",
+    "bounded native mid-decode guided refresh",
+    "freeze source hashes after validation"
+  ],
+  "model_manifest": "reports/model_weight_sha256_20260912.json"
+}

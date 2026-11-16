@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "selection_rule": "First four entries in the existing first16_full113 ordering, frozen before any new baseline task outcome",
+  "source": "/home/chaidi/qw3/benchmark/claude_deepswe_ab/tasks_first16_full113.txt",
+  "source_sha256": "2018d2de77eb2c869d6cf94515ae746f42bd90b6ccb473819ef06013abab7ec8",
+  "seed": 73,
+  "tasks": [
+    {
+      "task_id": "superjson-error-stack-serialization",
+      "verifier_image": "qw3-deepswe-superjson-error-stack-serialization-verifier:v1.1"
+    },
+    {
+      "task_id": "textual-richlog-follow-state",
+      "verifier_image": "qw3-deepswe-textual-richlog-follow-state-verifier:v1.1"
+    },
+    {
+      "task_id": "koota-composite-trait-aspects",
+      "verifier_image": "qw3-deepswe-koota-composite-trait-aspects-verifier:v1.1"
+    },
+    {
+      "task_id": "awilix-async-container-initialization",
+      "verifier_image": "qw3-deepswe-awilix-async-container-initialization-verifier:v1.1"
+    }
+  ],
+  "calibration_rule": "Use separate sources/tasks for calibration; never tune on these four outcomes",
+  "status": "manifest_frozen_not_started"
+}

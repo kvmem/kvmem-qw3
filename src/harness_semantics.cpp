@@ -368,9 +368,9 @@ HarnessSemanticPlan derive_harness_semantic_plan(
 
     if (query_order.has_value()) {
         size_t suffix_order = *query_order;
-        // A tool continuation keeps only the newest unfinished tool transaction:
-        // all parallel result messages plus the assistant call that produced
-        // them. Completed earlier transactions remain semantic candidates.
+        // Identify the newest tool transaction for accounting. Its assistant
+        // call and all parallel results are retrieval candidates, rather than
+        // an implicit mandatory/replay suffix.
         size_t tail = messages.size();
         while (tail > *query_order + 1 &&
                is_meta_only_message(kind, prompt, messages[tail - 1])) {
@@ -378,6 +378,7 @@ HarnessSemanticPlan derive_harness_semantic_plan(
         }
         if (tail > *query_order + 1 &&
             is_tool_result_message(prompt, messages[tail - 1])) {
+            plan.live_suffix_is_tool = true;
             size_t first_result = tail - 1;
             while (first_result > *query_order + 1 &&
                    (is_tool_result_message(prompt, messages[first_result - 1]) ||
@@ -393,9 +394,22 @@ HarnessSemanticPlan derive_harness_semantic_plan(
             }
         }
         const HarnessRenderedMessageSpan &suffix = messages[suffix_order];
+        if (plan.live_suffix_is_tool) {
+            for (size_t order = suffix_order; order < messages.size(); ++order) {
+                const auto &span = messages[order];
+                if (!valid_segment_bounds(prompt, span)) continue;
+                if (is_tool_result_message(prompt, span))
+                    plan.tool_result_spans.push_back({span.segment_begin, span.segment_end,
+                                                     HarnessSpanReason::ToolResult});
+                else if (span.role == "assistant")
+                    plan.tool_call_spans.push_back({span.segment_begin, span.segment_end,
+                                                   HarnessSpanReason::ToolCall});
+            }
+        }
         if (valid_segment_bounds(prompt, suffix)) {
             plan.live_suffix_message_begin_index = suffix.message_index;
-            plan.history_end = suffix.segment_begin;
+            plan.history_end = plan.live_suffix_is_tool
+                ? prompt.size() : suffix.segment_begin;
             plan.live_suffix_span = HarnessByteSpan{
                 suffix.segment_begin, prompt.size(),
                 HarnessSpanReason::LiveToolTrajectory};
@@ -417,6 +431,37 @@ HarnessSemanticPlan derive_harness_semantic_plan(
                     }),
         plan.spans.end());
     return plan;
+}
+
+std::vector<HarnessByteSpan> select_harness_mandatory_spans(
+        const HarnessSemanticPlan &plan, const KvMemMandatoryConfig &config) {
+    std::vector<HarnessByteSpan> selected;
+    for (const auto &span : plan.spans) {
+        bool keep = false;
+        switch (span.reason) {
+        case HarnessSpanReason::SystemControl: keep = config.system; break;
+        case HarnessSpanReason::RootTask: keep = config.root; break;
+        case HarnessSpanReason::CurrentQuery:
+            keep = config.protects_current_query(
+                plan.root_task_message_index == plan.current_query_message_index);
+            break;
+        case HarnessSpanReason::ProjectPolicy: keep = config.policy; break;
+        case HarnessSpanReason::LiveToolTrajectory: break;
+        case HarnessSpanReason::ToolCall: keep = config.tool_call; break;
+        case HarnessSpanReason::ToolResult: keep = config.tool_result; break;
+        }
+        if (keep) {
+            auto selected_span = span;
+            if (span.reason == HarnessSpanReason::CurrentQuery && !config.query)
+                selected_span.reason = HarnessSpanReason::RootTask;
+            selected.push_back(selected_span);
+        }
+    }
+    if (config.tool_call)
+        selected.insert(selected.end(), plan.tool_call_spans.begin(), plan.tool_call_spans.end());
+    if (config.tool_result)
+        selected.insert(selected.end(), plan.tool_result_spans.begin(), plan.tool_result_spans.end());
+    return selected;
 }
 
 } // namespace detail

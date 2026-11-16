@@ -191,6 +191,7 @@ void QwenExecutor::kvmem_restore_attention_history(
 
 void QwenExecutor::kvmem_action_begin(int32_t open, int32_t close,
         int32_t think_open, int32_t think_close, bool thinking) {
+    kvmem_mismatch_begin(think_open, think_close, thinking);
     if (!action_enabled_) return;
     if (think_open < 0 || think_close < 0)
         throw std::invalid_argument("action attention requires think special tokens");
@@ -207,6 +208,7 @@ void QwenExecutor::kvmem_action_begin(int32_t open, int32_t close,
 }
 
 void QwenExecutor::kvmem_action_prepare(const uint32_t *tokens, uint32_t count, uint64_t base, bool prefill) {
+    kvmem_mismatch_prepare(tokens, count, base, prefill);
     if (kvmem_query_probe_guard_active() || kvmem_query_replay_active_ ||
         kvmem_provisional_prefill_ || kvmem_blend_active_) return;
     action_capture_prefill_ = prefill_attention_enabled_ && prefill && !action_running_ &&
@@ -321,6 +323,7 @@ void QwenExecutor::kvmem_action_layer_end(uint32_t layer, uint32_t base) {
 }
 
 void QwenExecutor::kvmem_action_commit(uint64_t target) {
+    kvmem_mismatch_commit(target);
     if ((!action_running_ && !action_capture_prefill_) || kvmem_query_probe_guard_active() || kvmem_query_replay_active_ ||
         kvmem_provisional_prefill_ || kvmem_blend_active_ ||
         target <= action_pending_base_) return;
@@ -394,6 +397,7 @@ void QwenExecutor::kvmem_action_commit(uint64_t target) {
 }
 
 void QwenExecutor::kvmem_action_end() {
+    mismatch_running_ = false;
     if (!action_running_) return;
     action_running_ = false;
     action_captured_ = false;

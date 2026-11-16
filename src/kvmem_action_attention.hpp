@@ -18,7 +18,8 @@ struct PrefillAttentionScore {
 // Transactional parser: speculative rows do not mutate committed state.
 // Only consumed generated tokens in the configured scope are sampled.
 struct ActionAttentionParser {
-    enum class Scope { ToolCall, NonThinking };
+    // AllOutput is used by the diagnostic observer, not selection-policy CLI.
+    enum class Scope { ToolCall, NonThinking, AllOutput };
     Scope scope = Scope::ToolCall;
     static Scope parse_scope(std::string_view value) {
         if (value == "tool-call") return Scope::ToolCall;
@@ -40,6 +41,14 @@ struct ActionAttentionParser {
         State s = committed;
         candidate.clear(); mask = 0; accepted = 0;
         for (uint32_t i = 0; i < count; ++i) {
+            if (scope == Scope::AllOutput) {
+                if (s.tokens++ % interval == 0) {
+                    if (i >= 64) throw std::runtime_error("observer capture batch exceeds 64 rows");
+                    mask |= uint64_t(1) << i;
+                }
+                candidate.push_back(s);
+                continue;
+            }
             const auto t = static_cast<int32_t>(tokens[i]);
             if (t == think_open) { s.thinking = true; s.action = false; }
             else if (t == think_close) s.thinking = false;

@@ -6,6 +6,7 @@
 #include "kvmem_session.hpp"
 #include "server.hpp"
 #include "speculative_options.hpp"
+#include "kvmem_mismatch_options.hpp"
 #include "json.hpp"
 
 #include <cctype>
@@ -185,6 +186,27 @@ void usage(std::ostream &os) {
         "                        0=raw mass, 1=mean density. Default: 0.5.\n"
         "  --kvmem-round-retrieval  Compatibility alias for\n"
         "                        --kvmem-semantic-expansion round.\n"
+        "  --kvmem-query-history on|off  Add Query relevance history across\n"
+        "                        input requests. Default: off; requires online,\n"
+        "                        serialized query-conditioned mean-k/topk retrieval.\n"
+        "  --kvmem-query-history-decay F  Query history decay per input request,\n"
+        "                        0..1. Default: 0.5; independent of output attention.\n"
+        "  --kvmem-mandatory-parts P  Automatic harness hard retention:\n"
+        "                        default|all|none, or a comma-separated list of\n"
+        "                        system,root,query,policy,tool-call,tool-result.\n"
+        "                        Default: system,root,query,policy. Disabled parts\n"
+        "                        remain retrievable; sink/recent use their own flags.\n"
+        "  --kvmem-middecode-recent-tokens N  Generated-tail retention: auto or >=0.\n"
+        "                        Default: auto. 0 disables extra mid-decode pins,\n"
+        "                        including open-fragment protection at emergencies.\n"
+        "  --kvmem-mismatch-log PATH  Async CPU Mean-K mismatch JSONL, observation only.\n"
+        "                        Requires CPU mean-k, query-conditioned, serialized online KVMem.\n"
+        "  --kvmem-mismatch-layers L  last|spread3|all|layer IDs. Default: spread3.\n"
+        "  --kvmem-mismatch-query-mode M  sampled|block-mean. Block mean includes all tokens.\n"
+        "  --kvmem-mismatch-interval N  Probe interval in eligible tokens. Default: 1024.\n"
+        "  --kvmem-mismatch-samples N  Query samples per probe, 1..4. Default: 4.\n"
+        "  --kvmem-mismatch-half-life N  Debt half-life in tokens. Default: 8192.\n"
+        "  --kvmem-mismatch-epsilon F  Background omission allowance, [0,1). Default: 0.1.\n"
         "  --kvmem-action-attention on|off  Sample output attention. Default: off.\n"
         "  --kvmem-action-scope M   tool-call|non-thinking. Default: tool-call.\n"
         "  --kvmem-action-layers L last|spread3|all|layer IDs (e.g. 3,31,63).\n"
@@ -244,6 +266,11 @@ void usage(std::ostream &os) {
         "                        Requires --ctx = N * block size; history may grow\n"
         "                        beyond it. Serialized CPU mean-K path only.\n"
         "  --kvmem-repository-gc MODE  off|shadow|delete (default: delete).\n"
+        "  --kvmem-session-capacity N  Retain N keyed histories independently of\n"
+        "                        active slots (0 = legacy cache, default). Requires\n"
+        "                        bounded continuous serving and session reuse.\n"
+        "  --kvmem-session-swap-gb F  CPU budget in GiB for exact suspended KV\n"
+        "                        pages; required with --kvmem-session-capacity.\n"
         "  --kvmem-gc-shadow    Evaluate candidates without deleting payloads.\n"
         "  --kvmem-gc-cpu N     Bind the low-priority GC worker to CPU N.\n"
         "  --no-kvmem-raw-k-nvme Keep the complete raw-K authority in CPU memory.\n"
@@ -546,6 +573,15 @@ int main(int argc, char **argv) {
                 engine.prefill_chunk = 0;
             } else if (arg == "--kvmem") {
                 engine.kvmem_enabled = true;
+            } else if (arg == "--kvmem-query-history") {
+                const std::string value = need(arg);
+                if (value != "on" && value != "off")
+                    throw std::runtime_error(arg + " must be on|off");
+                engine.kvmem_query_history = value == "on";
+            } else if (arg == "--kvmem-query-history-decay") {
+                engine.kvmem_query_history_decay = parse_float(need(arg), arg);
+            } else if (arg == "--kvmem-mandatory-parts") {
+                engine.kvmem_mandatory = qw3::KvMemMandatoryConfig::parse(need(arg));
             } else if (arg == "--kvmem-action-attention" ||
                        arg == "--kvmem-action-pressure" ||
                        arg == "--kvmem-prefill-attention") {
@@ -555,6 +591,21 @@ int main(int argc, char **argv) {
                 if (arg == "--kvmem-action-attention") engine.kvmem_attention.enabled = value == "on";
                 else if (arg == "--kvmem-action-pressure") engine.kvmem_attention.pressure = value == "on";
                 else engine.kvmem_attention.prefill = value == "on";
+            } else if (arg == "--kvmem-mismatch-log") {
+                engine.kvmem_mismatch.log_path = need(arg);
+                if (engine.kvmem_mismatch.log_path.empty()) throw std::invalid_argument("empty mismatch log path");
+            } else if (arg == "--kvmem-mismatch-layers") {
+                engine.kvmem_mismatch.layers = need(arg);
+            } else if (arg == "--kvmem-mismatch-query-mode") {
+                engine.kvmem_mismatch.query_mode = need(arg);
+            } else if (arg == "--kvmem-mismatch-interval") {
+                engine.kvmem_mismatch.interval = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-mismatch-samples") {
+                engine.kvmem_mismatch.samples = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-mismatch-half-life") {
+                engine.kvmem_mismatch.half_life = parse_float(need(arg), arg);
+            } else if (arg == "--kvmem-mismatch-epsilon") {
+                engine.kvmem_mismatch.epsilon = parse_float(need(arg), arg);
             } else if (arg == "--kvmem-action-scope") {
                 engine.kvmem_attention.scope = need(arg);
             } else if (arg == "--kvmem-action-layers") {
@@ -819,6 +870,14 @@ int main(int argc, char **argv) {
                     throw std::runtime_error(
                         "--kvmem-middecode-trigger-tokens must be positive");
                 }
+            } else if (arg == "--kvmem-middecode-recent-tokens") {
+                const auto value = need(arg);
+                engine.kvmem_middecode_recent_tokens =
+                    value == "auto" ? -1 : parse_int(value, arg);
+                if (value != "auto" && engine.kvmem_middecode_recent_tokens < 0) {
+                    throw std::runtime_error(
+                        "--kvmem-middecode-recent-tokens must be auto or >= 0");
+                }
             } else if (arg == "--kvmem-middecode-max-refreshes") {
                 engine.kvmem_middecode_max_refreshes =
                     parse_int(need(arg), arg);
@@ -970,6 +1029,13 @@ int main(int argc, char **argv) {
                 serve_cfg.prefix_cache = true;
             } else if (arg == "--kvmem-prefix-cache") {
                 serve_cfg.kvmem_prefix_cache = true;
+            } else if (arg == "--kvmem-session-capacity") {
+                const int value = parse_int(need(arg), arg);
+                if (value < 0)
+                    throw std::invalid_argument("--kvmem-session-capacity must be >= 0");
+                engine.kvmem_session_capacity = static_cast<uint32_t>(value);
+            } else if (arg == "--kvmem-session-swap-gb") {
+                engine.kvmem_session_swap_bytes = parse_gib_bytes(need(arg), arg);
             } else if (arg == "--kvmem-query-replay") {
                 serve_cfg.kvmem_query_replay = true;
             } else if (arg == "--kv-dtype") {
@@ -1155,12 +1221,38 @@ int main(int argc, char **argv) {
         }
 
         qw3::detail::normalize_speculative_options(engine);
+        if ((engine.kvmem_session_capacity || engine.kvmem_session_swap_bytes) && !serve)
+            throw std::invalid_argument("KVMem session memory requires serve");
+        qw3::detail::validate_mismatch_options(engine);
+        if (engine.kvmem_mismatch.enabled() && serve_cfg.continuous_batching)
+            throw std::invalid_argument("CPU mismatch observation requires --no-continuous-batching");
         engine.kvmem_attention.validate();
         if (engine.kvmem_attention.enabled && !engine.kvmem_enabled)
             throw std::runtime_error("--kvmem-action-attention on requires --kvmem");
         if (engine.kvmem_attention.enabled &&
             (engine.kvmem_method != "retrieval" || engine.kvmem_semantic_expansion != "none"))
             throw std::runtime_error("action attention requires --kvmem-method retrieval and --kvmem-semantic-expansion none");
+        if (!std::isfinite(engine.kvmem_query_history_decay) ||
+            engine.kvmem_query_history_decay < 0 || engine.kvmem_query_history_decay > 1)
+            throw std::runtime_error("--kvmem-query-history-decay must be in [0,1]");
+        if (engine.kvmem_query_history) {
+            if (!engine.kvmem_enabled)
+                throw std::runtime_error("--kvmem-query-history on requires --kvmem");
+            if (engine.kvmem_method != "retrieval" ||
+                engine.kvmem_retrieval_method != "mean-k" ||
+                engine.kvmem_select_policy != "topk" ||
+                engine.kvmem_semantic_expansion != "none")
+                throw std::runtime_error("Query history requires --kvmem-method retrieval, --kvmem-retrieval-method mean-k, --kvmem-select-policy topk and --kvmem-semantic-expansion none");
+            if (!engine.kvmem_query_conditioned)
+                throw std::runtime_error("Query history requires --kvmem-query-conditioned");
+            if (serve_cfg.continuous_batching || !engine.kvmem_archive_dir.empty())
+                throw std::runtime_error("Query history requires --no-continuous-batching and online (non-archive) KVMem");
+            if (engine.kvmem_guided_reselect == "boundary" || engine.kvmem_guided_reselect == "both")
+                throw std::runtime_error("Query history does not support --kvmem-guided-reselect boundary|both; use off or middecode");
+            if (engine.kvmem_attention.enabled && engine.kvmem_attention.combine == "score" &&
+                engine.kvmem_attention.fraction == 1)
+                throw std::runtime_error("Query history cannot be combined with 100% attention score selection");
+        }
         // Historical launch scripts must migrate explicitly; silently ignoring
         // their old switches would produce a mislabeled attention experiment.
         for (const char *suffix : {"ACTION_ATTENTION", "ACTION_SCOPE", "ACTION_FRACTION",

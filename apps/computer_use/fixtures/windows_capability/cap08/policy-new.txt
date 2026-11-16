@@ -1,4 +1,0 @@
-Effective: 2026-10-02
-This policy replaces the previous policy.
-Reimbursement: 60% of cost
-Maximum: 90.00

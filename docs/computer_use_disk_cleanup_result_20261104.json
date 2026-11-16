@@ -1,0 +1,65 @@
+{
+  "date": "2026-11-04",
+  "status": "complete",
+  "user_instruction": "Remove all assessed rebuildable/redownloadable data; do not migrate to /data.",
+  "runtime_before_GiB": 153.325,
+  "runtime_after_GiB": 49.823,
+  "runtime_reclaimed_GiB": 103.502,
+  "apps_after_GiB": 49.836,
+  "filesystem_free_before_GiB": 2.381,
+  "filesystem_free_after_GiB": 135.243,
+  "net_filesystem_free_increase_GiB": 132.862,
+  "removed_targets": 912,
+  "migrated_bytes": 0,
+  "existing_data_archives_untouched": true,
+  "removed_categories": [
+    "Windows VM disk",
+    "OSWorld Ubuntu base disk",
+    "downloaded OSWorld canonical asset snapshot",
+    "versioned client dependency copies",
+    "70 deployment archives after source extraction",
+    "Android SDK/Appium/JDK and generated devices",
+    "Cua Python environment and hardlinked uv cache",
+    "downloaded installers/browser runtimes/OCR dependencies and models",
+    "279 setup input copies matching pinned asset SHA256",
+    "418 MKV duplicates after MP4 SHA256 validation"
+  ],
+  "preserved": [
+    "original scores, native tool receipts, task outputs, unique MP4 recordings",
+    "frozen source snapshots and per-version app source",
+    "39 distinct archive source backups; 1762 files verified against original ZIP CRC32/length",
+    "custom source extracted from Alienware runtime deployment tar",
+    "configuration, dependency versions, source URLs, source hashes and rebuild scripts"
+  ],
+  "artifact_checks": [
+    {
+      "task": "01-004",
+      "score_unchanged": true,
+      "raw_receipts_unchanged": true,
+      "continuous_video_present": true
+    },
+    {
+      "task": "02-038",
+      "score_unchanged": true,
+      "raw_receipts_unchanged": true,
+      "continuous_video_present": true
+    }
+  ],
+  "source_preservation_checks": {
+    "passed": true,
+    "files_checked": 1762,
+    "archives": 39,
+    "verification": "Original ZIP member CRC32 and length against retained source files"
+  },
+  "environment_containers_stopped": [
+    "qw3-computer-linux",
+    "qw3-computer-windows",
+    "qw3-computer-android"
+  ],
+  "tests_resumed": false,
+  "environment_rebuild_required": true,
+  "rebuild_metadata": "/home/chaidi/qw3/apps/computer_use/.runtime/cleanup-20261104/rebuild",
+  "actions_journal": "/home/chaidi/qw3/apps/computer_use/.runtime/cleanup-20261104/actions.jsonl",
+  "remaining_data": "Experimental records, screenshots, task outputs, raw inference/API evidence, source and reconstruction metadata; generated evaluation outputs in OSWorld cache retained.",
+  "scope_note": "No global Docker/image pruning; no writes or migration to /data. Global filesystem free delta can include concurrent unrelated activity."
+}

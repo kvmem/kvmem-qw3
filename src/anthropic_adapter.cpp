@@ -419,7 +419,7 @@ static bool anthropic_request_to_openai_impl(
         }
         openai_request["max_tokens"] = max_tokens;
     }
-    for (const char *key : {"temperature", "top_p", "top_k"}) {
+    for (const char *key : {"temperature", "top_p", "top_k", "kvmem_mandatory_parts"}) {
         if (request.contains(key)) openai_request[key] = request[key];
     }
     if (request.contains("stop_sequences")) {

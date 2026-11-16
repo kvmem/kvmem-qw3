@@ -41,6 +41,14 @@ public:
         (void)id;
         return false;
     }
+    virtual KvMemSessionInfo kvmem_session_info(const std::string &id) {
+        (void)id;
+        return {};
+    }
+    virtual bool erase_kvmem_session(const std::string &id) {
+        (void)id;
+        return false;
+    }
     virtual VisionEncoding encode_vision(
             const std::vector<VisionImage> &images) {
         (void)images;

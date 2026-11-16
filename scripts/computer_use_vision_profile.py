@@ -12,12 +12,22 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
 import time
 
-from computer_use_phase_report import fields
+FIELD = re.compile(r'\b([A-Za-z_]\w*)=("(?:\\.|[^"\\])*"|[^\s]+)')
+
+def fields(line):
+    result = {}
+    for key, value in FIELD.findall(line):
+        try:
+            result[key] = json.loads(value)
+        except ValueError:
+            result[key] = value
+    return result
 
 
 def identity(path):
@@ -100,7 +110,7 @@ def main(args):
             shards = sorted({name for key, name in weights.items() if key.startswith('model.visual.')})
             if not shards or any(Path(name).name != name for name in shards):
                 raise ValueError('Unexpected visual weight index')
-            sources = [Path(__file__), root / 'scripts/computer_use_phase_report.py',
+            sources = [Path(__file__),
                        root / 'tests/vision_gpu_parity.cpp', root / 'src/vision_gpu_frontend.cpp',
                        root / 'src/vision_cpu_frontend.cpp', root / 'scripts/qw3_vision_cpu_worker.py']
             state['identities'] = [identity(p) for p in [binary, build / 'libqw3_core.a', index, model / 'config.json', *[model / s for s in shards], *sources]]

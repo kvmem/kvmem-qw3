@@ -1,0 +1,159 @@
+{
+  "date": "2026-11-04",
+  "timezone": "Asia/Shanghai",
+  "mode": "read_only_assessment",
+  "deleted_files": 0,
+  "moved_files": 0,
+  "runtime_allocated_bytes": 164631318528,
+  "runtime_allocated_GiB": 153.325,
+  "measurement": "Allocated blocks, no following directory symlinks; shared inodes counted once. Freeable estimates exclude links outside candidate sets.",
+  "filesystems": {
+    "/home/chaidi/qw3": {
+      "total_GiB": 914.42,
+      "free_GiB": 2.79
+    },
+    "/data": {
+      "total_GiB": 3666.45,
+      "free_GiB": 459.33
+    }
+  },
+  "candidates": [
+    {
+      "kind": "Windows native client payloads",
+      "path_pattern": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-native-client-*/{codex,python}",
+      "allocated_GiB": 15.918,
+      "action": "Deduplicate identical payloads or remove obsolete extracted payloads after preserving required dependency versions. Keep every revision app source, manifest, qualification evidence and a common binary copy.",
+      "physical_local_bundle_directories": 37,
+      "already_migrated_symlink_directories": 14,
+      "sample_codex_exe_sha256": "52f75c649bebb8001102a1dd129c1ea6d02b0940321e6d7e82ee0526753bd58a",
+      "sample_versions_checked": [
+        "14",
+        "48",
+        "50"
+      ],
+      "estimated_reclaim_after_retaining_common_payload": "about 15 GiB; exact deletion list not authorized/generated"
+    },
+    {
+      "kind": "Client ZIP deployment bundles",
+      "path_patterns": [
+        "/home/chaidi/qw3/apps/computer_use/.runtime/windows-native-client-*.zip",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/windows/**/client.zip",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/windows/**/client*-*.zip"
+      ],
+      "files": 59,
+      "allocated_GiB": 9.968,
+      "action": "Rebuildable deployment archives. Preserve at least required reference archives, all per-revision source and manifests before removing redundant copies. Byte-identical archive reconstruction is not guaranteed."
+    },
+    {
+      "kind": "Downloaded installers",
+      "suffixes": [
+        ".msix",
+        ".dmg",
+        ".iso",
+        ".whl"
+      ],
+      "files": 30,
+      "allocated_GiB": 1.593,
+      "examples": [
+        "/home/chaidi/qw3/apps/computer_use/.runtime/physical-windows-alienware-20261008/packages/ChatGPT-x64.msix",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/execution-assist-20261007/Codex-arm-download-20261008.dmg"
+      ],
+      "action": "Redownloadable in principle; keep source/version/hash receipts. Availability of exact remote versions was not probed."
+    },
+    {
+      "kind": "Android SDK and tooling",
+      "paths": [
+        "/home/chaidi/qw3/apps/computer_use/.runtime/android/sdk",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/android/sdk-downloads",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/android/appium",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/android/appium-home",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/android/npm-cache",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/android/jdk"
+      ],
+      "allocated_GiB": 5.231,
+      "action": "Reinstall using SDK/package/source manifests; container is stopped."
+    },
+    {
+      "kind": "Generated Android devices",
+      "paths": [
+        "/home/chaidi/qw3/apps/computer_use/.runtime/android/container-avd",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/android-idle-recovery-live-*/avd"
+      ],
+      "allocated_GiB": 5.14,
+      "action": "Recreatable devices, but deletion loses installed app/device state. Keep configuration and task outputs, or migrate if retaining the exact state."
+    },
+    {
+      "kind": "Cua Python environment and uv cache",
+      "paths": [
+        "/home/chaidi/qw3/apps/computer_use/.runtime/cua-local-20261008/env",
+        "/home/chaidi/qw3/apps/computer_use/.runtime/cua-local-20261008/uv-cache"
+      ],
+      "allocated_GiB": 1.544,
+      "uv_cache_only_reclaim_GiB": 0.11,
+      "reason": "1.379 GiB of the apparent cache is hardlinked into the environment.",
+      "action": "Recreate environment from frozen setup records, or migrate the pair. Do not count cache size as additional reclaimable space."
+    },
+    {
+      "kind": "Duplicate video containers",
+      "pattern": "/home/chaidi/qw3/apps/computer_use/.runtime/**/screen.mkv",
+      "mp4_sibling_and_complete_recording_count": 418,
+      "allocated_GiB": 1.137,
+      "action": "After validating the MP4 copies, remove redundant MKV containers; preserve MP4 and recording/capture metadata."
+    },
+    {
+      "kind": "Customized Windows VM disk",
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/windows/storage/data.qcow2",
+      "allocated_GiB": 58.874,
+      "logical_file_GiB": 62.449,
+      "running": false,
+      "action": "Prefer migration to /data. This is an installed VM, not a download cache; deleting requires reinstalling and requalifying Windows/software/configuration."
+    }
+  ],
+  "outside_apps": [
+    {
+      "kind": "OSWorld Ubuntu base disk",
+      "path": "/home/chaidi/qw3/third_party/OSWorld-V2/docker_vm_data/osworld-v2-ubuntu-x86.qcow2",
+      "allocated_GiB": 25.521,
+      "active_container": "qw3-computer-linux",
+      "mounted_read_only": true,
+      "container_started": "2026-10-04T07:11:42.724661996Z",
+      "action": "Stop the using container before migration/deletion. A pinned base image can be restored using the project provider instructions; preserve baseline SHA256 and exact release."
+    },
+    {
+      "kind": "OSWorld cached task materials",
+      "path": "/home/chaidi/qw3/third_party/OSWorld-V2/cache",
+      "allocated_GiB": 4.508,
+      "action": "Download scripts exist. Preserve pinned release, hashes and local stateful website materials; complete upstream assets require gated Hugging Face access."
+    }
+  ],
+  "preserve_or_archive": {
+    "inference_and_api_directories_allocated_GiB": 22.212,
+    "not_additive_to_other_history_totals": true,
+    "reason": "These are generated experimental records, not downloadable environments.",
+    "keep": [
+      "result/score JSON",
+      "task/asset/source hashes",
+      "frozen source snapshots",
+      "native tool receipts and delivery ledgers",
+      "continuous MP4 recordings",
+      "failed/interrupted trial evidence",
+      "versioned configuration and environment recipes"
+    ],
+    "active_replay_services_observed": true,
+    "recommendation": "Migrate old raw records to /data with original paths preserved instead of blanket deletion."
+  },
+  "recommended_order": [
+    "Deduplicate deployment payloads and redundant ZIPs, retain required exact reference copies and sources.",
+    "Remove selected installers and validated duplicate MKV files.",
+    "Migrate the stopped 58.9 GiB Windows VM to /data, preserve original path compatibility.",
+    "If OSWorld is not needed locally, stop the known using container then migrate its 25.5 GiB base image and 4.5 GiB assets.",
+    "Archive generated experimental records; do not treat them as redownloadable cache."
+  ],
+  "scope_limits": [
+    "No data removed or moved.",
+    "No tests started, resumed or stopped in this assessment.",
+    "No blanket Docker prune.",
+    "No remote download availability verification.",
+    "Some deployment paths are pre-existing symlinks to /data and are excluded from local allocated-space totals."
+  ]
+}

@@ -136,6 +136,9 @@ add_library(qw3_core
     src/qwen_executor.cpp
     src/kvmem_blend.cpp
     src/kvmem_action_attention.cpp
+    src/kvmem_mismatch_observer.cpp
+    src/kvmem_mismatch_capture.cpp
+    src/kvmem_query_history_executor.cpp
     src/qwen_weights.cpp
     src/qwen_config.cpp
     src/kvmem_store.cpp
@@ -331,6 +334,13 @@ if(QW3_BUILD_TESTS)
     add_executable(qw3-idle-session-cache tests/idle_session_cache_test.cpp)
     target_include_directories(qw3-idle-session-cache PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME qw3-idle-session-cache COMMAND qw3-idle-session-cache)
+    add_executable(qw3-kvmem-session-cache tests/kvmem_session_cache_test.cpp)
+    target_include_directories(qw3-kvmem-session-cache PRIVATE src)
+    add_test(NAME qw3-kvmem-session-cache COMMAND qw3-kvmem-session-cache)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME qw3-kvmem-session-cli
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/kvmem_session_cli_test.py $<TARGET_FILE:qw3>)
+    endif()
     add_executable(qw3-host-io-buffer-pool tests/host_io_buffer_pool_test.cpp)
     target_include_directories(qw3-host-io-buffer-pool PRIVATE src include)
     target_link_libraries(qw3-host-io-buffer-pool PRIVATE Threads::Threads)
@@ -380,6 +390,25 @@ if(QW3_BUILD_TESTS)
 
     add_test(NAME qw3-prompt-render COMMAND qw3-prompt-render)
 
+    add_executable(qw3-kvmem-query-history tests/kvmem_query_history_test.cpp)
+    target_include_directories(qw3-kvmem-query-history PRIVATE src)
+    add_test(NAME qw3-kvmem-query-history COMMAND qw3-kvmem-query-history)
+    add_executable(qw3-kvmem-query-history-executor tests/kvmem_query_history_executor_test.cpp)
+    target_include_directories(qw3-kvmem-query-history-executor PRIVATE src)
+    target_link_libraries(qw3-kvmem-query-history-executor PRIVATE qw3_core)
+    add_test(NAME qw3-kvmem-query-history-executor COMMAND qw3-kvmem-query-history-executor)
+    add_executable(qw3-kvmem-query-history-identity tests/kvmem_query_history_identity_test.cpp)
+    target_include_directories(qw3-kvmem-query-history-identity PRIVATE src)
+    target_link_libraries(qw3-kvmem-query-history-identity PRIVATE qw3_core)
+    add_test(NAME qw3-kvmem-query-history-identity COMMAND qw3-kvmem-query-history-identity)
+    add_executable(qw3-kvmem-mismatch tests/kvmem_mismatch_test.cpp)
+    target_include_directories(qw3-kvmem-mismatch PRIVATE src)
+    target_link_libraries(qw3-kvmem-mismatch PRIVATE qw3_core)
+    add_test(NAME qw3-kvmem-mismatch COMMAND qw3-kvmem-mismatch)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME qw3-kvmem-mismatch-cli COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/kvmem_mismatch_cli_test.py $<TARGET_FILE:qw3>)
+    endif()
     add_executable(qw3-kvmem-action-attention tests/kvmem_action_attention_test.cpp)
     target_link_libraries(qw3-kvmem-action-attention PRIVATE qw3_core)
     target_include_directories(qw3-kvmem-action-attention PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -469,6 +498,10 @@ if(QW3_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include)
     add_test(NAME qw3-kvmem-request-plan
         COMMAND qw3-kvmem-request-plan)
+    add_executable(qw3-kvmem-mandatory tests/kvmem_mandatory_test.cpp)
+    target_include_directories(qw3-kvmem-mandatory PRIVATE src include)
+    target_include_directories(qw3-kvmem-mandatory SYSTEM PRIVATE third_party)
+    add_test(NAME qw3-kvmem-mandatory COMMAND qw3-kvmem-mandatory)
 
     add_executable(qw3-kvmem-computer-use-refresh
         tests/kvmem_computer_use_refresh_test.cpp)
@@ -638,6 +671,9 @@ if(QW3_BUILD_TESTS)
         target_link_libraries(qw3-kvmem-repository-index PRIVATE qw3_core)
         add_test(NAME qw3-kvmem-repository-index COMMAND qw3-kvmem-repository-index)
         add_executable(qw3-kvmem-repository-model-probe tests/kvmem_repository_model_probe.cpp)
+        add_executable(qw3-kvmem-mismatch-model-probe tests/kvmem_mismatch_model_probe.cpp)
+        target_include_directories(qw3-kvmem-mismatch-model-probe PRIVATE src)
+        target_link_libraries(qw3-kvmem-mismatch-model-probe PRIVATE qw3_core)
         add_executable(qw3-kvmem-action-model-probe tests/kvmem_action_model_probe.cpp)
         target_include_directories(qw3-kvmem-action-model-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(qw3-kvmem-action-model-probe PRIVATE qw3_core)

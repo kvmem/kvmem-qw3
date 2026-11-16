@@ -1,0 +1,92 @@
+{
+  "prerequisite": "/home/chaidi/qw3/baselines/kv_retrieval/results/decode_controls_shared_20260912/result.json",
+  "prerequisite_success": "completed_diagnostic_controls",
+  "steps": [
+    {
+      "name": "infllm_24k",
+      "command": [
+        "/home/chaidi/qw3/baselines/kv_retrieval/.venv/bin/python",
+        "/home/chaidi/qw3/baselines/kv_retrieval/run_fixed_trace.py",
+        "--trace",
+        "/home/chaidi/qw3/baselines/kv_retrieval/results/calibration_trace_termenv_dense_20260912",
+        "--shared-gpu",
+        "--method",
+        "infllm",
+        "--out",
+        "/home/chaidi/qw3/baselines/kv_retrieval/results/infllm_24k_capacity_shared_20260912_v2",
+        "--port",
+        "18243",
+        "--infllm-config",
+        "/home/chaidi/qw3/baselines/kv_retrieval/configs/infllm_24k_candidate.json",
+        "--infllm-max-gpu-gib",
+        "57",
+        "--gpu-process-cap-gib",
+        "58",
+        "--memory-inventory"
+      ],
+      "minimum_free_gpu_gib": 59
+    },
+    {
+      "name": "native_pilot_budget",
+      "env": {
+        "QW3_KVMEM_PREFIX_CACHE_TRACE": "1",
+        "QW3_KVMEM_SCRATCH_RESERVE_MIB": "1536"
+      },
+      "command": [
+        "/home/chaidi/qw3/baselines/kv_retrieval/.venv/bin/python",
+        "/home/chaidi/qw3/baselines/kv_retrieval/run_fixed_trace.py",
+        "--trace",
+        "/home/chaidi/qw3/baselines/kv_retrieval/results/calibration_trace_termenv_dense_20260912",
+        "--shared-gpu",
+        "--method",
+        "native_kvmem",
+        "--out",
+        "/home/chaidi/qw3/baselines/kv_retrieval/results/native_pilot_budget_capacity_shared_20260912",
+        "--port",
+        "18239",
+        "--native-context",
+        "524288",
+        "--native-cpu-gb",
+        "40",
+        "--kvmem-budget",
+        "32768",
+        "--kvmem-gen-budget",
+        "32768",
+        "--kvmem-middecode-trigger",
+        "16384",
+        "--native-gpu-memory-ratio",
+        ".98",
+        "--required-free-gpu-gib",
+        "60",
+        "--gpu-process-cap-gib",
+        "60"
+      ],
+      "minimum_free_gpu_gib": 60
+    },
+    {
+      "name": "native_dense_64k",
+      "command": [
+        "/home/chaidi/qw3/baselines/kv_retrieval/.venv/bin/python",
+        "/home/chaidi/qw3/baselines/kv_retrieval/run_fixed_trace.py",
+        "--trace",
+        "/home/chaidi/qw3/baselines/kv_retrieval/results/calibration_trace_termenv_dense_20260912",
+        "--shared-gpu",
+        "--method",
+        "native_dense",
+        "--out",
+        "/home/chaidi/qw3/baselines/kv_retrieval/results/native_dense_64k_capacity_shared_20260912",
+        "--port",
+        "18239",
+        "--native-context",
+        "65536",
+        "--required-free-gpu-gib",
+        "59",
+        "--gpu-process-cap-gib",
+        "60",
+        "--limit",
+        "19"
+      ],
+      "minimum_free_gpu_gib": 59
+    }
+  ]
+}

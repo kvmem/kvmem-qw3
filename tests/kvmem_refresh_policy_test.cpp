@@ -273,6 +273,14 @@ int main() {
             "safe refresh unexpectedly pinned the complete epoch");
     require(kvmem_middecode_recent_tokens(65536) == 8192,
             "64K budget did not keep an 8K generated tail");
+    require(kvmem_middecode_refresh_recent_tokens(36864, 4000, false, 0) == 0 &&
+            kvmem_middecode_refresh_recent_tokens(36864, 16000, true, 0) == 0,
+            "explicit zero restored hidden recent pins at a refresh boundary");
+    require(kvmem_middecode_refresh_recent_tokens(36864, 16000, true, 1024) == 1024 &&
+            kvmem_middecode_refresh_recent_tokens(36864, 4000, false, 1024) == 1024,
+            "explicit recent budget did not replace the automatic policy");
+    require(kvmem_bounded_tail_pin_from_block(100, 64, 0, {0, 1, 2}) == 0xffffffffu,
+            "zero recent budget left a tail pin active");
     require(kvmem_middecode_pin_from_block(100000, 65536, 128) ==
                 (100000 - 8192) / 128,
             "recent tail block boundary is incorrect");

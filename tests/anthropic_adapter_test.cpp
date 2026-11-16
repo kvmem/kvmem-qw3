@@ -86,6 +86,7 @@ void test_request_conversion() {
                                     {"properties", json{{"command", json{{"type", "string"}}}}},
                                     {"required", json::array({"command"})}}}}})},
         {"tool_choice", json{{"type", "auto"}}},
+        {"kvmem_mandatory_parts", json{{"tool-call", false}, {"tool-result", true}}},
         {"messages", json::array({
              json{{"role", "user"}, {"content", "inspect the repo"}},
              json{{"role", "assistant"},
@@ -126,6 +127,8 @@ void test_request_conversion() {
             "thinking configuration did not map");
     require(converted["stream_options"]["include_usage"] == true,
             "streaming conversion did not request usage");
+    require(converted["kvmem_mandatory_parts"] == request["kvmem_mandatory_parts"],
+            "Claude mandatory configuration was lost during conversion");
     for (auto it = converted.begin(); it != converted.end(); ++it) {
         require(it.key().rfind("_qw3_", 0) != 0,
                 "private server metadata leaked into converted request");

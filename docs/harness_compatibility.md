@@ -38,22 +38,103 @@ does not assume a fixed token count or pin everything after the first query.
   the same path, so policy cost does not grow once per tool round.
 - `live_suffix` is separate from the exact mandatory spans. It identifies the
   newest unfinished assistant tool call plus all parallel results, or the
-  current user turn when no tool transaction is open. A short suffix is
-  replayed completely. An oversized suffix is split into protocol/head/tail
-  anchors plus a retrievable body, so it is never confused with the scoring
-  query or treated as a maximum tool-output size.
+  current user turn when no tool transaction is open. Tool calls and results
+  are ordinary retrieval candidates, including the latest transaction. They
+  do not gain mandatory protection from belonging to `live_suffix` by default.
+  Only the
+  final KV block is hard and replayed to seed generation (32 tokens at the
+  production block size, possibly sharing a boundary with the result tail).
+  A real user instruction retains its separate mandatory lifetime.
 
-Completed assistant/tool rounds before `live_suffix` are ordinary historical
-retrieval candidates. In particular, the current task may be used to score old
-tool evidence without making the whole interval from that task to the prompt
-end non-evictable.
+Completed and current assistant/tool rounds are ordinary historical retrieval
+candidates. The current task can score all tool evidence without making the
+interval from that task to the prompt end non-evictable. Explicit policy, visual
+and client pins retain their own independent lifetimes; optional experimental
+file-evidence pins still require their explicit configuration.
+
+## Configure mandatory parts
+
+`mandatory_tokens` in the trace is the measured hard-retention total. Configure
+which automatic harness lifetimes contribute to that total with
+`--kvmem-mandatory-parts`:
+
+| Part | Region | Default |
+|---|---|---|
+| `system` | System/developer control and tool schemas/protocol | On |
+| `root` | First durable real-user task | On |
+| `query` | Current real-user instruction | On |
+| `policy` | Latest applicable workspace policy frames | On |
+| `tool-call` | Current assistant tool call, including its arguments | Off |
+| `tool-result` | Current tool results, including parallel results | Off |
+
+```sh
+# Current defaults: ordinary retrieval for tool calls/results.
+--kvmem-mandatory-parts system,root,query,policy
+
+# Also protect results, while leaving call arguments retrievable.
+--kvmem-mandatory-parts system,root,query,policy,tool-result
+
+# All six lifetimes, or no automatic semantic lifetimes.
+--kvmem-mandatory-parts all
+--kvmem-mandatory-parts none
+```
+
+`default` selects `system,root,query,policy`. A comma-separated list replaces
+the selection, so omitted parts are off. Unknown/empty/duplicate parts fail
+before model loading. `tool-call` and `tool-result` refer to the current
+transaction; completed tool rounds remain ordinary retrieval candidates.
+
+An identified harness or compatible tool client can override a request on
+either `/v1/chat/completions` or `/v1/messages`:
+
+```json
+{"kvmem_mandatory_parts": {"tool-call": false, "tool-result": true}}
+```
+
+The object changes only the named switches from the server's configuration.
+A string or array replaces the selection, e.g. `"system,query"` or
+`["system", "query"]`; `[]`/`"none"` disables all six, and `"default"` inherits
+the configured server selection. Each request is independent.
+
+Turning off a lifetime makes its original source retrievable; it does not
+delete text, alter tool arguments, change the scoring query, or synthesize a
+replacement. Overlap with another enabled lifetime still protects a block.
+For a single user turn, `root` and `query` identify the same message: either
+enabled switch protects it. Fixed sink/recent allocation, visual/client pins,
+optional experimental file-evidence pins, and the final decode-seed block have
+their own independent rules. To remove the fixed bands as well, explicitly set
+`--kvmem-sink-tokens 0 --kvmem-recent-tokens 0`. `none` therefore need not produce
+zero `mandatory_tokens`.
+
+Mid-decode guided refreshes have a separate generated-tail policy. Configure it
+with `--kvmem-middecode-recent-tokens auto|N`. The default `auto` preserves the
+existing bounded recent tail and protects the complete open epoch at an emergency
+refresh. An explicit token count replaces that policy at both safe and emergency
+refreshes; `0` disables these additional pins, including open-fragment protection.
+For a retention ablation with only a 1K fixed sink, use:
+
+```sh
+--kvmem-mandatory-parts none --kvmem-sink-tokens 1024 \
+--kvmem-recent-tokens 0 --kvmem-middecode-recent-tokens 0
+```
+
+The final decode-seed block and any explicit client/visual/evidence pins remain
+independent. Disabling hard retention does not remove their source text from the
+input or historical retrieval index.
+
+Selected regions are charged once at KV block granularity within the existing
+budget. Capacity fitting can reduce oversized hard regions; enabling a part
+does not enlarge the GPU window. Trace fields expose `mandatory_parts`,
+`spans_tool_call`, `spans_tool_result` and the resulting `mandatory_tokens`.
 
 ## Retrieval query and live suffix
 
 `score_query_span`, raw `live_suffix_span`, and fitted `live_replay_span` are
 independent. The first produces retrieval Q, the second identifies the complete
 unfinished transaction in durable KVMem storage, and the third is the bounded
-contiguous tail that must be present immediately before decode. The executor
+contiguous tail that must be present immediately before decode. For a tool
+continuation, that replay tail is only the final KV block; selection can recall
+the rest of the transaction by relevance. The executor
 never uses the scoring query's start block as a `pin_from_block` boundary. It
 selects the historical window first and then replays only the fitted tail.
 
@@ -77,15 +158,16 @@ overlap:
 
 ```text
 durable/indexed: complete prompt, including every byte of large tool results
-hard active: sink + protocol/task/policy anchors + live head/bounded tail
-soft active: query-selected blocks from all durable history and live bodies
-replay: only the contiguous fitted live tail
+hard active: sink + protocol/task/policy anchors + final decode-seed block
+soft active: query-selected blocks from all tool calls/results and other history
+replay: final block for a tool continuation; fitted tail for a user instruction
 ```
 
-If the raw union fits, behavior is unchanged and the complete short live suffix
-is replayed. If it exceeds the active budget, deterministic capacity fitting
-allocates the contiguous recent live tail first, then its protocol envelope,
-the sink, and fair anchors from the other semantic spans. One eighth of the
+By default the current tool round is excluded from the hard union except for
+its final decode-seed block, whether its body is short, long or larger than the budget.
+If the remaining required spans exceed the active budget, deterministic
+capacity fitting protects the decode seed, sink and fair semantic anchors. A
+real user suffix retains its fitted head/tail behavior. One eighth of the
 active block budget is reserved for query-selected evidence in this fitted
 case. The omitted middle
 blocks are not dropped or summarized: pressure prefill writes them to the

@@ -4,8 +4,10 @@
 #include "continuous_prefill_policy.hpp"
 #include "cooperative_request.hpp"
 #include "idle_session_cache.hpp"
+#include "kvmem_session_cache.hpp"
 #include "dflash_batch_executor.hpp"
 #include "speculative_options.hpp"
+#include "kvmem_mismatch_options.hpp"
 #include "dflash_deferred_refresh.hpp"
 #include "q8_verification_math.hpp"
 #include "q8_verification_diagnostics.hpp"
@@ -107,6 +109,17 @@ double wall_seconds() {
     return std::chrono::duration<double>(clk::now().time_since_epoch()).count();
 }
 
+void validate_query_history_guided_request(const EngineOptions &engine,
+                                           const GenerationOptions &options) {
+    if (engine.kvmem_query_history &&
+        (options.kvmem_query_guided_direct ||
+         options.kvmem_query_guided_thinking_max_tokens != 0 ||
+         options.kvmem_query_guided_query_max_tokens != 0))
+        throw std::invalid_argument(
+            "query history does not support initial/boundary guided Query; "
+            "middecode guided refresh remains supported");
+}
+
 class ScopedKvmemRequestGc {
 public:
     explicit ScopedKvmemRequestGc(QwenExecutor *executor) : executor_(executor) {
@@ -115,6 +128,32 @@ public:
     ~ScopedKvmemRequestGc() { executor_->kvmem_gc_end_step(); }
 private:
     QwenExecutor *executor_;
+};
+
+class ScopedKvmemQueryHistory {
+public:
+    ScopedKvmemQueryHistory(QwenExecutor *executor,
+            detail::KvmemQueryHistoryState &state,
+            const std::vector<uint32_t> &input,
+            const std::vector<detail::MultimodalTokenIdentity> &identities,
+            const std::vector<std::array<uint32_t, 3>> &positions,
+            uint64_t fingerprint, double decay)
+        : executor_(executor), state_(state) {
+        next_input_ = state.prepare_input(input, identities, positions, fingerprint);
+        executor_->kvmem_query_history_begin(state.scores, next_input_.input_end,
+                                             next_input_.verified_prefix, decay);
+    }
+    ~ScopedKvmemQueryHistory() { executor_->kvmem_query_history_abort(); }
+    void finalize_input() {
+        executor_->kvmem_query_history_finalize_input();
+        state_.accept_input(std::move(next_input_));
+    }
+    ScopedKvmemQueryHistory(const ScopedKvmemQueryHistory &) = delete;
+    ScopedKvmemQueryHistory &operator=(const ScopedKvmemQueryHistory &) = delete;
+private:
+    QwenExecutor *executor_;
+    detail::KvmemQueryHistoryState &state_;
+    detail::KvmemQueryHistoryState::PreparedInput next_input_;
 };
 
 class ScopedKvMemSemanticBudget {
@@ -2054,9 +2093,30 @@ public:
         }
         options_ = options;
         detail::normalize_speculative_options(options_);
+        detail::validate_mismatch_options(options_);
         options_.kvmem_attention.validate();
         if (options_.kvmem_attention.enabled && !options_.kvmem_enabled)
             throw std::invalid_argument("--kvmem-action-attention on requires --kvmem");
+        if (!std::isfinite(options_.kvmem_query_history_decay) ||
+            options_.kvmem_query_history_decay < 0 || options_.kvmem_query_history_decay > 1)
+            throw std::invalid_argument("KVMem query history decay must be in [0, 1]");
+        if (options_.kvmem_query_history &&
+            (options_.kvmem_guided_reselect == "boundary" ||
+             options_.kvmem_guided_reselect == "both"))
+            throw std::invalid_argument(
+                "query history does not support --kvmem-guided-reselect boundary|both; "
+                "use off or middecode");
+        if (options_.kvmem_query_history &&
+            (!options_.kvmem_enabled || !options_.kvmem_query_conditioned ||
+             options_.kvmem_method != "retrieval" ||
+             options_.kvmem_retrieval_method != "mean-k" ||
+             options_.kvmem_select_policy != "topk" ||
+             options_.kvmem_semantic_expansion != "none" ||
+             !options_.kvmem_archive_dir.empty() ||
+             env_flag_enabled("QW3_CONTINUOUS_BATCHING") ||
+             (options_.kvmem_attention.enabled && options_.kvmem_attention.combine == "score" &&
+              options_.kvmem_attention.fraction == 1)))
+            throw std::invalid_argument("query history requires serialized online query-conditioned mean-k block TopK with a nonzero Query selection weight");
         if (!options_.dflash_model_path.empty() &&
             (options_.native_mtp_trace || mtp_trace_enabled(options_) || mtp_speculate_enabled(options_) ||
              mtp_prefix_enabled(options_) || (options_.native_mtp_chain_set && options_.native_mtp_chain > 0)))
@@ -2072,6 +2132,20 @@ public:
              !env_flag_enabled("QW3_CONTINUOUS_KVMEM_COOPERATIVE_PREFILL") ||
              continuous_mtp_layered_verify_enabled() || prefix_cache_enabled()))
             throw std::invalid_argument("bounded continuous KVMem requires the complete cooperative controller, ragged verification and request-owned prefix state");
+        if (options_.kvmem_session_swap_bytes && !options_.kvmem_session_capacity)
+            throw std::invalid_argument("KVMem session swap budget requires a session capacity");
+        if (options_.kvmem_session_capacity) {
+            if (!bounded_continuous_enabled() || !kvmem_prefix_cache_enabled() ||
+                !env_flag_enabled("QW3_CONTINUOUS_KVMEM_SESSION_REUSE") ||
+                options_.kvmem_session_capacity < continuous_batching_max_active() ||
+                !options_.kvmem_session_swap_bytes)
+                throw std::invalid_argument("KVMem session memory requires bounded continuous session reuse, capacity >= max-active and a positive swap budget");
+            const char *dtype = std::getenv("QW3_KV_DTYPE");
+            if (dtype && std::string(dtype) == "q8")
+                throw std::invalid_argument("KVMem session memory does not support q8 KV scale planes");
+            session_memory_ = std::make_unique<SessionMemoryCache>(
+                SessionMemoryCache::Config{true, options_.kvmem_session_capacity, 0});
+        }
         if ((options_.kvmem_gc_max_blocks || options_.kvmem_gc_shadow || options_.kvmem_gc_cpu >= 0) &&
             (!options_.kvmem_enabled ||
              (!options_.kvmem_gc_max_blocks && !options_.kvmem_repository_blocks))) {
@@ -3319,6 +3393,7 @@ public:
         // logical history and the same selected GPU window.
         struct MilestoneState {
             uint32_t position = 0;
+            detail::KvmemQueryHistoryState query_history;
             QwenExecutor::StateSnapshot executor_state;
             QwenExecutor::StateSnapshot api_boundary_state;
             uint32_t api_boundary_pos = 0;
@@ -3337,6 +3412,7 @@ public:
                 state.api_boundary_pos = kvmem_api_boundary_pos_;
                 state.api_tail_tokens = kvmem_api_tail_tokens_;
                 state.session_tokens = kvmem_api_tokens_;
+                state.query_history = kvmem_api_query_history_;
                 state.selected_blocks =
                     kvmem_checkpoint_block_ids(executor_.get());
                 state.api_boundary_state = kvmem_api_boundary_ckpt_.ready
@@ -3367,6 +3443,7 @@ public:
                 kvmem_api_boundary_pos_ = state.api_boundary_pos;
                 kvmem_api_tail_tokens_ = state.api_tail_tokens;
                 kvmem_api_tokens_ = state.session_tokens;
+                kvmem_api_query_history_ = state.query_history;
                 kvmem_api_boundary_ckpt_ = state.api_boundary_state.ready
                     ? clone_milestone_state_snapshot(
                           state.api_boundary_state)
@@ -3789,8 +3866,16 @@ public:
                          const GenerationOptions &options,
                          const CancellableTokenCallback &on_text) override {
         std::unique_lock<std::mutex> request_lock(request_setup_mu_);
+        if (session_memory_ &&
+            (!options.continuous_batching || options.kvmem_prefix_cache_key.empty()))
+            throw std::invalid_argument("KVMem session memory requires a keyed full-history continuous request");
+        validate_query_history_guided_request(options_, options);
+        if (options.continuous_batching && options_.kvmem_mismatch.enabled())
+            throw std::invalid_argument("CPU mismatch observation requires --no-continuous-batching");
         if (options.continuous_batching && options_.kvmem_attention.enabled)
             throw std::invalid_argument("action attention currently requires --no-continuous-batching");
+        if (options.continuous_batching && options_.kvmem_query_history)
+            throw std::invalid_argument("query history currently requires --no-continuous-batching");
         if (!options.kvmem_prefix_cache_key.empty() &&
             (!valid_local_kvmem_cache_id(options.kvmem_prefix_cache_key) ||
              !options_.kvmem_enabled || !options.continuous_batching ||
@@ -3908,6 +3993,7 @@ public:
         if (reset) {
             kvmem_api_session_active_ = true;
             kvmem_api_session_id_ = options.kvmem_session_id;
+            kvmem_api_query_history_ = {};
             kvmem_api_boundary_ckpt_ = QwenExecutor::StateSnapshot{};
             kvmem_api_boundary_pos_ = 0;
             kvmem_api_tail_tokens_.clear();
@@ -3950,6 +4036,9 @@ public:
                                   const CancellableTokenCallback &on_text,
                                   bool reset_session,
                                   std::unique_lock<std::mutex> *request_lock = nullptr) {
+        validate_query_history_guided_request(options_, options);
+        if (options_.kvmem_query_history && options.continuous_batching)
+            throw std::invalid_argument("query history currently requires --no-continuous-batching");
         if (!model_) throw std::runtime_error("qwen-native backend is not loaded");
         if (options_.native_kernels != "cuda") {
             throw std::runtime_error("qwen-native now uses a device-resident executor; use --native-kernels cuda");
@@ -4326,6 +4415,7 @@ private:
         QwenExecutor::StateSnapshot executor_state;
         QwenExecutor::StateSnapshot api_boundary_state;
         QwenExecutor::AttentionHistorySnapshot attention_history;
+        detail::KvmemQueryHistoryState query_history;
         uint32_t api_boundary_pos = 0;
         std::vector<uint32_t> api_tail_tokens;
         std::vector<uint32_t> session_tokens;
@@ -4387,7 +4477,16 @@ private:
         mix_u64(static_cast<uint64_t>(options.kvmem_guided_query_tokens));
         mix_u64(static_cast<uint64_t>(options.kvmem_middecode_trigger_tokens));
         mix_u64(static_cast<uint64_t>(options.kvmem_middecode_max_refreshes));
+        mix_u64(static_cast<uint64_t>(options.kvmem_middecode_recent_tokens));
         mix_string(options.kvmem_retrieval_method);
+        mix_u64(options.kvmem_query_history);
+        mix_string(options.kvmem_mandatory.parts());
+        {
+            uint64_t bits = 0;
+            static_assert(sizeof(bits) == sizeof(options.kvmem_query_history_decay));
+            std::memcpy(&bits, &options.kvmem_query_history_decay, sizeof(bits));
+            mix_u64(bits);
+        }
         const auto &attention = options.kvmem_attention;
         mix_u64(attention.enabled); mix_string(attention.scope);
         mix_string(attention.combine);
@@ -4588,6 +4687,7 @@ private:
         try {
             executor_->capture_state(next.executor_state);
             next.attention_history = executor_->kvmem_capture_attention_history();
+            next.query_history = kvmem_api_query_history_;
             next.api_boundary_state = kvmem_api_boundary_ckpt_.ready
                 ? clone_milestone_state_snapshot(kvmem_api_boundary_ckpt_)
                 : QwenExecutor::StateSnapshot{};
@@ -4622,6 +4722,7 @@ private:
                 (void)executor_->kvmem_set_selection(entry.selected_blocks, true);
             }
             executor_->kvmem_restore_attention_history(entry.attention_history);
+            kvmem_api_query_history_ = entry.query_history;
             kvmem_api_boundary_pos_ = entry.api_boundary_pos;
             kvmem_api_tail_tokens_ = entry.api_tail_tokens;
             kvmem_api_tokens_ = entry.session_tokens;
@@ -4686,6 +4787,7 @@ private:
             const std::string &id = options.kvmem_cache_save_id;
             kvmem_api_session_active_ = true;
             kvmem_api_session_id_ = id;
+            kvmem_api_query_history_ = {};
             kvmem_api_boundary_ckpt_ = QwenExecutor::StateSnapshot{};
             kvmem_api_boundary_pos_ = 0;
             kvmem_api_tail_tokens_.clear();
@@ -4763,6 +4865,10 @@ private:
         bool active_mtp = false;
         bool full_controller = false;
         bool session_key_claimed = false;
+        enum class SessionControl { None, Info, Erase };
+        SessionControl session_control = SessionControl::None;
+        KvMemSessionInfo session_info;
+        bool session_erased = false;
 
         std::mutex mu;
         std::condition_variable cv;
@@ -4770,6 +4876,45 @@ private:
         std::string generated;
         std::string error;
     };
+
+    std::shared_ptr<ContinuousBatchRequest> session_control_request(
+            const std::string &key, ContinuousBatchRequest::SessionControl control) {
+        if (!valid_local_kvmem_cache_id(key))
+            throw std::invalid_argument("invalid KVMem session key");
+        if (!session_memory_) return {};
+        auto req = std::make_shared<ContinuousBatchRequest>();
+        req->id = ++cb_request_counter_;
+        req->full_controller = true;
+        req->session_control = control;
+        req->options.kvmem_prefix_cache_key = key;
+        {
+            std::lock_guard<std::mutex> lock(cb_mu_);
+            if (cb_session_keys_inflight_.count(key))
+                throw std::runtime_error("KVMem session already has an outstanding request: " + key);
+            if (cb_pending_.size() >= continuous_batching_max_pending())
+                throw std::runtime_error("KVMem session admission rejected: pending queue full");
+            cb_pending_.push_back(req);
+            try {
+                cb_session_keys_inflight_.insert(key);
+                req->session_key_claimed = true;
+            } catch (...) { cb_pending_.pop_back(); throw; }
+        }
+        ensure_continuous_request_worker(req);
+        std::unique_lock<std::mutex> lock(req->mu);
+        req->cv.wait(lock, [&] { return req->done; });
+        if (!req->error.empty()) throw std::runtime_error(req->error);
+        return req;
+    }
+
+    KvMemSessionInfo kvmem_session_info(const std::string &id) override {
+        const auto req = session_control_request(id, ContinuousBatchRequest::SessionControl::Info);
+        return req ? req->session_info : KvMemSessionInfo{};
+    }
+
+    bool erase_kvmem_session(const std::string &id) override {
+        const auto req = session_control_request(id, ContinuousBatchRequest::SessionControl::Erase);
+        return req && req->session_erased;
+    }
 
     struct ContinuousRequestKvState {
         uint32_t seq_len = 0;
@@ -4825,12 +4970,30 @@ private:
     }
 
     struct ContinuousSessionResident {
+        std::string key;
         std::unique_ptr<QwenExecutor> executor;
         std::unique_ptr<detail::KvmemPrefixState> prefix;
     };
+    using SessionMemoryCache = detail::KvmemSessionCache<ContinuousSessionResident>;
 
     struct ContinuousBatchActive {
+        ContinuousBatchActive() = default;
+        ContinuousBatchActive(ContinuousBatchActive &&) noexcept = default;
+        ContinuousBatchActive &operator=(ContinuousBatchActive &&) noexcept = default;
+        ContinuousBatchActive(const ContinuousBatchActive &) = delete;
+        ContinuousBatchActive &operator=(const ContinuousBatchActive &) = delete;
+        ~ContinuousBatchActive() {
+            // Last-resort unwind: a manager lease must never return an empty
+            // shell after its borrowed executor/history were destroyed.
+            if (session_owner) {
+                if (executor) session_owner->executor = std::move(executor);
+                if (kvmem_prefix) session_owner->prefix = std::move(kvmem_prefix);
+                session_owner.invalidate();
+                session_owner.park(0);
+            }
+        }
         std::shared_ptr<ContinuousBatchRequest> req;
+        SessionMemoryCache::Active session_owner;
         // Declared before executor: pages stop being used before refs drop.
         std::unique_ptr<PrefixEntryLease> prefix_lease;
         // Stable immutable owner, retained through executor teardown and all
@@ -7075,20 +7238,66 @@ private:
     }
 
     void start_continuous_batch_worker() {
-        std::lock_guard<std::mutex> lk(cb_mu_);
+        // The worker never acquires lifecycle_mu_. Joining without cb_mu_
+        // lets a failing previous worker finish releasing request budgets.
+        std::lock_guard<std::mutex> lifecycle(cb_lifecycle_mu_);
+        std::unique_lock<std::mutex> lk(cb_mu_);
         if (cb_running_) return;
         // A previous worker may have exited on its own (e.g. an unrecoverable
         // error inside the loop) leaving cb_running_ == false but the thread
         // object still joinable. Reassigning a joinable std::thread calls
         // std::terminate, so join the dead worker before spawning a new one.
-        if (cb_worker_.joinable()) cb_worker_.join();
+        if (cb_worker_.joinable()) {
+            lk.unlock();
+            cb_worker_.join();
+            lk.lock();
+        }
         cb_stop_ = false;
         cb_running_ = true;
-        cb_worker_ = std::thread([this]() { continuous_batch_worker_loop(); });
-        log("native continuous_batching: enabled=true mode=batch_step_executor");
+        try {
+            cb_worker_ = std::thread([this]() { continuous_batch_worker_loop(); });
+        } catch (...) {
+            cb_running_ = false;
+            throw;
+        }
+        lk.unlock();
+        try { log("native continuous_batching: enabled=true mode=batch_step_executor"); }
+        catch (...) {} // Successful start must not become a failed admission.
+    }
+
+    // Queue first, start second: a worker that fails between those actions
+    // either drains this request or is restarted here. If another submitter
+    // starts a worker after our start failed, it may already own the request;
+    // in that case the caller must keep its callbacks alive and await done.
+    void ensure_continuous_request_worker(
+            const std::shared_ptr<ContinuousBatchRequest> &req) {
+        try {
+            start_continuous_batch_worker();
+        } catch (...) {
+            const auto failure = std::current_exception();
+            bool removed = false;
+            {
+                std::lock_guard<std::mutex> lock(cb_mu_);
+                const auto it = std::find(cb_pending_.begin(), cb_pending_.end(), req);
+                if (it != cb_pending_.end()) {
+                    cb_pending_.erase(it);
+                    removed = true;
+                }
+            }
+            if (removed) {
+                try { std::rethrow_exception(failure); }
+                catch (const std::exception &e) {
+                    complete_continuous_request(req, {}, e.what());
+                } catch (...) {
+                    complete_continuous_request(req, {}, "worker failed");
+                }
+            }
+        }
+        cb_cv_.notify_one();
     }
 
     void stop_continuous_batch_worker() {
+        std::lock_guard<std::mutex> lifecycle(cb_lifecycle_mu_);
         {
             std::lock_guard<std::mutex> lk(cb_mu_);
             // If the worker self-exited (cb_running_ already false) the thread
@@ -7099,13 +7308,16 @@ private:
         }
         cb_cv_.notify_all();
         if (cb_worker_.joinable()) cb_worker_.join();
-        cb_running_ = false;
+        {
+            std::lock_guard<std::mutex> lock(cb_mu_);
+            cb_running_ = false;
+            cb_stop_ = false;
+        }
     }
 
     std::string generate_continuous_batched(const std::vector<uint32_t> &prompt_tokens,
                                             const GenerationOptions &options,
                                             const CancellableTokenCallback &on_text) {
-        start_continuous_batch_worker();
         auto req = std::make_shared<ContinuousBatchRequest>();
         req->id = ++cb_request_counter_;
         req->prompt_tokens = prompt_tokens;
@@ -7199,12 +7411,15 @@ private:
             }
             cb_reserved_tokens_ += req->reserved_tokens;
         }
-        cb_cv_.notify_one();
+        ensure_continuous_request_worker(req);
 
         std::unique_lock<std::mutex> lk(req->mu);
         while (!req->cv.wait_for(lk, std::chrono::milliseconds(100),
                                  [&]() { return req->done; })) {
-            if (!request_cancelled(req->options)) continue;
+            bool cancelled = false;
+            try { cancelled = request_cancelled(req->options); }
+            catch (...) { cancelled = true; }
+            if (!cancelled) continue;
             lk.unlock();
             bool removed = false;
             {
@@ -7225,12 +7440,17 @@ private:
     void complete_continuous_request(const std::shared_ptr<ContinuousBatchRequest> &req,
                                      std::string generated,
                                      std::string error = {}) {
-        release_continuous_request_budget(req);
+        if (!req) return;
         {
             std::lock_guard<std::mutex> lk(req->mu);
+            // Dispatch cleanup can encounter requests already completed by a
+            // controller or queue cancellation. Never overwrite that result.
+            if (req->done) return;
+            release_continuous_request_budget(req);
             req->generated = std::move(generated);
             req->error = std::move(error);
             req->options.should_cancel = {};
+            req->options.stream_stopped_successfully = {};
             req->done = true;
         }
         req->cv.notify_one();
@@ -7396,7 +7616,23 @@ private:
     void continuous_batch_worker_loop() {
         std::vector<ContinuousBatchActive> active;
         std::vector<ContinuousBatchActive> prefilling;
+        // Keep ownership outside the execution try, including batches removed
+        // from the queue whose controller setup has not reached its own try.
+        std::optional<std::deque<std::shared_ptr<ContinuousBatchRequest>>> incoming;
+        std::vector<std::shared_ptr<ContinuousBatchRequest>> dispatched;
+        std::string failure;
+        const auto fail_request = [&](const std::shared_ptr<ContinuousBatchRequest> &req) {
+            try {
+                complete_continuous_request(req, {}, failure.empty()
+                    ? "continuous batching admission rejected: worker stopped" : failure);
+            } catch (...) {
+                // Avoid allocating a long diagnostic while handling host OOM.
+                complete_continuous_request(req, {}, "worker failed");
+            }
+        };
         try {
+            incoming.emplace();
+            auto &arrivals = *incoming;
             DeviceStatus st = device_->begin();
             if (!st.ok) throw std::runtime_error(st.message);
 
@@ -7410,7 +7646,6 @@ private:
             ContinuousDecodeBatch decode_batch;
 
             while (true) {
-                std::deque<std::shared_ptr<ContinuousBatchRequest>> arrivals;
                 {
                     std::unique_lock<std::mutex> lk(cb_mu_);
                     cb_cv_.wait(lk, [&]() {
@@ -7444,8 +7679,7 @@ private:
                     if (req && !req->full_controller) cb_kvmem_sessions_.clear();
                     if (req && (req->active_mtp || req->full_controller)) {
                         if (active.empty() && prefilling.empty()) {
-                            std::vector<std::shared_ptr<ContinuousBatchRequest>>
-                                mtp_reqs;
+                            auto &mtp_reqs = dispatched;
                             while (!arrivals.empty() &&
                                    mtp_reqs.size() < max_active &&
                                    arrivals.front() &&
@@ -7459,11 +7693,15 @@ private:
                                     run_continuous_controlled_requests(mtp_reqs, ctx_size, max_active);
                                 else
                                     run_continuous_mtp_batch_requests(mtp_reqs, ctx_size, max_active);
+                                // Both batch paths are synchronous. A partial
+                                // setup/early return must not strand a promise.
+                                for (const auto &batch_req : mtp_reqs)
+                                    complete_continuous_request(batch_req, {}, "worker failed");
+                                mtp_reqs.clear();
                             }
                         }
                         break;
                     }
-                    arrivals.pop_front();
                     try {
                         ContinuousBatchActive a;
                         initialize_continuous_active(a, req, ctx_size);
@@ -7471,6 +7709,7 @@ private:
                     } catch (const std::exception &e) {
                         complete_continuous_request(req, {}, e.what());
                     }
+                    arrivals.pop_front();
                 }
                 if (!arrivals.empty()) {
                     std::lock_guard<std::mutex> lk(cb_mu_);
@@ -7495,34 +7734,64 @@ private:
             }
 
             cb_kvmem_sessions_.clear();
+            if (session_memory_) {
+                session_memory_->clear();
+                session_swap_bytes_ = 0;
+            }
             st = device_->end();
             if (!st.ok) throw std::runtime_error(st.message);
-            {
-                std::lock_guard<std::mutex> lk(cb_mu_);
-                cb_running_ = false;
-                cb_stop_ = false;
-            }
-        } catch (const std::exception &e) {
-            std::deque<std::shared_ptr<ContinuousBatchRequest>> pending;
-            {
-                std::lock_guard<std::mutex> lk(cb_mu_);
-                pending.swap(cb_pending_);
-                cb_running_ = false;
-                cb_stop_ = false;
-            }
-            while (!pending.empty()) {
-                complete_continuous_request(pending.front(), {}, e.what());
-                pending.pop_front();
+        } catch (...) {
+            try {
+                throw;
+            } catch (const std::exception &e) {
+                try { failure = e.what(); }
+                catch (...) { failure = "worker failed"; }
+            } catch (...) { failure = "worker failed"; }
+            for (const auto &req : dispatched) fail_request(req);
+            dispatched.clear();
+            if (incoming) {
+                for (const auto &req : *incoming) fail_request(req);
+                incoming->clear();
             }
             for (auto &a : active) {
-                if (a.req) complete_continuous_active(a, {}, e.what());
+                if (a.req) {
+                    const auto req = a.req;
+                    try { complete_continuous_active(a, {}, failure); }
+                    catch (...) { fail_request(req); }
+                }
             }
             for (auto &a : prefilling) {
-                if (a.req) complete_continuous_active(a, {}, e.what());
+                if (a.req) {
+                    const auto req = a.req;
+                    try { complete_continuous_active(a, {}, failure); }
+                    catch (...) { fail_request(req); }
+                }
             }
+            active.clear();
+            prefilling.clear();
             cb_kvmem_sessions_.clear();
-            log(std::string("native continuous_batching: worker_failed reason=\"") +
-                e.what() + "\"");
+            try {
+                log(std::string("native continuous_batching: worker_failed reason=\"") +
+                    failure + "\"");
+            } catch (...) {}
+        }
+        // Submitters may enqueue while failure/stop cleanup is in progress.
+        // Drain them before publishing stopped, atomically with the empty-queue
+        // observation. After this point the worker never takes cb_mu_ again;
+        // a replacement worker can safely join this one before starting.
+        for (;;) {
+            std::shared_ptr<ContinuousBatchRequest> req;
+            {
+                std::lock_guard<std::mutex> lock(cb_mu_);
+                if (cb_pending_.empty()) {
+                    cb_running_ = false;
+                    cb_stop_ = false;
+                    break;
+                }
+                req = cb_pending_.front();
+                cb_pending_.pop_front();
+            }
+            fail_request(req);
         }
     }
 
@@ -7579,6 +7848,95 @@ private:
         float output_logit = 0.0f;
         NativeExecutorReport report;
     };
+
+    static uint64_t session_memory_now_ms() {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
+    void trace_session_memory(const char *event, const std::string &key, uint64_t bytes) noexcept {
+        try {
+            log(std::string("native kvmem_session_memory: event=") + event +
+                " key=" + key + " swap_bytes=" + std::to_string(bytes));
+        } catch (...) { /* Telemetry cannot undo a completed residency transfer. */ }
+    }
+
+    void prepare_session_memory_slot(const std::string &key, uint32_t max_active) {
+        check_session_memory_device();
+        if (session_memory_->is_poisoned(key))
+            throw std::runtime_error("KVMem session memory conflict: invalid continuation; delete the session before rebuilding: " + key);
+        const bool found = session_memory_->contains(key);
+        if (!found && session_memory_->size() >= options_.kvmem_session_capacity)
+            throw std::runtime_error("KVMem session admission rejected: history capacity exhausted; explicitly release an idle session");
+        // A warm hit already owns its page quota. A cold hit/new history needs
+        // one slot; suspend idle owners without erasing their histories.
+        if (found && !session_memory_->is_cold(key)) return;
+        const size_t active = session_memory_->stats().active;
+        if (active >= max_active)
+            throw std::runtime_error("KVMem session admission rejected: no active slot");
+        const size_t idle_limit = max_active - active - 1;
+        session_memory_->cool_to(idle_limit, session_memory_now_ms(),
+            [&](ContinuousSessionResident &owner) {
+                if (!owner.executor) return false;
+                const uint64_t remaining = session_swap_bytes_ < options_.kvmem_session_swap_bytes
+                    ? options_.kvmem_session_swap_bytes - session_swap_bytes_ : 0;
+                if (!owner.executor->kvmem_suspend_idle(remaining)) return false;
+                const uint64_t bytes = owner.executor->kvmem_idle_swap_bytes();
+                session_swap_bytes_ += bytes;
+                trace_session_memory("park", owner.key, bytes);
+                return true;
+            });
+        if (session_memory_->stats().idle_warm > idle_limit)
+            throw std::runtime_error("KVMem session admission rejected: insufficient swap budget or an idle owner cannot be suspended");
+    }
+
+    void check_session_memory_device() const {
+        if (session_memory_device_failed_)
+            throw std::runtime_error("KVMem session device failure: an unfinished transfer holds quarantined pages; restart the engine before generation or deletion");
+    }
+
+    void process_session_control(const std::shared_ptr<ContinuousBatchRequest> &req) {
+        try {
+            if (req->session_control == ContinuousBatchRequest::SessionControl::Erase)
+                check_session_memory_device();
+            const auto &key = req->options.kvmem_prefix_cache_key;
+            const auto *owner = session_memory_->peek_idle(key);
+            if (owner) {
+                auto &info = req->session_info;
+                info.id = key;
+                info.found = true;
+                info.state = session_memory_->is_poisoned(key) ? "invalid" :
+                    session_memory_->is_cold(key) ? "suspended" : "warm";
+                if (owner->executor) {
+                    info.swap_bytes = owner->executor->kvmem_idle_swap_bytes();
+                    info.retained_device_bytes = owner->executor->kvmem_idle_retained_device_bytes();
+                    if (owner->prefix) {
+                        info.history_tokens = kvmem_warm_history_size(*owner->prefix, owner->executor.get());
+                        // Checkpoints live with the prefix owner, outside the
+                        // executor's tensor inventory. Count shared snapshots
+                        // conservatively, matching the executor metric.
+                        auto add_snapshot = [&](QwenExecutor::StateSnapshot &snapshot) {
+                            const uint64_t bytes = detail::PrefixStateStorage::bytes(snapshot);
+                            info.retained_device_bytes = bytes > UINT64_MAX - info.retained_device_bytes
+                                ? UINT64_MAX : info.retained_device_bytes + bytes;
+                        };
+                        add_snapshot(owner->prefix->end_checkpoint);
+                        add_snapshot(owner->prefix->prompt_checkpoint);
+                        for (auto &checkpoint : owner->prefix->replay_checkpoints)
+                            add_snapshot(checkpoint.state);
+                    }
+                }
+                if (req->session_control == ContinuousBatchRequest::SessionControl::Erase) {
+                    req->session_erased = session_memory_->erase(key);
+                    session_swap_bytes_ -= info.swap_bytes;
+                    trace_session_memory("release", key, info.swap_bytes);
+                }
+            }
+            complete_continuous_request(req, {});
+        } catch (const std::exception &e) {
+            complete_continuous_request(req, {}, e.what());
+        }
+    }
 
     void run_continuous_controlled_requests(
             const std::vector<std::shared_ptr<ContinuousBatchRequest>> &requests,
@@ -7642,7 +8000,18 @@ private:
             auto req = active[row].req;
             pending[row] = nullptr;
             controllers[row].reset(); // unwind/join before returning any pages
-            if (error.empty() && !req->options.kvmem_prefix_cache_key.empty() &&
+            if (active[row].session_owner) {
+                auto &owner = active[row].session_owner;
+                owner->executor = std::move(active[row].executor);
+                owner->prefix = std::move(active[row].kvmem_prefix);
+                bool invalid = !error.empty() || active[row].stream_cancelled ||
+                    !owner->prefix || !owner->prefix->valid;
+                try { invalid = invalid || request_cancelled(req->options); }
+                catch (...) { invalid = true; }
+                if (invalid)
+                    owner.invalidate();
+                owner.park(session_memory_now_ms());
+            } else if (error.empty() && !req->options.kvmem_prefix_cache_key.empty() &&
                 active[row].kvmem_prefix && active[row].kvmem_prefix->valid &&
                 !active[row].stream_cancelled) {
                 try {
@@ -7668,6 +8037,10 @@ private:
         };
         auto admit = [&](const std::shared_ptr<ContinuousBatchRequest> &req) {
             PhaseScope phase(clock, Phase::Admit);
+            if (req->session_control != ContinuousBatchRequest::SessionControl::None) {
+                process_session_control(req);
+                return;
+            }
             ++admitted; first_request = std::min(first_request, req->id); last_request = std::max(last_request, req->id);
             size_t row = 0;
             while (row < max_active && controllers[row]) ++row;
@@ -7676,6 +8049,47 @@ private:
             try {
                 check_request_cancelled(req->options);
                 const auto &key = req->options.kvmem_prefix_cache_key;
+                if (session_memory_) {
+                    prepare_session_memory_slot(key, max_active);
+                    auto lease = session_memory_->acquire(key, [&](ContinuousSessionResident &owner) {
+                        const uint64_t bytes = owner.executor->kvmem_idle_swap_bytes();
+                        try {
+                            owner.executor->kvmem_resume_idle();
+                        } catch (...) {
+                            // Failed, undrained DMA must never overlap later
+                            // requests, even though its pages are quarantined.
+                            if (owner.executor->kvmem_idle_quarantined_pages())
+                                session_memory_device_failed_ = true;
+                            throw;
+                        }
+                        session_swap_bytes_ -= bytes;
+                        trace_session_memory("resume", key, bytes);
+                        return true;
+                    }, session_memory_now_ms());
+                    const bool hit = bool(lease);
+                    if (!lease) {
+                        lease = session_memory_->create(key, [&] {
+                            // Construct off-registry. Failed allocation leaves no
+                            // half-built history owner or consumed history slot.
+                            ContinuousBatchActive next;
+                            initialize_continuous_active(next, req, ctx_size, true);
+                            auto owner = std::make_unique<ContinuousSessionResident>();
+                            owner->key = key;
+                            owner->executor = std::move(next.executor);
+                            owner->prefix = std::make_unique<detail::KvmemPrefixState>();
+                            return owner;
+                        }, session_memory_now_ms());
+                        trace_session_memory("create", key, 0);
+                    }
+                    active[row].session_owner = std::move(lease);
+                    active[row].executor = std::move(active[row].session_owner->executor);
+                    active[row].kvmem_prefix = std::move(active[row].session_owner->prefix);
+                    active[row].executor->set_input_embedding_overrides(
+                        req->options.input_embedding_overrides, req->prompt_tokens,
+                        req->options.input_mrope_positions);
+                    if (hit && continuous_batching_trace_enabled())
+                        log("native continuous_kvmem_session: event=hit request=" + std::to_string(req->id) + " key=" + key);
+                } else {
                 auto resident = key.empty() ? nullptr : cb_kvmem_sessions_.take(key);
                 if (resident) {
                     active[row].executor = std::move(resident->executor);
@@ -7694,6 +8108,7 @@ private:
                     initialize_continuous_active(active[row], req, ctx_size, true);
                     if (!key.empty() || bounded_continuous_enabled())
                         active[row].kvmem_prefix = std::make_unique<detail::KvmemPrefixState>();
+                }
                 }
                 if (continuous_batching_trace_enabled())
                     log("native continuous_dflash_admit: request=" + std::to_string(req->id) +
@@ -7737,9 +8152,13 @@ private:
                         const bool keep = !req->on_text || req->on_text(piece);
                         // Cancellation can arrive inside the user callback as
                         // well as while this controller waits for its peers.
-                        const bool cancelled = !keep || request_cancelled(req->options);
+                        const bool stopped_successfully = !keep && session_memory_ &&
+                            req->options.stream_stopped_successfully &&
+                            req->options.stream_stopped_successfully();
+                        const bool cancelled = (!keep && !stopped_successfully) ||
+                            request_cancelled(req->options);
                         active[row].stream_cancelled |= cancelled;
-                        return !cancelled;
+                        return keep && !cancelled;
                     };
                     results[row] = generate_mtp(prompt, active[row].req->options,
                         emit, nullptr, active[row].req->spec_mtp, false,
@@ -7778,6 +8197,7 @@ private:
                         log("native continuous_prefill_admission: request=" + std::to_string(req->id) +
                             " held_prefills=" + std::to_string(held_prefills));
                 }
+                check_session_memory_device();
                 std::vector<ContinuousMtpVerifyJob> jobs;
                 std::vector<ContinuousVerifyWork *> work;
                 std::vector<ContinuousDraftWork *> drafts;
@@ -8117,9 +8537,18 @@ private:
                         " batch_seconds=" + std::to_string(verify_seconds));
                 clock.enter(Phase::Other);
             }
-        } catch (const std::exception &e) {
+        } catch (...) {
+            std::string error = "unknown continuous controller failure";
+            try { throw; }
+            catch (const std::exception &e) { error = e.what(); }
+            catch (...) {}
+            // Admission can fail before a controller exists. It can also fail
+            // part way through the initial group. Complete every claimed
+            // request, including dynamically admitted rows, exactly once.
             for (size_t row = 0; row < max_active; ++row)
-                if (controllers[row]) finish(row, e.what());
+                if (active[row].req) finish(row, error);
+            for (const auto &req : requests)
+                complete_continuous_request(req, {}, error);
         }
         } // Include batch scratch destruction after the last promise completes.
         if (clock.enabled) {
@@ -9973,6 +10402,15 @@ private:
             throw std::invalid_argument("action attention currently requires --no-continuous-batching and online (non-archive) KVMem");
         KvMemStoreConfig bs_cfg;
         bs_cfg.attention = options_.kvmem_attention;
+        bs_cfg.mismatch = options_.kvmem_mismatch;
+        if (bs_cfg.mismatch.enabled() && env_flag_enabled("QW3_CONTINUOUS_BATCHING"))
+            throw std::invalid_argument("CPU mismatch observation requires --no-continuous-batching");
+        bs_cfg.query_history = options_.kvmem_query_history;
+        bs_cfg.query_history_decay = options_.kvmem_query_history_decay;
+        if (bs_cfg.query_history &&
+            (env_flag_enabled("QW3_CONTINUOUS_BATCHING") ||
+             !options_.kvmem_archive_dir.empty()))
+            throw std::invalid_argument("query history currently requires serialized online (non-archive) KVMem");
         bs_cfg.repository_blocks = options_.kvmem_repository_blocks;
         if (options_.kvmem_repository_gc_mode == "off")
             bs_cfg.repository_gc_mode = KvMemRepositoryGc::Mode::Off;
@@ -11312,7 +11750,8 @@ private:
             uint32_t(std::max(options_.kvmem_budget, options_.kvmem_prefill_budget)),
             uint32_t(std::max(1, options_.kvmem_gen_budget)),
             env_uint64_or("QW3_KVMEM_PROBE_RESERVE_TOKENS", 8192),
-            options_.kvmem_cpu_bytes, options_.kvmem_nvme_bytes);
+            options_.kvmem_cpu_bytes, options_.kvmem_nvme_bytes,
+            options_.kvmem_session_capacity);
     }
 
     bool kvmem_repository_enabled(const QwenExecutor *executor_) const {
@@ -11483,7 +11922,7 @@ private:
             options.kvmem_query_end > options.kvmem_query_begin,
             uint64_t(prompt.size()), sel_budget,
             options.kvmem_reselect_mode != KvMemReselectMode::Off,
-            options.kvmem_prepare_query_only ||
+            options.kvmem_prepare_query_only || options_.kvmem_query_history ||
                 options.kvmem_middecode_trigger_tokens != 0,
             /*warm_capture=*/true, qc_source_index_supported);
         // Preparation needs the same checkpoint safety properties as active
@@ -12514,12 +12953,18 @@ private:
                                const GenerationOptions &request_options,
                                const CancellableTokenCallback &on_text,
                                DumpStream *dump) {
+        validate_query_history_guided_request(options_, request_options);
         if (env_flag_enabled("QW3_KVMEM_SKIP_POSTSELECTION_QUERY_REPLAY")) {
             throw std::invalid_argument(
                 "the no-postselection-query-replay ablation requires native MTP");
         }
         ScopedKvmemRequestGc gc_request_scope(executor_.get());
         GenerationOptions options = request_options;
+        if (options_.kvmem_query_history &&
+            (options.kvmem_prefill_window_mode == KvMemPrefillWindowMode::SemanticChunk ||
+             options.kvmem_inline_refresh != KvMemInlineRefreshMode::Off ||
+             !options.kvmem_replay_query_spans.empty()))
+            throw std::invalid_argument("query history does not support semantic-chunk, inline-refresh, or transcript-replay requests");
         if (options.kvmem_request_plan.enabled &&
             options.kvmem_request_plan.pressure_ingest) {
             options.kvmem_prefill_window_mode =
@@ -12620,6 +13065,14 @@ private:
             executor_->reset_state();
             if ((kvmem_repository_enabled() || kvmem_prefix_cache_enabled())) warm_state_.valid = false;
         }
+        std::unique_ptr<ScopedKvmemQueryHistory> query_history_scope;
+        if (options_.kvmem_query_history) {
+            query_history_scope = std::make_unique<ScopedKvmemQueryHistory>(
+                executor_.get(), warm_state_.query_history, prompt_tokens,
+                input_embedding_cache_identities(options.input_embedding_overrides),
+                options.input_mrope_positions,
+                options.input_embedding_fingerprint, options_.kvmem_query_history_decay);
+        }
 #if 0  // Archived DeltaNet recurrent-state seed.
         if (rebuilt_state_seed) {
             if (warm_reuse) {
@@ -12662,7 +13115,7 @@ private:
             options.kvmem_query_end > options.kvmem_query_begin,
             static_cast<uint64_t>(prompt_tokens.size()), kvmem_sel_budget,
             options.kvmem_reselect_mode != KvMemReselectMode::Off,
-            options.kvmem_prepare_query_only ||
+            options.kvmem_prepare_query_only || options_.kvmem_query_history ||
                 options.kvmem_middecode_trigger_tokens != 0,
             warm_capture, qc_source_index_supported);
         const bool qc_select_active = qc.select_active;
@@ -12891,9 +13344,10 @@ private:
             query_replay_begin = ru.query_snapshot_reuse
                 ? detail::kvmem_cached_query_replay_boundary(
                     requested_replay_begin, options.kvmem_query_begin,
-                    options.kvmem_query_end, bt, reuse_m)
+                    options.kvmem_query_end, bt, reuse_m, options.kvmem_replay_minimal)
                 : detail::kvmem_complete_query_replay_boundary(
-                    requested_replay_begin, options.kvmem_query_begin, options.kvmem_query_end, bt);
+                    requested_replay_begin, options.kvmem_query_begin, options.kvmem_query_end,
+                    bt, options.kvmem_replay_minimal);
             if (query_replay_begin == 0) {
                 throw std::runtime_error(
                     "KVMem query replay requires a non-zero aligned boundary");
@@ -13616,6 +14070,7 @@ private:
         // Match the MTP/DFlash timing boundary: initial working-set selection,
         // query replay and prompt checkpointing happen before decode. Keep the
         // old combined duration explicitly below for historical log comparison.
+        if (query_history_scope) query_history_scope->finalize_input();
         const double t_plain_decode_start = wall_seconds();
 
         // A zero completion budget is a real prefill-only transaction. Persist
@@ -14059,6 +14514,7 @@ private:
                              const ContinuousMtpDraftHook *mtp_draft_hook = nullptr,
                              const ContinuousPrefillHook *prefill_hook = nullptr,
                              detail::KvmemPrefixState *override_warm_state = nullptr) {
+        validate_query_history_guided_request(options_, request_options);
         GenerationOptions options = request_options;
         if (options.kvmem_request_plan.enabled &&
             options.kvmem_request_plan.pressure_ingest) {
@@ -14069,6 +14525,13 @@ private:
         QwenExecutor *executor_ =
             override_executor != nullptr ? override_executor : this->executor_.get();
         if (!executor_) throw std::runtime_error("MTP executor unavailable");
+        if (options_.kvmem_query_history &&
+            (override_executor != nullptr ||
+             options.kvmem_prefill_window_mode == KvMemPrefillWindowMode::SemanticChunk ||
+             options.kvmem_inline_refresh != KvMemInlineRefreshMode::Off ||
+             !options.kvmem_replay_query_spans.empty() ||
+             (options.thinking_compaction_enabled() && !options.kvmem_session_id.empty())))
+            throw std::invalid_argument("query history requires a serialized request without semantic-chunk, inline-refresh, transcript replay, or API thinking compaction");
         if (override_warm_state && (!override_executor || !reset_session ||
                                     !options.kvmem_session_id.empty()))
             throw std::invalid_argument("explicit warm state requires a full-prompt executor request");
@@ -14287,6 +14750,23 @@ private:
         const uint64_t logical_prompt_tokens = reset_session
             ? static_cast<uint64_t>(prompt_tokens.size())
             : (executor_->position() + prompt_tokens.size());
+        std::unique_ptr<ScopedKvmemQueryHistory> query_history_scope;
+        if (options_.kvmem_query_history) {
+            if (!reset_session && !api_session)
+                throw std::invalid_argument("query history append requires an identified API session");
+            if (api_session && reset_session) kvmem_api_query_history_ = {};
+            std::vector<uint32_t> logical_input;
+            if (api_session && !reset_session) logical_input = kvmem_api_tokens_;
+            logical_input.insert(logical_input.end(), prompt_tokens.begin(), prompt_tokens.end());
+            if (logical_input.size() != logical_prompt_tokens)
+                throw std::invalid_argument("query history API session lacks complete committed token identity");
+            auto &history = api_session ? kvmem_api_query_history_ : warm_state_.query_history;
+            query_history_scope = std::make_unique<ScopedKvmemQueryHistory>(
+                executor_, history, logical_input,
+                input_embedding_cache_identities(options.input_embedding_overrides),
+                options.input_mrope_positions,
+                options.input_embedding_fingerprint, options_.kvmem_query_history_decay);
+        }
         // Logical token positions identify durable pages and may be much larger
         // than the trained context. MTP local-position mode keeps that identity
         // separate from RoPE: prefix rows use the exact compact frame produced
@@ -14345,7 +14825,7 @@ private:
             options.kvmem_query_end > options.kvmem_query_begin,
             logical_prompt_tokens, kvmem_sel_budget,
             options.kvmem_reselect_mode != KvMemReselectMode::Off,
-            options.kvmem_prepare_query_only ||
+            options.kvmem_prepare_query_only || options_.kvmem_query_history ||
                 options.kvmem_middecode_trigger_tokens != 0,
             kvmem_warm_capture, qc_source_index_supported);
         const bool qc_select_active = qc.select_active;
@@ -14703,7 +15183,7 @@ private:
             executor_->kvmem_set_pin_from_block(UINT64_MAX);
         }
         if (kvmem_on && api_session) {
-            if (qc_select_active) {
+            if (qc_select_active || (options_.kvmem_query_history && qc_capture_active)) {
                 executor_->kvmem_set_query_span(
                     options.kvmem_query_begin, options.kvmem_query_end,
                     logical_prompt_tokens,
@@ -15171,9 +15651,10 @@ private:
                 ? detail::kvmem_cached_query_replay_boundary(
                     kvmem_effective_replay_begin(options),
                     options.kvmem_query_begin, options.kvmem_query_end,
-                    bt, kvmem_reuse_m)
+                    bt, kvmem_reuse_m, options.kvmem_replay_minimal)
                 : detail::kvmem_complete_query_replay_boundary(
-                    kvmem_effective_replay_begin(options), options.kvmem_query_begin, options.kvmem_query_end, bt);
+                    kvmem_effective_replay_begin(options), options.kvmem_query_begin,
+                    options.kvmem_query_end, bt, options.kvmem_replay_minimal);
             if (kvmem_query_replay_begin == 0) {
                 throw std::runtime_error(
                     "KVMem query replay requires a non-zero aligned boundary");
@@ -17865,6 +18346,7 @@ private:
         // Boundary between the post-prefill reselect and the decode loop. For
         // plain MTP (kvmem off) the reselect block above is skipped, so this
         // equals t_prefill_end and decode_s stays byte-identical to before.
+        if (query_history_scope) query_history_scope->finalize_input();
         const double t_reselect_end = wall_seconds();
         auto emit_native_accounting = [&](double t_decode_done,
                                           double t_native_done) {
@@ -18653,14 +19135,18 @@ private:
                 executor_->block_store()->select_budget_tokens();
             const uint32_t desired_recent =
                 detail::kvmem_middecode_refresh_recent_tokens(
-                    select_budget, epoch_tokens, emergency_refresh);
+                    select_budget, epoch_tokens, emergency_refresh,
+                    options_.kvmem_middecode_recent_tokens);
             const uint32_t actual_recent =
                 executor_->kvmem_set_bounded_recent_pin(desired_recent);
-            if (emergency_refresh && actual_recent < epoch_tokens) {
+            const uint32_t required_emergency_tail =
+                options_.kvmem_middecode_recent_tokens < 0
+                    ? epoch_tokens : desired_recent;
+            if (emergency_refresh && actual_recent < required_emergency_tail) {
                 throw std::runtime_error(
-                    "KVMem mid-decode emergency refresh requires the full "
-                    "open tool/code epoch as live suffix: required_tokens=" +
-                    std::to_string(epoch_tokens) +
+                    "KVMem mid-decode emergency refresh cannot retain the "
+                    "required live suffix: required_tokens=" +
+                    std::to_string(required_emergency_tail) +
                     " retained_tokens=" + std::to_string(actual_recent) +
                     " selection_budget=" + std::to_string(select_budget));
             }
@@ -18710,6 +19196,13 @@ private:
                  << " query=" << escape_text(query_text);
             log(rmsg.str());
             return true;
+        };
+        std::optional<detail::KvmemAcceptedOutput> api_accepted_output;
+        const bool session_stream_stop = session_memory_ && options.stream_stopped_successfully;
+        if ((options_.kvmem_query_history && api_session) || session_stream_stop)
+            api_accepted_output.emplace(logical_prompt_tokens);
+        const auto record_api_output = [&](uint64_t begin, const uint32_t *tokens, size_t count) {
+            if (api_accepted_output) api_accepted_output->record(begin, tokens, count);
         };
         auto emit_generated_token = [&](uint32_t &token) -> bool {
             recover_thinking_eos(budget, token);
@@ -18856,6 +19349,7 @@ private:
             }
             if (!step.ok) throw std::runtime_error("decode failed");
             decode_ops += step.ops_executed;
+            record_api_output(feed_base, &feed, 1);
             // Sample before reselect/prefix work can reuse logits scratch.
             const uint32_t sampled = pick_from_last_logits(
                 step.argmax_token >= 0 ? step.argmax_token : eos);
@@ -19119,6 +19613,7 @@ private:
                     step = forward_controlled_token(current);
                     if (!step.ok) throw std::runtime_error("decode failed");
                     decode_ops += step.ops_executed;
+                    record_api_output(current_base, &current, 1);
                     const int32_t new_argmax = step.argmax_token >= 0 ? step.argmax_token : eos;
                     // Sample/pick before commit_mtp_prefix so logits_ is intact.
                     next_token = pick_from_last_logits(new_argmax);
@@ -19389,6 +19884,7 @@ private:
                         rebuild_accepted_mtp_prefix(verify_tokens, verify_base_position,
                                                     kvmem_finish_after_prefix);
                     }
+                    record_api_output(verify_base_position, verify_tokens.data(), verify_tokens.size());
                     for (uint32_t i = 0; i < accepted; ++i) {
                         if (!emit_generated_token(drafts[i])) break;
                     }
@@ -19498,6 +19994,7 @@ private:
                         rebuild_accepted_mtp_prefix(replay, verify_base_position,
                                                     kvmem_finish_after_prefix);
                     }
+                    record_api_output(verify_base_position, replay.data(), replay.size());
                     for (uint32_t i = 0; i < accepted; ++i) {
                         if (!emit_generated_token(drafts[i])) break;
                     }
@@ -19555,6 +20052,10 @@ private:
                 const uint64_t base = executor_->position();
                 step = executor_->forward_one_token(static_cast<uint32_t>(thinking_close_id));
                 if (!step.ok) throw std::runtime_error("thinking close forward failed");
+                if (session_stream_stop) {
+                    const uint32_t close = static_cast<uint32_t>(thinking_close_id);
+                    record_api_output(base, &close, 1);
+                }
                 // Preserve the continuation before MTP/summary reuse logits scratch.
                 thinking_follow_token = pick_from_last_logits(step.argmax_token >= 0 ? step.argmax_token : eos);
                 const bool finish = kvmem_advance_to(executor_->position(), true);
@@ -19720,6 +20221,9 @@ private:
         generated.clear();
         if (compacted) {
             // No action has been published before the thinking boundary.
+            // Replacement replay changes the committed suffix, including any
+            // verifier rows that were accepted before publication stopped.
+            if (session_stream_stop) api_accepted_output.emplace(logical_prompt_tokens);
             // Re-enter thinking while replaying its accepted replacement.
             executor_->kvmem_action_begin(tokenizer_->token_id("<tool_call>"),
                 tokenizer_->token_id("</tool_call>"), tokenizer_->token_id("<think>"),
@@ -19742,6 +20246,7 @@ private:
                 const uint64_t base = executor_->position();
                 step = executor_->forward_n_tokens(chunk);
                 if (!step.ok) throw std::runtime_error("thinking replacement replay failed");
+                if (session_stream_stop) record_api_output(base, chunk.data(), chunk.size());
                 prime_mtp_prefix(chunk, base);
                 if (!use_mtp_prefix) throw std::runtime_error("thinking replacement lost MTP prefix");
                 kvmem_advance_to(executor_->position());
@@ -19798,6 +20303,31 @@ private:
         const double t_decode_end = wall_seconds();
 
         executor_->kvmem_action_end();
+        if (options_.kvmem_query_history && api_session) {
+            // A live API continuation identifies accepted target rows, not the
+            // emitted-but-unforwarded final token. Preserve this exact suffix
+            // alongside the existing aligned replay checkpoint.
+            const uint64_t accepted_end = executor_->position();
+            const auto &accepted_tokens = api_accepted_output->tokens();
+            if (accepted_end < logical_prompt_tokens ||
+                accepted_end - logical_prompt_tokens != accepted_tokens.size() ||
+                kvmem_api_tokens_.size() != logical_prompt_tokens ||
+                kvmem_api_boundary_pos_ > logical_prompt_tokens)
+                throw std::runtime_error("query history API decode lost its accepted token identity");
+            const size_t accepted = static_cast<size_t>(accepted_end - logical_prompt_tokens);
+            kvmem_api_tokens_.insert(kvmem_api_tokens_.end(), accepted_tokens.begin(),
+                                    accepted_tokens.end());
+            kvmem_api_tail_tokens_.assign(
+                kvmem_api_tokens_.begin() + kvmem_api_boundary_pos_, kvmem_api_tokens_.end());
+            if (!kvmem_active_input_mrope_positions_.empty()) {
+                const auto last = kvmem_active_input_mrope_positions_.back();
+                const uint32_t next = std::max({last[0], last[1], last[2]}) + 1u;
+                for (size_t i = 0; i < accepted; ++i) {
+                    const uint32_t position = next + static_cast<uint32_t>(i);
+                    kvmem_active_input_mrope_positions_.push_back({position, position, position});
+                }
+            }
+        }
 
         // kvmem prefix cache: record this request's end as the warm resume point.
         // warm_log = prompt + emitted tokens, resized down to the executor
@@ -19806,9 +20336,16 @@ private:
         // to KV but not emitted because max_tokens was hit) invalidates the warm
         // state instead of capturing an inconsistent checkpoint. Captured inside
         // the device scope since capture_state issues device copies.
-        if (kvmem_warm_capture && !stream_cancelled) {
+        const bool stopped_successfully = stream_cancelled && session_stream_stop &&
+            options.stream_stopped_successfully() && !request_cancelled(options);
+        if (kvmem_warm_capture && (!stream_cancelled || stopped_successfully)) {
             const uint64_t pos = executor_->position();
-            if (capture_kvmem_warm_history(prompt_tokens, gen_tokens, pos, options, warm_state_, executor_)) {
+            // A stop can cut publication in the middle of an already committed
+            // verifier batch. Preserve its exact token identity; the next full
+            // prompt's prefix check decides which accepted rows remain usable.
+            const auto &capture_tokens = stopped_successfully
+                ? api_accepted_output->tokens() : gen_tokens;
+            if (capture_kvmem_warm_history(prompt_tokens, capture_tokens, pos, options, warm_state_, executor_)) {
                 const bool postselection_checkpoint_current =
                     kvmem_postselection_ckpt.ready &&
                     kvmem_postselection_pos <= pos &&
@@ -20450,6 +20987,9 @@ private:
     // Worker-only residents retire before shared pools. Inflight key claims
     // are protected by cb_mu_, including cancellation from an API thread.
     detail::IdleSessionCache<ContinuousSessionResident> cb_kvmem_sessions_;
+    std::unique_ptr<SessionMemoryCache> session_memory_;
+    uint64_t session_swap_bytes_ = 0; // worker-owned exact suspended page images
+    bool session_memory_device_failed_ = false; // worker-owned, fail closed after undrained DMA
     std::unordered_set<std::string> cb_session_keys_inflight_;
 
     // ---- Prefix cache: lossless page-aligned prefix reuse -----------------
@@ -20576,6 +21116,7 @@ private:
     // Canonical teacher-forced token history for named local-cache integrity
     // metadata. This is host-only (4 bytes/token) and does not duplicate KV.
     std::vector<uint32_t> kvmem_api_tokens_;
+    detail::KvmemQueryHistoryState kvmem_api_query_history_;
     uint64_t kvmem_active_input_embedding_fingerprint_ = 0;
     std::vector<GenerationOptions::InputEmbeddingOverride>
         kvmem_active_input_embedding_overrides_;
@@ -20631,6 +21172,7 @@ private:
     std::unique_ptr<DeviceTensor> cb_prefill_recurrent_state_batch_;
     std::unique_ptr<DeviceTensor> cb_prefill_conv_state_batch_;
 
+    std::mutex cb_lifecycle_mu_;
     std::mutex cb_mu_;
     std::condition_variable cb_cv_;
     std::deque<std::shared_ptr<ContinuousBatchRequest>> cb_pending_;

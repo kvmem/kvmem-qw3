@@ -1,0 +1,172 @@
+{
+  "model_manifest": "reports/model_weight_sha256_20260912.json",
+  "task_manifest": "tasks_pilot4.json",
+  "cpu_kv_cap_gib": 110,
+  "temperature": 1,
+  "top_p": 0.95,
+  "top_k": 20,
+  "thinking_budget": 28672,
+  "agent_timeout_s": 0,
+  "frozen": true,
+  "frozen_at": 1789189565.5896823,
+  "scope": "InfLLM author-small active window only; original four DeepSWE tasks seed1000; reuse historical KVMem/qw3",
+  "seed": 1000,
+  "prefill_chunk": 2048,
+  "max_output_tokens": 32000,
+  "gpu_process_cap_gib": 60,
+  "gguf": {
+    "path": "/home/chaidi/qw3/models/Qwen3.8-27B-Q8_0.gguf",
+    "sha256": "a680f44a06920e5d689774823782006aa3acc8db95750323373b24139b67e348",
+    "size_mtime": [
+      29047086048,
+      1786757197995505184
+    ],
+    "checked_at": 1789185176.9996622,
+    "matches_historical_locked_weight_hash": true
+  },
+  "validation_evidence": [
+    "reports/aligned_q8_fp8_validation_20260912_v2.json",
+    "reports/fp8_long_window_components_20260912.json",
+    "reports/controller_selected_windows_20260912.json"
+  ],
+  "historical_audit": "reports/historical_reuse_configuration_audit_20260912.json",
+  "source_sha256": {
+    "run_pilot_arm.py": "f174aa9045fcec08087ec0dd5e94ad24a578d9c2a89af7ba71806e9ec5d1843d",
+    "run_pilot_campaign.py": "9516ef5e8f0f3306fcbc22b054aafb708a3832e4103a81096462ef82cf365a98",
+    "summarize_pilot.py": "fecc3597cadf3459b3279395793f7038124c5fcca0845107ade675bc9fee0592",
+    "trace_proxy.py": "2e6bf30af16cd22cd6c2b9bedb3f09927973575f2836b526ebd41645f3084509",
+    "serve_infllm.py": "9467ac4617a6c3d51833f0dac79663db6ef0d05874be2f1d754464b51ea062ee",
+    "run_model_smoke.py": "a618b49a6e862682cb59066731c8eb629a3ec970e6dcb4e6f9f315c59158c9d9",
+    "native_bridge.cpp": "39bf2c42797f20e3effd3b689c1969f9b5525d341f3dd6b7bc7075205f60b04f",
+    "native_build/qw3": "7284aa9f39728a7ffac44610a25f36b22f633b45d5e90df31d77efadb527a8d6",
+    "native_build/baseline_native_bridge": "675a60bff835a1e52b30ffba98e6a0e364767173167a5cf1e604e46bd115972f",
+    "configs/infllm_32k_candidate.json": "225b91a2c9a6411955d4a6ff078ffeb743b37749c2927057f911877a70bfbcb8",
+    "tasks_pilot4.json": "19899289928f25b2771b23fc779a1046018fe1b39e466f55b97167722196f1a2",
+    "reports/model_weight_sha256_20260912.json": "66af4a550d1761227f02ff9750cb2d85723bba4df13f6b5fb84be05964526aa8",
+    "reports/native_source_manifest.json": "05b2ef214786519f6e58d37146305bfc66d644c6620c275d549d70ecd286fe65",
+    "harness/run_deepswe_cell.sh": "6a651cef773e8a8d9fc05cbe96fb47dbd269f042b5ed7f99ce27725d7765675c",
+    "harness/container_claude_agent.sh": "f93eaa40c1d69e40a5a12856f7c263283911780f0bfece614b0ef3cea800cc13",
+    "kv_baselines/__init__.py": "f5ff007832957be067c62c9a13cc42440b33dfe0d5843f8952464dbdcc88a1fa",
+    "kv_baselines/frontend.py": "786411691903453cdfff09b2f5980af685a145e1c063278b0a029cba51179c8f",
+    "kv_baselines/generation.py": "13309903a35a9dd221604d099c38a7abbd979059d0d86dfdd205815b855bb8c3",
+    "kv_baselines/infllm_adapter.py": "b9f68444661093afb11a7f2df79fad6c0e9d4916692737d906c8a4319e0cc7d2",
+    "kv_baselines/infllm_hybrid.py": "ada2e6a84b878c0f86fad23bca3e9ca6e2201d7746ddadf299697d0cdbe39b68",
+    "kv_baselines/memory.py": "1cbaff723cc5e4e792fe6a1df3d420f0bcb20d74e15ab10e93fdd8d98c360c3e",
+    "kv_baselines/precision.py": "bb3a286bf15dcdef38c6b5a251ec1877518a178a4b219224f0d5dcbbd9b55b00",
+    "kv_baselines/session.py": "369ce3d6a3bec27c7bf1e7d79a86cc98754c49001f52f487de18191b3f6d105f",
+    "kv_baselines/session_state.py": "00b9b3d0bede02db09647420ebf8b6e7b0cc939aca5b738af42cde892068b031",
+    "kv_baselines/upstream.py": "d080efe2144821c9ff7ff966297fe47e0dc8b40d1bf73b1f9fa00ee3fb8b891b",
+    "serve_aligned_infllm.py": "3389143373746f43ff2207fe20d67a2bdb13889d05f5fa4bf1fc268401954c6f",
+    "run_aligned_infllm_arm.py": "1861721af709e154ca869748cd25f10444f723b4af8642bfec56c1eb5d0e8a74",
+    "run_window_campaign.py": "4018f85ef1dc7a27cd67fcc05bb2b095e94c16e0fc7c1070aceffee563a58625",
+    "summarize_window_campaign.py": "a31f2b0aaa53546515563cca95bc1f6f8b1a34eb6d3e0316c2a001fdd8c68dc9",
+    "observe_pilot_memory.py": "43a4cdb167a1bafab7c2caf6af5746f23eb5014636ddad7f666c4d421b58dbad",
+    "configs/infllm_192k_fp8.json": "81622f566ec8f1ca620d55e1be26f40ecf3317450084d7cc3f940979daf34c57",
+    "configs/infllm_author_small_fp8.json": "00073131f78f56934fe744ad5af8db4b05c7a08eec40d6e22300b0e0d8eaaf2d",
+    "alignment/harness/container_claude_agent.sh": "2df61f624c07b260931bb39369c1c87a5480f1874f2c4c95a137cd1c6ebab094",
+    "compat_build/native_q8/libaligned_q8.so": "eeed62bd5548af97831c2d5938f8186378fc6f6582c4c49c5f7e3590ce305ee0",
+    "validate_aligned_infllm.py": "56759cdd3ff2255481a9629ac5115b6991482444125d26e3f30ad8e88ed04016",
+    "validate_fp8_long_window.py": "ff6f378d0f36ca8f207c8f9989477b39995b09bd376e5d55ae8708f186fbfb5a",
+    "reports/aligned_q8_fp8_validation_20260912_v2.json": "36f225a77d9503fa61e97ca3465f164c147ef4e003fc8d4ac4c09130b69b9b54",
+    "reports/fp8_long_window_components_20260912.json": "d891ca7e4301296c8c64abd5933ac13bf72d3bb2dd2c729506136541a18e97fa",
+    "reports/historical_reuse_configuration_audit_20260912.json": "7be14a2e1e5bb312d85879d98dbe6804afe487488d49ea6487874ee120af3d02",
+    "alignment/fp8_kv.py": "b51fe3a791bea351eda74bdaf859bd4533a37dec028167bad116fcab9a7dd773",
+    "alignment/q8_model.py": "cb2200bd84897f5a99f48a0e88810f8e1c12a75855f7efbe2982b8951529b2bf",
+    "alignment/session.py": "58d2669f795da59bd67071bdde9110dc26b2ba41cd7f183b8fb1b6fad6cd21d3",
+    "alignment/native_q8.py": "5b8ebec1b3f9d7c324e6193fbf732019a4a339231947229598500ebda664fefd",
+    "reports/aligned_current_gguf_identity_20260912.json": "390e88491ae98ae0309254e3d1077be69db742bd69f48f1be4f585219ca36a1f",
+    "reports/controller_selected_windows_20260912.json": "b4f936ec020104881823e8fe6f29b6a7262c0fdb93b374ab2a7ca179afc62a9b"
+  },
+  "image_identity": [
+    {
+      "task": "superjson-error-stack-serialization",
+      "kind": "agent",
+      "image": "public.ecr.aws/d3j8x8q7/swe-bench-202605:kh701jywhzgddknqwzsq6npjv98226tq-v1.1",
+      "id": "sha256:ada56382a90fbe2dd01bde0f685a1bbd0ceac556f7b802199e60dbbca6e76387"
+    },
+    {
+      "task": "superjson-error-stack-serialization",
+      "kind": "verifier",
+      "image": "qw3-deepswe-superjson-error-stack-serialization-verifier:v1.1",
+      "id": "sha256:e834a5b963758c13d1549ae0d59de48e3e940cbd09f3e746872e90301a4730ae"
+    },
+    {
+      "task": "textual-richlog-follow-state",
+      "kind": "agent",
+      "image": "public.ecr.aws/d3j8x8q7/swe-bench-202605:kh70247kxfz01g03p1dpz9fqv183g47e-v1.1",
+      "id": "sha256:4320874bd134826ff13721acf5a30eb8f58431928dcac97022d56aefbc496c8c"
+    },
+    {
+      "task": "textual-richlog-follow-state",
+      "kind": "verifier",
+      "image": "qw3-deepswe-textual-richlog-follow-state-verifier:v1.1",
+      "id": "sha256:ebadd1542881722f514b33ac76652bdf77344e992f83fa91277593636a43cc4a"
+    },
+    {
+      "task": "koota-composite-trait-aspects",
+      "kind": "agent",
+      "image": "public.ecr.aws/d3j8x8q7/swe-bench-202605:kh705e1hgmtj22pyetcmqa8ygs83bh33-v1.1",
+      "id": "sha256:7a3afca50b7b8a2181ec2706f235ea85eebaa731500e9137c434a4190567ac27"
+    },
+    {
+      "task": "koota-composite-trait-aspects",
+      "kind": "verifier",
+      "image": "qw3-deepswe-koota-composite-trait-aspects-verifier:v1.1",
+      "id": "sha256:a6ee3b47aaef67cd8559e97c75c43c1b1fe358eb0d43b0bda774cc4ca8a58aec"
+    },
+    {
+      "task": "awilix-async-container-initialization",
+      "kind": "agent",
+      "image": "public.ecr.aws/d3j8x8q7/swe-bench-202605:kh70bg8gy4xks4eyh1s71ecmk9822p9c-v1.1",
+      "id": "sha256:748294a8ece567691f0a628d03c3531024d9f5e1acd13d5c6dd1ecba490831e6"
+    },
+    {
+      "task": "awilix-async-container-initialization",
+      "kind": "verifier",
+      "image": "qw3-deepswe-awilix-async-container-initialization-verifier:v1.1",
+      "id": "sha256:497622e49c3fe08679faacbb9c6c1569da1e67032eb8420aff09f679fd96a385"
+    }
+  ],
+  "variants": {
+    "small": {
+      "context_tokens": 3145728,
+      "allocator_cap_gib": 36,
+      "minimum_free_gpu_gib": 38,
+      "config": "configs/infllm_author_small_fp8.json",
+      "active_capacity_tokens": 6272
+    }
+  },
+  "comparison_limitations": [
+    "Author-small InfLLM active capacity 6272 intentionally differs from historical KVMem capacity ceiling 196608; large-window experiment canceled by user.",
+    "No MTP in InfLLM; historical native models used MTP chain4.",
+    "Same Q8_0 source blocks, but HF/FLA BF16 intermediate activations versus native FP32 residual.",
+    "FP8 stored unrotated InfLLM K; author RoPE semantics retained; no claim of identical positional treatment.",
+    "FP16 assembled attention buffer and computation views, FP8 persistent KV.",
+    "Shared-GPU measurements excluded from formal speedup ratios.",
+    "Same numeric seed and sampling settings, different RNG implementation.",
+    "Single seed, four tasks: pilot evidence, not population accuracy estimate."
+  ],
+  "client": {
+    "version": "2.1.148",
+    "model_id": "Qwen3.8-27B[3m]",
+    "logical_context": 3145728,
+    "disable_compaction": true,
+    "disallowed_tools": [
+      "Agent"
+    ],
+    "agent_memory": "8g",
+    "effort": "xhigh"
+  },
+  "resources": {
+    "history_storage": "CPU; no NVMe; no GC",
+    "gpu_cache_overfetch_ratio": 2,
+    "host_memory_observer": true
+  },
+  "user_scope_override": {
+    "at": 1789189565.5896823,
+    "instruction": "由于大 activate window 吞吐太低，停止大窗口，只测试小 activate window。",
+    "supersedes": "/home/chaidi/qw3/baselines/kv_retrieval/configs/infllm_two_windows_deepswe4_s1000_20260912.json",
+    "retired_campaign": "results/infllm_two_windows_deepswe4_s1000_20260912",
+    "large_arm_is_task_outcome": false
+  }
+}

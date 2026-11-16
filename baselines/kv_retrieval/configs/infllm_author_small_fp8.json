@@ -1,0 +1,14 @@
+{
+  "n_init": 128,
+  "n_local": 4096,
+  "block_size": 128,
+  "max_cached_block": 32,
+  "topk": 16,
+  "exc_block_size": 512,
+  "repr_topk": 4,
+  "fattn": true,
+  "cache_strategy": "lru",
+  "async_global_stream": true,
+  "pin_memory": true,
+  "attention_dtype": "float16"
+}

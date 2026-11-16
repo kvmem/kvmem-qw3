@@ -165,8 +165,12 @@ void test_bounded_query_and_live_tool_suffix() {
         require(plan.live_suffix_span.has_value() &&
                     plan.live_suffix_span->begin == spans[3].segment_begin &&
                     plan.live_suffix_span->end == prompt.size() &&
-                    plan.history_end == spans[3].segment_begin,
+                    plan.live_suffix_is_tool &&
+                    plan.history_end == prompt.size(),
                 "bounded live suffix/history boundary is incorrect");
+        require(spans[3].segment_begin < plan.history_end &&
+                    spans[4].segment_end <= plan.history_end,
+                "latest tool call/result were excluded from retrieval");
         require(spans[1].segment_begin < plan.history_end &&
                     spans[2].segment_end <= plan.history_end,
                 "completed tool transaction was not returned to history");
@@ -202,7 +206,7 @@ void test_mini_swe_agent_native_tool_lifetimes() {
     require(plan.live_suffix_message_begin_index == 3 &&
                 plan.live_suffix_span.has_value() &&
                 plan.live_suffix_span->begin == spans[3].segment_begin &&
-                plan.history_end == spans[3].segment_begin,
+                plan.live_suffix_is_tool && plan.history_end == prompt.size(),
             "mini-swe-agent live bash transaction boundary is incorrect");
     require(spans[1].segment_begin < plan.history_end &&
                 spans[2].segment_end <= plan.history_end,
@@ -230,7 +234,8 @@ void test_claude_user_role_tool_response_and_parallel_results() {
     require(plan.current_query_message_index == 0,
             "Claude user-role tool result displaced the task query");
     require(plan.live_suffix_message_begin_index == 1 &&
-                plan.live_suffix_span->begin == spans[1].segment_begin,
+                plan.live_suffix_span->begin == spans[1].segment_begin &&
+                plan.live_suffix_is_tool && plan.history_end == prompt.size(),
             "parallel Claude tool results did not retain their assistant call");
 }
 
@@ -256,6 +261,66 @@ void test_new_user_query_is_its_own_live_suffix() {
             "root task span was not byte-exact");
     require(plan.live_suffix_span->begin == spans[2].segment_begin,
             "new query live suffix started before the query");
+    require(!plan.live_suffix_is_tool && plan.history_end == spans[2].segment_begin,
+            "real user instruction became ordinary tool history");
+}
+
+void test_configurable_mandatory_parts() {
+    std::string prompt = "CONTROL\n";
+    const size_t control_end = prompt.size();
+    std::vector<HarnessRenderedMessageSpan> spans;
+    spans.push_back(append_message(prompt, 0, "user", "root task"));
+    spans.push_back(append_message(prompt, 1, "assistant", "old call"));
+    spans.push_back(append_message(prompt, 2, "tool", "old result"));
+    spans.push_back(append_message(prompt, 3, "user", "current task"));
+    spans.push_back(append_message(prompt, 4, "assistant", "Write arguments"));
+    spans.push_back(append_message(prompt, 5, "tool", "Write result"));
+    spans.push_back(append_message(prompt, 6, "tool",
+        "<system-reminder>Instructions from: pkg/AGENTS.md\npolicy\n</system-reminder>"));
+
+    for (HarnessKind kind : {HarnessKind::ClaudeCode, HarnessKind::OpenCode,
+                             HarnessKind::DeepSeekHarness, HarnessKind::MiniSweAgent,
+                             HarnessKind::GenericToolClient}) {
+        const auto plan = derive_harness_semantic_plan(kind, prompt, control_end, spans);
+        require(plan.tool_call_spans.size() == 1 && plan.tool_result_spans.size() == 2,
+                "current call/result metadata lost a parallel or policy-only result");
+        for (unsigned mask = 0; mask < 64; ++mask) {
+            qw3::KvMemMandatoryConfig config{bool(mask & 1), bool(mask & 2),
+                bool(mask & 4), bool(mask & 8), bool(mask & 16), bool(mask & 32)};
+            HarnessSemanticPlan selected;
+            selected.spans = qw3::detail::select_harness_mandatory_spans(plan, config);
+            require(count_reason(selected, HarnessSpanReason::SystemControl) == config.system &&
+                        count_reason(selected, HarnessSpanReason::RootTask) == config.root &&
+                        count_reason(selected, HarnessSpanReason::CurrentQuery) == config.query &&
+                        count_reason(selected, HarnessSpanReason::ProjectPolicy) == config.policy &&
+                        count_reason(selected, HarnessSpanReason::ToolCall) == config.tool_call &&
+                        count_reason(selected, HarnessSpanReason::ToolResult) == 2u * config.tool_result,
+                    "independent mandatory category switch was bypassed");
+            if (config.tool_call) {
+                const auto *call = find_reason(selected, HarnessSpanReason::ToolCall);
+                require(call->begin == spans[4].segment_begin && call->end == spans[4].segment_end,
+                        "call-only retention included its result or an older call");
+            }
+            if (config.tool_result) {
+                const auto *result = find_reason(selected, HarnessSpanReason::ToolResult);
+                require(result->begin == spans[5].segment_begin && result->end == spans[5].segment_end,
+                        "result-only retention included its call or an older result");
+            }
+            require(plan.root_task_message_index == 0 && plan.current_query_message_index == 3 &&
+                        plan.history_end == prompt.size(),
+                    "mandatory configuration changed query identity or source history");
+        }
+    }
+
+    std::string one = "CONTROL\n";
+    std::vector<HarnessRenderedMessageSpan> one_span{append_message(one, 0, "user", "only task")};
+    const auto one_plan = derive_harness_semantic_plan(HarnessKind::OpenCode, one, 8, one_span);
+    HarnessSemanticPlan root_only;
+    root_only.spans = qw3::detail::select_harness_mandatory_spans(
+        one_plan, qw3::KvMemMandatoryConfig::parse("root"));
+    require(count_reason(root_only, HarnessSpanReason::RootTask) == 1 &&
+                count_reason(root_only, HarnessSpanReason::CurrentQuery) == 0,
+            "root-only mask lost the shared first/current task or misreported its reason");
 }
 
 void test_tool_and_meta_turns_do_not_displace_root_or_current_task() {
@@ -346,6 +411,7 @@ int main() {
     test_mini_swe_agent_native_tool_lifetimes();
     test_claude_user_role_tool_response_and_parallel_results();
     test_new_user_query_is_its_own_live_suffix();
+    test_configurable_mandatory_parts();
     test_tool_and_meta_turns_do_not_displace_root_or_current_task();
     test_latest_policy_copy_is_exact_mandatory();
     test_missing_control_prefix_does_not_invent_system_pin();

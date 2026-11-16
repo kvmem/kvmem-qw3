@@ -19,6 +19,17 @@ int main() try {
     const auto rounded = BoundedContinuousResources::plan(2, 32, 16, 32, 64, 33, 17, 12, 0);
     check(rounded.pages_per_request == 10 && rounded.arena_pages == 20,
           "partial generation/private blocks were not reserved");
+    const auto histories = BoundedContinuousResources::plan(2, 32, 16, 131072, 131072,
+        65536, 8192, 90ull << 30, 180ull << 30, 8);
+    check(histories.arena_pages == 25600 && histories.pages_per_request == 12800,
+          "idle histories must not reserve additional GPU slots");
+    check(histories.cpu_bytes_per_owner == (10ull << 30) &&
+          histories.nvme_bytes_per_owner == (20ull << 30),
+          "retained histories exceeded total tier quotas");
+    bool too_few_histories = false;
+    try { (void)BoundedContinuousResources::plan(4, 32, 16, 32, 32, 32, 0, 0, 0, 2); }
+    catch (const std::invalid_argument &) { too_few_histories = true; }
+    check(too_few_histories, "history capacity below active slots was accepted");
     for (unsigned invalid = 0; invalid < 5; ++invalid) {
         bool threw = false;
         try {

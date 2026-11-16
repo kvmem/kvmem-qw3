@@ -438,3 +438,15 @@ static_assert(qw3::detail::kvmem_cached_query_replay_boundary(
 static_assert((145814 - qw3::detail::kvmem_cached_query_replay_boundary(
     145088, 41769, 41784, 32, 139744) + 31) / 32 == 23);
 static_assert((145814 - 139744 + 31) / 32 == 190);
+// Both fresh-Q and cached-Q replay retain the final block of a large Write,
+// rather than promoting its 29K-token interaction back into a pinned suffix.
+static_assert(qw3::detail::kvmem_complete_query_replay_boundary(
+                  109728, 54137, 54152, 32) == 109728);
+static_assert(qw3::detail::kvmem_cached_query_replay_boundary(
+                  109728, 54137, 54152, 32, 80480) == 109728);
+// A disabled current-query lifetime must not regain a long implicit pin when
+// the last replay block happens to overlap Q. Its complete Q is preserved.
+static_assert(qw3::detail::kvmem_complete_query_replay_boundary(
+                  1440, 1024, 1450, 32, true) == 1440);
+static_assert(qw3::detail::kvmem_cached_query_replay_boundary(
+                  1440, 1024, 1450, 32, 1300, true) == 1440);

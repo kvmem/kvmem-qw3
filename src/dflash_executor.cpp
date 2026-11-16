@@ -17,6 +17,29 @@ void require(bool ok, const char *message) {
 }
 } // namespace
 
+uint64_t DFlashExecutor::retained_device_bytes() const {
+    uint64_t bytes = 0;
+    const auto add = [&](const DeviceTensor *tensor) {
+        if (!tensor) return;
+        if (tensor->elem_size && tensor->count > (UINT64_MAX - bytes) / tensor->elem_size)
+            bytes = UINT64_MAX;
+        else bytes += tensor->count * tensor->elem_size;
+    };
+    const DeviceTensor *tensors[] = {
+        context_projection_.get(), context_norm_.get(), compact_.get(),
+        hidden_.get(), norm_.get(), mixed_.get(), delta_.get(), q_.get(),
+        attention_.get(), branch_.get(), conv_out_.get(), ffn_gate_.get(),
+        ffn_up_.get(), ffn_mid_.get(), output_.get(), logits_.get(), top_ids_.get(),
+        top_values_.get(), top_scratch_ids_.get(), top_scratch_values_.get(),
+        selector_hidden_.get(), tokens_.get(), probabilities_.get(), anchor_.get(), uniforms_.get()
+    };
+    for (const auto *tensor : tensors) add(tensor);
+    for (const auto &layer : layers_) {
+        add(layer.keys.get()); add(layer.values.get()); add(layer.raw_keys.get());
+    }
+    return bytes;
+}
+
 DFlashExecutor::DFlashExecutor(const DFlashWeights &weights, DeviceBackend &backend)
     : weights_(weights), backend_(backend) {
     check(backend_.begin());

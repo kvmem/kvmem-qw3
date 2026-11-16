@@ -18,8 +18,10 @@ struct KvPageTableTestAccess {
     static void raw_storage(const QwenNativeModel &, const QwenWeights &, DeviceBackend &, const std::string &);
     static void mtp_recent_window(const QwenNativeModel &, const QwenWeights &, DeviceBackend &);
     static void historical_pins(const QwenNativeModel &, const QwenWeights &, DeviceBackend &);
+    static void partial_tail_selection(const QwenNativeModel &, const QwenWeights &, DeviceBackend &);
     static void bounded_mrope(const QwenNativeModel &, const QwenWeights &, DeviceBackend &);
     static void bounded_config_guards(const QwenNativeModel &, const QwenWeights &, DeviceBackend &);
+    static void idle_swap(const QwenNativeModel &, const QwenWeights &, DeviceBackend &);
 };
 }
 using namespace qw3;
@@ -32,13 +34,37 @@ struct RecordingBackend final : DeviceBackend {
     struct Tensor : DeviceTensor { std::vector<int32_t> words; };
     std::vector<std::pair<uint64_t, uint64_t>> uploads;
     uint32_t transfer_fences = 0;
+    int reads = 0, writes = 0, fail_read = 0, fail_write = 0;
+    bool fail_drain_after_write = false, drain_failed = false;
+    DeviceStatus wait_kv_transfer() override { return {!drain_failed, "injected drain failure"}; }
+    DeviceStatus copy_bytes_to_host(const DeviceTensor &src, void *dst,
+                                    uint64_t offset, uint64_t bytes) override {
+        if (++reads == fail_read) return {false, "injected idle KV capture failure"};
+        const auto &tensor = dynamic_cast<const Tensor &>(src);
+        check(offset <= src.count * src.elem_size && bytes <= src.count * src.elem_size - offset,
+              "idle KV read outside tensor");
+        std::memcpy(dst, reinterpret_cast<const uint8_t *>(tensor.words.data()) + offset, bytes);
+        return {};
+    }
+    DeviceStatus copy_bytes_from_host(DeviceTensor &dst, uint64_t offset,
+                                      const void *src, uint64_t bytes) override {
+        if (++writes == fail_write) {
+            drain_failed = fail_drain_after_write;
+            return {false, "injected idle KV restore failure"};
+        }
+        auto &tensor = dynamic_cast<Tensor &>(dst);
+        check(offset <= dst.count * dst.elem_size && bytes <= dst.count * dst.elem_size - offset,
+              "idle KV write outside tensor");
+        std::memcpy(reinterpret_cast<uint8_t *>(tensor.words.data()) + offset, src, bytes);
+        return {};
+    }
     DeviceStatus record_kv_transfer_fence(std::unique_ptr<DeviceTransferFence> &fence) override {
         ++transfer_fences; fence.reset(); return {};
     }
     const char *name() const override { return "page-table-recorder"; }
     DeviceStatus begin() override { return {}; }
     DeviceStatus end() override { return {}; }
-    DeviceStatus synchronize() override { return {}; }
+    DeviceStatus synchronize() override { return {!drain_failed, "injected drain failure"}; }
     std::unique_ptr<DeviceTensor> tensor_f32(uint64_t count, const char *) override {
         auto t = std::make_unique<Tensor>(); t->count = count; t->words.resize(count); return t;
     }
@@ -467,6 +493,74 @@ void qw3::KvPageTableTestAccess::mtp_recent_window(const QwenNativeModel &model,
     check(e.mtp_window_page_count_ == 5, "repeated MTP draft extension duplicated its tail");
 }
 
+void qw3::KvPageTableTestAccess::partial_tail_selection(const QwenNativeModel &model,
+        const QwenWeights &weights, DeviceBackend &backend) {
+    QwenExecutor e(model, weights, backend, 256);
+    KvMemStoreConfig cfg; cfg.block_tokens = 32;
+    cfg.select_budget = cfg.prefill_budget = 96;
+    cfg.sink_blocks = 1; cfg.recent_blocks = 0;
+    cfg.select_method = KvMemMethod::Retrieval;
+    e.block_store_ = std::make_unique<KvMemStore>(cfg);
+    e.block_store_->register_append(143); // four sealed blocks and a 15-token tail
+    e.block_store_->set_retrieval_scores({100, 90, 80, 70, 0});
+    check(e.kvmem_materialize_mandatory_blocks() == std::vector<uint32_t>({4}),
+          "unpinned partial decode tail was not protected");
+    // No semantic/query pins: this exercised the previous fast-path bypass.
+    check(e.kvmem_selection_with_pin() == std::vector<uint32_t>({0, 1, 4}),
+          "zero-score partial tail lost to older scored blocks");
+    const auto pressure = e.block_store_->pick_prefill_pressure_blocks(
+        e.kvmem_materialize_mandatory_blocks(), {});
+    check(pressure.size() == 3 && std::find(pressure.begin(), pressure.end(), 4) != pressure.end(),
+          "capacity selection dropped the current partial tail");
+    // A durable request-tail pin can be older than the in-progress decode tail.
+    e.kvmem_set_mandatory_token_spans({{96, 128}});
+    check(e.kvmem_set_bounded_recent_pin(0) == 0 &&
+          e.kvmem_materialize_mandatory_blocks() == std::vector<uint32_t>({3, 4}) &&
+          e.kvmem_selection_with_pin() == std::vector<uint32_t>({0, 3, 4}),
+          "zero recent removed the physical append tail or preserved an extra suffix");
+    e.block_store_->register_append(17);
+    check(e.kvmem_materialize_mandatory_blocks() == std::vector<uint32_t>({3}),
+          "sealed decode tail remained unnecessarily mandatory");
+    e.kvmem_set_mandatory_token_spans({});
+    check(e.kvmem_materialize_mandatory_blocks().empty(),
+          "sealed tail added semantic retention at recent zero");
+
+    // A caller using exact explicit selection may intentionally discard a
+    // suffix before replay. Continuing at the old position must fail safely,
+    // before page aliases or GPU work can be submitted.
+    e.position_ = 143; e.window_query_pos_ = 96;
+    const auto before = e.window_pages_host_;
+    unsigned rejected = 0;
+    try { e.kvmem_extend_window_for_decode(); } catch (const std::logic_error &) { ++rejected; }
+    try { e.kvmem_extend_window_for_decode_n(8, 143); } catch (const std::logic_error &) { ++rejected; }
+    try { e.kvmem_extend_mtp_window_for_decode_n(8, 143); } catch (const std::logic_error &) { ++rejected; }
+    check(rejected == 3 && e.window_pages_host_ == before,
+          "incompatible page offsets reached an append path");
+
+    // Repository IDs can be recycled: retain the partial historical tail,
+    // not the numerically greatest physical slot.
+    const uint64_t origin = uint64_t{1} << 40;
+    auto repo = std::make_shared<KvMemRepository>(KvMemRepository::Config{4, 32});
+    cfg.repository_blocks = 4; cfg.sink_blocks = 0;
+    e.block_store_ = std::make_unique<KvMemStore>(cfg, repo);
+    KvMemBlockHandle oldest;
+    for (uint32_t i = 0; i < 4; ++i) {
+        auto lease = repo->try_reserve(origin + 32 * i, 32).commit();
+        const auto h = lease.handle();
+        if (i == 0) oldest = h;
+        e.block_store_->register_repository_block(std::move(lease), 0);
+        e.block_store_->set_block_tier(h.slot, KvTier::CPU, 0, -1, h.generation);
+    }
+    check(repo->retire_if_unpinned(oldest), "partial-tail fixture could not retire old history");
+    repo->try_reclaim(oldest, [](const auto &) { return true; });
+    auto lease = repo->try_reserve(origin + 128, 15).commit();
+    const auto tail = lease.handle();
+    e.block_store_->register_repository_block(std::move(lease), 0);
+    check(tail.slot == oldest.slot &&
+          e.kvmem_materialize_mandatory_blocks() == std::vector<uint32_t>({tail.slot}),
+          "partial-tail pin used physical slot order instead of history");
+}
+
 void qw3::KvPageTableTestAccess::historical_pins(const QwenNativeModel &model,
         const QwenWeights &weights, DeviceBackend &backend) {
     for (const uint64_t origin : {4096ull, 1ull << 40}) {
@@ -598,6 +692,152 @@ void KvPageTableTestAccess::bounded_config_guards(
     }
 }
 
+void KvPageTableTestAccess::idle_swap(
+        const QwenNativeModel &model, const QwenWeights &weights, DeviceBackend &base) {
+    auto &backend = dynamic_cast<RecordingBackend &>(base);
+    PagePool main_parent(12), mtp_parent(12);
+    constexpr uint32_t page_size = 16, physical_slots = 12 * page_size;
+    std::vector<std::unique_ptr<DeviceTensor>> storage;
+    for (uint32_t t = 0; t < 4; ++t) {
+        auto tensor = backend.tensor_f32(physical_slots * 4, "idle-test-arena");
+        tensor->elem_size = t == 0 ? 1 : t == 2 ? 4 : 2;
+        tensor->dtype = t == 0 ? DeviceTensorDType::FP8_E4M3 :
+            t == 2 ? DeviceTensorDType::F32 : DeviceTensorDType::F16;
+        auto &words = dynamic_cast<RecordingBackend::Tensor &>(*tensor).words;
+        auto *bytes = reinterpret_cast<uint8_t *>(words.data());
+        for (size_t i = 0; i < words.size() * sizeof(int32_t); ++i)
+            bytes[i] = uint8_t((i * 13 + t * 73 + i / 37) & 255);
+        storage.push_back(std::move(tensor));
+    }
+    QwenExecutor::KvCacheStorage main_cache{physical_slots, {storage[0].get()}, {storage[1].get()}};
+    QwenExecutor::KvCacheStorage mtp_cache{physical_slots, {storage[2].get()}, {storage[3].get()}};
+    auto e = std::make_unique<QwenExecutor>(model, weights, backend, 128,
+        &main_parent, &main_cache, &mtp_parent, &mtp_cache);
+    auto repo = std::make_shared<KvMemRepository>(KvMemRepository::Config{4, 32});
+    KvMemStoreConfig config; config.block_tokens = 32;
+    e->block_store_ = std::make_unique<KvMemStore>(config, repo);
+    e->block_store_->register_repository_block(repo->try_reserve(0, 32).commit(), 0);
+    e->kvmem_enabled_ = e->kvmem_active_ = true;
+    e->kvmem_gpu_page_pool_ = std::make_unique<SharedKvPagePool>(main_parent, 3, 2, "idle-test-main");
+    e->kvmem_mtp_gpu_page_pool_ = std::make_unique<SharedKvPagePool>(mtp_parent, 3, 2, "idle-test-mtp");
+    e->kv_pages_.configure_bounded(128, e->kvmem_gpu_page_pool_.get());
+    e->mtp_kv_pages_.configure_bounded(128, e->kvmem_mtp_gpu_page_pool_.get());
+    e->kv_pages_.ensure_logical_page_ranges_resident(backend, {{0, 1}, {3, 1}});
+    e->mtp_kv_pages_.ensure_logical_page_ranges_resident(backend, {{0, 1}, {3, 1}});
+    const auto original_main = e->kv_pages_.pages, original_mtp = e->mtp_kv_pages_.pages;
+    e->window_pages_host_ = {original_main[3], original_main[0], original_main[3]};
+    e->mtp_window_pages_host_ = {original_mtp[0], original_mtp[3]};
+    e->window_page_count_ = 3; e->mtp_window_page_count_ = 2;
+    e->sync_window_pages_device(3); e->sync_mtp_window_pages_device(2);
+    e->position_ = (uint64_t{1} << 34) + 31;
+    e->window_query_pos_ = 31; e->kvmem_selection_generation_ = 17;
+    e->prefill_attention_scores_[12] = {4, 2};
+    e->action_round_mass_[12] = 0.75;
+    e->h_ = backend.tensor_f32(4, "idle-hidden");
+    auto *hidden = e->h_.get();
+    dynamic_cast<RecordingBackend::Tensor &>(*hidden).words[0] = 123456;
+    const auto *identity = e->block_store_.get();
+    const uint64_t estimate = e->kvmem_idle_snapshot_bytes();
+    check(estimate > 0 && e->kvmem_idle_retained_device_bytes() >= 16,
+          "idle snapshot or retained private-device accounting is empty");
+    std::vector<std::vector<uint8_t>> saved;
+    for (size_t t = 0; t < storage.size(); ++t) {
+        const auto &pages = t < 2 ? original_main : original_mtp;
+        const uint64_t bytes_per_page = uint64_t(page_size) * 4 * storage[t]->elem_size;
+        saved.emplace_back(bytes_per_page * 2);
+        for (size_t p = 0; p < 2; ++p)
+            check(backend.copy_bytes_to_host(*storage[t], saved.back().data() + p * bytes_per_page,
+                uint64_t(pages[p ? 3 : 0]) * bytes_per_page, bytes_per_page).ok, "test read failed");
+    }
+    const int reads_before = backend.reads;
+    check(!e->kvmem_suspend_idle(estimate - 1) && backend.reads == reads_before &&
+          main_parent.used_pages() == 3 && mtp_parent.used_pages() == 3,
+          "swap budget refusal performed copies or released the live owner");
+    backend.fail_read = backend.reads + 3;
+    bool failed = false;
+    try { e->kvmem_suspend_idle(estimate); } catch (const std::runtime_error &) { failed = true; }
+    check(failed && !e->kvmem_idle_suspended() && e->kv_pages_.pages == original_main &&
+          main_parent.used_pages() == 3 && mtp_parent.used_pages() == 3,
+          "failed capture changed the live session or its reservation");
+    backend.fail_read = 0;
+    check(e->kvmem_suspend_idle(estimate) && e->kvmem_idle_swap_bytes() == estimate &&
+          main_parent.used_pages() == 0 && mtp_parent.used_pages() == 0,
+          "successful suspension did not release both complete reservations");
+    failed = false;
+    try { e->mutable_decode_state_view(); } catch (const std::logic_error &) { failed = true; }
+    check(failed, "cold executor exposed old physical pages for compute");
+    SharedKvPagePool peer_main(main_parent, 6, 0, "peer-main");
+    SharedKvPagePool peer_mtp(mtp_parent, 6, 0, "peer-mtp");
+    // Simulate another request overwriting all pages that used to hold A.
+    for (auto &tensor : storage) {
+        auto &words = dynamic_cast<RecordingBackend::Tensor &>(*tensor).words;
+        std::fill(words.begin(), words.end(), 0x45454545);
+    }
+    {
+        SharedKvPagePool tight_mtp(mtp_parent, 4, 0, "tight-mtp");
+        failed = false;
+        try { e->kvmem_resume_idle(); } catch (const std::runtime_error &) { failed = true; }
+        check(failed && e->kvmem_idle_suspended() && e->kvmem_idle_swap_bytes() == estimate &&
+              main_parent.used_pages() == 6 && mtp_parent.used_pages() == 10,
+              "MTP admission failure lost the cold image or leaked target pages");
+    }
+    backend.fail_write = backend.writes + 5; // Fail after main and into MTP.
+    failed = false;
+    try { e->kvmem_resume_idle(); } catch (const std::runtime_error &) { failed = true; }
+    check(failed && e->kvmem_idle_suspended() && e->kv_pages_.pages == original_main &&
+          main_parent.used_pages() == 6 && mtp_parent.used_pages() == 6,
+          "partial restore lost the retryable image or published a partial directory");
+    backend.fail_write = backend.writes + 2;
+    backend.fail_drain_after_write = true;
+    failed = false;
+    try { e->kvmem_resume_idle(); } catch (const std::runtime_error &) { failed = true; }
+    check(failed && e->kvmem_idle_suspended() && e->kvmem_idle_quarantined_pages() == 6 &&
+          main_parent.used_pages() == 9 && mtp_parent.used_pages() == 9,
+          "failed device drain returned potentially in-flight pages to another request");
+    backend.fail_write = 0;
+    backend.fail_drain_after_write = backend.drain_failed = false;
+    e->kvmem_resume_idle();
+    check(!e->kvmem_idle_suspended() && e->kvmem_idle_swap_bytes() == 0 &&
+          e->kv_pages_.pages != original_main && e->mtp_kv_pages_.pages != original_mtp,
+          "resume did not move the exact snapshot to newly leased physical pages");
+    check(e->block_store_.get() == identity && e->h_.get() == hidden &&
+          dynamic_cast<RecordingBackend::Tensor &>(*hidden).words[0] == 123456 &&
+          e->position_ == (uint64_t{1} << 34) + 31 && e->window_query_pos_ == 31 &&
+          e->kvmem_selection_generation_ == 17 && e->prefill_attention_scores_.at(12).mean() == 2 &&
+          e->action_round_mass_.at(12) == 0.75,
+          "parking changed history identity, hidden state, scores or logical coordinates");
+    check(e->window_pages_host_ == std::vector<int32_t>{e->kv_pages_.pages[3], e->kv_pages_.pages[0], e->kv_pages_.pages[3]} &&
+          e->mtp_window_pages_host_ == std::vector<int32_t>{e->mtp_kv_pages_.pages[0], e->mtp_kv_pages_.pages[3]},
+          "compact window ordering or aliased pages were not remapped");
+    const auto check_directory = [&](const Table &table) {
+        const auto &words = dynamic_cast<RecordingBackend::Tensor &>(*table.device_pages).words;
+        check(table.device_synced == table.pages.size() &&
+              std::equal(table.pages.begin(), table.pages.end(), words.begin()),
+              "restored device page directory differs from its logical owner");
+    };
+    check_directory(e->kv_pages_); check_directory(e->mtp_kv_pages_);
+    for (size_t t = 0; t < storage.size(); ++t) {
+        const auto &pages = t < 2 ? e->kv_pages_.pages : e->mtp_kv_pages_.pages;
+        const uint64_t bytes_per_page = uint64_t(page_size) * 4 * storage[t]->elem_size;
+        std::vector<uint8_t> restored(saved[t].size());
+        for (size_t p = 0; p < 2; ++p)
+            check(backend.copy_bytes_to_host(*storage[t], restored.data() + p * bytes_per_page,
+                uint64_t(pages[p ? 3 : 0]) * bytes_per_page, bytes_per_page).ok, "test restore read failed");
+        check(restored == saved[t], "idle resume changed original FP8/FP16/FP32 KV bytes");
+        const auto &words = dynamic_cast<RecordingBackend::Tensor &>(*storage[t]).words;
+        const auto *bytes = reinterpret_cast<const uint8_t *>(words.data());
+        const auto &old = t < 2 ? original_main : original_mtp;
+        check(std::all_of(bytes + uint64_t(old[0]) * bytes_per_page,
+                         bytes + uint64_t(old[0] + 1) * bytes_per_page,
+                         [](uint8_t x) { return x == 0x45; }),
+              "restore overwrote a peer's reassigned page");
+    }
+    check(e->kvmem_suspend_idle(estimate), "second suspension failed");
+    e.reset();
+    check(main_parent.used_pages() == 6 && mtp_parent.used_pages() == 6,
+          "cold destruction freed stale physical IDs belonging to another request");
+}
+
 static void executor_raw_storage() {
     const auto dir = std::filesystem::temp_directory_path() / ("qw3-executor-storage-" + std::to_string(getpid()));
     std::filesystem::create_directories(dir);
@@ -613,8 +853,10 @@ static void executor_raw_storage() {
         KvPageTableTestAccess::raw_storage(model, weights, backend, dir.string());
         KvPageTableTestAccess::mtp_recent_window(model, weights, backend);
         KvPageTableTestAccess::historical_pins(model, weights, backend);
+        KvPageTableTestAccess::partial_tail_selection(model, weights, backend);
         KvPageTableTestAccess::bounded_mrope(model, weights, backend);
         KvPageTableTestAccess::bounded_config_guards(model, weights, backend);
+        KvPageTableTestAccess::idle_swap(model, weights, backend);
     } catch (...) { std::filesystem::remove_all(dir); throw; }
     std::filesystem::remove_all(dir);
 }
